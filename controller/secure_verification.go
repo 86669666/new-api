@@ -19,6 +19,21 @@ import (
 )
 
 func GetVerificationMethods(c *gin.Context) {
+	if service.IsOrganizationScope(c.Query("scope")) {
+		identity, _, _, err := organizationRequest(c, false, false, 0, true)
+		if err != nil {
+			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		requirements, err := service.OrganizationVerificationRequirementsWithContext(c.Request.Context(), identity, c.Query("scope"))
+		if err != nil {
+			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		common.ApiSuccess(c, requirements)
+		return
+	}
+
 	identity, ok := middleware.GetStepUpIdentity(c)
 	if !ok {
 		writeAccountStatusError(c, http.StatusUnauthorized, "The current sign-in method does not support security verification")
@@ -39,6 +54,8 @@ func writeSecurityOperationError(c *gin.Context, err error) {
 	var code, message string
 	var protocolError *protocol.Error
 	switch {
+	case errors.Is(err, model.ErrOrganizationMembershipActive):
+		code, message = "ORGANIZATION_MEMBERSHIP_ACTIVE", model.OrganizationMembershipMessage
 	case errors.Is(err, passkeysvc.ErrRPIDUnavailable):
 		code, message = "PASSKEY_RP_ID_UNAVAILABLE", "This Passkey domain is not available on this website. Use its original website or another verification method."
 	case errors.Is(err, system_setting.ErrPasskeyRPIDInvalid):
@@ -155,14 +172,65 @@ func requireAdminUserProof(c *gin.Context, scope string, context any) *model.Aut
 }
 
 func UniversalVerify(c *gin.Context) {
-	identity, ok := middleware.GetStepUpIdentity(c)
-	if !ok {
-		writeAccountStatusError(c, http.StatusUnauthorized, "The current sign-in method does not support security verification")
+	raw, err := readSecurityProducerBody(c)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
 		return
 	}
 	var request service.VerificationInput
-	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
-		common.ApiErrorT(c, "Invalid parameters")
+	if common.ValidateJSONObjectFields(raw, []string{"method", "scope"}, []string{"context", "code", "password", "password_encrypted", "encryption_key_id"}) != nil || common.Unmarshal(raw, &request) != nil {
+		writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
+		return
+	}
+	if service.IsOrganizationScope(request.Scope) {
+		identity, data, _, err := organizationRequest(c, false, false, 64*1024, false)
+		if err != nil {
+			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		var request service.VerificationInput
+		if common.UnmarshalStrictObject(data, &request) != nil {
+			writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
+			return
+		}
+		var fields map[string]common.RawMessage
+		_ = common.Unmarshal(data, &fields)
+		required := []string{"method", "scope", "context"}
+		switch request.Method {
+		case service.VerificationMethodTwoFA:
+			required = append(required, "code")
+		case service.VerificationMethodPassword:
+			if common.PasswordLoginEncryptionEnabled {
+				required = append(required, "password_encrypted", "encryption_key_id")
+			} else {
+				required = append(required, "password")
+			}
+		default:
+			writeOrganizationLifecycleError(c, service.ErrVerificationUnavailable)
+			return
+		}
+		if len(fields) != len(required) {
+			writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
+			return
+		}
+		for _, key := range required {
+			if _, ok := fields[key]; !ok {
+				writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
+				return
+			}
+		}
+		proof, err := service.VerifyOrganizationInputWithContext(c.Request.Context(), identity, request)
+		if err != nil {
+			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		organizationVerificationSuccess(c, identity, proof)
+		return
+	}
+
+	identity, ok := middleware.GetStepUpIdentity(c)
+	if !ok {
+		writeAccountStatusError(c, http.StatusUnauthorized, "The current sign-in method does not support security verification")
 		return
 	}
 	proof, err := service.VerifySecurityInput(identity, request)

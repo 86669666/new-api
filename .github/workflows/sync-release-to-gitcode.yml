@@ -22,7 +22,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    if: ${{ vars.GITCODE_REPOSITORY != '' }}
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.freeze.outputs.sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: refs/tags/${{ inputs.tag_name }}
+      - id: freeze
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  quality:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      sha: ${{ needs.prepare.outputs.sha }}
+
   prepare-release:
+    needs: [prepare, quality]
     name: Create or update GitCode release
     if: ${{ vars.GITCODE_REPOSITORY != '' }}
     runs-on: ubuntu-latest
@@ -34,6 +53,22 @@ jobs:
       release_asset_matrix: ${{ steps.assets.outputs.matrix }}
       has_release_assets: ${{ steps.assets.outputs.has_assets }}
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ needs.quality.outputs.verified_sha }}
+          fetch-depth: 0
+      - name: Verify both release tags name the tested commit
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          CANDIDATE_SHA: ${{ needs.quality.outputs.verified_sha }}
+          GITCODE_REPOSITORY: ${{ vars.GITCODE_REPOSITORY }}
+        run: |
+          test -n "$CANDIDATE_SHA"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git fetch --force --tags origin
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$CANDIDATE_SHA"
+          git fetch --no-tags "https://gitcode.com/$GITCODE_REPOSITORY.git" "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$CANDIDATE_SHA"
       - name: Create or update GitCode release
         id: release
         env:
@@ -230,7 +265,7 @@ jobs:
 
   gitcode-release-assets:
     name: Publish GitCode asset (${{ matrix.file_name }})
-    needs: prepare-release
+    needs: [prepare-release, quality]
     if: ${{ inputs.sync_files && needs.prepare-release.result == 'success' && needs.prepare-release.outputs.has_release_assets == 'true' }}
     strategy:
       fail-fast: false

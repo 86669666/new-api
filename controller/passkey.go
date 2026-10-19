@@ -469,6 +469,21 @@ func AdminResetPasskey(c *gin.Context) {
 }
 
 func PasskeyVerifyBegin(c *gin.Context) {
+	raw, readErr := readSecurityProducerBody(c)
+	if readErr != nil {
+		writeOrganizationLifecycleError(c, readErr)
+		return
+	}
+	var request passkeyVerifyBeginRequest
+	if common.ValidateJSONObjectFields(raw, []string{"scope"}, []string{"context", "rp_id"}) != nil || common.Unmarshal(raw, &request) != nil {
+		writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
+		return
+	}
+	if service.IsOrganizationScope(request.Scope) {
+		organizationPasskeyBegin(c)
+		return
+	}
+
 	if !system_setting.PasskeySettingsSnapshot().Enabled {
 		common.ApiErrorT(c, "Passkey authentication is disabled.")
 		return
@@ -477,11 +492,6 @@ func PasskeyVerifyBegin(c *gin.Context) {
 	user, err := getAuthenticatedUser(c)
 	if err != nil {
 		writeSecurityOperationError(c, err)
-		return
-	}
-	var request passkeyVerifyBeginRequest
-	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
-		common.ApiErrorT(c, "Invalid Passkey verification request")
 		return
 	}
 	binding, err := service.BindVerificationOperation(service.VerificationOperation{Scope: request.Scope, Context: request.Context})
@@ -545,6 +555,35 @@ func PasskeyVerifyBegin(c *gin.Context) {
 }
 
 func PasskeyVerifyFinish(c *gin.Context) {
+	raw, readErr := readSecurityProducerBody(c)
+	if readErr != nil {
+		writeOrganizationLifecycleError(c, readErr)
+		return
+	}
+	// Decode once before selecting a branch: case aliases and duplicate keys
+	// cannot make inspection and consumption use different flow tokens.
+	var request passkeyFinishRequest
+	if common.ValidateJSONObjectFields(raw, []string{"flow_token", "credential"}, nil) != nil || common.UnmarshalWebAuthnFinishObject(raw, &request) != nil || request.FlowToken == "" || len(request.Credential) == 0 {
+		writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
+		return
+	}
+	identity, ok := middleware.GetStepUpIdentity(c)
+	if !ok {
+		writeSecurityOperationError(c, service.ErrAuthTokenInvalid)
+		return
+	}
+	security, err := passkeysvc.InspectStepUpSecurityWithContext(c.Request.Context(), request.FlowToken, identity)
+	if err != nil {
+		// Unknown, cancelled and storage-failed inspections all stop here.
+		// None can be retried through the personal challenge consumer.
+		writeSecurityOperationError(c, err)
+		return
+	}
+	if service.IsOrganizationScope(security.Scope) {
+		organizationPasskeyFinish(c, security, &request)
+		return
+	}
+
 	if !system_setting.PasskeySettingsSnapshot().Enabled {
 		common.ApiErrorT(c, "Passkey authentication is disabled.")
 		return
@@ -556,11 +595,6 @@ func PasskeyVerifyFinish(c *gin.Context) {
 		return
 	}
 
-	request, err := parsePasskeyFinishRequest(c)
-	if err != nil {
-		common.ApiErrorT(c, "Invalid Passkey verification request")
-		return
-	}
 	parsedCredential, err := protocol.ParseCredentialRequestResponseBytes(request.Credential)
 	if err != nil {
 		writeSecurityOperationError(c, err)
@@ -573,11 +607,6 @@ func PasskeyVerifyFinish(c *gin.Context) {
 		return
 	}
 
-	identity, ok := middleware.GetStepUpIdentity(c)
-	if !ok {
-		common.ApiErrorT(c, "The current sign-in method does not support security verification")
-		return
-	}
 	sessionData, security, err := passkeysvc.PopSessionDataFlow(
 		request.FlowToken,
 		model.AuthFlowPurposePasskeyStepUp,
@@ -637,4 +666,152 @@ func getAuthenticatedUser(c *gin.Context) (*model.User, error) {
 		return nil, model.ErrUserSessionInactive
 	}
 	return user, nil
+}
+
+func organizationPasskeyBegin(c *gin.Context) {
+	identity, data, _, err := organizationRequest(c, false, false, 64*1024, false)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	var request passkeyVerifyBeginRequest
+	if common.ValidateJSONObjectFields(data, []string{"scope", "context"}, []string{"rp_id"}) != nil || common.UnmarshalStrictObject(data, &request) != nil {
+		writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
+		return
+	}
+	op, _, _, err := service.RebuildOrganizationOperationWithContext(c.Request.Context(), identity, service.VerificationOperation{Scope: request.Scope, Context: request.Context})
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	attempt, err := model.ReserveOrganizationVerificationAttemptWithContext(c.Request.Context(), identity)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	if _, err := service.RequireVerificationMethodWithContext(c.Request.Context(), identity, op.Scope, service.VerificationMethodPasskey); err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	user, err := getAuthenticatedUserWithContext(c)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	credential := &model.PasskeyCredential{}
+	err = model.DB.WithContext(c.Request.Context()).Where("user_id = ?", user.Id).First(credential).Error
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	credentialRPID := ""
+	if credential.RPID != nil {
+		credentialRPID = *credential.RPID
+	}
+	wa, rpIDs, err := passkeysvc.BuildLoginWebAuthn(c.Request, request.RPID, credentialRPID)
+	if err != nil {
+		writeOrganizationLifecycleError(c, service.ErrVerificationFailed)
+		return
+	}
+	assertion, sessionData, err := wa.BeginLogin(passkeysvc.NewWebAuthnUser(user, credential), webauthnlib.WithUserVerification(protocol.VerificationRequired))
+	if err != nil {
+		writeOrganizationLifecycleError(c, service.ErrVerificationFailed)
+		return
+	}
+	currentSession, err := model.GetUserSessionBySIDWithContext(c.Request.Context(), identity.SessionID)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	binding := service.OrganizationVerificationBinding(op)
+	flowToken, expiresAt, err := passkeysvc.CreateSessionDataFlowWithContext(c.Request.Context(), model.AuthFlowPurposePasskeyStepUp, passkeysvc.FlowSecurity{AuthSessionIdentity: identity, Scope: op.Scope, ContextHash: binding.ContextHash, OrganizationContext: op.Context, OrganizationAttemptID: attempt.Id, OrganizationExpiresAt: min(attempt.ExpiresAt.Unix(), currentSession.ExpiresAt)}, sessionData)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"options": assertion, "rp_ids": rpIDs, "flow_token": flowToken, "expires_at": expiresAt})
+}
+func organizationPasskeyFinish(c *gin.Context, inspected *passkeysvc.FlowSecurity, request *passkeyFinishRequest) {
+	identity, _, _, err := organizationRequest(c, false, false, 64*1024, false)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	if _, err := service.RequireVerificationMethodWithContext(c.Request.Context(), identity, inspected.Scope, service.VerificationMethodPasskey); err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	sessionData, security, err := passkeysvc.PopSessionDataFlowWithContext(c.Request.Context(), request.FlowToken, model.AuthFlowPurposePasskeyStepUp, identity)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	if !service.IsOrganizationScope(security.Scope) || sessionData.UserVerification != protocol.VerificationRequired {
+		writeOrganizationLifecycleError(c, model.ErrAuthFlowInvalid)
+		return
+	}
+	op, _, _, err := service.RebuildOrganizationOperationWithContext(c.Request.Context(), identity, service.VerificationOperation{Scope: security.Scope, Context: security.OrganizationContext})
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	if service.OrganizationVerificationBinding(op).ContextHash != security.ContextHash {
+		writeOrganizationLifecycleError(c, service.ErrProofContext)
+		return
+	}
+	user, err := getAuthenticatedUserWithContext(c)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	credential := &model.PasskeyCredential{}
+	err = model.DB.WithContext(c.Request.Context()).Where("user_id = ?", user.Id).First(credential).Error
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	parsed, err := protocol.ParseCredentialRequestResponseBytes(request.Credential)
+	if err != nil {
+		writeOrganizationLifecycleError(c, service.ErrVerificationFailed)
+		return
+	}
+	wa, err := passkeysvc.BuildWebAuthnForRPID(c.Request, sessionData.RelyingPartyID)
+	if err != nil {
+		writeOrganizationLifecycleError(c, service.ErrVerificationFailed)
+		return
+	}
+	if credential.RPID != nil && *credential.RPID != "" && *credential.RPID != sessionData.RelyingPartyID {
+		writeOrganizationLifecycleError(c, service.ErrVerificationFailed)
+		return
+	}
+	validated, err := wa.ValidateLogin(passkeysvc.NewWebAuthnUser(user, credential), *sessionData, parsed)
+	if err != nil || validated == nil || !validated.Flags.UserVerified || validated.Authenticator.CloneWarning {
+		writeOrganizationLifecycleError(c, service.ErrVerificationFailed)
+		return
+	}
+	if err := model.UpdateOrganizationPasskeyAssertionStateWithContext(c.Request.Context(), user.Id, validated, time.Now(), sessionData.RelyingPartyID, credential); err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	proof, err := service.CompleteOrganizationVerificationWithContext(c.Request.Context(), identity, op, service.VerificationMethodPasskey)
+	if err != nil {
+		writeOrganizationLifecycleError(c, err)
+		return
+	}
+	organizationVerificationSuccess(c, identity, proof)
+}
+
+func getAuthenticatedUserWithContext(c *gin.Context) (*model.User, error) {
+	id := c.GetInt("id")
+	if id == 0 {
+		return nil, service.ErrAuthTokenInvalid
+	}
+	var user model.User
+	if err := model.DB.WithContext(c.Request.Context()).First(&user, id).Error; err != nil {
+		return nil, err
+	}
+	if user.Status != common.UserStatusEnabled {
+		return nil, model.ErrUserSessionInactive
+	}
+	return &user, nil
 }

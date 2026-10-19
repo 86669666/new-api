@@ -73,6 +73,7 @@ func TestMigrationSchemaStability(t *testing.T) {
 				dsn = os.Getenv("TEST_POSTGRES_DSN")
 			}
 			if dsn == "" {
+				require.NotEqual(t, "1", os.Getenv("NEWAPI_REQUIRE_DATABASES"), "required database DSN is missing")
 				t.Skip("test database DSN is not configured")
 			}
 			t.Setenv("MIGRATION_TEST_DSN", dsn)

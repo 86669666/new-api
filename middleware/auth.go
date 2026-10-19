@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -156,6 +157,32 @@ func GetAuthIdentity(c *gin.Context) (service.AuthIdentity, bool) {
 	}
 	identity, ok := value.(service.AuthIdentity)
 	return identity, ok
+}
+
+// RequirePersonalResourceOwner resolves ownership only from the identity set by
+// dashboard authentication. It must run after UserAuth and does not replace the
+// route's credential scopes or object authorization checks.
+func RequirePersonalResourceOwner(c *gin.Context) (int, bool) {
+	identity, ok := GetAuthIdentity(c)
+	if !ok || identity.UserID <= 0 {
+		writeDashboardAuthError(c, service.ErrAuthTokenInvalid)
+		return 0, false
+	}
+	selection := organizationRequestSelection(c)
+	if selection.code != "" {
+		rejectOrganizationSelection(c, selection.code)
+		return 0, false
+	}
+	if selection.id != 0 {
+		rejectOrganizationSelection(c, "ORG_RESOURCE_UNSUPPORTED")
+		return 0, false
+	}
+	scope, valid := hosttypes.NewPersonalResourceScope(identity.UserID)
+	if valid {
+		return scope.PersonalOwnerID()
+	}
+	writeDashboardAuthError(c, service.ErrAuthTokenInvalid)
+	return 0, false
 }
 
 // GetSessionAuthIdentity returns only identities backed by a live dashboard
@@ -407,11 +434,26 @@ func writeDashboardAuthError(c *gin.Context, err error) {
 	abortWithWebMessage(c, http.StatusInternalServerError, "AUTH_INTERNAL_ERROR", common.NewMessage("Database error, please contact the administrator"))
 }
 
+// AccessTokenScopeAllowed applies the credential's scope ceiling only. Callers
+// must still enforce the user's permission or object ownership separately.
+// Browser sessions and legacy access tokens retain their existing permissions.
+func AccessTokenScopeAllowed(c *gin.Context, scope string) bool {
+	if !c.GetBool("use_access_token") || c.GetBool("access_token_legacy") {
+		return true
+	}
+	return service.AccessTokenScopeGranted(c.GetStringSlice("access_token_scopes"), scope)
+}
+
+// HasPermission intersects user authorization with the current credential's
+// scope. Handler-level checks must use this as well as route-level checks.
+func HasPermission(c *gin.Context, permission authz.Permission) bool {
+	return AccessTokenScopeAllowed(c, service.AccessTokenScopeOf(permission)) &&
+		authz.Can(c.GetInt("id"), c.GetInt("role"), permission)
+}
+
 func RequirePermission(permission authz.Permission) func(c *gin.Context) {
 	return func(c *gin.Context) {
-		role := c.GetInt("role")
-		userID := c.GetInt("id")
-		if authz.Can(userID, role, permission) {
+		if HasPermission(c, permission) {
 			c.Next()
 			return
 		}

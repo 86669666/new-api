@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"strings"
@@ -163,13 +164,52 @@ func GetPasskeyByCredentialID(credentialID []byte) (*PasskeyCredential, error) {
 // assertion. Registration identity (credential ID, public key, AAGUID,
 // transports and attestation metadata) is immutable on this path.
 func UpdatePasskeyAssertionState(userID int, credential *webauthn.Credential, lastUsedAt time.Time, rpID string) error {
+	return updatePasskeyAssertionState(userID, credential, lastUsedAt, rpID, nil)
+}
+
+// The expected registration binds the signature-verified key to the row locked
+// at persistence time. Concurrent assertions may never lower the stored counter.
+func UpdateOrganizationPasskeyAssertionState(userID int, credential *webauthn.Credential, lastUsedAt time.Time, rpID string, expected *PasskeyCredential) error {
+	return UpdateOrganizationPasskeyAssertionStateWithContext(context.Background(), userID, credential, lastUsedAt, rpID, expected)
+}
+
+func UpdateOrganizationPasskeyAssertionStateWithContext(ctx context.Context, userID int, credential *webauthn.Credential, lastUsedAt time.Time, rpID string, expected *PasskeyCredential) error {
+	if expected == nil || credential == nil || !credential.Flags.UserVerified || credential.Authenticator.CloneWarning {
+		return ErrFriendlyPasskeyNotFound
+	}
+	return updatePasskeyAssertionStateWithContext(ctx, userID, credential, lastUsedAt, rpID, expected)
+}
+func updatePasskeyAssertionState(userID int, credential *webauthn.Credential, lastUsedAt time.Time, rpID string, expected *PasskeyCredential) error {
+	return updatePasskeyAssertionStateWithContext(context.Background(), userID, credential, lastUsedAt, rpID, expected)
+}
+
+func updatePasskeyAssertionStateWithContext(ctx context.Context, userID int, credential *webauthn.Credential, lastUsedAt time.Time, rpID string, expected *PasskeyCredential) error {
 	if userID <= 0 || credential == nil || len(credential.ID) == 0 || lastUsedAt.IsZero() || rpID == "" {
 		return errors.New("failed to save the Passkey, please try again")
 	}
 	credentialID := base64.StdEncoding.EncodeToString(credential.ID)
-	passkeyOptionMutex.Lock()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Keep the same lock and ordering as registration/configuration updates.
+	// Polling TryLock bounds the wait without leaving a goroutine blocked on
+	// Lock after this request has already returned.
+	wait := time.NewTicker(10 * time.Millisecond)
+	defer wait.Stop()
+	for !passkeyOptionMutex.TryLock() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wait.C:
+		}
+	}
 	defer passkeyOptionMutex.Unlock()
-	return DB.Transaction(func(tx *gorm.DB) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := validatePasskeyRPIDWithTx(tx, rpID); err != nil {
 			return err
 		}
@@ -184,12 +224,21 @@ func UpdatePasskeyAssertionState(userID int, credential *webauthn.Credential, la
 		if stored.RPID != nil && *stored.RPID != "" && *stored.RPID != rpID {
 			return system_setting.ErrPasskeyRPIDUnavailable
 		}
+		if expected != nil {
+			if stored.ID != expected.ID || stored.UserID != expected.UserID || stored.CredentialID != expected.CredentialID || stored.PublicKey != expected.PublicKey || stored.BackupEligible != credential.Flags.BackupEligible {
+				return ErrFriendlyPasskeyNotFound
+			}
+			if (stored.SignCount != 0 || credential.Authenticator.SignCount != 0) && credential.Authenticator.SignCount <= stored.SignCount && !stored.BackupEligible {
+				return ErrFriendlyPasskeyNotFound
+			}
+		}
+		signCount := max(stored.SignCount, credential.Authenticator.SignCount)
 		result := tx.Model(&PasskeyCredential{}).
 			Where("user_id = ? AND credential_id = ?", userID, credentialID).
 			Where("rp_id IS NULL OR rp_id = ? OR rp_id = ?", "", rpID).
 			Updates(map[string]any{
 				"rp_id":           rpID,
-				"sign_count":      credential.Authenticator.SignCount,
+				"sign_count":      signCount,
 				"clone_warning":   credential.Authenticator.CloneWarning,
 				"user_present":    credential.Flags.UserPresent,
 				"user_verified":   credential.Flags.UserVerified,

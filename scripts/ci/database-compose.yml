@@ -1,0 +1,54 @@
+# Dedicated, disposable CI instances only. Never extends the application stack.
+services:
+  mysql:
+    profiles: [isolated-ci]
+    image: docker.io/library/mysql@sha256:213bbfaf699693a40a20a12bb4342d2589a15a3dc7153db698eaed252a92458e
+    pull_policy: never
+    platform: linux/arm64
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_DATABASE: newapi_ci_contracts
+    networks: [isolated]
+    healthcheck:
+      test: [CMD, mysqladmin, ping, --silent]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  postgres:
+    profiles: [isolated-ci]
+    image: docker.io/library/postgres@sha256:91a22c143801df42c2e4a8f9926eab5e48f39f40beb5220b7c29d4478263c341
+    pull_policy: never
+    platform: linux/arm64
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: newapi_ci_contracts
+    networks: [isolated]
+    healthcheck:
+      test: [CMD, pg_isready, -U, postgres, -d, newapi_ci_contracts]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  clickhouse:
+    profiles: [isolated-clickhouse]
+    image: docker.io/clickhouse/clickhouse-server@sha256:55719d0c430c468baed505842a08834574bef0a76c9860d1f344d026d52c5457
+    pull_policy: never
+    platform: linux/arm64
+    environment:
+      CLICKHOUSE_PASSWORD_FILE: /run/newapi-clickhouse/password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '0'
+    volumes:
+      - type: bind
+        source: ${NEWAPI_CH_SECRET_DIR:-/nonexistent-newapi-clickhouse-secret}
+        target: /run/newapi-clickhouse
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [isolated]
+    healthcheck:
+      test: [CMD, clickhouse-client, --config-file, /run/newapi-clickhouse/client.xml, --query, SELECT 1]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+networks:
+  isolated:
+    internal: true

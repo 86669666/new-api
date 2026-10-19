@@ -972,6 +972,9 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 			}
 		}
 		var err error
+		if err := guardOrganizationUserDeletion(tx, user.Id); err != nil {
+			return err
+		}
 		nextAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
 			return err
@@ -1002,6 +1005,9 @@ func (user *User) HardDelete() (int64, error) {
 	var revokedAccessTokens int64
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var err error
+		if err := guardOrganizationUserDeletion(tx, user.Id); err != nil {
+			return err
+		}
 		deletedAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
 			return err

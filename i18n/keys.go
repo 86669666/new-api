@@ -4,6 +4,12 @@ package i18n
 // errors returned to AI clients, emails and notifications. Web console messages
 // are not listed here; the web console translates them (see common.Message).
 
+const (
+	MsgOrganizationSelectorInvalid  = "organization.selector_invalid"
+	MsgOrganizationSelectorConflict = "organization.selector_conflict"
+	MsgOrganizationScopeUnsupported = "organization.scope_unsupported"
+)
+
 // Errors returned to AI clients
 const (
 	MsgDatabaseError          = "common.database_error"

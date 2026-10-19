@@ -3,18 +3,55 @@ name: Publish Docker image (Multi-arch)
 on:
   push:
     tags:
-      - '*'
-      - '!nightly*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag name to build (e.g., v0.10.8-alpha.3)'
+        description: 'Release tag (vMAJOR.MINOR.PATCH or prerelease); only newest stable promotes latest'
         required: true
         type: string
 
+permissions:
+  contents: read
+
+# Keep stable and preview pending runs (up to GitHub's 100-run queue limit).
+# All Docker publishers share this lock. Receipts, rather than tags, bind the run.
+concurrency:
+  group: publish-docker-new-api
+  queue: max
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.freeze.outputs.sha }}
+      version: ${{ steps.freeze.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Freeze release tag commit
+        id: freeze
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 scripts/ci/release_policy.py promotion --tag "$RELEASE_TAG"
+          SHA=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          test "$(git rev-parse HEAD)" = "$SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  quality:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      sha: ${{ needs.prepare.outputs.sha }}
+
   build_single_arch:
-    name: Build & push (${{ matrix.arch }})
+    needs: [prepare, quality]
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -25,128 +62,112 @@ jobs:
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
-
     permissions:
-      packages: write
       contents: read
       id-token: write
-
     steps:
-      - name: Check out
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          fetch-depth: ${{ github.event_name == 'workflow_dispatch' && 0 || 1 }}
-          ref: ${{ github.event.inputs.tag || github.ref }}
-
-      - name: Resolve tag & write VERSION
-        id: version
+          ref: ${{ needs.quality.outputs.verified_sha }}
+      - name: Verify candidate and write build version
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
+          VERIFIED_SHA: ${{ needs.quality.outputs.verified_sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-            if ! git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
-              echo "::error::Tag '$TAG' does not exist"
-              exit 1
-            fi
-          else
-            TAG=${GITHUB_REF#refs/tags/}
-          fi
-          echo "TAG=${TAG}" >> $GITHUB_ENV
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "${TAG}" > VERSION
-          echo "Building tag: ${TAG} for ${{ matrix.arch }}"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+          test -n "$VERIFIED_SHA"
+          test "$CANDIDATE_SHA" = "$VERIFIED_SHA"
+          test "$(git rev-parse HEAD)" = "$VERIFIED_SHA"
+          echo "$VERSION" > VERSION
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+      - uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata (labels)
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: calciumion/new-api
-
-      - name: Build & push
+          labels: org.opencontainers.image.revision=${{ needs.quality.outputs.verified_sha }}
+      - name: Build and push run-scoped image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: ${{ matrix.platform }}
           push: true
-          tags: |
-            calciumion/new-api:${{ env.TAG }}-${{ matrix.arch }}
-            calciumion/new-api:latest-${{ matrix.arch }}
+          tags: calciumion/new-api:ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - name: Sign image with cosign
-        run: cosign sign --yes calciumion/new-api@${{ steps.build.outputs.digest }}
-
-      - name: Image summary
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+      - name: Sign immutable image and record candidate receipt
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+          CANDIDATE_SHA: ${{ needs.quality.outputs.verified_sha }}
         run: |
-          echo "### Docker Image Digest (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "calciumion/new-api:${TAG}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          cosign sign --yes "calciumion/new-api@$DIGEST"
+          python3 scripts/ci/release_policy.py receipt --directory receipts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: digest-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+          path: receipts/*.json
+          if-no-files-found: error
 
   create_manifests:
-    name: Create multi-arch manifests
-    needs: [build_single_arch]
+    needs: [prepare, quality, build_single_arch]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-
     permissions:
+      contents: read
       id-token: write
-
     steps:
-      - name: Set version
-        run: echo "TAG=${{ needs.build_single_arch.outputs.tag }}" >> $GITHUB_ENV
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ needs.quality.outputs.verified_sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: digest-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: receipts
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+      - uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create & push manifest (version)
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+      - name: Recheck version tag before publishing its manifest
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.version }}
+          CANDIDATE_SHA: ${{ needs.quality.outputs.verified_sha }}
         run: |
-          docker buildx imagetools create \
-            -t calciumion/new-api:${TAG} \
-            calciumion/new-api:${TAG}-amd64 \
-            calciumion/new-api:${TAG}-arm64
-
-      - name: Create & push manifest (latest)
+          git fetch --force --tags origin
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$CANDIDATE_SHA"
+      - name: Assemble and sign this run's immutable manifest
+        id: manifest
+        env:
+          CANDIDATE_SHA: ${{ needs.quality.outputs.verified_sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          docker buildx imagetools create \
-            -t calciumion/new-api:latest \
-            calciumion/new-api:latest-amd64 \
-            calciumion/new-api:latest-arm64
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign manifests with cosign
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          python3 scripts/ci/release_policy.py sources --directory receipts > sources.txt
+          mapfile -t SOURCES < sources.txt
+          docker buildx imagetools create -t "calciumion/new-api:$VERSION" --metadata-file manifest.json "${SOURCES[@]}"
+          DIGEST=$(jq -er '."containerimage.descriptor".digest | select(test("^sha256:[0-9a-f]{64}$"))' manifest.json)
+          cosign sign --yes "calciumion/new-api@$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Candidate $CANDIDATE_SHA: calciumion/new-api@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Promote only the newest stable release
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.version }}
+          CANDIDATE_SHA: ${{ needs.quality.outputs.verified_sha }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
-          cosign sign --yes calciumion/new-api:${TAG}
-          cosign sign --yes calciumion/new-api:latest
-
-      - name: Manifest summary
-        run: |
-          echo "### Multi-arch Manifest" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          docker buildx imagetools inspect calciumion/new-api:${TAG} >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          git fetch --force --tags origin
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$CANDIDATE_SHA"
+          if [ "$(python3 scripts/ci/release_policy.py promotion --tag "$RELEASE_TAG")" = true ]; then
+            docker buildx imagetools create -t calciumion/new-api:latest "calciumion/new-api@$DIGEST"
+          fi

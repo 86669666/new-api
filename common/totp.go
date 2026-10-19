@@ -2,11 +2,13 @@ package common
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
@@ -43,7 +45,7 @@ func ValidateTOTPCode(secret, code string) bool {
 	}
 
 	// 验证验证码
-	return totp.Validate(cleanCode, secret)
+	return len(MatchingTOTPSteps(secret, cleanCode, time.Now())) != 0
 }
 
 // GenerateBackupCodes 生成备用恢复码
@@ -148,4 +150,31 @@ func GenerateQRCodeData(secret, username string) string {
 	accountName := fmt.Sprintf("%s (%s)", username, issuer)
 	return fmt.Sprintf("otpauth://totp/%s:%s?secret=%s&issuer=%s&digits=6&period=30",
 		issuer, accountName, secret, issuer)
+}
+
+// MatchingTOTPSteps returns every accepted counter, including rare collisions.
+// Callers must atomically claim the entire set; accepting a different matching
+// counter after a replay would allow one code to authorize twice.
+func MatchingTOTPSteps(secret, code string, now time.Time) []int64 {
+	if len(code) != 6 {
+		return nil
+	}
+	for _, c := range code {
+		if c < '0' || c > '9' {
+			return nil
+		}
+	}
+	var steps []int64
+	counter := now.Unix() / 30
+	for offset := int64(-1); offset <= 1; offset++ {
+		step := counter + offset
+		if step < 0 {
+			continue
+		}
+		expected, err := totp.GenerateCodeCustom(secret, time.Unix(step*30, 0), totp.ValidateOpts{Period: 30, Skew: 0, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
+		if err == nil && subtle.ConstantTimeCompare([]byte(expected), []byte(code)) == 1 {
+			steps = append(steps, step)
+		}
+	}
+	return steps
 }

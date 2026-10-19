@@ -204,11 +204,15 @@ func CountUserSessionsCreatedSince(userID int, createdAfter int64) (int64, error
 }
 
 func GetUserSessionBySID(sid string) (*UserSession, error) {
+	return GetUserSessionBySIDWithContext(context.Background(), sid)
+}
+
+func GetUserSessionBySIDWithContext(ctx context.Context, sid string) (*UserSession, error) {
 	if sid == "" {
 		return nil, ErrUserSessionInvalid
 	}
 	var session UserSession
-	if err := DB.Where("sid = ?", sid).First(&session).Error; err != nil {
+	if err := DB.WithContext(ctx).Where("sid = ?", sid).First(&session).Error; err != nil {
 		return nil, err
 	}
 	return &session, nil
@@ -282,6 +286,10 @@ func getUserSessionCache(sid string) (*userSessionCacheEntry, error) {
 // reactivate a revoked Session after the tombstone expires. Deny states pass a
 // zero deadline because their TTL starts when they are published.
 func writeUserSessionCache(entry *userSessionCacheEntry, cacheDeadline time.Time) error {
+	return writeUserSessionCacheWithContext(context.Background(), entry, cacheDeadline)
+}
+
+func writeUserSessionCacheWithContext(ctx context.Context, entry *userSessionCacheEntry, cacheDeadline time.Time) error {
 	if entry == nil || !common.RedisEnabled {
 		return nil
 	}
@@ -340,7 +348,7 @@ else
   redis.call('PEXPIRE', KEYS[1], ARGV[15])
 end
 return 1`
-	result, err := common.RDB.Eval(context.Background(), script, []string{userSessionCacheKey(entry.SID)},
+	result, err := common.RDB.Eval(ctx, script, []string{userSessionCacheKey(entry.SID)},
 		entry.SID, entry.UserID, entry.Version, entry.UserAuthVersion, entry.Status,
 		entry.LoginMethod, entry.IP, entry.UserAgent, entry.CreatedAt, entry.LastActiveAt,
 		entry.ExpiresAt, entry.RevokedAt, entry.RevokedReason, entry.CacheSchema, redisExpiration,
@@ -364,11 +372,15 @@ return 1`
 }
 
 func confirmUserSessionActiveSnapshot(session *UserSession) error {
+	return confirmUserSessionActiveSnapshotWithContext(context.Background(), session)
+}
+
+func confirmUserSessionActiveSnapshotWithContext(ctx context.Context, session *UserSession) error {
 	if session == nil || session.SID == "" || session.UserID <= 0 || session.Version <= 0 || session.UserAuthVersion <= 0 {
 		return ErrUserSessionInvalid
 	}
 	var count int64
-	err := DB.Model(&UserSession{}).
+	err := DB.WithContext(ctx).Model(&UserSession{}).
 		Where(
 			"sid = ? AND user_id = ? AND status = ? AND revoked_at = ? AND expires_at > ? AND version = ? AND user_auth_version = ?",
 			session.SID,
@@ -390,6 +402,10 @@ func confirmUserSessionActiveSnapshot(session *UserSession) error {
 }
 
 func writeUserSessionDenyFence(session *UserSession, status string, now int64, reason string) error {
+	return writeUserSessionDenyFenceWithContext(context.Background(), session, status, now, reason)
+}
+
+func writeUserSessionDenyFenceWithContext(ctx context.Context, session *UserSession, status string, now int64, reason string) error {
 	if !common.RedisEnabled {
 		return nil
 	}
@@ -397,7 +413,7 @@ func writeUserSessionDenyFence(session *UserSession, status string, now int64, r
 	entry.Status = status
 	entry.RevokedAt = now
 	entry.RevokedReason = reason
-	return writeUserSessionCache(entry, time.Time{})
+	return writeUserSessionCacheWithContext(ctx, entry, time.Time{})
 }
 
 func ListActiveUserSessions(userID int, currentSID string, now int64) ([]UserSession, error) {
@@ -550,12 +566,16 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 }
 
 func RevokeUserSession(userID int, sid, reason string) (bool, error) {
+	return RevokeUserSessionWithContext(context.Background(), userID, sid, reason)
+}
+
+func RevokeUserSessionWithContext(ctx context.Context, userID int, sid, reason string) (bool, error) {
 	if userID <= 0 || sid == "" {
 		return false, ErrUserSessionInvalid
 	}
 	now := time.Now().Unix()
 	var candidate UserSession
-	if err := DB.Where("sid = ? AND user_id = ?", sid, userID).First(&candidate).Error; err != nil {
+	if err := DB.WithContext(ctx).Where("sid = ? AND user_id = ?", sid, userID).First(&candidate).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return false, nil
 		}
@@ -564,12 +584,12 @@ func RevokeUserSession(userID int, sid, reason string) (bool, error) {
 	if candidate.Status != UserSessionStatusActive || candidate.RevokedAt != 0 || candidate.ExpiresAt <= now {
 		return false, nil
 	}
-	if err := writeUserSessionDenyFence(&candidate, UserSessionStatusRevoking, now, reason); err != nil {
+	if err := writeUserSessionDenyFenceWithContext(ctx, &candidate, UserSessionStatusRevoking, now, reason); err != nil {
 		return false, err
 	}
 
 	var revoked bool
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var current UserSession
 		if err := lockForUpdate(tx).Where("sid = ? AND user_id = ?", sid, userID).First(&current).Error; err != nil {
 			return err
@@ -595,7 +615,7 @@ func RevokeUserSession(userID int, sid, reason string) (bool, error) {
 		candidate.Status = UserSessionStatusRevoked
 		candidate.RevokedAt = now
 		candidate.RevokedReason = reason
-		if err := writeUserSessionCache(candidate.cacheEntry(), time.Time{}); err != nil {
+		if err := writeUserSessionCacheWithContext(ctx, candidate.cacheEntry(), time.Time{}); err != nil {
 			common.SysLog(common.LogText("failed to finalize user session revoke tombstone: %s", err.Error()))
 		}
 	}
@@ -869,4 +889,80 @@ func deleteRevokedUserSessionsBefore(revokedBefore, issuanceCutoff int64) error 
 			}
 		}
 	}
+}
+
+// RotateOrganizationSession revokes the original identity and creates a fresh
+// SID in one user-first transaction. Its original absolute expiry is retained.
+// A committed revoke is never undone when publication fails.
+func RotateOrganizationSession(identity AuthSessionIdentity, next *UserSession, validate func(*gorm.DB, *UserVerificationState) error) error {
+	return RotateOrganizationSessionWithContext(context.Background(), identity, next, validate)
+}
+
+func RotateOrganizationSessionWithContext(ctx context.Context, identity AuthSessionIdentity, next *UserSession, validate func(*gorm.DB, *UserVerificationState) error) error {
+	if next == nil || validate == nil || next.SID == identity.SessionID || next.UserID != identity.UserID || next.UserAuthVersion != identity.UserAuthVersion {
+		return ErrUserSessionInvalid
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	deadline := userSessionCacheDeadline()
+	var old UserSession
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&User{}).Where("id = ?", identity.UserID).UpdateColumn("auth_version", gorm.Expr("auth_version")).Error; err != nil {
+			return err
+		}
+		state, current, err := OrganizationVerificationStateWithTx(tx, identity)
+		if err != nil {
+			return err
+		}
+		old = *current
+		if err := validate(tx, state); err != nil {
+			return err
+		}
+		now := time.Now().Unix()
+		if old.ExpiresAt <= now {
+			return ErrUserSessionInactive
+		}
+		// Fence must succeed before DB commit; late positive fills carry an earlier deadline.
+		if err := writeUserSessionDenyFenceWithContext(ctx, &old, UserSessionStatusRevoking, now, "organization_verification"); err != nil {
+			return err
+		}
+		if err := tx.Model(&UserSession{}).Where("sid = ? AND version = ? AND status = ?", old.SID, identity.SessionVersion, UserSessionStatusActive).Updates(map[string]any{"status": UserSessionStatusRevoked, "revoked_at": now, "revoked_reason": "organization_verification", "previous_refresh_hash": "", "previous_valid_until": 0, "refresh_hash": ""}).Error; err != nil {
+			return err
+		}
+		next.ExpiresAt = old.ExpiresAt
+		next.Version = 1
+		next.CreatedAt = now
+		next.LastActiveAt = now
+		if err := createUserSessionWithTx(tx, next); err != nil {
+			return err
+		}
+		old.Status = UserSessionStatusRevoked
+		old.RevokedAt = now
+		old.RevokedReason = "organization_verification"
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Failure cannot resurrect old state. The precommit fence still protects all
+	// positive snapshots observed before it; a later read sees the revoked DB row.
+	_ = writeUserSessionCacheWithContext(ctx, old.cacheEntry(), time.Time{})
+	_ = writeUserSessionCacheWithContext(ctx, next.cacheEntry(), deadline)
+	if err := confirmUserSessionActiveSnapshotWithContext(ctx, next); err != nil {
+		return CleanupOrganizationSession(next, err)
+	}
+	return nil
+}
+
+// CleanupOrganizationSession is only for known committed rotations whose
+// confirmation or issuance failed. Cancellation cannot skip bounded cleanup;
+// it never restores the old SID or returns partially issued credentials.
+func CleanupOrganizationSession(session *UserSession, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := RevokeUserSessionWithContext(ctx, session.UserID, session.SID, "organization_issue_failed")
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("organization session cleanup failed: %w", err))
+	}
+	return cause
 }

@@ -74,3 +74,7 @@ channel.upstream_update_added_models: "新增模型示例（展示 {{.Shown}}/{{
 channel.upstream_update_removed_models: "删除模型示例（展示 {{.Shown}}/{{.Total}}）：{{.Models}}"
 channel.upstream_update_failed_channels: "失败渠道 ID（展示 {{.Shown}}/{{.Total}}）：{{.Ids}}"
 channel.upstream_update_more_omitted: "（其余 {{.Count}} 个已省略）"
+
+organization.selector_invalid: "组织选择参数无效。"
+organization.selector_conflict: "组织选择参数冲突。"
+organization.scope_unsupported: "此接口不支持组织资源。"

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
@@ -132,4 +133,35 @@ func TestSessionCookieOriginGuardDoesNotTrustForwardedProtoFromClient(t *testing
 	router.ServeHTTP(response, request)
 
 	assert.Equal(t, http.StatusForbidden, response.Code)
+}
+
+func TestOrganizationOriginUsesConfiguredTrustEvenWithoutSecureCookies(t *testing.T) {
+	oldAddress, oldTrusted, oldSecure := system_setting.ServerAddress, common.SessionCookieTrustedURLs, common.SessionCookieSecure
+	system_setting.ServerAddress = "https://panel.example.com"
+	common.SessionCookieTrustedURLs = []string{"https://trusted.example.com"}
+	common.SessionCookieSecure = false
+	t.Cleanup(func() {
+		system_setting.ServerAddress, common.SessionCookieTrustedURLs, common.SessionCookieSecure = oldAddress, oldTrusted, oldSecure
+	})
+	for _, tc := range []struct {
+		name    string
+		headers http.Header
+		allowed bool
+	}{
+		{"native", http.Header{}, true},
+		{"configured", http.Header{"Origin": {"https://panel.example.com"}}, true},
+		{"trusted referer", http.Header{"Referer": {"https://trusted.example.com/account"}}, true},
+		{"host spoof", http.Header{"Origin": {"https://attacker.example.com"}}, false},
+		{"forwarded spoof", http.Header{"Origin": {"https://attacker.example.com"}, "X-Forwarded-Host": {"attacker.example.com"}}, false},
+		{"null", http.Header{"Origin": {"null"}}, false},
+		{"multiple", http.Header{"Origin": {"https://panel.example.com", "https://panel.example.com"}}, false},
+		{"metadata without origin", http.Header{"Sec-Fetch-Site": {"same-origin"}}, false},
+		{"bad referer", http.Header{"Referer": {"https://attacker.example.com/page"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("POST", "https://attacker.example.com/api/organizations", nil)
+			r.Header = tc.headers
+			assert.Equal(t, tc.allowed, OrganizationOriginAllowed(r))
+		})
+	}
 }

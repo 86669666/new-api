@@ -280,7 +280,10 @@ func getTaskForArtifactRequest(c *gin.Context, taskID string) (*model.Task, bool
 		}
 		return task, true, nil
 	}
-	if c.GetInt("token_id") == 0 && c.GetInt("role") >= common.RoleAdminUser {
+	// A personal usage token stays owner-scoped even when its user is an
+	// administrator. Global task access requires the administrative log scope.
+	if c.GetInt("token_id") == 0 && c.GetInt("role") >= common.RoleAdminUser &&
+		middleware.AccessTokenScopeAllowed(c, "log:read") {
 		return model.GetByOnlyTaskId(taskID)
 	}
 	return model.GetByTaskId(c.GetInt("id"), taskID)
@@ -424,8 +427,11 @@ func GetAllTask(c *gin.Context) {
 }
 
 func GetUserTask(c *gin.Context) {
+	userID, ok := middleware.RequirePersonalResourceOwner(c)
+	if !ok {
+		return
+	}
 	pageInfo := common.GetPageQuery(c)
-	userID := c.GetInt("id")
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
 	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp}

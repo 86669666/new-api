@@ -3,7 +3,10 @@ package common
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
+	"slices"
+	"unicode/utf8"
 
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/gin-gonic/gin/binding"
@@ -82,4 +85,130 @@ func GetJsonType(data RawMessage) string {
 // JsonRawMessageToString returns JSON strings as their decoded value and other JSON values as raw text.
 func JsonRawMessageToString(data RawMessage) string {
 	return kitutil.JsonRawMessageToString(data)
+}
+
+// ValidateStrictJSONObject rejects ambiguous JSON before decoding typed fields.
+// Null is forbidden throughout the security envelope. The WebAuthn finish
+// variant permits only the protocol-defined nullable response.userHandle.
+func ValidateStrictJSONObject(data []byte) error {
+	return validateStrictJSONObject(data, false)
+}
+
+// ValidateWebAuthnFinishJSONObject retains strict syntax and envelope validation
+// while allowing the nullable userHandle emitted by WebAuthn serializers.
+func ValidateWebAuthnFinishJSONObject(data []byte) error {
+	return validateStrictJSONObject(data, true)
+}
+
+func validateStrictJSONObject(data []byte, webAuthnFinish bool) error {
+	if !utf8.Valid(data) {
+		return errors.New("invalid UTF-8 JSON")
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.UseNumber()
+	token, err := d.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') {
+		return errors.New("JSON object required")
+	}
+	if err := strictJSONContainer(d, '{', nil, webAuthnFinish); err != nil {
+		return err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return errors.New("trailing JSON data")
+	}
+	return nil
+}
+func strictJSONContainer(d *json.Decoder, kind json.Delim, path []string, webAuthnFinish bool) error {
+	if len(path) > 64 {
+		return errors.New("JSON nesting too deep")
+	}
+	seen := map[string]bool{}
+	for d.More() {
+		key := ""
+		if kind == '{' {
+			token, err := d.Token()
+			if err != nil {
+				return err
+			}
+			var ok bool
+			key, ok = token.(string)
+			if !ok || seen[key] {
+				return errors.New("duplicate JSON key")
+			}
+			seen[key] = true
+		}
+		token, err := d.Token()
+		if err != nil {
+			return err
+		}
+		if token == nil {
+			if webAuthnFinish && kind == '{' && len(path) == 2 && path[0] == "credential" && path[1] == "response" && key == "userHandle" {
+				continue
+			}
+			return errors.New("null JSON field")
+		}
+		if delim, ok := token.(json.Delim); ok {
+			if delim != '{' && delim != '[' {
+				return errors.New("invalid JSON delimiter")
+			}
+			if err := strictJSONContainer(d, delim, append(path, key), webAuthnFinish); err != nil {
+				return err
+			}
+		}
+	}
+	token, err := d.Token()
+	if err != nil {
+		return err
+	}
+	expected := json.Delim('}')
+	if kind == '[' {
+		expected = ']'
+	}
+	if token != expected {
+		return errors.New("invalid JSON close")
+	}
+	return nil
+}
+func UnmarshalStrictObject(data []byte, v any) error {
+	if err := ValidateStrictJSONObject(data); err != nil {
+		return err
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	return d.Decode(v)
+}
+
+// UnmarshalWebAuthnFinishObject does not constrain protocol extension keys;
+// callers validate the exact finish envelope and the WebAuthn library verifies
+// the credential. Only response.userHandle may be null.
+func UnmarshalWebAuthnFinishObject(data []byte, v any) error {
+	if err := ValidateWebAuthnFinishJSONObject(data); err != nil {
+		return err
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	return d.Decode(v)
+}
+
+// ValidateJSONObjectFields rejects case aliases as unknown wire fields before
+// encoding/json's case-insensitive struct matching can merge them.
+func ValidateJSONObjectFields(data []byte, required, optional []string) error {
+	var fields map[string]RawMessage
+	if err := Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range required {
+		if _, ok := fields[name]; !ok {
+			return errors.New("missing JSON field")
+		}
+	}
+	for name := range fields {
+		if !slices.Contains(required, name) && !slices.Contains(optional, name) {
+			return errors.New("unknown JSON field")
+		}
+	}
+	return nil
 }

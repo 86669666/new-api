@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -335,6 +336,78 @@ func TestUpdatePasskeyAssertionStateCannotRewriteRegistrationIdentity(t *testing
 	require.NotNil(t, updated.LastUsedAt)
 	assert.Equal(t, usedAt.Unix(), updated.LastUsedAt.Unix())
 
+	// Organization assertions reject clone reports and stale registration identity.
+	assert.ErrorIs(t, UpdateOrganizationPasskeyAssertionState(user.Id, validated, usedAt, "example.com", &updated), ErrFriendlyPasskeyNotFound)
+	validated.Authenticator.CloneWarning = false
+	stale := updated
+	stale.PublicKey = "replaced-after-signature"
+	assert.ErrorIs(t, UpdateOrganizationPasskeyAssertionState(user.Id, validated, usedAt, "example.com", &stale), ErrFriendlyPasskeyNotFound)
+	// Backed-up authenticators may report a lower/zero counter; persistence must
+	// keep the high-water mark rather than regress it.
+	validated.Authenticator.SignCount = 0
+	require.NoError(t, UpdateOrganizationPasskeyAssertionState(user.Id, validated, usedAt, "example.com", &updated))
+	require.NoError(t, DB.First(&updated, stored.ID).Error)
+	assert.EqualValues(t, 8, updated.SignCount)
+	require.NoError(t, DB.Model(&updated).Update("backup_eligible", false).Error)
+	updated.BackupEligible = false
+	validated.Flags.BackupEligible = false
+	assert.ErrorIs(t, UpdateOrganizationPasskeyAssertionState(user.Id, validated, usedAt, "example.com", &updated), ErrFriendlyPasskeyNotFound)
+	// Cancellation must return while the original serialization lock is still
+	// held. No waiter goroutine may later acquire it and update the credential.
+	for _, mode := range []string{"cancelled_before", "cancelled_while_locked", "expired_deadline", "deadline_while_locked"} {
+		t.Run("lock_wait_"+mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			expectedError := context.Canceled
+			if mode == "expired_deadline" {
+				cancel()
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				defer cancel()
+				expectedError = context.DeadlineExceeded
+			} else if mode == "deadline_while_locked" {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+				defer cancel()
+				expectedError = context.DeadlineExceeded
+			} else if mode == "cancelled_before" {
+				cancel()
+			}
+			passkeyOptionMutex.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					passkeyOptionMutex.Unlock()
+				}
+			}()
+			started := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				close(started)
+				done <- UpdateOrganizationPasskeyAssertionStateWithContext(ctx, user.Id, validated, usedAt, "example.com", &updated)
+			}()
+			<-started
+			if mode != "deadline_while_locked" {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				assert.ErrorIs(t, err, expectedError)
+			case <-time.After(2 * time.Second):
+				// Release and join the test worker before failing; no leaked test
+				// goroutine may outlive the SQLite fixture.
+				passkeyOptionMutex.Unlock()
+				locked = false
+				<-done
+				t.Fatal("cancelled assertion remained blocked on the Passkey lock")
+			}
+			passkeyOptionMutex.Unlock()
+			locked = false
+			var unchanged PasskeyCredential
+			require.NoError(t, DB.First(&unchanged, updated.ID).Error)
+			assert.Equal(t, updated.SignCount, unchanged.SignCount)
+			assert.Equal(t, updated.LastUsedAt, unchanged.LastUsedAt)
+		})
+	}
 	validated.ID = []byte("another-credential")
 	assert.ErrorIs(t, UpdatePasskeyAssertionState(user.Id, validated, usedAt, "example.com"), ErrPasskeyNotFound)
 }
@@ -344,4 +417,51 @@ func assertUserAuthVersion(t *testing.T, userID int, expected int64) {
 	var version int64
 	require.NoError(t, DB.Model(&User{}).Where("id = ?", userID).Select("auth_version").Scan(&version).Error)
 	assert.Equal(t, expected, version)
+}
+
+func TestTOTPStepClaimSurvivesAuthVersionChangeAndEnrollment(t *testing.T) {
+	truncateTables(t)
+	user := User{Username: "totp-step-user", Password: "unused", Status: common.UserStatusEnabled, AuthVersion: 1}
+	require.NoError(t, DB.Create(&user).Error)
+	secret := "JBSWY3DPEHPK3PXP"
+	factor := TwoFA{UserId: user.Id, Secret: secret, IsEnabled: true}
+	require.NoError(t, DB.Create(&factor).Error)
+	code, err := totp.GenerateCode(secret, time.Now())
+	require.NoError(t, err)
+	ok, err := factor.ValidateTOTPAndUpdateUsage(code)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, DB.Model(&user).Update("auth_version", 2).Error)
+	ok, err = factor.ValidateTOTPAndUpdateUsage(code)
+	require.NoError(t, err)
+	assert.False(t, ok)
+	var markers []AuthFlow
+	require.NoError(t, DB.Where("purpose = ?", "totp_step").Find(&markers).Error)
+	require.NotEmpty(t, markers)
+	for _, marker := range markers {
+		assert.Empty(t, marker.Payload)
+		assert.NotContains(t, marker.TokenHash, secret)
+		assert.NotContains(t, marker.TokenHash, code)
+		assert.True(t, marker.ExpiresAt.After(time.Now().Add(4*time.Minute)))
+	}
+	require.NoError(t, DB.Model(&factor).Updates(map[string]any{"is_enabled": false, "failed_attempts": 0}).Error)
+	identity := AuthSessionIdentity{UserID: user.Id, SessionID: "totp-enrollment-session", SessionVersion: 1, UserAuthVersion: 2}
+	require.NoError(t, DB.Create(&UserSession{SID: identity.SessionID, UserID: user.Id, Version: 1, UserAuthVersion: 2, Status: UserSessionStatusActive, RefreshHash: strings.Repeat("a", 64), ExpiresAt: time.Now().Add(time.Hour).Unix()}).Error)
+	payload, err := common.Marshal(twoFAEnrollmentPayload{TwoFAID: factor.Id, SecretHash: common.GenerateHMACWithKey([]byte("twofa-enrollment:"+common.SessionSecret), secret), Authorization: &AuthFlowAuthorization{AuthSessionIdentity: identity, ProofID: 1}})
+	require.NoError(t, err)
+	token, _, err := CreateAuthFlow(AuthFlowCreate{Purpose: AuthFlowPurposeTwoFASetup, UserId: user.Id, SessionId: identity.SessionID, Payload: string(payload), ExpiresAt: time.Now().Add(time.Minute)})
+	require.NoError(t, err)
+	assert.ErrorIs(t, EnableTwoFAEnrollment(identity, token, code), ErrTwoFACodeInvalid)
+	var pending TwoFA
+	require.NoError(t, DB.First(&pending, factor.Id).Error)
+	assert.False(t, pending.IsEnabled)
+	assert.Equal(t, 1, pending.FailedAttempts)
+	// Successful activation claims the next accepted step before auth_version changes.
+	next, err := totp.GenerateCode(secret, time.Now().Add(30*time.Second))
+	require.NoError(t, err)
+	require.NoError(t, EnableTwoFAEnrollment(identity, token, next))
+	require.NoError(t, DB.First(&pending, factor.Id).Error)
+	ok, err = pending.ValidateTOTPAndUpdateUsage(next)
+	require.NoError(t, err)
+	assert.False(t, ok)
 }

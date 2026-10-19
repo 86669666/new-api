@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -830,3 +831,164 @@ type passkeyCredentialBeforeRPID struct {
 }
 
 func (passkeyCredentialBeforeRPID) TableName() string { return "passkey_credentials" }
+
+// Real handlers and software-signed assertions with the existing fixture's
+// injected authenticated identity. Full router/login acceptance belongs to A03.
+func TestOrganizationPasskeyEnvelopeBeforeConsumption(t *testing.T) {
+	for _, mode := range []string{"nullable_handle", "absent_handle", "value_handle", "personal_flow", "canonical_org_alias_unknown", "canonical_unknown_alias_org", "alias_first_org", "alias_first_unknown", "alias_only", "duplicate_token", "inspection_storage_failure", "inspection_cancelled"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("TEST_SECURITY_DIALECT", "sqlite")
+			user, identity := setupSecurityEnrollmentTest(t)
+			key := newSecurityLoginPasskey(t, user.Id)
+			originalAddress := system_setting.ServerAddress
+			system_setting.ServerAddress = "https://example.com"
+			t.Cleanup(func() { system_setting.ServerAddress = originalAddress })
+			require.NoError(t, model.DB.AutoMigrate(&model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}))
+			org, err := model.CreateOrganization(identity, "review fixture")
+			require.NoError(t, err)
+			wire, command, err := service.DecodeOrganizationCommand("self_disable", []byte(fmt.Sprintf(`{"revision":"%d","disabled":true,"reason":""}`, org.Revision)), false, fmt.Sprint(org.ID), "", "")
+			require.NoError(t, err)
+			op, _, _, err := service.PreviewOrganizationOperation(identity, "self_disable", wire, command)
+			require.NoError(t, err)
+			if mode == "personal_flow" {
+				op.Scope = service.VerificationScopeAccessTokenGenerate
+				op.Context = common.RawMessage(`{"scopes":["profile:read"],"expires_at":0}`)
+			}
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("auth_identity", identity)
+				c.Set("id", identity.UserID)
+				c.Set("role", common.RoleCommonUser)
+				c.Set("session_id", identity.SessionID)
+				c.Set("auth_version", identity.UserAuthVersion)
+				c.Set("session_version", identity.SessionVersion)
+				c.Next()
+			})
+			router.POST("/api/user/passkey/verify/begin", PasskeyVerifyBegin)
+			router.POST("/api/user/passkey/verify/finish", PasskeyVerifyFinish)
+			request := func(path, body string) *httptest.ResponseRecorder {
+				recorder := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, "https://example.com"+path, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Origin", "https://example.com")
+				router.ServeHTTP(recorder, req)
+				return recorder
+			}
+			body, err := common.Marshal(map[string]any{"scope": op.Scope, "context": op.Context})
+			require.NoError(t, err)
+			beginResponse := request("/api/user/passkey/verify/begin", string(body))
+			require.Equal(t, 200, beginResponse.Code)
+			var beginEnvelope struct {
+				Success bool               `json:"success"`
+				Data    passkeyDomainBegin `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(beginResponse.Body.Bytes(), &beginEnvelope))
+			require.True(t, beginEnvelope.Success)
+			begin := beginEnvelope.Data
+			assertion := passkeyDomainAssertion(t, key, begin.Options.PublicKey.Challenge, "example.com", "https://example.com", user.Id, true)
+			if mode == "absent_handle" {
+				delete(assertion["response"].(map[string]any), "userHandle")
+			}
+			if mode == "nullable_handle" {
+				assertion["response"].(map[string]any)["userHandle"] = nil
+				assertion["clientExtensionResults"] = map[string]any{"example": true}
+			}
+			assertionBytes, err := common.Marshal(assertion)
+			require.NoError(t, err)
+			finishBody := fmt.Sprintf(`{"flow_token":%q,"credential":%s}`, begin.FlowToken, assertionBytes)
+			if mode == "canonical_org_alias_unknown" {
+				finishBody = fmt.Sprintf(`{"flow_token":%q,"FLOW_TOKEN":"unknown-review-fixture","credential":%s}`, begin.FlowToken, assertionBytes)
+			}
+			if mode == "canonical_unknown_alias_org" {
+				finishBody = fmt.Sprintf(`{"flow_token":"unknown-review-fixture","FLOW_TOKEN":%q,"credential":%s}`, begin.FlowToken, assertionBytes)
+			}
+			if mode == "alias_first_org" {
+				finishBody = fmt.Sprintf(`{"FLOW_TOKEN":%q,"flow_token":"unknown-review-fixture","credential":%s}`, begin.FlowToken, assertionBytes)
+			}
+			if mode == "alias_first_unknown" {
+				finishBody = fmt.Sprintf(`{"FLOW_TOKEN":"unknown-review-fixture","flow_token":%q,"credential":%s}`, begin.FlowToken, assertionBytes)
+			}
+			if mode == "alias_only" {
+				finishBody = fmt.Sprintf(`{"FLOW_TOKEN":%q,"credential":%s}`, begin.FlowToken, assertionBytes)
+			}
+			if mode == "duplicate_token" {
+				finishBody = fmt.Sprintf(`{"flow_token":"unknown-review-fixture","flow_token":%q,"credential":%s}`, begin.FlowToken, assertionBytes)
+			}
+			if mode == "inspection_storage_failure" || mode == "inspection_cancelled" {
+				injected := false
+				require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register("test:stepup-inspection-failure", func(tx *gorm.DB) {
+					if !injected && tx.Statement.Table == "auth_flows" {
+						injected = true
+						if mode == "inspection_cancelled" {
+							tx.AddError(context.Canceled)
+						} else {
+							tx.AddError(errors.New("injected step-up inspection storage failure"))
+						}
+					}
+				}))
+				t.Cleanup(func() { _ = model.DB.Callback().Query().Remove("test:stepup-inspection-failure") })
+			}
+			finish := request("/api/user/passkey/verify/finish", finishBody)
+			var result struct {
+				Success bool   `json:"success"`
+				Code    string `json:"code"`
+			}
+			require.NoError(t, common.Unmarshal(finish.Body.Bytes(), &result))
+			var flow model.AuthFlow
+			require.NoError(t, model.DB.Where("purpose = ?", model.AuthFlowPurposePasskeyStepUp).First(&flow).Error)
+			after, err := model.GetPasskeyByUserID(user.Id)
+			require.NoError(t, err)
+			t.Logf("mode=%s status=%d success=%v code=%s challenge_consumed=%v sign_count=%d", mode, finish.Code, result.Success, result.Code, flow.ConsumedAt != nil, after.SignCount)
+			if mode == "nullable_handle" || mode == "absent_handle" || mode == "value_handle" || mode == "personal_flow" {
+				assert.True(t, result.Success)
+				assert.NotNil(t, flow.ConsumedAt)
+				assert.EqualValues(t, 1, after.SignCount)
+			} else {
+				assert.False(t, result.Success)
+				assert.Empty(t, finish.Header().Values("Set-Cookie"))
+				var responseEnvelope map[string]common.RawMessage
+				require.NoError(t, common.Unmarshal(finish.Body.Bytes(), &responseEnvelope))
+				assert.True(t, len(responseEnvelope["data"]) == 0, "no partial proof or session bundle")
+				var proofs int64
+				require.NoError(t, model.DB.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposeSecurityProof).Count(&proofs).Error)
+				assert.Zero(t, proofs)
+				expectedStatus := 400
+				if mode == "inspection_storage_failure" || mode == "inspection_cancelled" {
+					expectedStatus = 500
+				}
+				assert.Equal(t, expectedStatus, finish.Code)
+				assert.Nil(t, flow.ConsumedAt, "strict envelope or inspection failure must not consume the organization challenge")
+				assert.Zero(t, after.SignCount, "rejected envelope must not persist a verified assertion")
+			}
+		})
+	}
+}
+
+func TestSecurityProducerScopeAliases(t *testing.T) {
+	for _, route := range []struct {
+		path    string
+		handler gin.HandlerFunc
+		prefix  string
+	}{
+		{"/api/user/passkey/verify/begin", PasskeyVerifyBegin, ""},
+		{"/api/verify", UniversalVerify, `"method":"password","password":"fixture-password",`},
+	} {
+		for _, fields := range []string{
+			`"scope":"organization.rename","SCOPE":"access_token.generate"`,
+			`"SCOPE":"organization.rename","scope":"access_token.generate"`,
+			`"scope":"access_token.generate","SCOPE":"organization.rename"`,
+			`"SCOPE":"access_token.generate","scope":"organization.rename"`,
+		} {
+			t.Run(route.path+"/"+fields, func(t *testing.T) {
+				_, identity := setupSecurityEnrollmentTest(t)
+				body := "{" + route.prefix + fields + `,"context":{}}`
+				response := securityEnrollmentRequest(http.MethodPost, route.path, body, "", identity, route.handler)
+				assert.Equal(t, http.StatusBadRequest, response.Code)
+				var count int64
+				require.NoError(t, model.DB.Model(&model.AuthFlow{}).Count(&count).Error)
+				assert.Zero(t, count, "ambiguous scope must not create attempts, challenges or proofs")
+				assert.Empty(t, response.Header().Values("Set-Cookie"))
+			})
+		}
+	}
+}

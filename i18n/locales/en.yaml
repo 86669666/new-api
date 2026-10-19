@@ -73,3 +73,7 @@ channel.upstream_update_added_models: "Added model examples (showing {{.Shown}}/
 channel.upstream_update_removed_models: "Removed model examples (showing {{.Shown}}/{{.Total}}): {{.Models}}"
 channel.upstream_update_failed_channels: "Failed channel IDs (showing {{.Shown}}/{{.Total}}): {{.Ids}}"
 channel.upstream_update_more_omitted: " ({{.Count}} more omitted)"
+
+organization.selector_invalid: "Invalid organization selector."
+organization.selector_conflict: "Organization selectors conflict."
+organization.scope_unsupported: "Organization resources are not supported on this endpoint."

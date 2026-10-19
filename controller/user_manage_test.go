@@ -68,7 +68,7 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 			}
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}))
 	require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
 	versionQuery := "SELECT version()"
 	if dialect == "sqlite" {
@@ -638,6 +638,48 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 			} else if !tc.failCache {
 				assert.Equal(t, strconv.Itoa(tc.wantCached), server.HGet(quotaKey, "Quota"))
 			}
+		})
+	}
+}
+
+func TestManageUserOrganizationMembershipBlocksBothDeleteEntrypoints(t *testing.T) {
+	for _, hard := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hard=%t", hard), func(t *testing.T) {
+			db := setupManageUserTestDB(t)
+			user := model.User{Username: "organization-member", AffCode: "organization-member", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AuthVersion: 1}
+			require.NoError(t, db.Create(&user).Error)
+			bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "organization-delete")
+			require.NoError(t, err)
+			memberIdentity, err := service.ParseAccessToken(bundle.AccessToken)
+			require.NoError(t, err)
+			_, err = model.CreateOrganization(memberIdentity, "Protected organization")
+			require.NoError(t, err)
+			identity, proof := manageUserProof(t, db, service.VerificationOperation{Scope: service.VerificationScopeAdminUserDelete, Context: []byte(fmt.Sprintf(`{"user_id":%d}`, user.Id))})
+			var response *httptest.ResponseRecorder
+			if hard {
+				response = httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(response)
+				c.Request = httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/user/%d", user.Id), nil)
+				c.Request.Header.Set("X-Security-Proof", proof)
+				c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}
+				c.Set("id", identity.UserID)
+				c.Set("role", common.RoleRootUser)
+				c.Set("session_id", identity.SessionID)
+				c.Set("auth_version", identity.UserAuthVersion)
+				c.Set("session_version", identity.SessionVersion)
+				DeleteUser(c)
+			} else {
+				response = performVerifiedManageUserRequest(t, fmt.Sprintf(`{"id":%d,"action":"delete"}`, user.Id), identity, proof)
+			}
+			assert.Contains(t, response.Body.String(), `"success":false`)
+			assert.Contains(t, response.Body.String(), model.OrganizationMembershipMessage)
+			assert.Contains(t, response.Body.String(), `"message_key":"`+model.OrganizationMembershipMessage+`"`)
+			require.NoError(t, db.First(&user, user.Id).Error)
+			assert.EqualValues(t, 1, user.AuthVersion)
+			_, _, err = service.ValidateLoginSession(memberIdentity)
+			assert.NoError(t, err)
+			_, err = service.ConsumeOperationProof(proof, identity, service.VerificationOperation{Scope: service.VerificationScopeAdminUserDelete, Context: []byte(fmt.Sprintf(`{"user_id":%d}`, user.Id))})
+			assert.Error(t, err)
 		})
 	}
 }

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -270,31 +271,94 @@ func disableTwoFAWithAuthVersion(userId int, identity *AuthSessionIdentity) erro
 
 // ValidateTOTPAndUpdateUsage 验证TOTP并更新使用记录
 func (t *TwoFA) ValidateTOTPAndUpdateUsage(code string) (bool, error) {
-	// 检查是否被锁定
-	if t.IsLocked() {
-		return false, fmt.Errorf("the account is locked, retry after %v", t.LockedUntil.Format("2006-01-02 15:04:05"))
-	}
+	return t.ValidateTOTPAndUpdateUsageWithContext(context.Background(), code)
+}
 
-	// 验证TOTP码
-	if !common.ValidateTOTPCode(t.Secret, code) {
-		// 增加失败次数
-		if err := t.IncrementFailedAttempts(); err != nil {
-			return false, err
+func (t *TwoFA) ValidateTOTPAndUpdateUsageWithContext(ctx context.Context, code string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	valid := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Reserve SQLite's writer before reading. RowsAffected is dialect-dependent.
+		if err := tx.Model(&User{}).Where("id = ?", t.UserId).UpdateColumn("auth_version", gorm.Expr("auth_version")).Error; err != nil {
+			return err
 		}
-		return false, nil
+		var user User
+		if err := lockForUpdate(tx).First(&user, t.UserId).Error; err != nil {
+			return err
+		}
+		if user.Status != common.UserStatusEnabled {
+			return ErrUserSessionInactive
+		}
+		var current TwoFA
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", t.Id, t.UserId).First(&current).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		if !current.IsEnabled || current.Secret != t.Secret {
+			return ErrTwoFANotEnabled
+		}
+		if current.LockedUntil != nil && now.Before(*current.LockedUntil) {
+			return nil
+		}
+		steps := common.MatchingTOTPSteps(current.Secret, code, now)
+		if len(steps) != 0 {
+			err := claimTOTPStepsWithTx(tx, &current, steps, now)
+			if err != nil && !errors.Is(err, ErrAuthFlowConsumed) {
+				return err
+			}
+			valid = err == nil
+		}
+		if valid {
+			current.FailedAttempts = 0
+			current.LockedUntil = nil
+			current.LastUsedAt = &now
+		} else {
+			if current.LockedUntil != nil {
+				current.FailedAttempts = 0
+				current.LockedUntil = nil
+			}
+			current.FailedAttempts++
+			if current.FailedAttempts >= common.MaxFailAttempts {
+				until := now.Add(time.Duration(common.LockoutDuration) * time.Second)
+				current.LockedUntil = &until
+			}
+		}
+		if err := tx.Model(&current).Updates(map[string]any{"failed_attempts": current.FailedAttempts, "locked_until": current.LockedUntil, "last_used_at": current.LastUsedAt}).Error; err != nil {
+			return err
+		}
+		*t = current
+		return nil
+	})
+	return valid && err == nil, err
+}
+
+// User and factor locks serialize every shared TOTP use. No OTP or secret is
+// stored; replay identity deliberately excludes session and authentication version.
+func claimTOTPStepsWithTx(tx *gorm.DB, factor *TwoFA, steps []int64, now time.Time) error {
+	assertions := make([]string, 0, len(steps))
+	for _, step := range steps {
+		fingerprint := common.GenerateHMACWithKey([]byte("totp-factor-v1:"+common.SessionSecret), factor.Secret)
+		assertion := common.GenerateHMACWithKey([]byte("totp-step-v1:"+common.SessionSecret), fmt.Sprintf("%d:%s:%d", factor.UserId, fingerprint, step))
+		var count int64
+		if err := tx.Model(&AuthFlow{}).Where("token_hash = ?", authFlowTokenHash("external:totp_step:"+assertion)).Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 0 {
+			return ErrAuthFlowConsumed
+		}
+		assertions = append(assertions, assertion)
 	}
-
-	// 验证成功，重置失败次数并更新最后使用时间
-	now := time.Now()
-	t.FailedAttempts = 0
-	t.LockedUntil = nil
-	t.LastUsedAt = &now
-
-	if err := t.updateUsageState(); err != nil {
-		return false, err
+	for i, assertion := range assertions {
+		expiry := now.Add(300 * time.Second)
+		if end := time.Unix((steps[i]+2)*30, 0); end.After(expiry) {
+			expiry = end
+		}
+		if err := ClaimExternalAuthAssertionWithTx(tx, "totp_step", assertion, expiry); err != nil {
+			return err
+		}
 	}
-
-	return true, nil
+	return nil
 }
 
 // ValidateBackupCodeAndUpdateUsage 验证备用码并更新使用记录

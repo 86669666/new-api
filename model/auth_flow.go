@@ -1,10 +1,12 @@
 package model
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -61,6 +63,7 @@ func (AuthFlow) TableName() string {
 }
 
 type AuthFlowCreate struct {
+	CreatedAt time.Time
 	Purpose   string
 	Provider  string
 	Intent    string
@@ -145,7 +148,13 @@ func authFlowTokenHash(token string) string {
 }
 
 func CreateAuthFlow(input AuthFlowCreate) (string, *AuthFlow, error) {
-	return createAuthFlowWithTx(DB, input)
+	return CreateAuthFlowWithContext(context.Background(), input)
+}
+
+func CreateAuthFlowWithContext(ctx context.Context, input AuthFlowCreate) (string, *AuthFlow, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return createAuthFlowWithTx(DB.WithContext(ctx), input)
 }
 
 func createAuthFlowWithTx(tx *gorm.DB, input AuthFlowCreate) (string, *AuthFlow, error) {
@@ -159,6 +168,7 @@ func createAuthFlowWithTx(tx *gorm.DB, input AuthFlowCreate) (string, *AuthFlow,
 	token := base64.RawURLEncoding.EncodeToString(random)
 	flow := &AuthFlow{
 		TokenHash: authFlowTokenHash(token),
+		CreatedAt: input.CreatedAt,
 		Purpose:   input.Purpose,
 		Provider:  input.Provider,
 		Intent:    input.Intent,
@@ -242,11 +252,17 @@ func ConsumeAuthFlow(token string, match AuthFlowMatch) (*AuthFlow, error) {
 // ConsumeAuthFlowWithAction consumes a flow and runs action in the same
 // database transaction. An action failure rolls the consumption back.
 func ConsumeAuthFlowWithAction(token string, match AuthFlowMatch, action func(tx *gorm.DB, flow *AuthFlow) error) (*AuthFlow, error) {
+	return ConsumeAuthFlowWithActionWithContext(context.Background(), token, match, action)
+}
+
+func ConsumeAuthFlowWithActionWithContext(ctx context.Context, token string, match AuthFlowMatch, action func(tx *gorm.DB, flow *AuthFlow) error) (*AuthFlow, error) {
 	if token == "" || match.Purpose == "" {
 		return nil, ErrAuthFlowInvalid
 	}
 	var consumed AuthFlow
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Claim with the first write, rather than upgrading a prior read lock.
 		// SQLite cannot reliably upgrade two concurrent deferred read transactions.
 		now := time.Now()
@@ -289,4 +305,136 @@ func DeleteExpiredAuthFlows(now time.Time) error {
 	cutoff := now.Add(-AuthFlowDefaultCleanupRetention)
 	return DB.Where("expires_at < ? OR (consumed_at IS NOT NULL AND consumed_at < ?)", cutoff, cutoff).
 		Delete(&AuthFlow{}).Error
+}
+
+// OrganizationVerificationBudgetError is a durable per-account rolling limit.
+type OrganizationVerificationBudgetError struct{ RetryAfter int }
+
+func (e *OrganizationVerificationBudgetError) Error() string {
+	return "Security verification rate limit exceeded."
+}
+
+// OrganizationVerificationStateWithTx shares the caller's existing locks and
+// transaction; no cache or nested transaction participates in factor policy.
+func OrganizationVerificationStateWithTx(tx *gorm.DB, identity AuthSessionIdentity) (*UserVerificationState, *UserSession, error) {
+	if identity.UserID <= 0 || identity.SessionID == "" || strings.HasPrefix(identity.SessionID, "pat:") || strings.HasPrefix(identity.SessionID, "legacy") {
+		return nil, nil, ErrUserSessionInactive
+	}
+	if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
+		return nil, nil, err
+	}
+	state, err := getUserVerificationState(tx, identity.UserID, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	var session UserSession
+	if err := tx.Where("sid = ? AND user_id = ?", identity.SessionID, identity.UserID).First(&session).Error; err != nil {
+		return nil, nil, err
+	}
+	return state, &session, nil
+}
+
+func ReserveOrganizationVerificationAttempt(identity AuthSessionIdentity) (*AuthFlow, error) {
+	return ReserveOrganizationVerificationAttemptWithContext(context.Background(), identity)
+}
+
+func ReserveOrganizationVerificationAttemptWithContext(ctx context.Context, identity AuthSessionIdentity) (*AuthFlow, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var result *AuthFlow
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&User{}).Where("id = ?", identity.UserID).UpdateColumn("auth_version", gorm.Expr("auth_version")).Error; err != nil {
+			return err
+		}
+		_, session, err := OrganizationVerificationStateWithTx(tx, identity)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		var attempts []AuthFlow
+		if err := tx.Select("id", "created_at").Where("purpose = ? AND user_id = ? AND created_at > ?", "org_verify_attempt", identity.UserID, now.Add(-300*time.Second)).Order("created_at,id").Find(&attempts).Error; err != nil {
+			return err
+		}
+		if len(attempts) >= 5 {
+			return &OrganizationVerificationBudgetError{RetryAfter: max(1, int(math.Ceil(attempts[0].CreatedAt.Add(300*time.Second).Sub(now).Seconds())))}
+		}
+		_, result, err = createAuthFlowWithTx(tx, AuthFlowCreate{Purpose: "org_verify_attempt", UserId: identity.UserID, SessionId: identity.SessionID, CreatedAt: now, ExpiresAt: now.Add(300 * time.Second)})
+		if err != nil {
+			return err
+		}
+		if session.ExpiresAt <= time.Now().Unix() {
+			return ErrUserSessionInactive
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func ValidateOrganizationAttemptWithTx(tx *gorm.DB, identity AuthSessionIdentity, id int64) error {
+	if id <= 0 {
+		return ErrAuthFlowInvalid
+	}
+	var attempt AuthFlow
+	if err := tx.Where("id = ? AND purpose = ? AND user_id = ? AND session_id = ?", id, "org_verify_attempt", identity.UserID, identity.SessionID).First(&attempt).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrAuthFlowInvalid
+		}
+		return err
+	}
+	if !time.Now().Before(attempt.ExpiresAt) {
+		return ErrAuthFlowExpired
+	}
+	return nil
+}
+
+func CreateOrganizationProofFlow(identity AuthSessionIdentity, payload string, expiresAt time.Time, validate func(*gorm.DB, *UserVerificationState) error) (string, error) {
+	return CreateOrganizationProofFlowWithContext(context.Background(), identity, payload, expiresAt, validate)
+}
+
+func CreateOrganizationProofFlowWithContext(ctx context.Context, identity AuthSessionIdentity, payload string, expiresAt time.Time, validate func(*gorm.DB, *UserVerificationState) error) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var token string
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&User{}).Where("id = ?", identity.UserID).UpdateColumn("auth_version", gorm.Expr("auth_version")).Error; err != nil {
+			return err
+		}
+		state, session, err := OrganizationVerificationStateWithTx(tx, identity)
+		if err != nil {
+			return err
+		}
+		if err := validate(tx, state); err != nil {
+			return err
+		}
+		if expiresAt.Unix() > session.ExpiresAt || !time.Now().Before(expiresAt) {
+			return ErrAuthFlowExpired
+		}
+		token, _, err = createAuthFlowWithTx(tx, AuthFlowCreate{Purpose: AuthFlowPurposeSecurityProof, UserId: identity.UserID, SessionId: identity.SessionID, Payload: payload, ExpiresAt: expiresAt})
+		return err
+	})
+	return token, err
+}
+
+// InspectAuthFlowRoute selects a protocol branch from a stored, identity-bound
+// flow, including resolved/expired flows. It grants nothing: consumption must
+// still enforce status, expiry and identity with ConsumeAuthFlowWithAction.
+func InspectAuthFlowRoute(token string, match AuthFlowMatch) (*AuthFlow, error) {
+	return InspectAuthFlowRouteWithContext(context.Background(), token, match)
+}
+
+func InspectAuthFlowRouteWithContext(ctx context.Context, token string, match AuthFlowMatch) (*AuthFlow, error) {
+	if token == "" || match.Purpose == "" || match.UserId <= 0 || match.SessionId == "" {
+		return nil, ErrAuthFlowInvalid
+	}
+	var flow AuthFlow
+	if err := applyAuthFlowMatch(DB.WithContext(ctx), token, match).First(&flow).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+		return nil, ErrAuthFlowInvalid
+	}
+	return &flow, nil
 }

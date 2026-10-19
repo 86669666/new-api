@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
@@ -12,8 +13,10 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 const (
@@ -124,6 +127,9 @@ func ParseDashboardAccessToken(raw string) (identity AuthIdentity, internal bool
 }
 
 func IssueSecurityProof(identity AuthIdentity, method string, binding VerificationBinding) (string, int64, error) {
+	if IsOrganizationScope(binding.Scope) {
+		return "", 0, ErrProofScope
+	}
 	method = strings.TrimSpace(method)
 	if identity.UserID <= 0 || identity.SessionID == "" || identity.UserAuthVersion <= 0 || identity.SessionVersion <= 0 || method == "" || binding.Scope == "" || binding.ContextHash == "" {
 		return "", 0, ErrAuthTokenInvalid
@@ -202,4 +208,30 @@ func parseAuthClaims(raw, expectedUse string, key []byte) (*authClaims, error) {
 		return nil, ErrAuthTokenInvalid
 	}
 	return claims, nil
+}
+
+// Keep the signing dependency private; package tests can fail publication after
+// a real committed rotation without adding a runtime or HTTP bypass.
+var signOrganizationProof = func(claims authClaims) (string, error) {
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(authSigningKey(securityProofTokenUse))
+}
+
+func issueOrganizationSecurityProofWithContext(ctx context.Context, identity AuthIdentity, method string, operation VerificationOperation, sessionExpiry int64) (string, int64, error) {
+	now := time.Now()
+	expiry := time.Unix(min(now.Add(SecurityProofTTL).Unix(), sessionExpiry), 0)
+	payload, err := common.Marshal(organizationProofPayload{SchemaVersion: 1, Identity: identity, Scope: operation.Scope, Method: method, Context: operation.Context})
+	if err != nil {
+		return "", 0, err
+	}
+	passwordEnabled, passkeyEnabled := common.PasswordLoginEnabled, system_setting.PasskeySettingsSnapshot().Enabled
+	id, err := model.CreateOrganizationProofFlowWithContext(ctx, identity, string(payload), expiry, func(tx *gorm.DB, state *model.UserVerificationState) error {
+		return organizationPolicy(state, method, passwordEnabled, passkeyEnabled)
+	})
+	if err != nil {
+		return "", 0, err
+	}
+	binding := OrganizationVerificationBinding(operation)
+	claims := authClaims{TokenUse: securityProofTokenUse, SessionID: identity.SessionID, UserAuthVersion: identity.UserAuthVersion, SessionVersion: identity.SessionVersion, Method: method, Scopes: []string{binding.Scope}, ContextHash: binding.ContextHash, RegisteredClaims: jwt.RegisteredClaims{Issuer: authTokenIssuer, Subject: strconv.Itoa(identity.UserID), Audience: jwt.ClaimStrings{authTokenAudience}, ExpiresAt: jwt.NewNumericDate(expiry), NotBefore: jwt.NewNumericDate(now), IssuedAt: jwt.NewNumericDate(now), ID: id}}
+	token, err := signOrganizationProof(claims)
+	return token, expiry.Unix(), err
 }

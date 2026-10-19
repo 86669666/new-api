@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
@@ -741,7 +742,7 @@ func AddChannel(c *gin.Context) {
 	// type-61 channel dedicated to it.
 	if addChannelRequest.Channel != nil &&
 		(addChannelRequest.Channel.Type == constant.ChannelTypeTaskPlugin || len(addChannelRequest.Channel.GetSetting().TaskPluginBindings()) > 0) &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
+		!middleware.HasPermission(c, authz.TaskPluginBind) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "task plugin channels require the task_plugin.bind permission",
@@ -981,7 +982,7 @@ func EditTagChannels(c *gin.Context) {
 		return
 	}
 	if (channelTag.ParamOverride != nil || channelTag.HeaderOverride != nil) &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
+		!middleware.HasPermission(c, authz.ChannelSensitiveWrite) {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
@@ -1088,7 +1089,7 @@ func UpdateChannel(c *gin.Context) {
 	clearChannelReadOnlyFields(&channel, requestData)
 
 	if channel.Type == constant.ChannelTypeTaskPlugin &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
+		!middleware.HasPermission(c, authz.TaskPluginBind) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "task plugin channels require the task_plugin.bind permission",
@@ -1122,7 +1123,7 @@ func UpdateChannel(c *gin.Context) {
 	// administrators without it can still edit the rest of a gateway channel.
 	if settingProvided &&
 		!slices.Equal(channel.GetSetting().TaskPluginBindings(), originChannel.GetSetting().TaskPluginBindings()) &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
+		!middleware.HasPermission(c, authz.TaskPluginBind) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "task plugin channels require the task_plugin.bind permission",
@@ -1134,7 +1135,7 @@ func UpdateChannel(c *gin.Context) {
 	channel.ChannelInfo = originChannel.ChannelInfo
 
 	if channelHasSensitiveChanges(&channel, originChannel, requestData) &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
+		!middleware.HasPermission(c, authz.ChannelSensitiveWrite) {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
@@ -1565,7 +1566,7 @@ func CopyChannel(c *gin.Context) {
 		return
 	}
 	if (origin.Type == constant.ChannelTypeTaskPlugin || len(origin.GetSetting().TaskPluginBindings()) > 0) &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
+		!middleware.HasPermission(c, authz.TaskPluginBind) {
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "task plugin channels require the task_plugin.bind permission"})
 		return
 	}
@@ -1655,7 +1656,7 @@ func ManageMultiKeys(c *gin.Context) {
 		return
 	}
 	if multiKeyActionRequiresSensitiveWrite(request.Action) &&
-		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
+		!middleware.HasPermission(c, authz.ChannelSensitiveWrite) {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}

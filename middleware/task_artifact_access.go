@@ -121,6 +121,8 @@ func redactTaskArtifactAccessQuery() gin.HandlerFunc {
 			return
 		}
 
+		// Preserve only canonical scope/error before capability query redaction.
+		organizationRequestSelection(c)
 		rawAccess, present, invalid := popTaskArtifactAccessQuery(c.Request)
 		if present {
 			c.Set(taskArtifactAccessRawContextKey, rawAccess)

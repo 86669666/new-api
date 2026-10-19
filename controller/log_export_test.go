@@ -31,6 +31,7 @@ func callLogHandler(t *testing.T, handler gin.HandlerFunc, userId int, role int,
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/log?"+query, nil)
 	ctx.Set("id", userId)
+	ctx.Set("auth_identity", service.AuthIdentity{UserID: userId})
 	ctx.Set("role", role)
 	handler(ctx)
 	var lines []map[string]any

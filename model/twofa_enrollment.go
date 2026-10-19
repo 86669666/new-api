@@ -72,6 +72,7 @@ func EnableTwoFAEnrollment(identity AuthSessionIdentity, token, code string) err
 	if err != nil {
 		return ErrTwoFACodeInvalid
 	}
+	var verificationError error
 	_, err = ConsumeAuthFlowWithAction(token, AuthFlowMatch{
 		Purpose: AuthFlowPurposeTwoFASetup, UserId: identity.UserID, SessionId: identity.SessionID,
 	}, func(tx *gorm.DB, flow *AuthFlow) error {
@@ -96,8 +97,35 @@ func EnableTwoFAEnrollment(identity AuthSessionIdentity, token, code string) err
 		if !hmac.Equal([]byte(payload.SecretHash), []byte(secretHash)) {
 			return ErrTwoFASetupInvalid
 		}
-		if !common.ValidateTOTPCode(pending.Secret, cleanCode) {
-			return ErrTwoFACodeInvalid
+		now := time.Now()
+		locked := pending.LockedUntil != nil && now.Before(*pending.LockedUntil)
+		steps := common.MatchingTOTPSteps(pending.Secret, cleanCode, now)
+		valid := !locked && len(steps) > 0
+		if valid {
+			claimErr := claimTOTPStepsWithTx(tx, &pending, steps, now)
+			if claimErr != nil && !errors.Is(claimErr, ErrAuthFlowConsumed) {
+				return claimErr
+			}
+			valid = claimErr == nil
+		}
+		if !valid {
+			verificationError = ErrTwoFACodeInvalid
+			if !locked {
+				if pending.LockedUntil != nil {
+					pending.FailedAttempts = 0
+					pending.LockedUntil = nil
+				}
+				pending.FailedAttempts++
+				if pending.FailedAttempts >= common.MaxFailAttempts {
+					until := now.Add(time.Duration(common.LockoutDuration) * time.Second)
+					pending.LockedUntil = &until
+				}
+				if err := tx.Model(&pending).Updates(map[string]any{"failed_attempts": pending.FailedAttempts, "locked_until": pending.LockedUntil}).Error; err != nil {
+					return err
+				}
+			}
+			// Keep the challenge retryable while committing bounded factor failures.
+			return tx.Model(flow).Update("consumed_at", nil).Error
 		}
 		if _, err := IncrementUserAuthVersionWithTx(tx, identity.UserID); err != nil {
 			return err
@@ -109,6 +137,9 @@ func EnableTwoFAEnrollment(identity AuthSessionIdentity, token, code string) err
 	}
 	if err != nil {
 		return err
+	}
+	if verificationError != nil {
+		return verificationError
 	}
 	return PublishUserAuthCache(identity.UserID)
 }

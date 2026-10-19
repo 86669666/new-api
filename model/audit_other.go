@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/chcol"
 	"github.com/QuantumNous/new-api/common"
 )
 
@@ -81,6 +82,13 @@ func (other *AuditOther) Scan(value any) error {
 		data = []byte(value)
 	case []byte:
 		data = value
+	case *chcol.JSON:
+		// Native ClickHouse JSON retains typed numbers and reconstructs nested paths.
+		var err error
+		data, err = common.Marshal(value)
+		if err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unsupported audit metadata database type %T", value)
 	}

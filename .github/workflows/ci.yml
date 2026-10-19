@@ -2,13 +2,22 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, closed]
+    types: [opened, reopened, synchronize, closed]
+  workflow_call:
+    inputs:
+      sha:
+        description: Frozen full candidate commit
+        required: true
+        type: string
+    outputs:
+      verified_sha:
+        value: ${{ jobs.quality-gate.outputs.sha }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: quality-${{ github.workflow }}-${{ github.event_name }}-${{ inputs.sha || github.ref }}
   cancel-in-progress: true
 
 # Checkout the event commit in both jobs. A PR merge ref can disappear while
@@ -26,8 +35,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ github.event.pull_request.base.repo.full_name }}
-          ref: ${{ github.sha }}
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.sha || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -81,8 +90,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ github.event.pull_request.base.repo.full_name }}
-          ref: ${{ github.sha }}
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.sha || github.sha }}
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -97,3 +106,66 @@ jobs:
 
       - name: Test
         run: bun run test
+
+  database:
+    name: Required real database contracts
+    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+          MYSQL_DATABASE: newapi_ci_contracts
+        ports:
+          - '127.0.0.1::3306'
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: newapi_ci_contracts
+        ports:
+          - '127.0.0.1::5432'
+        options: >-
+          --health-cmd="pg_isready -U postgres -d newapi_ci_contracts"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+      - name: Required three-database suite (no skips)
+        env:
+          NEWAPI_TEST_PROFILE: isolated-ci
+          TEST_MYSQL_DSN: root@tcp(127.0.0.1:${{ job.services.mysql.ports['3306'] }})/newapi_ci_contracts?parseTime=true
+          TEST_POSTGRES_DSN: postgres://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/newapi_ci_contracts?sslmode=disable
+        run: python3 scripts/ci/database_gate.py
+
+  quality-gate:
+    name: Required quality gate
+    needs: [backend, frontend, database]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - name: Verify every required result and candidate
+        id: verify
+        env:
+          EXPECTED_SHA: ${{ inputs.sha || github.sha }}
+          QUALITY_RESULTS: '{"backend":"${{ needs.backend.result }}","frontend":"${{ needs.frontend.result }}","database":"${{ needs.database.result }}"}'
+        run: |
+          python3 scripts/ci/release_policy.py quality
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          echo "sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+      - name: Release policy regression tests
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'

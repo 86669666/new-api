@@ -1,7 +1,9 @@
 package passkey
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -19,6 +21,10 @@ type flowPayload struct {
 }
 
 type FlowSecurity struct {
+	OrganizationContext   common.RawMessage `json:"organization_context,omitempty"`
+	OrganizationAttemptID int64             `json:"organization_attempt_id,omitempty"`
+	OrganizationExpiresAt int64             `json:"organization_expires_at,omitempty"`
+
 	model.AuthSessionIdentity
 	Scope          string                       `json:"scope"`
 	ContextHash    string                       `json:"context_hash"`
@@ -28,6 +34,10 @@ type FlowSecurity struct {
 }
 
 func CreateSessionDataFlow(purpose string, security FlowSecurity, data *webauthn.SessionData) (string, int64, error) {
+	return CreateSessionDataFlowWithContext(context.Background(), purpose, security, data)
+}
+
+func CreateSessionDataFlowWithContext(ctx context.Context, purpose string, security FlowSecurity, data *webauthn.SessionData) (string, int64, error) {
 	if data == nil {
 		return "", 0, errors.New("passkey session data is empty")
 	}
@@ -49,7 +59,13 @@ func CreateSessionDataFlow(purpose string, security FlowSecurity, data *webauthn
 	if purpose == model.AuthFlowPurposeLoginPasskey && security.LoginExpiresAt < expiresAt.Unix() {
 		expiresAt = time.Unix(security.LoginExpiresAt, 0)
 	}
-	token, _, err := model.CreateAuthFlow(model.AuthFlowCreate{
+	if security.OrganizationAttemptID > 0 {
+		if purpose != model.AuthFlowPurposePasskeyStepUp || len(security.OrganizationContext) == 0 || security.OrganizationExpiresAt <= time.Now().Unix() {
+			return "", 0, model.ErrAuthFlowInvalid
+		}
+		expiresAt = time.Unix(min(expiresAt.Unix(), security.OrganizationExpiresAt, data.Expires.Unix()), 0)
+	}
+	token, _, err := model.CreateAuthFlowWithContext(ctx, model.AuthFlowCreate{
 		Purpose:   purpose,
 		UserId:    security.UserID,
 		SessionId: security.SessionID,
@@ -63,8 +79,12 @@ func CreateSessionDataFlow(purpose string, security FlowSecurity, data *webauthn
 }
 
 func PopSessionDataFlow(token, purpose string, identity model.AuthSessionIdentity) (*webauthn.SessionData, *FlowSecurity, error) {
+	return PopSessionDataFlowWithContext(context.Background(), token, purpose, identity)
+}
+
+func PopSessionDataFlowWithContext(ctx context.Context, token, purpose string, identity model.AuthSessionIdentity) (*webauthn.SessionData, *FlowSecurity, error) {
 	var payload flowPayload
-	_, err := model.ConsumeAuthFlowWithAction(token, model.AuthFlowMatch{
+	_, err := model.ConsumeAuthFlowWithActionWithContext(ctx, token, model.AuthFlowMatch{
 		Purpose:   purpose,
 		UserId:    identity.UserID,
 		SessionId: identity.SessionID,
@@ -94,10 +114,50 @@ func PopSessionDataFlow(token, purpose string, identity model.AuthSessionIdentit
 		if purpose == model.AuthFlowPurposePasskeyRegister && (security.Authorization == nil || security.Authorization.ProofID <= 0 || security.Authorization.AuthSessionIdentity != identity) {
 			return model.ErrAuthFlowInvalid
 		}
-		return model.ValidateAuthSessionWithTx(tx, identity)
+		if err := model.ValidateAuthSessionWithTx(tx, identity); err != nil {
+			return err
+		}
+		if strings.HasPrefix(security.Scope, "organization.") || strings.HasPrefix(security.Scope, "platform.organization.") {
+			if security.OrganizationAttemptID <= 0 || len(security.OrganizationContext) == 0 {
+				return model.ErrAuthFlowInvalid
+			}
+			if err := model.ValidateOrganizationAttemptWithTx(tx, identity, security.OrganizationAttemptID); err != nil {
+				return err
+			}
+			_, session, err := model.OrganizationVerificationStateWithTx(tx, identity)
+			if err != nil {
+				return err
+			}
+			now := time.Now()
+			if now.Unix() >= min(flow.ExpiresAt.Unix(), security.OrganizationExpiresAt, session.ExpiresAt, payload.SessionData.Expires.Unix()) {
+				return model.ErrAuthFlowExpired
+			}
+			if err := tx.Model(flow).Update("consumed_at", now).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	return &payload.SessionData, &payload.Security, nil
+}
+
+// Inspection selects the server-owned protocol branch only; PopSessionDataFlow
+// remains the sole atomic consumer and repeats the identity and deadline checks.
+func InspectStepUpSecurity(token string, identity model.AuthSessionIdentity) (*FlowSecurity, error) {
+	return InspectStepUpSecurityWithContext(context.Background(), token, identity)
+}
+
+func InspectStepUpSecurityWithContext(ctx context.Context, token string, identity model.AuthSessionIdentity) (*FlowSecurity, error) {
+	flow, err := model.InspectAuthFlowRouteWithContext(ctx, token, model.AuthFlowMatch{Purpose: model.AuthFlowPurposePasskeyStepUp, UserId: identity.UserID, SessionId: identity.SessionID})
+	if err != nil {
+		return nil, err
+	}
+	var payload flowPayload
+	if common.UnmarshalJsonStr(flow.Payload, &payload) != nil || payload.Security.AuthSessionIdentity != identity {
+		return nil, model.ErrAuthFlowInvalid
+	}
+	return &payload.Security, nil
 }

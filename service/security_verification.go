@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/hmac"
 	"encoding/json"
 	"errors"
@@ -365,6 +366,13 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 }
 
 func GetVerificationRequirements(identity AuthIdentity, scope string) (*VerificationRequirements, error) {
+	return GetVerificationRequirementsWithContext(context.Background(), identity, scope)
+}
+
+func GetVerificationRequirementsWithContext(ctx context.Context, identity AuthIdentity, scope string) (*VerificationRequirements, error) {
+	if IsOrganizationScope(scope) {
+		return OrganizationVerificationRequirementsWithContext(ctx, identity, scope)
+	}
 	if scope == VerificationScopeLogin {
 		return nil, ErrProofScope
 	}
@@ -470,7 +478,11 @@ func verificationOAuthProviders(user *model.User) ([]VerificationOAuthProvider, 
 }
 
 func RequireVerificationMethod(identity AuthIdentity, scope, method string) (*VerificationRequirements, error) {
-	requirements, err := GetVerificationRequirements(identity, scope)
+	return RequireVerificationMethodWithContext(context.Background(), identity, scope, method)
+}
+
+func RequireVerificationMethodWithContext(ctx context.Context, identity AuthIdentity, scope, method string) (*VerificationRequirements, error) {
+	requirements, err := GetVerificationRequirementsWithContext(ctx, identity, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -489,6 +501,9 @@ func RequireVerificationMethod(identity AuthIdentity, scope, method string) (*Ve
 // CompleteSecurityVerification runs after the concrete authentication ceremony.
 // Recheck the session and policy after potentially slow external authentication.
 func CompleteSecurityVerification(identity AuthIdentity, binding VerificationBinding, method string) (*SecurityProof, error) {
+	if IsOrganizationScope(binding.Scope) {
+		return nil, ErrProofScope
+	}
 	if err := ValidateStepUpIdentity(identity); err != nil {
 		return nil, err
 	}
@@ -505,6 +520,9 @@ func CompleteSecurityVerification(identity AuthIdentity, binding VerificationBin
 // ConsumeOperationProof accepts a proof at most once. The consumption commits
 // before the caller performs its action; an action failure must not restore it.
 func ConsumeOperationProof(raw string, identity AuthIdentity, operation VerificationOperation) (*model.AuthFlowAuthorization, error) {
+	if IsOrganizationScope(operation.Scope) {
+		return nil, ErrProofScope
+	}
 	binding, err := BindVerificationOperation(operation)
 	if err != nil {
 		return nil, err

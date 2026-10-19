@@ -118,12 +118,14 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 			case "mysql":
 				dsn := os.Getenv("TEST_MYSQL_DSN")
 				if dsn == "" {
+					require.NotEqual(t, "1", os.Getenv("NEWAPI_REQUIRE_DATABASES"), "required database DSN is missing")
 					t.Skip("TEST_MYSQL_DSN is not configured")
 				}
 				driver = mysql.Open(dsn)
 			case "postgres":
 				dsn := os.Getenv("TEST_POSTGRES_DSN")
 				if dsn == "" {
+					require.NotEqual(t, "1", os.Getenv("NEWAPI_REQUIRE_DATABASES"), "required database DSN is missing")
 					t.Skip("TEST_POSTGRES_DSN is not configured")
 				}
 				driver = postgres.Open(dsn)

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -69,6 +70,30 @@ func isAllowedSessionOrigin(request *http.Request, origin string) bool {
 	}
 	for _, trustedOrigin := range common.SessionCookieTrustedURLs {
 		if subtle.ConstantTimeCompare([]byte(origin), []byte(trustedOrigin)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// OrganizationOriginAllowed uses configured public origins only. Request Host,
+// forwarding headers and the secure-cookie development switch confer no trust.
+func OrganizationOriginAllowed(request *http.Request) bool {
+	if len(request.Header.Values("Origin")) == 0 && len(request.Header.Values("Referer")) == 0 {
+		for key := range request.Header {
+			if strings.HasPrefix(strings.ToLower(key), "sec-fetch-") {
+				return false
+			}
+		}
+		return true
+	}
+	origin, ok := requestBrowserOrigin(request)
+	if !ok {
+		return false
+	}
+	for _, candidate := range append([]string{system_setting.ServerAddress}, common.SessionCookieTrustedURLs...) {
+		configured, err := common.NormalizeOrigin(candidate)
+		if err == nil && subtle.ConstantTimeCompare([]byte(origin), []byte(configured)) == 1 {
 			return true
 		}
 	}

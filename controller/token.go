@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
@@ -130,7 +131,10 @@ func setTokenAutoGroups(c *gin.Context, token *model.Token, groups []string) boo
 }
 
 func GetAllTokens(c *gin.Context) {
-	userId := c.GetInt("id")
+	userId, ok := middleware.RequirePersonalResourceOwner(c)
+	if !ok {
+		return
+	}
 	pageInfo := common.GetPageQuery(c)
 	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
@@ -161,8 +165,11 @@ func SearchTokens(c *gin.Context) {
 }
 
 func GetToken(c *gin.Context) {
+	userId, ok := middleware.RequirePersonalResourceOwner(c)
+	if !ok {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
-	userId := c.GetInt("id")
 	if err != nil {
 		common.ApiError(c, err)
 		return

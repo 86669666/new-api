@@ -17,11 +17,14 @@ import (
 	"gorm.io/driver/clickhouse"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -31,21 +34,52 @@ import (
 	"gorm.io/gorm"
 )
 
-func setupAccessTokenAudit(t *testing.T) (*model.User, string) {
+func setupAccessTokenAudit(t *testing.T, additionalModels ...any) (*model.User, string) {
 	t.Helper()
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	previousRedis := common.RedisEnabled
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	models := []any{&model.User{}, &model.UserSession{}, &model.Log{}, &model.AuditLog{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{},
+		&model.AuthFlow{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}}
+	models = append(models, additionalModels...)
+	dialect := common.DatabaseType(os.Getenv("TEST_TASK_DB_DIALECT"))
+	var dsn string
+	switch dialect {
+	case "", common.DatabaseTypeSQLite:
+		dialect = common.DatabaseTypeSQLite
+	case common.DatabaseTypeMySQL:
+		dsn = os.Getenv("TEST_MYSQL_DSN")
+	case common.DatabaseTypePostgreSQL:
+		dsn = os.Getenv("TEST_POSTGRES_DSN")
+	default:
+		t.Fatalf("unsupported test dialect %q", dialect)
+	}
+	// The audit writer uses its fixed table name, so isolate the whole database
+	// rather than adding a table prefix. Remote fixtures require loopback DSNs.
+	db, _ := newAuditTestDatabase(t, string(dialect), dsn)
+	sqlDB, err := db.DB()
 	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	require.NoError(t, db.AutoMigrate(models...))
 	require.NoError(t, i18n.Init())
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Log{}, &model.AuditLog{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{},
-		&model.AuthFlow{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}))
 	model.DB, model.LOG_DB = db, db
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	common.SetDatabaseTypes(dialect, dialect)
+	previousMaster := common.IsMasterNode
+	t.Setenv("LOG_SQL_DSN", "")
+	common.IsMasterNode = false
+	// Initialize dialect-specific column quoting used by real relay token auth.
+	require.NoError(t, model.InitLogDB())
+	common.IsMasterNode = previousMaster
+	var version string
+	versionQuery := "SELECT version()"
+	if dialect == common.DatabaseTypeSQLite {
+		versionQuery = "SELECT sqlite_version()"
+	}
+	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+	t.Logf("database: %s %s", dialect, version)
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
 	common.RedisEnabled = false
-	previousMaster := common.IsMasterNode
 	common.IsMasterNode = true
 	require.NoError(t, authz.Init(db))
 	t.Cleanup(func() {
@@ -54,7 +88,8 @@ func setupAccessTokenAudit(t *testing.T) (*model.User, string) {
 		common.SetDatabaseTypes(previousMain, previousLog)
 		common.RedisEnabled = previousRedis
 	})
-	token := "legacy-opaque-token"
+	// Match the legacy CHAR(32) column without dialect-specific blank padding.
+	token := "legacy-opaque-token-123456789012"
 	user := &model.User{Username: "audit-owner", Password: "placeholder", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AccessToken: &token, AuthVersion: 1, AffCode: "audit-owner"}
 	require.NoError(t, db.Create(user).Error)
 	return user, token
@@ -1256,3 +1291,302 @@ CREATE TABLE IF NOT EXISTS logs (
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(toDateTime(created_at))
 ORDER BY (created_at, request_id)`
+
+func TestScopedAccessTokenChannelPermissionIntersection(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, body, credential     string
+		permission                               authz.Permission
+		userAllowed, scopeAllowed, root, success bool
+	}{
+		{"key_scope_denied", "PUT", "/api/channel/", `{"id":%d,"key":"replacement"}`, "pat", authz.ChannelWrite, true, false, false, false},
+		{"key_user_denied", "PUT", "/api/channel/", `{"id":%d,"key":"replacement"}`, "pat", authz.ChannelWrite, false, true, false, false},
+		{"key_both_denied", "PUT", "/api/channel/", `{"id":%d,"key":"replacement"}`, "pat", authz.ChannelWrite, false, false, false, false},
+		{"key_both_allowed", "PUT", "/api/channel/", `{"id":%d,"key":"replacement"}`, "pat", authz.ChannelWrite, true, true, false, true},
+		{"root_scope_denied", "PUT", "/api/channel/", `{"id":%d,"key":"replacement"}`, "pat", authz.ChannelWrite, true, false, true, false},
+		{"base_url_scope_denied", "PUT", "/api/channel/", `{"id":%d,"base_url":"https://changed.invalid"}`, "pat", authz.ChannelWrite, true, false, false, false},
+		{"header_scope_denied", "PUT", "/api/channel/", `{"id":%d,"header_override":"{\"X-Test\":\"changed\"}"}`, "pat", authz.ChannelWrite, true, false, false, false},
+		{"ordinary_edit", "PUT", "/api/channel/", `{"id":%d,"name":"renamed"}`, "pat", authz.ChannelWrite, false, false, false, true},
+		{"tag_scope_denied", "PUT", "/api/channel/tag", `{"tag":"scope-test","header_override":"{}"}`, "pat", authz.ChannelWrite, true, false, false, false},
+		{"tag_allowed", "PUT", "/api/channel/tag", `{"tag":"scope-test","header_override":"{}"}`, "pat", authz.ChannelWrite, true, true, false, true},
+		{"delete_scope_denied", "POST", "/api/channel/multi_key/manage", `{"channel_id":%d,"action":"delete_key","key_index":0}`, "pat", authz.ChannelOperate, true, false, false, false},
+		{"delete_allowed", "POST", "/api/channel/multi_key/manage", `{"channel_id":%d,"action":"delete_key","key_index":0}`, "pat", authz.ChannelOperate, true, true, false, true},
+		{"delete_disabled_scope_denied", "POST", "/api/channel/multi_key/manage", `{"channel_id":%d,"action":"delete_disabled_keys"}`, "pat", authz.ChannelOperate, true, false, false, false},
+		{"plugin_bind_root_scope_denied", "PUT", "/api/channel/", `{"id":%d,"type":61}`, "pat", authz.ChannelWrite, true, true, true, false},
+		{"browser_compatibility", "PUT", "/api/channel/", `{"id":%d,"key":"replacement"}`, "browser", authz.ChannelWrite, true, false, false, true},
+		{"legacy_compatibility", "PUT", "/api/channel/", `{"id":%d,"key":"replacement"}`, "legacy", authz.ChannelWrite, true, false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, legacy := setupAccessTokenAudit(t, &model.Channel{}, &model.Ability{})
+			if tc.root {
+				require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+			}
+			require.NoError(t, authz.SetUserPermissions(user.Id, authz.PermissionsMap{
+				"channel": {"write": true, "operate": true, "sensitive_write": tc.userAllowed},
+			}))
+			channel := &model.Channel{Type: 1, Name: "original", Key: "first\nsecond", Models: "test-model", Group: "default", Status: common.ChannelStatusEnabled,
+				Tag: common.GetPointer("scope-test"), BaseURL: common.GetPointer("https://original.invalid"),
+				ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyStatusList: map[int]int{0: 3}},
+			}
+			require.NoError(t, channel.Insert())
+			before, err := model.GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			scopes := []string{service.AccessTokenScopeOf(tc.permission)}
+			if tc.scopeAllowed {
+				scopes = append(scopes, service.AccessTokenScopeOf(authz.ChannelSensitiveWrite))
+			}
+			credential := legacy
+			switch tc.credential {
+			case "pat":
+				credential, _ = createScopedAccessToken(t, user.Id, 0, scopes...)
+			case "browser":
+				_, credential = createAccessTokenTestSession(t, user.Id, "channel-scope-session")
+			case "legacy":
+				setLegacyAccessTokenRetireAt(t, time.Now().Unix()+3600)
+			}
+			middleware.DeclareAccessTokenPermissionRoute(tc.method, tc.path, tc.permission)
+			router := gin.New()
+			handler := UpdateChannel
+			switch tc.path {
+			case "/api/channel/tag":
+				handler = EditTagChannels
+			case "/api/channel/multi_key/manage":
+				handler = ManageMultiKeys
+			}
+			router.Handle(tc.method, tc.path, middleware.AdminAuth(), middleware.RequirePermission(tc.permission), handler)
+			body := tc.body
+			if strings.Contains(body, "%d") {
+				body = fmt.Sprintf(body, channel.Id)
+			}
+			response := accessTokenRequest(router, tc.method, tc.path, credential, "", body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var result struct {
+				Success bool `json:"success"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			require.Equal(t, tc.success, result.Success, response.Body.String())
+			after, err := model.GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			if !tc.success {
+				if tc.name == "plugin_bind_root_scope_denied" {
+					assert.Contains(t, response.Body.String(), "task_plugin.bind permission")
+				} else {
+					assert.Contains(t, response.Body.String(), "Unauthorized, insufficient privileges")
+				}
+				assert.Equal(t, before, after, "denied writes must preserve channel data")
+				return
+			}
+			switch tc.name {
+			case "ordinary_edit":
+				assert.Equal(t, "renamed", after.Name)
+				assert.Equal(t, before.Key, after.Key)
+			case "tag_allowed":
+				require.NotNil(t, after.HeaderOverride)
+				assert.Equal(t, "{}", *after.HeaderOverride)
+			case "delete_allowed":
+				assert.Equal(t, "second", after.Key)
+				assert.Equal(t, 1, after.ChannelInfo.MultiKeySize)
+			default:
+				assert.Equal(t, "replacement", after.Key)
+			}
+		})
+	}
+}
+
+func TestScopedAccessTokenTaskArtifactOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name, credential string
+		role             int
+		scopes           []string
+		foreignAllowed   bool
+	}{
+		{"admin_personal", "pat", common.RoleAdminUser, []string{"usage:read"}, false},
+		{"root_personal", "pat", common.RoleRootUser, []string{"usage:read"}, false},
+		{"admin_global", "pat", common.RoleAdminUser, []string{"usage:read", "log:read"}, true},
+		{"ordinary_with_global_scope", "pat", common.RoleCommonUser, []string{"usage:read", "log:read"}, false},
+		{"admin_browser", "browser", common.RoleAdminUser, nil, true},
+		{"ordinary_browser", "browser", common.RoleCommonUser, nil, false},
+		{"admin_legacy", "legacy", common.RoleAdminUser, nil, true},
+		{"admin_relay_key", "relay", common.RoleAdminUser, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, legacy := setupAccessTokenAudit(t, &model.Task{}, &model.Token{})
+			require.NoError(t, model.DB.Model(user).Update("role", tc.role).Error)
+			other := &model.User{Username: "other-owner", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "other-owner"}
+			require.NoError(t, model.DB.Create(other).Error)
+			for _, owner := range []*model.User{user, other} {
+				require.NoError(t, model.DB.Create(&model.Task{TaskID: fmt.Sprintf("scope-task-%d", owner.Id), UserId: owner.Id,
+					Platform: "document", Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess,
+					FailReason: "https://upstream.invalid/private.mp4?signature=fixture",
+				}).Error)
+			}
+			oldSecret, oldAddress := common.CryptoSecret, system_setting.TaskPublicAddress
+			common.CryptoSecret = "task-scope-regression-fixture"
+			system_setting.TaskPublicAddress = "https://gateway.invalid"
+			t.Cleanup(func() { common.CryptoSecret, system_setting.TaskPublicAddress = oldSecret, oldAddress })
+			credential := legacy
+			switch tc.credential {
+			case "pat":
+				credential, _ = createScopedAccessToken(t, user.Id, 0, tc.scopes...)
+			case "browser":
+				_, credential = createAccessTokenTestSession(t, user.Id, "artifact-scope-session")
+			case "legacy":
+				setLegacyAccessTokenRetireAt(t, time.Now().Unix()+3600)
+			case "relay":
+				credential = "relayfixturekey"
+				require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: credential, Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1}).Error)
+			}
+			router := gin.New()
+			pathPrefix := "/api/task/"
+			router.GET("/api/task/:task_id/artifacts", middleware.UserAuth(), GetDashboardTaskArtifacts)
+			if tc.credential == "relay" {
+				pathPrefix = "/v1/tasks/"
+				router.GET("/v1/tasks/:key/artifacts", middleware.TokenAuth(), GetTaskArtifacts)
+			}
+			for _, target := range []struct {
+				id      int
+				allowed bool
+			}{{user.Id, true}, {other.Id, tc.foreignAllowed}, {9999, false}} {
+				taskID := fmt.Sprintf("scope-task-%d", target.id)
+				response := accessTokenRequest(router, "GET", pathPrefix+taskID+"/artifacts", credential, "", "")
+				if !target.allowed {
+					assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+					assert.Contains(t, response.Body.String(), `"code":"artifact_not_found"`)
+					assert.NotContains(t, response.Body.String(), "legacy_content_url")
+					assert.NotContains(t, response.Body.String(), service.TaskArtifactAccessQueryParameter+"=")
+					continue
+				}
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				var result struct {
+					LegacyContentURL string `json:"legacy_content_url"`
+					Data             struct {
+						LegacyContentURL string `json:"legacy_content_url"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				link := result.Data.LegacyContentURL
+				if tc.credential == "relay" {
+					link = result.LegacyContentURL
+				}
+				require.NotEmpty(t, link)
+				parsed, err := url.Parse(link)
+				require.NoError(t, err)
+				assert.True(t, service.VerifyTaskArtifactAccess(parsed.Query().Get(service.TaskArtifactAccessQueryParameter), taskID, "video"))
+				assert.NotContains(t, response.Body.String(), "upstream.invalid")
+			}
+		})
+	}
+}
+
+func TestPersonalResourceScopeReadCompatibility(t *testing.T) {
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		for _, credentialKind := range []string{"session", "pat", "legacy"} {
+			t.Run(fmt.Sprintf("role_%d/%s", role, credentialKind), func(t *testing.T) {
+				user, credential := setupAccessTokenAudit(t, &model.Token{}, &model.Task{})
+				require.NoError(t, model.DB.Model(user).Update("role", role).Error)
+				other := &model.User{Username: "scope-other", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "scope-other"}
+				require.NoError(t, model.DB.Create(other).Error)
+				ownToken := seedToken(t, model.DB, user.Id, "scope-own", "scope-own-secret-key")
+				otherToken := seedToken(t, model.DB, other.Id, "scope-foreign", "scope-foreign-secret-key")
+				for _, owner := range []*model.User{user, other} {
+					require.NoError(t, model.DB.Create(&model.Task{TaskID: fmt.Sprintf("personal-task-%d", owner.Id), UserId: owner.Id, Platform: "document", Status: model.TaskStatusSuccess}).Error)
+					require.NoError(t, model.LOG_DB.Create(&model.Log{UserId: owner.Id, CreatedAt: time.Now().Unix(), Type: model.LogTypeError, RequestId: fmt.Sprintf("personal-log-%d", owner.Id), Other: `{"admin_info":{"private":"must-not-leak"}}`}).Error)
+				}
+				switch credentialKind {
+				case "session":
+					_, credential = createAccessTokenTestSession(t, user.Id, "personal-scope-session")
+				case "pat":
+					credential, _ = createScopedAccessToken(t, user.Id, 0, "api_key:read", "usage:read")
+				case "legacy":
+					setLegacyAccessTokenRetireAt(t, time.Now().Unix()+3600)
+				}
+				router := gin.New()
+				router.Use(middleware.OrganizationSelectionBoundary())
+				router.GET("/api/token/", middleware.UserAuth(), GetAllTokens)
+				router.GET("/api/token/:id", middleware.UserAuth(), GetToken)
+				router.GET("/api/task/self", middleware.UserAuth(), GetUserTask)
+				router.GET("/api/log/self", middleware.UserAuth(), GetUserLogs)
+				for _, endpoint := range []struct{ path, field, value string }{
+					{"/api/token/", "name", "scope-own"},
+					{"/api/task/self", "task_id", fmt.Sprintf("personal-task-%d", user.Id)},
+					{"/api/log/self", "request_id", fmt.Sprintf("personal-log-%d", user.Id)},
+				} {
+					for _, selection := range []string{"", "&org_id=0"} {
+						t.Run(endpoint.path+selection, func(t *testing.T) {
+							request := httptest.NewRequest(http.MethodGet, endpoint.path+fmt.Sprintf("?user_id=%d&p=1&size=10", other.Id)+selection, nil)
+							request.Header.Set("Authorization", "Bearer "+credential)
+							response := httptest.NewRecorder()
+							router.ServeHTTP(response, request)
+							require.Equal(t, http.StatusOK, response.Code)
+							var body struct {
+								Success bool `json:"success"`
+								Data    struct {
+									Total int              `json:"total"`
+									Items []map[string]any `json:"items"`
+								} `json:"data"`
+							}
+							require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+							require.True(t, body.Success, response.Body.String())
+							assert.Equal(t, 1, body.Data.Total)
+							require.Len(t, body.Data.Items, 1)
+							assert.Equal(t, endpoint.value, body.Data.Items[0][endpoint.field])
+							assert.NotContains(t, response.Body.String(), ownToken.Key)
+							assert.NotContains(t, response.Body.String(), otherToken.Key)
+							assert.NotContains(t, response.Body.String(), "must-not-leak")
+							assert.NotContains(t, response.Body.String(), "org_id")
+						})
+					}
+					selected := accessTokenRequest(router, http.MethodGet, endpoint.path+"?org_id=999", credential, "", "")
+					assert.Equal(t, http.StatusForbidden, selected.Code)
+				}
+				own := accessTokenRequest(router, http.MethodGet, fmt.Sprintf("/api/token/%d", ownToken.Id), credential, "", "")
+				ownBody := decodeAPIResponse(t, own)
+				require.True(t, ownBody.Success)
+				assert.NotContains(t, own.Body.String(), ownToken.Key)
+				foreign := accessTokenRequest(router, http.MethodGet, fmt.Sprintf("/api/token/%d", otherToken.Id), credential, "", "")
+				assert.Equal(t, http.StatusOK, foreign.Code)
+				assert.False(t, decodeAPIResponse(t, foreign).Success)
+				assert.NotContains(t, foreign.Body.String(), otherToken.Key)
+				wrongScope, _ := createScopedAccessToken(t, user.Id, 0, "profile:read")
+				for _, path := range []string{"/api/token/", fmt.Sprintf("/api/token/%d", ownToken.Id), "/api/task/self", "/api/log/self"} {
+					assert.Equal(t, http.StatusForbidden, accessTokenRequest(router, http.MethodGet, path, wrongScope, "", "").Code)
+				}
+			})
+		}
+	}
+}
+
+func TestPersonalResourceScopeRejectsInvalidIdentity(t *testing.T) {
+	for _, id := range []int{-1, 0, 1, 2} {
+		scope, valid := types.NewPersonalResourceScope(id)
+		assert.Equal(t, id > 0, valid)
+		owner, ownerValid := scope.PersonalOwnerID()
+		assert.Equal(t, id > 0, ownerValid)
+		assert.Zero(t, scope.OrganizationID())
+		if id > 0 {
+			assert.Equal(t, id, owner)
+		} else {
+			assert.Zero(t, owner)
+		}
+	}
+	var zero types.ResourceScope
+	_, valid := zero.PersonalOwnerID()
+	assert.False(t, valid)
+	previousDB, previousLogDB := model.DB, model.LOG_DB
+	model.DB, model.LOG_DB = nil, nil
+	t.Cleanup(func() { model.DB, model.LOG_DB = previousDB, previousLogDB })
+	for _, identity := range []any{nil, "forged", service.AuthIdentity{}, service.AuthIdentity{UserID: -1}} {
+		for _, handler := range []gin.HandlerFunc{GetAllTokens, GetToken, GetUserTask, GetUserLogs} {
+			response := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(response)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/?user_id=1&org_id=1", nil)
+			ctx.Set("id", 1) // Legacy untyped context alone must not establish ownership.
+			if identity != nil {
+				ctx.Set("auth_identity", identity)
+			}
+			require.NotPanics(t, func() { handler(ctx) }, "must reject before querying nil DB")
+			assert.Equal(t, http.StatusUnauthorized, response.Code)
+			assert.True(t, ctx.IsAborted())
+			assert.Contains(t, response.Body.String(), "AUTH_UNAUTHORIZED")
+		}
+	}
+}
