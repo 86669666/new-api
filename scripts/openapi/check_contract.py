@@ -328,6 +328,17 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
 
 
 def check_organization_task_reads(api):
+    task_list = api['paths']['/api/task/self']['get']
+    delivery = task_list['x-organization-list-revocation']
+    assert delivery['initial_snapshot'] == 'page and total authorized together'
+    assert delivery['final_check'] == 'after projection and before first JSON publication'
+    assert delivery['current_session_member_enabled'] is True
+    assert delivery['organization_wide_roles'] == ['owner', 'admin']
+    assert delivery['scope_narrowing_status'] == 404 and delivery['empty_pages_checked'] is True
+    assert delivery['requery_tasks_or_total'] is False and delivery['scope_marker_in_response'] is False
+    assert delivery['initial_member_promotion'] == 'may publish original own-submission snapshot'
+    assert delivery['denial'] == 'no data, items or total'
+    assert task_list['x-organization-scope-security'] == [{'DashboardJWT': []}]
     base = '/api/organizations/{org_id}/tasks/{task_row_id}'
     expected = [('GET', base), ('GET', base + '/artifacts'),
                 ('GET', base + '/artifacts/{artifact_key}/content'),
@@ -435,7 +446,8 @@ def check_organization_task_reads(api):
             response = pointer(api, response['$ref'])
         assert response['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
         assert ('Content-Disposition' in response['headers']) == (status == '200')
-    return {'routes': len(expected), 'batch_routes': 1, 'export_routes': 1, 'anonymous_access': False, 'live_http': False}
+    return {'routes': len(expected), 'batch_routes': 1, 'export_routes': 1, 'list_publication_check': True,
+            'anonymous_access': False, 'live_http': False}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

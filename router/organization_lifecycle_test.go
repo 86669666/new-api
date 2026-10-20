@@ -1753,6 +1753,161 @@ func TestOrganizationTaskExport(t *testing.T) {
 	}
 }
 
+func TestOrganizationTaskListRevocation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("task metadata list must not call an upstream")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(upstream.Close)
+	for _, change := range []string{"remove", "platform_disable", "session_revoke", "downgrade_own_page", "downgrade_empty_page"} {
+		t.Run(change, func(t *testing.T) {
+			c, rows := newOrganizationTaskReadClient(t, upstream.URL)
+			actor := "member"
+			if change == "platform_disable" {
+				actor = "owner"
+			} else if change == "session_revoke" || strings.HasPrefix(change, "downgrade_") {
+				actor = "admin"
+			}
+			base := "/api/task/self?org_id=" + strconv.FormatInt(c.orgA, 10)
+			endpoint := base + "&p=1&page_size=100"
+			var ownTotal int64
+			if strings.HasPrefix(change, "downgrade_") {
+				// Put an admin-owned row first on every dialect, including those
+				// whose sequence does not advance after an explicit fixture ID.
+				task := *rows["admin"]
+				task.ID, task.TaskID = 9007199254741993, "list-admin-own-page"
+				require.NoError(t, task.InsertWithContext(t.Context()))
+				rows["admin_first"] = &task
+				require.NoError(t, c.db.Model(&model.Task{}).Where("organization_id = ? AND user_id = ?", c.orgA, c.users["admin"].Id).Count(&ownTotal).Error)
+				endpoint = base + "&p=1&page_size=1"
+				if change == "downgrade_empty_page" {
+					endpoint = base + "&p=100&page_size=1"
+				}
+			}
+			status, headers, initial := c.json(t, "GET", endpoint, actor, nil, "")
+			require.Equal(t, 200, status)
+			assert.Equal(t, "private, no-store", headers.Get("Cache-Control"))
+			assert.Empty(t, headers.Get("Content-Disposition"))
+			assert.Equal(t, true, initial["success"])
+			assert.Equal(t, "", initial["message"])
+			data := initial["data"].(map[string]any)
+			assert.ElementsMatch(t, []string{"page", "page_size", "total", "items"}, slices.Collect(maps.Keys(data)))
+			if strings.HasPrefix(change, "downgrade_") {
+				assert.Greater(t, int64(data["total"].(float64)), ownTotal, "the original count includes other members")
+				items := data["items"].([]any)
+				if change == "downgrade_empty_page" {
+					require.Empty(t, items)
+				} else {
+					require.Len(t, items, 1)
+					assert.Equal(t, strconv.FormatInt(rows["admin_first"].ID, 10), items[0].(map[string]any)["task_row_id"])
+				}
+			}
+			var ownerBefore, personalBefore map[string]any
+			if change == "remove" {
+				status, _, ownerBefore = c.json(t, "GET", endpoint, "owner", nil, "")
+				require.Equal(t, 200, status)
+				assert.Greater(t, ownerBefore["data"].(map[string]any)["total"].(float64), data["total"].(float64))
+				status, _, personalBefore = c.json(t, "GET", "/api/task/self", "owner", nil, "")
+				require.Equal(t, 200, status)
+				for _, item := range personalBefore["data"].(map[string]any)["items"].([]any) {
+					assert.NotContains(t, item.(map[string]any), "task_row_id")
+				}
+			}
+			pool := &organizationTaskBatchPublicationPool{ConnPool: c.db.ConnPool, entered: make(chan struct{}), release: make(chan struct{})}
+			originalPool, originalStatementPool := c.db.ConnPool, c.db.Statement.ConnPool
+			c.db.ConnPool, c.db.Statement.ConnPool = pool, pool
+			callback := "test:organization-task-list-publication"
+			require.NoError(t, c.db.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "tasks" && tx.Error == nil {
+					if transaction, ok := tx.Statement.ConnPool.(*organizationTaskBatchPublicationTx); ok {
+						transaction.taskRead = true
+					}
+				}
+			}))
+			var release sync.Once
+			t.Cleanup(func() {
+				release.Do(func() { close(pool.release) })
+				c.server.Close()
+				c.db.ConnPool, c.db.Statement.ConnPool = originalPool, originalStatementPool
+				require.NoError(t, c.db.Callback().Query().Remove(callback))
+			})
+			request, err := http.NewRequest("GET", c.server.URL+endpoint, nil)
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+c.bearer[actor])
+			type result struct {
+				status  int
+				headers http.Header
+				body    []byte
+				err     error
+			}
+			done := make(chan result, 1)
+			go func() {
+				response, err := c.client.Do(request)
+				if err != nil {
+					done <- result{err: err}
+					return
+				}
+				defer response.Body.Close()
+				body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+				done <- result{response.StatusCode, response.Header, body, err}
+			}()
+			select {
+			case <-pool.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("list did not reach its committed publication barrier")
+			}
+			want, code := 404, "ORG_NOT_FOUND"
+			switch change {
+			case "remove":
+				c.mutate(t, "owner", "DELETE", c.path()+"/members/"+strconv.Itoa(c.users["member"].Id), "remove", map[string]any{"revision": c.revision(t)}, map[string]any{"target_user_id": strconv.Itoa(c.users["member"].Id)}, false)
+			case "platform_disable":
+				c.mutate(t, "root", "POST", fmt.Sprintf("/api/platform/organizations/%d/state", c.orgA), change, map[string]any{"revision": c.revision(t), "disabled": true, "reason": "task list revocation"}, nil, true)
+			case "session_revoke":
+				revoked, err := model.RevokeUserSession(c.users[actor].Id, c.sids[actor], "organization_task_list")
+				require.NoError(t, err)
+				require.True(t, revoked)
+				want, code = 401, "AUTH_SESSION_REVOKED"
+			default:
+				c.mutate(t, "owner", "PATCH", c.path()+"/members/"+strconv.Itoa(c.users["admin"].Id)+"/role", "change_role", map[string]any{"revision": c.revision(t), "role": "member"}, map[string]any{"target_user_id": strconv.Itoa(c.users["admin"].Id)}, true)
+			}
+			release.Do(func() { close(pool.release) })
+			select {
+			case response := <-done:
+				require.NoError(t, response.err)
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(response.body, &body))
+				organizationError(t, response.status, response.headers, body, want, code)
+				assert.NotContains(t, body, "total")
+				assert.NotContains(t, body, "items")
+			case <-time.After(5 * time.Second):
+				t.Fatal("revoked list did not finish after its barrier")
+			}
+			if strings.HasPrefix(change, "downgrade_") {
+				status, _, response := c.json(t, "GET", base+"&p=1&page_size=100", actor, nil, "")
+				require.Equal(t, 200, status)
+				fresh := response["data"].(map[string]any)
+				assert.EqualValues(t, ownTotal, fresh["total"])
+				ids := []string{}
+				for _, item := range fresh["items"].([]any) {
+					ids = append(ids, item.(map[string]any)["task_row_id"].(string))
+				}
+				assert.ElementsMatch(t, []string{strconv.FormatInt(rows["admin"].ID, 10), strconv.FormatInt(rows["admin_first"].ID, 10)}, ids)
+			} else {
+				status, headers, response := c.json(t, "GET", endpoint, actor, nil, "")
+				organizationError(t, status, headers, response, want, code)
+			}
+			if change == "remove" {
+				status, _, response := c.json(t, "GET", endpoint, "owner", nil, "")
+				require.Equal(t, 200, status)
+				assert.Equal(t, ownerBefore, response, "authorized owner page and total retain their wire shape")
+				status, _, response = c.json(t, "GET", "/api/task/self", "owner", nil, "")
+				require.Equal(t, 200, status)
+				assert.Equal(t, personalBefore, response, "personal task behavior is unaffected")
+			}
+		})
+	}
+}
+
 func TestOrganizationTaskReadLifecycle(t *testing.T) {
 	t.Run("isolation_permissions_and_artifacts", func(t *testing.T) {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

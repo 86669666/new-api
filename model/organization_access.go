@@ -32,16 +32,18 @@ type OrganizationAccessResult struct {
 // ReadOrganizationTasks lists organization-owned tasks under the same locked
 // membership read as the other organization projections, so a committed
 // removal or disable is observed by every later read. Owners and admins see
-// every organization task; members see only their own submissions.
-func ReadOrganizationTasks(identity AuthSessionIdentity, orgID int64, queryParams SyncTaskQueryParams, startIdx, num int) ([]*Task, int64, int, error) {
+// every organization task; members see only their own submissions. The returned
+// organizationWide flag records the scope of both rows and total for delivery.
+func ReadOrganizationTasks(identity AuthSessionIdentity, orgID int64, queryParams SyncTaskQueryParams, startIdx, num int) ([]*Task, int64, int, bool, error) {
 	var tasks []*Task
 	var total int64
+	var organizationWide bool
 	if orgID <= 0 || startIdx < 0 || num < 1 || num > 100 {
-		return nil, 0, 0, ErrOrganizationInvalidInput
+		return nil, 0, 0, false, ErrOrganizationInvalidInput
 	}
 	actorRole, err := organizationActorRole(identity)
 	if err != nil {
-		return nil, 0, actorRole, err
+		return nil, 0, actorRole, false, err
 	}
 	err = withOrganization(identity, OrganizationCommand{OrganizationID: orgID}, false, func(s *organizationState) error {
 		actorRole = s.users[identity.UserID].Role
@@ -49,7 +51,9 @@ func ReadOrganizationTasks(identity AuthSessionIdentity, orgID int64, queryParam
 			return ErrOrganizationNotFound
 		}
 		query := applyTaskQueryFilters(s.tx.Model(&Task{}).Where("organization_id = ?", orgID), queryParams)
-		if role := s.role(identity.UserID); role != OrganizationRoleOwner && role != OrganizationRoleAdmin {
+		role := s.role(identity.UserID)
+		organizationWide = role == OrganizationRoleOwner || role == OrganizationRoleAdmin
+		if !organizationWide {
 			query = query.Where("user_id = ?", identity.UserID)
 		}
 		query = query.Session(&gorm.Session{})
@@ -63,9 +67,38 @@ func ReadOrganizationTasks(identity AuthSessionIdentity, orgID int64, queryParam
 		return err
 	})
 	if err != nil {
-		return nil, 0, actorRole, err
+		return nil, 0, actorRole, false, err
 	}
-	return tasks, total, actorRole, nil
+	return tasks, total, actorRole, organizationWide, nil
+}
+
+// RecheckOrganizationTaskListAccessWithContext protects the original page and
+// total immediately before delivery, including an empty page. A formerly wide
+// read cannot be published under a current member-only grant.
+func RecheckOrganizationTaskListAccessWithContext(ctx context.Context, identity AuthSessionIdentity, orgID int64, organizationWide bool) (int, error) {
+	if orgID <= 0 {
+		return 0, ErrOrganizationInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	actorRole, err := organizationActorRole(identity)
+	if err != nil {
+		return actorRole, err
+	}
+	err = withOrganizationWithContext(ctx, identity, OrganizationCommand{OrganizationID: orgID}, false, func(s *organizationState) error {
+		actorRole = s.users[identity.UserID].Role
+		if s.member(identity.UserID) == nil || s.requireEnabled() != nil {
+			return ErrOrganizationNotFound
+		}
+		role := s.role(identity.UserID)
+		if organizationWide && role != OrganizationRoleOwner && role != OrganizationRoleAdmin {
+			return ErrOrganizationNotFound
+		}
+		_, err := validateOrganizationIdentity(s.tx, identity, organizationNow().Unix())
+		return err
+	})
+	return actorRole, err
 }
 
 // ReadOrganizationTaskWithContext binds every lookup to an internal row ID and

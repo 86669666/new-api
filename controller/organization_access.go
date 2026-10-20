@@ -198,7 +198,7 @@ func serveOrganizationTasks(c *gin.Context, orgID int64) {
 		writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, err)
 		return
 	}
-	items, total, actorRole, err := model.ReadOrganizationTasks(identity, orgID, params, int((page-1)*pageSize), int(pageSize))
+	items, total, actorRole, organizationWide, err := model.ReadOrganizationTasks(identity, orgID, params, int((page-1)*pageSize), int(pageSize))
 	if err != nil {
 		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
 		return
@@ -213,6 +213,11 @@ func serveOrganizationTasks(c *gin.Context, orgID int64) {
 		item.ResultURL = ""
 	}
 	pageInfo.SetItems(projected)
+	actorRole, err = model.RecheckOrganizationTaskListAccessWithContext(c.Request.Context(), identity, orgID, organizationWide)
+	if err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+		return
+	}
 	common.ApiSuccess(c, pageInfo)
 }
 

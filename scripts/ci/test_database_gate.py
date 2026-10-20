@@ -346,6 +346,21 @@ class OrganizationIdentityContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.validate_organization_identity_events(events, 'organization-task-batch')
 
+    def test_task_list_revocation_suite_is_one_closed_http_root(self):
+        suite = 'organization-task-list-revocation'
+        package = 'github.com/QuantumNous/new-api/router'
+        events = [{'Action': 'pass', 'Package': package, 'Test': 'TestOrganizationTaskListRevocation'},
+                  {'Action': 'pass', 'Package': package}]
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['roots'], ['TestOrganizationTaskListRevocation'])
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite][1], 'g14-organization-task-list-revocation')
+        for candidate in (events[1:], events[:-1], events + [{'Action': 'skip'}], events + [{'Action': 'fail'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': 'TestOrganizationTaskExport'}],
+                          [dict(event, Package='github.com/QuantumNous/new-api/model') for event in events]):
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+        with self.assertRaises(ValueError):
+            runner.validate_organization_identity_events(events, 'organization-task-export')
+
     def test_live_image_recomputes_bytes_instead_of_trusting_receipt_flags(self):
         import hashlib
         config = {'os': 'linux', 'architecture': 'arm64', 'rootfs': {'type': 'layers', 'diff_ids': ['sha256:layer']},
