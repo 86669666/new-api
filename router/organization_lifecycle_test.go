@@ -35,9 +35,12 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
@@ -50,6 +53,279 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
+
+// The polling response is local and deterministic; only the production polling
+// and funding paths touch the fixture database.
+type organizationTaskFundingAdaptor struct {
+	status      model.TaskStatus
+	adjustCalls int
+}
+
+func (a *organizationTaskFundingAdaptor) Init(*relaycommon.RelayInfo) {}
+func (a *organizationTaskFundingAdaptor) FetchTask(string, string, *model.Task, string) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+}
+func (a *organizationTaskFundingAdaptor) ParseTaskResult(*model.Task, *http.Response, []byte) (*relaycommon.TaskInfo, error) {
+	return &relaycommon.TaskInfo{Status: string(a.status), TotalTokens: 100, UsageFacts: map[string]any{"seconds": float64(8)}}, nil
+}
+func (a *organizationTaskFundingAdaptor) AdjustBillingOnComplete(*model.Task, *relaycommon.TaskInfo) int {
+	a.adjustCalls++
+	return 700
+}
+
+func TestOrganizationTaskFundingIsolation(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	require.NoError(t, f.db.AutoMigrate(&model.Channel{}, &model.UserSubscription{}))
+	oldBatch, oldConsume := common.BatchUpdateEnabled, common.LogConsumeEnabled
+	oldRatios := ratio_setting.ModelRatio2JSONString()
+	oldAdaptor, oldTimeout := service.GetTaskAdaptorFunc, constant.TaskTimeoutMinutes
+	common.BatchUpdateEnabled, common.LogConsumeEnabled = false, true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"funding-isolation-model":1}`))
+	t.Cleanup(func() {
+		common.BatchUpdateEnabled, common.LogConsumeEnabled = oldBatch, oldConsume
+		service.GetTaskAdaptorFunc, constant.TaskTimeoutMinutes = oldAdaptor, oldTimeout
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldRatios))
+	})
+	userID := f.users["member"].Id
+	require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+		"quota": 10000, "used_quota": 5000, "request_count": 10,
+	}).Error)
+	baseURL := f.server.URL
+	channel := &model.Channel{Type: constant.ChannelTypeOpenAI, Key: "owned-funding-fixture", Name: "funding-isolation", Status: common.ChannelStatusEnabled, BaseURL: &baseURL, UsedQuota: 5000}
+	require.NoError(t, f.db.Create(channel).Error)
+	token := &model.Token{UserId: userID, Key: strings.Repeat("f", 40), Name: "funding-isolation", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 8000, UsedQuota: 5000}
+	require.NoError(t, f.db.Create(token).Error)
+	sub := &model.UserSubscription{UserId: userID, AmountTotal: 100000, AmountUsed: 5000, Status: "active", StartTime: 1, EndTime: time.Now().Unix() + 3600}
+	require.NoError(t, f.db.Create(sub).Error)
+	otherSub := &model.UserSubscription{UserId: userID, AmountTotal: 100000, AmountUsed: 7000, Status: "active", StartTime: 2, EndTime: time.Now().Unix() + 7200}
+	require.NoError(t, f.db.Create(otherSub).Error)
+
+	accounting := func(t *testing.T) map[string]int64 {
+		t.Helper()
+		var u model.User
+		var tok model.Token
+		var ch model.Channel
+		var first, other model.UserSubscription
+		require.NoError(t, f.db.Select("quota", "used_quota", "request_count").First(&u, userID).Error)
+		require.NoError(t, f.db.Select("remain_quota", "used_quota").First(&tok, token.Id).Error)
+		require.NoError(t, f.db.Select("used_quota").First(&ch, channel.Id).Error)
+		require.NoError(t, f.db.Select("amount_used").First(&first, sub.Id).Error)
+		require.NoError(t, f.db.Select("amount_used").First(&other, otherSub.Id).Error)
+		var logs int64
+		require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type IN ?", userID, []int{model.LogTypeConsume, model.LogTypeRefund}).Count(&logs).Error)
+		return map[string]int64{"wallet": int64(u.Quota), "user_used": int64(u.UsedQuota), "requests": int64(u.RequestCount),
+			"token_remain": int64(tok.RemainQuota), "token_used": int64(tok.UsedQuota), "channel_used": ch.UsedQuota,
+			"subscription_used": first.AmountUsed, "other_subscription_used": other.AmountUsed, "logs": logs}
+	}
+	sequence := 0
+	newTask := func(t *testing.T, org int64, source string, subscriptionID, quota int) *model.Task {
+		t.Helper()
+		sequence++
+		task := &model.Task{TaskID: fmt.Sprintf("funding-isolation-%d", sequence), Platform: "funding-isolation", UserId: userID,
+			OrganizationID: org, ChannelId: channel.Id, Group: "default", Quota: quota, Status: model.TaskStatusFailure,
+			Progress: "100%", SubmitTime: time.Now().Unix(), Properties: model.Properties{OriginModelName: "funding-isolation-model"},
+			PrivateData: model.TaskPrivateData{BillingSource: source, SubscriptionId: subscriptionID, TokenId: token.Id,
+				BillingContext: &model.TaskBillingContext{OriginModelName: "funding-isolation-model", GroupRatio: 1, ModelRatio: 1}}}
+		require.NoError(t, f.db.Create(task).Error)
+		return task
+	}
+
+	t.Run("invalid_sources_have_no_financial_side_effects", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, source string
+			org          int64
+			subID        int
+		}{
+			{"organization_wallet", service.BillingSourceWallet, f.orgA, 0},
+			{"organization_subscription", service.BillingSourceSubscription, f.orgB, sub.Id},
+			{"organization_legacy", "", f.orgA, 0},
+			{"invalid_organization", service.BillingSourceWallet, -1, 0},
+			{"unknown_source", "unsupported", 0, 0},
+			{"subscription_without_id", service.BillingSourceSubscription, 0, 0},
+			{"subscription_negative_id", service.BillingSourceSubscription, 0, -1},
+			{"wallet_with_subscription", service.BillingSourceWallet, 0, sub.Id},
+			{"wallet_negative_subscription", service.BillingSourceWallet, 0, -1},
+			{"legacy_with_subscription", "", 0, sub.Id},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				task := newTask(t, tc.org, tc.source, tc.subID, 500)
+				before := accounting(t)
+				assert.False(t, service.RefundTaskQuota(t.Context(), task, "owned source isolation check"))
+				for _, actual := range []int{700, 300, 500} {
+					service.RecalculateTaskQuota(t.Context(), task, actual, common.NewMessage("Owned source isolation check"))
+				}
+				assert.False(t, service.RecalculateTaskQuotaByTokens(t.Context(), task, 100))
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/owned-funding-fixture", nil)
+				info := &relaycommon.RelayInfo{UserId: userID, TokenId: token.Id, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id}, TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "generate"}, OriginModelName: "funding-isolation-model"}
+				info.PriceData.Quota = 100
+				service.LogTaskConsumption(ctx, info, task)
+				assert.Equal(t, before, accounting(t))
+				assert.Equal(t, 500, task.Quota)
+				var stored model.Task
+				require.NoError(t, f.db.First(&stored, task.ID).Error)
+				assert.Equal(t, 500, stored.Quota)
+				assert.Equal(t, task.PrivateData, stored.PrivateData)
+				task.Quota = 0
+				require.NoError(t, task.UpdateQuota())
+				assert.False(t, service.RefundTaskQuota(t.Context(), task, "owned zero source check"))
+				assert.Equal(t, before, accounting(t))
+			})
+		}
+	})
+
+	t.Run("personal_wallet_subscription_and_legacy_remain_bound", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, source string
+			subID        int
+		}{
+			{"wallet", service.BillingSourceWallet, 0},
+			{"subscription", service.BillingSourceSubscription, sub.Id},
+			{"legacy_wallet", "", 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				task := newTask(t, 0, tc.source, tc.subID, 500)
+				before := accounting(t)
+				service.RecalculateTaskQuota(t.Context(), task, 500, common.NewMessage("Owned unchanged charge"))
+				assert.Equal(t, before, accounting(t))
+				for index, step := range []struct{ actual, net int }{{700, 200}, {300, -200}, {0, -500}} {
+					if index == 2 {
+						assert.True(t, service.RefundTaskQuota(t.Context(), task, "owned personal refund"))
+					} else {
+						service.RecalculateTaskQuota(t.Context(), task, step.actual, common.NewMessage("Owned personal difference"))
+					}
+					want := maps.Clone(before)
+					if tc.subID > 0 {
+						want["subscription_used"] += int64(step.net)
+					} else {
+						want["wallet"] -= int64(step.net)
+					}
+					want["token_remain"] -= int64(step.net)
+					for _, field := range []string{"token_used", "user_used", "channel_used"} {
+						want[field] += int64(step.net)
+					}
+					want["logs"] += int64(index + 1)
+					assert.Equal(t, want, accounting(t))
+					var stored model.Task
+					require.NoError(t, f.db.First(&stored, task.ID).Error)
+					assert.Equal(t, step.actual, task.Quota)
+					assert.Equal(t, step.actual, stored.Quota)
+				}
+				after := accounting(t)
+				assert.True(t, service.RefundTaskQuota(t.Context(), task, "owned zero refund"))
+				assert.Equal(t, after, accounting(t))
+			})
+		}
+		before := accounting(t)
+		task := newTask(t, 0, service.BillingSourceWallet, 0, 100)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/owned-funding-fixture", nil)
+		info := &relaycommon.RelayInfo{UserId: userID, TokenId: token.Id, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id}, TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "generate"}, OriginModelName: "funding-isolation-model"}
+		info.PriceData.Quota = 100
+		service.LogTaskConsumption(ctx, info, task)
+		want := maps.Clone(before)
+		want["user_used"] += 100
+		want["channel_used"] += 100
+		want["requests"]++
+		want["logs"]++
+		assert.Equal(t, want, accounting(t))
+	})
+
+	t.Run("completion_does_not_rebind_or_modify_reserved_usage", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			status  model.TaskStatus
+			org     int64
+			source  string
+			tiered  bool
+			perCall bool
+		}{
+			{"organization_adaptor", model.TaskStatusSuccess, f.orgA, service.BillingSourceWallet, false, false},
+			{"organization_expression", model.TaskStatusSuccess, f.orgA, service.BillingSourceWallet, true, false},
+			{"organization_per_call", model.TaskStatusSuccess, f.orgA, service.BillingSourceWallet, false, true},
+			{"organization_failure_refund", model.TaskStatusFailure, f.orgA, service.BillingSourceWallet, false, false},
+			{"unknown_personal_source", model.TaskStatusSuccess, 0, "unsupported", false, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				task := newTask(t, tc.org, tc.source, 0, 500)
+				task.Status, task.Progress = model.TaskStatusInProgress, "50%"
+				task.PrivateData.BillingContext.PerCallBilling = tc.perCall
+				if tc.tiered {
+					expression := `tier("completed", u("seconds"))`
+					task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+						ExprVersion: 1, GroupRatio: 1, QuotaPerUnit: 1, TaskUsageBilling: true, EstimatedTier: "reserved", UsageFacts: map[string]any{"seconds": float64(5)}}
+				}
+				require.NoError(t, f.db.Save(task).Error)
+				before := accounting(t)
+				adaptor := &organizationTaskFundingAdaptor{status: tc.status}
+				service.GetTaskAdaptorFunc = func(constant.TaskPlatform) service.TaskPollingAdaptor { return adaptor }
+				require.NoError(t, service.UpdateVideoTasks(t.Context(), task.Platform, map[int][]string{channel.Id: []string{task.TaskID}}, map[string]*model.Task{task.TaskID: task}))
+				assert.Zero(t, adaptor.adjustCalls, "unsupported funding must not invoke completion pricing")
+				assert.Equal(t, before, accounting(t))
+				var stored model.Task
+				require.NoError(t, f.db.First(&stored, task.ID).Error)
+				assert.Equal(t, tc.status, stored.Status, "poll completion is distinct from financial settlement")
+				assert.Equal(t, 500, stored.Quota)
+				assert.Equal(t, 500, task.Quota)
+				if tc.tiered {
+					for _, snapshot := range []*billingexpr.BillingSnapshot{task.PrivateData.BillingContext.TieredSnapshot, stored.PrivateData.BillingContext.TieredSnapshot} {
+						require.NotNil(t, snapshot)
+						assert.Equal(t, "reserved", snapshot.EstimatedTier)
+						assert.Equal(t, map[string]any{"seconds": float64(5)}, snapshot.UsageFacts)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("timeouts_preserve_unsupported_financial_markers", func(t *testing.T) {
+		constant.TaskTimeoutMinutes = 1
+		service.GetTaskAdaptorFunc = func(constant.TaskPlatform) service.TaskPollingAdaptor {
+			return &organizationTaskFundingAdaptor{status: model.TaskStatusSuccess}
+		}
+		for _, tc := range []struct {
+			name, source string
+			org          int64
+			legacy       bool
+			wantQuota    int
+			refund       bool
+		}{
+			{"organization_legacy", service.BillingSourceWallet, f.orgA, true, 500, false},
+			{"organization_modern", service.BillingSourceWallet, f.orgA, false, 500, false},
+			{"unknown_legacy", "unsupported", 0, true, 500, false},
+			{"personal_legacy", "", 0, true, 0, false},
+			{"personal_modern", service.BillingSourceWallet, 0, false, 0, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				task := newTask(t, tc.org, tc.source, 0, 500)
+				task.Status, task.Progress = model.TaskStatusInProgress, "50%"
+				task.SubmitTime = model.TaskRefundLegacyCutoff
+				if tc.legacy {
+					task.SubmitTime--
+				}
+				require.NoError(t, f.db.Save(task).Error)
+				before := accounting(t)
+				service.RunTaskPollingOnce(t.Context(), nil)
+				var stored model.Task
+				require.NoError(t, f.db.First(&stored, task.ID).Error)
+				assert.EqualValues(t, model.TaskStatusFailure, stored.Status)
+				assert.Equal(t, "100%", stored.Progress)
+				assert.Equal(t, tc.wantQuota, stored.Quota)
+				assert.Equal(t, task.PrivateData, stored.PrivateData)
+				want := maps.Clone(before)
+				if tc.refund {
+					want["wallet"] += 500
+					want["token_remain"] += 500
+					for _, field := range []string{"token_used", "user_used", "channel_used"} {
+						want[field] -= 500
+					}
+					want["logs"]++
+				}
+				assert.Equal(t, want, accounting(t))
+			})
+		}
+	})
+}
 
 // These tests consume the effective newapi-S3-lifecycle-g6-v1.1 HTTP contract.
 // Domain records establish fixtures only; proofs always come from the public

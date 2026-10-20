@@ -83,6 +83,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		fundingErr := validateTaskFundingSource(task)
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 
 		oldStatus := task.Status
@@ -93,7 +94,9 @@ func sweepTimedOutTasks(ctx context.Context) {
 			task.FailReason = legacyReason
 			// 旧系统任务明确不退款，随终态 CAS 一并清掉 quota，
 			// 避免留下可再次退款的计费状态。
-			task.Quota = 0
+			if fundingErr == nil {
+				task.Quota = 0
+			}
 		} else {
 			task.FailReason = reason
 		}
@@ -108,6 +111,10 @@ func sweepTimedOutTasks(ctx context.Context) {
 			continue
 		}
 		timedOutCount++
+		if fundingErr != nil {
+			logger.LogWarn(ctx, common.LogText("timed out task billing remains pending: %s", fundingErr.Error()))
+			continue
+		}
 		if !isLegacy && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, reason)
 		}
@@ -678,6 +685,10 @@ func truncateBase64(s string) string {
 //
 // 表达式求值失败会保留预扣额度，因此也视为已接管，避免错误全退。
 func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) bool {
+	if err := validateTaskFundingSource(task); err != nil {
+		logger.LogWarn(ctx, common.LogText("task completion settlement refused: %s", err.Error()))
+		return false
+	}
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
 		// 用量表达式结算只适用于成功任务；失败任务由调用方全额退款。
 		if task.Status == model.TaskStatusFailure {

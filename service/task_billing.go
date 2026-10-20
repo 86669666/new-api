@@ -24,6 +24,10 @@ import (
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
 // 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
 func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) {
+	if err := validateTaskFundingSource(task); err != nil {
+		logger.LogWarn(c, common.LogText("task consumption accounting refused: %s", err.Error()))
+		return
+	}
 	tokenName := c.GetString("token_name")
 	logContent := []*common.Message{common.NewMessage("Action {{action}}", map[string]any{"action": info.Action})}
 	// 支持任务仅按次计费
@@ -112,8 +116,35 @@ func taskIsSubscription(task *model.Task) bool {
 	return task.PrivateData.BillingSource == BillingSourceSubscription && task.PrivateData.SubscriptionId > 0
 }
 
+// validateTaskFundingSource accepts only personal funding snapshots produced by
+// submission. Historical personal tasks had neither billing field and used the
+// wallet. Organization tasks cannot use these sources until organization funding
+// has its own durable binding and settlement contract.
+func validateTaskFundingSource(task *model.Task) error {
+	if task == nil {
+		return fmt.Errorf("task funding snapshot is missing")
+	}
+	if task.OrganizationID != 0 {
+		return fmt.Errorf("organization funding is not supported (task_row_id=%d, organization_id=%d)", task.ID, task.OrganizationID)
+	}
+	switch task.PrivateData.BillingSource {
+	case "", BillingSourceWallet:
+		if task.PrivateData.SubscriptionId == 0 {
+			return nil
+		}
+	case BillingSourceSubscription:
+		if task.PrivateData.SubscriptionId > 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid persisted task funding source (task_row_id=%d)", task.ID)
+}
+
 // taskAdjustFunding 调整任务的资金来源（钱包或订阅），delta > 0 表示扣费，delta < 0 表示退还。
 func taskAdjustFunding(task *model.Task, delta int) error {
+	if err := validateTaskFundingSource(task); err != nil {
+		return err
+	}
 	if taskIsSubscription(task) {
 		return model.PostConsumeUserSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta))
 	}
@@ -261,6 +292,10 @@ func taskModelName(task *model.Task) string {
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
 // 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
+	if err := validateTaskFundingSource(task); err != nil {
+		logger.LogWarn(ctx, common.LogText("task refund refused: %s", err.Error()))
+		return false
+	}
 	quota := task.Quota
 	if quota == 0 {
 		return true
@@ -308,6 +343,10 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 // reason 写入日志内容（例如按 token 重算或 adaptor 调整）。
 // clamps 可选：若计算 actualQuota 时发生额度饱和，将其记入日志 admin_info（仅管理员可见）。
 func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason *common.Message, clamps ...*common.QuotaClamp) {
+	if err := validateTaskFundingSource(task); err != nil {
+		logger.LogWarn(ctx, common.LogText("task difference settlement refused: %s", err.Error()))
+		return
+	}
 	if actualQuota < 0 {
 		return
 	}
@@ -380,6 +419,10 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 // 当任务成功且返回了 totalTokens 时，根据模型倍率和分组倍率重新计算实际扣费额度，
 // 与预扣费的差额进行补扣或退还。支持钱包和订阅计费来源。
 func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) bool {
+	if err := validateTaskFundingSource(task); err != nil {
+		logger.LogWarn(ctx, common.LogText("task token settlement refused: %s", err.Error()))
+		return false
+	}
 	if totalTokens <= 0 {
 		return false
 	}
