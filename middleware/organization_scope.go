@@ -207,6 +207,12 @@ func OrganizationSelectionBoundary() gin.HandlerFunc {
 				isAccess, pathSelection = true, true
 			}
 		}
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			switch c.FullPath() {
+			case "/api/organizations/:org_id/tasks/:task_row_id", "/api/organizations/:org_id/tasks/:task_row_id/artifacts", "/api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content":
+				isAccess, pathSelection = true, true
+			}
+		}
 		if pathBound, exists := organizationLifecycleRoutes[c.Request.Method+" "+c.FullPath()]; exists {
 			isAccess, pathSelection, discovery = true, pathBound, !pathBound
 		}
@@ -217,9 +223,13 @@ func OrganizationSelectionBoundary() gin.HandlerFunc {
 			c.Header("Cache-Control", "private, no-store")
 		}
 		if isAccess {
-			ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-			defer cancel()
-			c.Request = c.Request.WithContext(ctx)
+			contentRead := (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) &&
+				c.FullPath() == "/api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content"
+			if !contentRead {
+				ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+				defer cancel()
+				c.Request = c.Request.WithContext(ctx)
+			}
 			markOrganizationSafeLog(c)
 			c.Header("Cache-Control", "private, no-store")
 		}

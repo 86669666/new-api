@@ -31,6 +31,8 @@ var (
 	ErrOrganizationForbidden        = errors.New("organization operation is forbidden")
 	ErrOrganizationDisabled         = errors.New("organization is disabled")
 	ErrOrganizationConflict         = errors.New("organization state changed")
+	ErrOrganizationAlreadyMember    = errors.New("user is already an organization member")
+	ErrOrganizationInvitationExists = errors.New("organization invitation already exists")
 	ErrOrganizationExpired          = errors.New("organization request expired")
 	ErrOrganizationTerminal         = errors.New("organization request is already resolved")
 	ErrOrganizationMembershipActive = common.NewMessage(OrganizationMembershipMessage)
@@ -118,18 +120,19 @@ type OrganizationEvent struct {
 // OrganizationCommand is an internal domain command, never an HTTP request DTO.
 // Each entry point rejects fields unrelated to its action. Versions are mandatory.
 type OrganizationCommand struct {
-	OrganizationID int64
-	Revision       int64
-	TargetUserID   int
-	Name           string
-	Username       string
-	Role           string
-	Disabled       bool
-	Reason         string
-	ObjectID       int64
-	Generation     int64
-	Replace        bool
-	Authorization  *OrganizationAuthorization
+	OrganizationID   int64
+	Revision         int64
+	TargetUserID     int
+	Name             string
+	Username         string
+	ExpectedUsername string // Internal exact selector binding; never part of the proof JSON.
+	Role             string
+	Disabled         bool
+	Reason           string
+	ObjectID         int64
+	Generation       int64
+	Replace          bool
+	Authorization    *OrganizationAuthorization
 }
 
 func organizationName(name string) (string, error) {

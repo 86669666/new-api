@@ -18,6 +18,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,8 +31,11 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -373,18 +377,176 @@ func TestOrganizationLifecycleStrictTransport(t *testing.T) {
 		{"media", valid, http.Header{"Content-Type": {"text/plain"}}, 415, "UNSUPPORTED_MEDIA_TYPE"},
 		{"origin", valid, http.Header{"Origin": {"https://untrusted.invalid"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
 		{"null_origin", valid, http.Header{"Origin": {"null"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
+		{"empty_origin", valid, http.Header{"Origin": {""}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
+		{"origin_list", valid, http.Header{"Origin": {"https://example.com, https://example.com"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
+		{"duplicate_origin", valid, http.Header{"Origin": {"https://example.com", "https://example.com"}}, 400, "ORG_REQUEST_INVALID"},
+		{"invalid_referer", valid, http.Header{"Referer": {"not-an-absolute-url"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
 		{"fetch_without_origin", valid, http.Header{"Sec-Fetch-Site": {"same-site"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
+		{"fetch_destination_without_origin", valid, http.Header{"Sec-Fetch-Dest": {"empty"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
 		{"idempotency", valid, http.Header{"Idempotency-Key": {"unsupported"}}, 400, "ORG_REQUEST_INVALID"},
 		{"override", valid, http.Header{"X-HTTP-Method-Override": {"DELETE"}}, 400, "ORG_REQUEST_INVALID"},
 		{"proof_forbidden", valid, http.Header{"X-Security-Proof": {"not-a-proof"}}, 400, "ORG_REQUEST_INVALID"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := http.Header{"Content-Type": {"application/json"}}
+			h := http.Header{"Content-Type": {"application/json"}, "Sec-Fetch-Mode": {"cors"}}
 			for k, v := range tc.headers {
 				h[k] = v
 			}
 			status, headers, b := c.request(t, "PATCH", c.path()+"/name", "owner", tc.body, h)
 			organizationError(t, status, headers, b, tc.status, tc.code)
+		})
+	}
+}
+
+func TestOrganizationLifecycleNativeFetchOrigin(t *testing.T) {
+	node := os.Getenv("NEWAPI_S3_NODE")
+	if node == "" {
+		t.Skip("requires Node fetch runtime; skip is not acceptance")
+	}
+	require.True(t, filepath.IsAbs(node))
+	curl, err := exec.LookPath("curl")
+	require.NoError(t, err)
+	c := newOrganizationLifecycleClient(t)
+
+	// Observe only non-secret source metadata while serving the production
+	// router. The bearer comes from the fixture's real password-login endpoint.
+	var metadataMu sync.Mutex
+	var metadata []http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers := http.Header{}
+		for key, values := range r.Header {
+			if strings.HasPrefix(strings.ToLower(key), "sec-fetch-") || strings.EqualFold(key, "Origin") || strings.EqualFold(key, "Referer") {
+				headers[key] = slices.Clone(values)
+			}
+		}
+		metadataMu.Lock()
+		metadata = append(metadata, headers)
+		metadataMu.Unlock()
+		c.engine.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	input, err := common.Marshal(map[string]string{"baseURL": server.URL, "bearer": c.bearer["owner"], "curl": curl})
+	require.NoError(t, err)
+	// Credentials travel through anonymous stdin pipes, including curl's config.
+	// Neither client sets, removes, nor overrides its default Fetch Metadata.
+	const script = `
+const { readFileSync } = require('node:fs');
+const { execFileSync } = require('node:child_process');
+const input = JSON.parse(readFileSync(0, 'utf8'));
+const results = [];
+(async () => {
+  for (const client of ['node', 'curl']) {
+    async function request(step, method, path, payload) {
+      const headers = { Authorization: 'Bearer ' + input.bearer, 'Accept-Language': 'en' };
+      if (payload) headers['Content-Type'] = 'application/json';
+      let status, body, cacheControl, setCookie;
+      if (client === 'node') {
+        const response = await fetch(input.baseURL + path, {
+          method, headers, body: payload && JSON.stringify(payload), signal: AbortSignal.timeout(10000)
+        });
+        status = response.status;
+        body = await response.json();
+        cacheControl = response.headers.get('cache-control');
+        setCookie = response.headers.has('set-cookie');
+      } else {
+        let config = 'url = ' + JSON.stringify(input.baseURL + path) + '\nrequest = ' + JSON.stringify(method) + '\n';
+        for (const [name, value] of Object.entries(headers)) config += 'header = ' + JSON.stringify(name + ': ' + value) + '\n';
+        if (payload) config += 'data = ' + JSON.stringify(JSON.stringify(payload)) + '\n';
+        const raw = execFileSync(input.curl, ['--disable', '--silent', '--show-error', '--noproxy', '*', '--max-time', '10', '--include', '--config', '-'], {
+          input: config, encoding: 'utf8', timeout: 12000, maxBuffer: 1048576, stdio: ['pipe', 'pipe', 'pipe']
+        });
+        const split = raw.indexOf('\r\n\r\n');
+        const head = raw.slice(0, split);
+        status = Number(head.match(/^HTTP\/\S+ (\d+)/)[1]);
+        body = JSON.parse(raw.slice(split + 4));
+        cacheControl = head.match(/^cache-control:\s*(.*)$/im)?.[1].trim() || '';
+        setCookie = /^set-cookie:/im.test(head);
+      }
+      const organizationID = body.data?.organization_id || body.data?.org_id || '';
+      results.push({ name: client + '_' + step, status, success: body.success, code: body.code || '', organizationID,
+        role: body.data?.my_role || '', cacheControl, setCookie });
+      return organizationID;
+    }
+    const id = await request('create', 'POST', '/api/organizations', { name: 'native-' + client });
+    if (/^[1-9]\d*$/.test(id)) await request('read', 'GET', '/api/organizations/' + id);
+  }
+  process.stdout.write(JSON.stringify({ nodeVersion: process.version, results }));
+})().catch(() => { process.stderr.write('native client regression failed\n'); process.exitCode = 1; });
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, node, "-e", script)
+	cmd.Stdin = bytes.NewReader(input)
+	output, err := cmd.Output()
+	require.NoError(t, err, "native clients must complete without exposing credentials in diagnostics")
+	var receipt struct {
+		NodeVersion string `json:"nodeVersion"`
+		Results     []struct {
+			Name           string `json:"name"`
+			Status         int    `json:"status"`
+			Success        bool   `json:"success"`
+			OrganizationID string `json:"organizationID"`
+			Role           string `json:"role"`
+			CacheControl   string `json:"cacheControl"`
+			SetCookie      bool   `json:"setCookie"`
+		} `json:"results"`
+	}
+	require.NoError(t, common.Unmarshal(output, &receipt))
+	require.Len(t, receipt.Results, 4)
+	for i, result := range receipt.Results {
+		assert.Equal(t, []string{"node_create", "node_read", "curl_create", "curl_read"}[i], result.Name)
+		assert.Equal(t, []int{201, 200, 201, 200}[i], result.Status)
+		assert.True(t, result.Success)
+		assert.Regexp(t, `^[1-9][0-9]*$`, result.OrganizationID)
+		assert.Equal(t, "private, no-store", result.CacheControl)
+		assert.False(t, result.SetCookie)
+		if i%2 == 1 {
+			assert.Equal(t, receipt.Results[i-1].OrganizationID, result.OrganizationID)
+			assert.Equal(t, "owner", result.Role)
+		}
+	}
+	metadataMu.Lock()
+	observed := slices.Clone(metadata)
+	metadataMu.Unlock()
+	require.Len(t, observed, 4)
+	assert.Equal(t, http.Header{"Sec-Fetch-Mode": {"cors"}}, observed[0])
+	assert.Equal(t, http.Header{"Sec-Fetch-Mode": {"cors"}}, observed[1])
+	assert.Empty(t, observed[2])
+	assert.Empty(t, observed[3])
+	t.Logf("Node %s default fetch and curl each created and read an organization with the same login session", receipt.NodeVersion)
+
+	patSuffix, err := common.GenerateRandomCharsKey(43)
+	require.NoError(t, err)
+	pat := model.AccessTokenPrefix + patSuffix
+	grant := &model.UserAccessToken{Name: "native-origin", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat)}
+	require.NoError(t, grant.SetScopes([]string{"*"}))
+	require.NoError(t, model.CreateUserAccessToken(c.users["root"].Id, grant, service.AccessTokenMaxPerUser))
+	legacy, err := common.GenerateRandomCharsKey(32)
+	require.NoError(t, err)
+	require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["root"].Id).Update("access_token", legacy).Error)
+	revoked, err := model.RevokeUserSession(c.users["admin"].Id, c.sids["admin"], "native_origin_regression")
+	require.NoError(t, err)
+	require.True(t, revoked)
+	for _, tc := range []struct {
+		name, credential, code string
+		status                 int
+	}{
+		{"missing", "", "AUTH_UNAUTHORIZED", 401},
+		{"invalid", "not-a-session", "AUTH_UNAUTHORIZED", 401},
+		{"revoked", c.bearer["admin"], "AUTH_SESSION_REVOKED", 401},
+		{"relay", c.bearer["relay"], "AUTH_UNAUTHORIZED", 401},
+		{"pat", pat, "AUTH_SESSION_REQUIRED", 403},
+		{"legacy", legacy, "AUTH_SESSION_REQUIRED", 403},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, method := range []string{"POST", "GET"} {
+				path, body := "/api/organizations", `{"name":"must-not-create"}`
+				if method == "GET" {
+					path, body = c.path(), ""
+				}
+				status, headers, response := c.request(t, method, path, tc.credential, body, http.Header{"Content-Type": {"application/json"}, "Sec-Fetch-Mode": {"cors"}})
+				organizationError(t, status, headers, response, tc.status, tc.code)
+			}
 		})
 	}
 }
@@ -410,6 +572,778 @@ func TestOrganizationLifecycleVisibilityAndRevision(t *testing.T) {
 	c.mutate(t, "member", "POST", c.path()+"/leave", "leave", map[string]any{"revision": c.revision(t)}, nil, false)
 	status, h, b = c.json(t, "GET", c.path()+"/self-state", "member", nil, "")
 	organizationError(t, status, h, b, 404, "ORG_NOT_FOUND")
+}
+
+func TestOrganizationLifecycleInvitationConflicts(t *testing.T) {
+	c := newOrganizationLifecycleClient(t)
+	path, initialRevision := c.path()+"/invitations", c.revision(t)
+	target := strconv.Itoa(c.users["foreign"].Id)
+	invitation := c.mutate(t, "owner", "POST", path, "invite", map[string]any{"revision": initialRevision, "target_user_id": target, "role": "member"}, nil, false)
+	currentRevision := c.revision(t)
+	assert.Equal(t, currentRevision, invitation["revision"])
+	assert.Equal(t, "1", invitation["generation"])
+	assert.Equal(t, "pending", invitation["status"])
+	for _, tc := range []struct {
+		name, actor, endpoint, revision, target, code, message string
+		status                                                 int
+	}{
+		{"pending invitation", "owner", path, currentRevision, target, "ORG_INVITATION_EXISTS", "An invitation already exists for this user. Use reissue to send another invitation.", 409},
+		{"existing member", "owner", path, currentRevision, strconv.Itoa(c.users["member"].Id), "ORG_ALREADY_MEMBER", "This user is already a member of the organization.", 409},
+		{"stale revision before invitation", "owner", path, initialRevision, target, "ORG_STATE_CHANGED", "Organization state changed. Refresh the organization state before retrying.", 409},
+		{"stale revision before member", "owner", path, initialRevision, strconv.Itoa(c.users["member"].Id), "ORG_STATE_CHANGED", "Organization state changed. Refresh the organization state before retrying.", 409},
+		{"stale revision before missing target", "owner", path, initialRevision, "999999999", "ORG_STATE_CHANGED", "Organization state changed. Refresh the organization state before retrying.", 409},
+		{"current revision missing target", "owner", path, currentRevision, "999999999", "ORG_NOT_FOUND", "", 404},
+		{"member cannot inspect invitation", "member", path, currentRevision, target, "ORG_FORBIDDEN", "", 403},
+		{"member cannot inspect membership", "member", path, currentRevision, strconv.Itoa(c.users["admin"].Id), "ORG_FORBIDDEN", "", 403},
+		{"nonmember cannot inspect invitation", "empty", path, currentRevision, target, "ORG_NOT_FOUND", "", 404},
+		{"foreign cannot inspect membership", "foreign", path, currentRevision, strconv.Itoa(c.users["member"].Id), "ORG_NOT_FOUND", "", 404},
+		{"other organization", "owner", fmt.Sprintf("/api/organizations/%d/invitations", c.orgB), "1", target, "ORG_NOT_FOUND", "", 404},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, h, b := c.json(t, "POST", tc.endpoint, tc.actor, map[string]any{"revision": tc.revision, "target_user_id": tc.target, "role": "member"}, "")
+			organizationError(t, status, h, b, tc.status, tc.code)
+			assert.NotContains(t, b, "revision")
+			if tc.message != "" {
+				assert.Equal(t, tc.message, b["message"])
+			}
+		})
+	}
+	for _, tc := range []struct{ target, revision, code string }{
+		{target, currentRevision, "ORG_INVITATION_EXISTS"},
+		{strconv.Itoa(c.users["member"].Id), currentRevision, "ORG_ALREADY_MEMBER"},
+		{target, initialRevision, "ORG_STATE_CHANGED"},
+	} {
+		command := map[string]any{"organization_id": strconv.FormatInt(c.orgA, 10), "revision": tc.revision, "target_user_id": tc.target, "role": "admin"}
+		status, h, b := c.json(t, "POST", c.path()+"/authorization-context", "owner", map[string]any{"action": "invite", "command": command}, "")
+		organizationError(t, status, h, b, 409, tc.code)
+	}
+	// Concurrent repeats observe the same existing slot; neither may add an
+	// invitation/event or advance the revision. Existing lock/CAS tests remain.
+	raw, err := common.Marshal(map[string]any{"revision": currentRevision, "target_user_id": target, "role": "member"})
+	require.NoError(t, err)
+	type reply struct {
+		status  int
+		headers http.Header
+		body    map[string]any
+		err     error
+	}
+	replies := make(chan reply, 2)
+	var requests sync.WaitGroup
+	for range 2 {
+		req, err := http.NewRequest("POST", c.server.URL+path, bytes.NewReader(raw))
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer "+c.bearer["owner"])
+		req.Header.Set("Content-Type", "application/json")
+		requests.Go(func() {
+			response, err := c.client.Do(req)
+			if err != nil {
+				replies <- reply{err: err}
+				return
+			}
+			defer response.Body.Close()
+			payload, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+			body := map[string]any{}
+			if err == nil {
+				err = common.Unmarshal(payload, &body)
+			}
+			replies <- reply{response.StatusCode, response.Header, body, err}
+		})
+	}
+	requests.Wait()
+	close(replies)
+	for result := range replies {
+		require.NoError(t, result.err)
+		organizationError(t, result.status, result.headers, result.body, 409, "ORG_INVITATION_EXISTS")
+	}
+	assert.Equal(t, currentRevision, c.revision(t))
+	var count int64
+	require.NoError(t, c.db.Model(&model.OrganizationInvitation{}).Where("organization_id = ?", c.orgA).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+	require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Where("organization_id = ? AND action = ?", c.orgA, "invitation.issued").Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+
+	slot := path + "/" + invitation["object_id"].(string)
+	for _, state := range []string{"declined", "revoked", "expired", "accepted"} {
+		t.Run("existing "+state+" slot", func(t *testing.T) {
+			body := map[string]any{"revision": c.revision(t), "generation": invitation["generation"]}
+			switch state {
+			case "declined":
+				c.mutate(t, "foreign", "POST", slot+"/decline", "invitation_decline", body, nil, false)
+			case "revoked":
+				c.mutate(t, "owner", "POST", slot+"/revoke", "invitation_revoke", body, nil, false)
+			case "expired":
+				require.NoError(t, c.db.Model(&model.OrganizationInvitation{}).Where("id = ?", invitation["object_id"]).Update("expires_at", time.Now().Unix()-1).Error)
+				require.NoError(t, model.ExpireOrganizationInvitations(c.orgA))
+			case "accepted":
+				c.mutate(t, "foreign", "POST", slot+"/accept", "invitation_accept", body, nil, false)
+				status, h, b := c.json(t, "POST", path, "owner", map[string]any{"revision": c.revision(t), "target_user_id": target, "role": "member"}, "")
+				organizationError(t, status, h, b, 409, "ORG_ALREADY_MEMBER")
+				c.mutate(t, "owner", "DELETE", fmt.Sprintf("%s/members/%s", c.path(), target), "remove", map[string]any{"revision": c.revision(t)}, map[string]any{"target_user_id": target}, false)
+			}
+			status, h, b := c.json(t, "POST", path, "owner", map[string]any{"revision": c.revision(t), "target_user_id": target, "role": "member"}, "")
+			organizationError(t, status, h, b, 409, "ORG_INVITATION_EXISTS")
+			assert.Equal(t, "An invitation already exists for this user. Use reissue to send another invitation.", b["message"])
+			reissue := map[string]any{"revision": c.revision(t), "generation": "999", "target_user_id": target, "role": "member"}
+			status, h, b = c.json(t, "POST", slot+"/reissue", "owner", reissue, "")
+			organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+			reissue["generation"] = invitation["generation"]
+			next := c.mutate(t, "owner", "POST", slot+"/reissue", "reissue", reissue, nil, false)
+			assert.Equal(t, invitation["object_id"], next["object_id"])
+			generation, err := strconv.ParseInt(invitation["generation"].(string), 10, 64)
+			require.NoError(t, err)
+			assert.Equal(t, strconv.FormatInt(generation+1, 10), next["generation"])
+			assert.Equal(t, "pending", next["status"])
+			invitation = next
+		})
+	}
+}
+
+// The rollback hook runs only after the real transaction is rolled back. It
+// makes selector changes and uncertain rollback outcomes deterministic, without
+// changing production callbacks or relying on concurrent timing.
+type organizationSelectorPool struct {
+	gorm.ConnPool
+	afterRollback func() error
+	fired         atomic.Bool
+}
+
+func (p *organizationSelectorPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	var pool gorm.ConnPool
+	var err error
+	if beginner, ok := p.ConnPool.(gorm.ConnPoolBeginner); ok {
+		pool, err = beginner.BeginTx(ctx, opts)
+	} else if beginner, ok := p.ConnPool.(gorm.TxBeginner); ok {
+		pool, err = beginner.BeginTx(ctx, opts)
+	} else {
+		return nil, errors.New("test pool cannot begin")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &organizationSelectorTx{ConnPool: pool, owner: p}, nil
+}
+
+type organizationSelectorTx struct {
+	gorm.ConnPool
+	owner *organizationSelectorPool
+}
+
+func (tx *organizationSelectorTx) Commit() error { return tx.ConnPool.(gorm.TxCommitter).Commit() }
+func (tx *organizationSelectorTx) Rollback() error {
+	if err := tx.ConnPool.(gorm.TxCommitter).Rollback(); err != nil {
+		return err
+	}
+	if tx.owner.fired.CompareAndSwap(false, true) {
+		return tx.owner.afterRollback()
+	}
+	return nil
+}
+
+func TestOrganizationLifecycleInvitationIdentity(t *testing.T) {
+	c := newOrganizationLifecycleClient(t)
+	path := c.path() + "/invitations"
+	longUsername, atUsername := strings.Repeat("名", 20), "target@example.test"
+	for actor, username := range map[string]string{"foreign": longUsername, "empty": atUsername} {
+		require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users[actor].Id).Update("username", username).Error)
+		c.users[actor].Username = username
+	}
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"both selectors", map[string]any{"target_user_id": strconv.Itoa(c.users["empty"].Id), "username": atUsername}},
+		{"no selector", map[string]any{}},
+		{"null username", map[string]any{"username": nil}},
+		{"nonstring username", map[string]any{"username": 42}},
+		{"empty username", map[string]any{"username": ""}},
+		{"over twenty codepoints", map[string]any{"username": strings.Repeat("名", 21)}},
+		{"control character", map[string]any{"username": "target\n"}},
+		{"email field", map[string]any{"email": atUsername}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := maps.Clone(tc.body)
+			body["revision"], body["role"] = c.revision(t), "member"
+			status, h, b := c.json(t, "POST", path, "owner", body, "")
+			organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+		})
+	}
+	for _, username := range []string{"TARGET@example.test", "tárget@example.test", atUsername + " "} {
+		status, h, b := c.json(t, "POST", path, "owner", map[string]any{"revision": c.revision(t), "username": username, "role": "member"}, "")
+		organizationError(t, status, h, b, 404, "ORG_NOT_FOUND")
+	}
+	for _, tc := range []struct {
+		actor, endpoint, revision, code string
+		status                          int
+	}{
+		{"owner", path, "1", "ORG_STATE_CHANGED", 409},
+		{"member", path, c.revision(t), "ORG_FORBIDDEN", 403},
+		{"root", path, c.revision(t), "ORG_NOT_FOUND", 404},
+		{"owner", fmt.Sprintf("/api/organizations/%d/invitations", c.orgB), "1", "ORG_NOT_FOUND", 404},
+	} {
+		for _, username := range []string{longUsername, "missing-user"} {
+			status, h, b := c.json(t, "POST", tc.endpoint, tc.actor, map[string]any{"revision": tc.revision, "username": username, "role": "member"}, "")
+			organizationError(t, status, h, b, tc.status, tc.code)
+			assert.NotContains(t, b, "revision")
+		}
+	}
+	// Legacy IDs and an exact username containing @ both use the public write
+	// and acceptance routes; neither requires an email lookup or new proof shape.
+	for _, tc := range []struct{ actor, field, value string }{
+		{"root", "target_user_id", strconv.Itoa(c.users["root"].Id)},
+		{"empty", "username", atUsername},
+	} {
+		invitation := c.mutate(t, "owner", "POST", path, "invite", map[string]any{"revision": c.revision(t), tc.field: tc.value, "role": "member"}, nil, false)
+		c.mutate(t, tc.actor, "POST", path+"/"+invitation["object_id"].(string)+"/accept", "invitation_accept", map[string]any{"revision": c.revision(t), "generation": invitation["generation"]}, nil, false)
+	}
+	status, h, b := c.json(t, "POST", path, "owner", map[string]any{"revision": c.revision(t), "username": atUsername, "role": "member"}, "")
+	organizationError(t, status, h, b, 409, "ORG_ALREADY_MEMBER")
+
+	revision := c.revision(t)
+	command := map[string]any{"organization_id": strconv.FormatInt(c.orgA, 10), "revision": revision, "username": longUsername, "role": "admin"}
+	status, h, b = c.json(t, "POST", c.path()+"/authorization-context", "owner", map[string]any{"action": "invite", "command": command}, "")
+	require.Equal(t, 200, status)
+	require.Equal(t, true, b["success"])
+	assert.True(t, organizationPrivateNoStore(h.Values("Cache-Control")))
+	op := b["data"].(map[string]any)["operation"].(map[string]any)
+	idBody := map[string]any{"revision": revision, "target_user_id": strconv.Itoa(c.users["foreign"].Id), "role": "admin"}
+	assert.Equal(t, c.operation(t, "owner", "invite", idBody, nil), op, "username preview must produce the original ID-only proof contract")
+	malformedContext := maps.Clone(op["context"].(map[string]any))
+	malformedContext["command"] = command
+	var flowCount int64
+	require.NoError(t, c.db.Model(&model.AuthFlow{}).Count(&flowCount).Error)
+	status, h, b = c.json(t, "POST", "/api/verify", "owner", map[string]any{"scope": op["scope"], "context": malformedContext, "method": "password", "password": c.passwords["owner"]}, "")
+	organizationError(t, status, h, b, 400, "SECURITY_CONTEXT_INVALID")
+	var afterCount int64
+	require.NoError(t, c.db.Model(&model.AuthFlow{}).Count(&afterCount).Error)
+	assert.Equal(t, flowCount, afterCount, "raw username proof context must not create verification state")
+	proof := c.proof(t, "owner", op, "password", "")
+	var flow model.AuthFlow
+	require.NoError(t, c.db.Where("purpose = ? AND user_id = ? AND session_id = ?", model.AuthFlowPurposeSecurityProof, c.users["owner"].Id, c.sids["owner"]).First(&flow).Error)
+	require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["foreign"].Id).Update("username", "renamed-foreign").Error)
+	c.users["foreign"].Username = "renamed-foreign"
+	reused := model.User{Username: longUsername, Password: "fixture-not-login-password", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: fmt.Sprintf("identity-%d", c.users["foreign"].Id)}
+	require.NoError(t, c.db.Create(&reused).Error)
+	status, h, b = c.json(t, "POST", path, "owner", map[string]any{"revision": revision, "username": longUsername, "role": "admin"}, proof)
+	organizationError(t, status, h, b, 403, "SECURITY_PROOF_CONTEXT_MISMATCH")
+	require.NoError(t, c.db.First(&flow, flow.Id).Error)
+	assert.Nil(t, flow.ConsumedAt)
+	status, _, b = c.json(t, "POST", path, "owner", idBody, proof)
+	require.Equal(t, 200, status)
+	require.Equal(t, true, b["success"])
+	invitation := b["data"].(map[string]any)
+	var stored model.OrganizationInvitation
+	require.NoError(t, c.db.First(&stored, invitation["object_id"]).Error)
+	assert.Equal(t, c.users["foreign"].Id, stored.TargetUserID)
+	c.mutate(t, "foreign", "POST", path+"/"+invitation["object_id"].(string)+"/accept", "invitation_accept", map[string]any{"revision": c.revision(t), "generation": invitation["generation"]}, nil, false)
+
+	for _, failure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("selector rollback failure=%t", failure), func(t *testing.T) {
+			require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", reused.Id).Update("username", longUsername).Error)
+			revision := c.revision(t)
+			var events, invitations int64
+			require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Count(&events).Error)
+			require.NoError(t, c.db.Model(&model.OrganizationInvitation{}).Count(&invitations).Error)
+			originalPool, originalStatementPool := c.db.ConnPool, c.db.Statement.ConnPool
+			pool := &organizationSelectorPool{ConnPool: originalPool, afterRollback: func() error {
+				if failure {
+					return errors.New("test rollback outcome uncertain")
+				}
+				return c.db.Model(&model.User{}).Where("id = ?", reused.Id).Update("username", "changed-after-resolve").Error
+			}}
+			c.db.ConnPool, c.db.Statement.ConnPool = pool, pool
+			t.Cleanup(func() { c.db.ConnPool, c.db.Statement.ConnPool = originalPool, originalStatementPool })
+			status, h, b := c.json(t, "POST", path, "owner", map[string]any{"revision": revision, "username": longUsername, "role": "member"}, "")
+			if failure {
+				organizationError(t, status, h, b, 500, "ORG_INTERNAL_ERROR")
+			} else {
+				organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+			}
+			assert.True(t, pool.fired.Load())
+			assert.Equal(t, revision, c.revision(t))
+			require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Count(&afterCount).Error)
+			assert.Equal(t, events, afterCount)
+			require.NoError(t, c.db.Model(&model.OrganizationInvitation{}).Count(&afterCount).Error)
+			assert.Equal(t, invitations, afterCount)
+		})
+	}
+
+	// Unavailable users stay in the member page with the same IDs and cursors.
+	require.NoError(t, c.db.Delete(&model.User{}, c.users["member"].Id).Error)
+	require.NoError(t, c.db.Unscoped().Delete(&model.User{}, c.users["admin"].Id).Error)
+	want := map[string]string{}
+	for _, actor := range []string{"owner", "admin", "member", "revoked", "root", "empty", "foreign"} {
+		username := c.users[actor].Username
+		if actor == "admin" || actor == "member" {
+			username = ""
+		}
+		want[strconv.Itoa(c.users[actor].Id)] = username
+	}
+	seen, cursor := map[string]string{}, ""
+	for range 4 {
+		endpoint := c.path() + "/members?limit=2" + cursor
+		status, _, b := c.json(t, "GET", endpoint, "owner", nil, "")
+		require.Equal(t, 200, status)
+		page := b["data"].(map[string]any)
+		for _, item := range page["items"].([]any) {
+			member := item.(map[string]any)
+			require.Len(t, member, 6)
+			id := member["user_id"].(string)
+			assert.NotContains(t, seen, id)
+			seen[id] = member["username"].(string)
+		}
+		if page["next_after_id"] == nil {
+			break
+		}
+		cursor = "&after_id=" + page["next_after_id"].(string)
+	}
+	assert.Equal(t, want, seen)
+	c.mutate(t, "owner", "DELETE", c.path()+"/members/"+strconv.Itoa(c.users["root"].Id), "remove", map[string]any{"revision": c.revision(t)}, map[string]any{"target_user_id": strconv.Itoa(c.users["root"].Id)}, false)
+	status, h, b = c.json(t, "GET", c.path()+"/members", "root", nil, "")
+	organizationError(t, status, h, b, 404, "ORG_NOT_FOUND")
+}
+
+// This fixture writes owned rows through the real task writer. It deliberately
+// does not submit organization work, invoke a provider or exercise billing.
+func newOrganizationTaskReadClient(t *testing.T, upstream string) (*organizationLifecycleClient, map[string]*model.Task) {
+	t.Helper()
+	c := newOrganizationLifecycleClient(t)
+	require.NoError(t, c.db.AutoMigrate(&model.Channel{}))
+	originalFetch := *system_setting.GetFetchSetting()
+	originalSecret := common.CryptoSecret
+	common.CryptoSecret = common.SessionSecret
+	t.Cleanup(func() {
+		*system_setting.GetFetchSetting() = originalFetch
+		common.CryptoSecret = originalSecret
+	})
+	address, err := url.Parse(upstream)
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1", address.Hostname())
+	*system_setting.GetFetchSetting() = system_setting.FetchSetting{EnableSSRFProtection: true, AllowPrivateIp: true,
+		IpFilterMode: true, IpList: []string{"127.0.0.1/32"}, AllowedPorts: []string{address.Port()}}
+	plugin := routerPluginSource("orgreadfixture", "1.0.0", `[{method:"GET",path:"/orgreadfixture/jobs/:task_id",type:"query",render:"native"}]`) + `
+export function listArtifacts(task) {
+ return [{key:"video",type:"video",mimeType:"video/mp4"}];
+}
+export function buildContentRequest(ctx) {
+ if (ctx.data.lookup) utils.fetch({url:ctx.baseUrl+"/lookup"});
+ return {url:ctx.data.url,method:ctx.clientRequest.method,headers:{"X-Fixture-Key":ctx.apiKey}};
+}
+`
+	_, err = jsplugin.DefaultRegistry.Register(plugin, jsplugin.Options{Key: "orgreadfixture", Version: "1.0.0"})
+	require.NoError(t, err)
+	channel := model.Channel{Name: "owned-organization-artifacts", Type: constant.ChannelTypeTaskPlugin,
+		Key: "fixture-provider-key", Status: common.ChannelStatusEnabled, BaseURL: &upstream}
+	require.NoError(t, c.db.Create(&channel).Error)
+	rows := map[string]*model.Task{}
+	for _, seed := range []struct {
+		name, actor string
+		org         int64
+	}{
+		{"personal", "owner", 0}, {"owner", "owner", c.orgA}, {"member", "member", c.orgA},
+		{"admin", "admin", c.orgA}, {"other_org", "member", c.orgB}, {"same_org_duplicate", "owner", c.orgA},
+		{"personal_duplicate", "owner", 0}, {"pending", "member", c.orgA}, {"failed", "member", c.orgA},
+		{"legacy_video", "member", c.orgA}, {"legacy_audio", "member", c.orgA}, {"discarded", "member", c.orgA},
+	} {
+		task := &model.Task{TaskID: "org-read-" + seed.name, UserId: c.users[seed.actor].Id, OrganizationID: seed.org,
+			Platform: "orgreadfixture", ChannelId: channel.Id, Action: constant.TaskActionTextToVideo,
+			Status: model.TaskStatusSuccess, Progress: "100%", SubmitTime: 1, FinishTime: 2,
+			PrivateData: model.TaskPrivateData{Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "orgreadfixture", Version: "1.0.0", APIVersion: 1}}}}
+		if slices.Contains([]string{"owner", "member", "other_org", "same_org_duplicate", "personal_duplicate"}, seed.name) {
+			task.TaskID = "shared-public-task-id"
+		}
+		task.SetData(map[string]any{"url": upstream + "/media?artifact-secret=org-private-canary"})
+		switch seed.name {
+		case "owner":
+			task.ID = 9007199254740993 // Wire row IDs must remain exact above JavaScript's integer range.
+		case "pending":
+			task.Status, task.Progress, task.FinishTime = model.TaskStatusInProgress, "20%", 0
+		case "failed":
+			task.Status = model.TaskStatusFailure
+			task.FailReason = "https://raw-error.invalid/private?raw-error-canary"
+			task.PrivateData.ResultURL = "https://raw-result.invalid/private?raw-result-canary"
+		case "personal", "legacy_video":
+			task.Platform, task.PrivateData = "document", model.TaskPrivateData{}
+			task.FailReason = "data:video/mp4;base64,YWJj"
+		case "legacy_audio":
+			task.Platform, task.PrivateData = constant.TaskPlatformSuno, model.TaskPrivateData{}
+			task.SetData([]any{map[string]any{"audio_url": "https://audio.invalid/private?audio-secret-canary"}})
+		case "discarded":
+			task.PrivateData.ResultDiscarded = true
+		}
+		require.NoError(t, task.InsertWithContext(t.Context()))
+		rows[seed.name] = task
+	}
+	return c, rows
+}
+
+func readOrganizationTaskContent(t *testing.T, c *organizationLifecycleClient, method, path, actor string, headers http.Header) (int, http.Header, []byte) {
+	t.Helper()
+	request, err := http.NewRequest(method, c.server.URL+path, nil)
+	require.NoError(t, err)
+	request.Header = headers.Clone()
+	if request.Header == nil {
+		request.Header = http.Header{}
+	}
+	if actor != "" {
+		request.Header.Set("Authorization", "Bearer "+c.bearer[actor])
+	}
+	response, err := c.client.Do(request)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	require.NoError(t, err)
+	return response.StatusCode, response.Header, body
+}
+
+func TestOrganizationTaskReadLifecycle(t *testing.T) {
+	t.Run("isolation_permissions_and_artifacts", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "fixture-provider-key", r.Header.Get("X-Fixture-Key"))
+			assert.Empty(t, r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("ETag", `"fixture-etag"`)
+			w.Header().Set("Set-Cookie", "provider-secret-canary")
+			w.Header().Set("Location", "https://redirect.invalid/private?location-secret-canary")
+			w.Header().Set("WWW-Authenticate", "provider-secret-canary")
+			if r.Header.Get("If-None-Match") != "" {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			if r.Header.Get("Range") == "bytes=900-" {
+				w.Header().Set("Content-Range", "bytes */14")
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			if r.Header.Get("Range") == "bytes=0-3" {
+				w.Header().Set("Content-Range", "bytes 0-3/14")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte("arti"))
+				return
+			}
+			w.Header().Set("Content-Length", "14")
+			if r.Method != http.MethodHead {
+				_, _ = w.Write([]byte("artifact-bytes"))
+			}
+		}))
+		t.Cleanup(upstream.Close)
+		c, rows := newOrganizationTaskReadClient(t, upstream.URL)
+		base := c.path() + "/tasks/"
+		for _, actor := range []string{"owner", "admin", "member"} {
+			status, _, response := c.json(t, "GET", "/api/task/self?org_id="+strconv.FormatInt(c.orgA, 10), actor, nil, "")
+			require.Equal(t, 200, status)
+			encoded, err := common.Marshal(response)
+			require.NoError(t, err)
+			for _, secret := range []string{"raw-error-canary", "raw-result-canary", "org-private-canary", "audio-secret-canary", "fixture-provider-key"} {
+				assert.NotContains(t, string(encoded), secret)
+			}
+			seen := map[string]bool{}
+			for _, value := range response["data"].(map[string]any)["items"].([]any) {
+				item := value.(map[string]any)
+				id, ok := item["task_row_id"].(string)
+				require.True(t, ok)
+				seen[id] = true
+				assert.Empty(t, item["result_url"])
+				assert.Empty(t, item["fail_reason"])
+			}
+			assert.Contains(t, seen, strconv.FormatInt(rows["member"].ID, 10))
+			assert.NotContains(t, seen, strconv.FormatInt(rows["other_org"].ID, 10))
+			assert.Equal(t, actor != "member", seen[strconv.FormatInt(rows["owner"].ID, 10)])
+		}
+		for _, tc := range []struct {
+			actor, row string
+			org        int64
+			status     int
+		}{
+			{"owner", "member", c.orgA, 200}, {"admin", "member", c.orgA, 200}, {"member", "member", c.orgA, 200},
+			{"member", "owner", c.orgA, 404}, {"owner", "same_org_duplicate", c.orgA, 200},
+			{"member", "other_org", c.orgB, 200}, {"member", "other_org", c.orgA, 404},
+			{"owner", "member", c.orgB, 404}, {"owner", "personal_duplicate", c.orgA, 404},
+			{"foreign", "member", c.orgA, 404}, {"root", "member", c.orgA, 404}, {"owner", "discarded", c.orgA, 404},
+		} {
+			endpoint := fmt.Sprintf("/api/organizations/%d/tasks/%d", tc.org, rows[tc.row].ID)
+			status, headers, response := c.json(t, "GET", endpoint, tc.actor, nil, "")
+			if tc.status == 200 {
+				require.Equal(t, 200, status)
+				data := response["data"].(map[string]any)
+				assert.Equal(t, strconv.FormatInt(rows[tc.row].ID, 10), data["task_row_id"])
+				assert.Equal(t, rows[tc.row].TaskID, data["task_id"])
+				require.Len(t, data, 10)
+			} else {
+				organizationError(t, status, headers, response, tc.status, "ORG_NOT_FOUND")
+			}
+		}
+		rowPath := base + strconv.FormatInt(rows["member"].ID, 10)
+		for _, suffix := range []string{"?access=old-capability", "?user_id=1", "?org_id=1&org_id=1"} {
+			status, _, _ := c.json(t, "GET", rowPath+suffix, "member", nil, "")
+			assert.Equal(t, 400, status)
+		}
+		for _, id := range []string{"0", "01", "-1", "9223372036854775808", "shared-public-task-id"} {
+			status, _, _ := c.json(t, "GET", base+id, "member", nil, "")
+			assert.Equal(t, 400, status)
+		}
+		for _, name := range []string{"member", "legacy_video"} {
+			status, headers, response := c.json(t, "GET", base+strconv.FormatInt(rows[name].ID, 10)+"/artifacts", "member", nil, "")
+			require.Equal(t, 200, status)
+			assert.True(t, organizationPrivateNoStore(headers.Values("Cache-Control")))
+			data := response["data"].(map[string]any)
+			artifacts := data["artifacts"].([]any)
+			require.Len(t, artifacts, 1)
+			content := artifacts[0].(map[string]any)["content_url"].(string)
+			assert.Equal(t, base+strconv.FormatInt(rows[name].ID, 10)+"/artifacts/video/content", content)
+			assert.NotContains(t, content, "access=")
+			for _, method := range []string{"GET", "HEAD"} {
+				status, headers, body := readOrganizationTaskContent(t, c, method, content, "member", nil)
+				require.Equal(t, 200, status)
+				assert.Equal(t, "private, no-store", headers.Get("Cache-Control"))
+				assert.Empty(t, headers.Get("Location"))
+				assert.Empty(t, headers.Get("Set-Cookie"))
+				assert.Empty(t, headers.Get("WWW-Authenticate"))
+				assert.Empty(t, headers.Get("Content-Encoding"))
+				if method == "HEAD" {
+					assert.Empty(t, body)
+				} else if name == "legacy_video" {
+					assert.Equal(t, "abc", string(body))
+				} else {
+					assert.Equal(t, "artifact-bytes", string(body))
+				}
+			}
+		}
+		for _, name := range []string{"pending", "legacy_audio"} {
+			status, _, response := c.json(t, "GET", base+strconv.FormatInt(rows[name].ID, 10)+"/artifacts", "member", nil, "")
+			require.Equal(t, 200, status)
+			assert.Empty(t, response["data"].(map[string]any)["artifacts"])
+		}
+		content := rowPath + "/artifacts/video/content"
+		for _, tc := range []struct {
+			headers http.Header
+			status  int
+			body    string
+		}{
+			{http.Header{"Range": {"bytes=0-3"}}, 206, "arti"},
+			{http.Header{"If-None-Match": {`"fixture-etag"`}}, 304, ""},
+			{http.Header{"Range": {"bytes=900-"}}, 416, ""},
+		} {
+			status, headers, body := readOrganizationTaskContent(t, c, "GET", content, "member", tc.headers)
+			assert.Equal(t, tc.status, status)
+			assert.Equal(t, tc.body, string(body))
+			assert.True(t, organizationPrivateNoStore(headers.Values("Cache-Control")))
+		}
+		patSuffix, err := common.GenerateRandomCharsKey(43)
+		require.NoError(t, err)
+		pat := model.AccessTokenPrefix + patSuffix
+		grant := &model.UserAccessToken{Name: "organization-task-read", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat)}
+		require.NoError(t, grant.SetScopes([]string{"*"}))
+		require.NoError(t, model.CreateUserAccessToken(c.users["root"].Id, grant, service.AccessTokenMaxPerUser))
+		legacy, err := common.GenerateRandomCharsKey(32)
+		require.NoError(t, err)
+		require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["root"].Id).Update("access_token", legacy).Error)
+		for _, tc := range []struct {
+			credential, code string
+			status           int
+		}{{pat, "AUTH_SESSION_REQUIRED", 403}, {legacy, "AUTH_SESSION_REQUIRED", 403}, {c.bearer["relay"], "AUTH_UNAUTHORIZED", 401}, {"", "AUTH_UNAUTHORIZED", 401}} {
+			status, headers, response := c.json(t, "GET", rowPath+"/artifacts", tc.credential, nil, "")
+			organizationError(t, status, headers, response, tc.status, tc.code)
+		}
+		status, _, _ := c.request(t, "GET", rowPath, "", "", http.Header{"Cookie": {service.RefreshCookieName + "=" + c.refresh["member"]}})
+		assert.Equal(t, 401, status)
+		revoked, err := model.RevokeUserSession(c.users["admin"].Id, c.sids["admin"], "organization_task_read")
+		require.NoError(t, err)
+		require.True(t, revoked)
+		status, headers, response := c.json(t, "GET", "/api/organizations/999999/tasks/1", "admin", nil, "")
+		organizationError(t, status, headers, response, 401, "AUTH_SESSION_REVOKED")
+		access, err := service.IssueTaskArtifactAccess(rows["member"].TaskID, "video")
+		require.NoError(t, err)
+		status, _, _ = readOrganizationTaskContent(t, c, "GET", "/v1/tasks/"+rows["member"].TaskID+"/artifacts/video/content?access="+url.QueryEscape(access), "", nil)
+		assert.Equal(t, 404, status, "an old public-ID capability cannot select an organization row")
+	})
+
+	for _, change := range []string{"remove", "self_disable", "platform_disable"} {
+		t.Run("completed_after_"+change, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("artifact-bytes")) }))
+			t.Cleanup(upstream.Close)
+			c, rows := newOrganizationTaskReadClient(t, upstream.URL)
+			base := c.path() + "/tasks/" + strconv.FormatInt(rows["pending"].ID, 10)
+			status, _, response := c.json(t, "GET", base, "member", nil, "")
+			require.Equal(t, 200, status)
+			assert.Equal(t, string(model.TaskStatusInProgress), response["data"].(map[string]any)["status"])
+			status, _, response = c.json(t, "GET", base+"/artifacts", "member", nil, "")
+			require.Equal(t, 200, status)
+			assert.Empty(t, response["data"].(map[string]any)["artifacts"])
+			oldURL := c.path() + "/tasks/" + strconv.FormatInt(rows["member"].ID, 10) + "/artifacts/video/content"
+			status, _, _ = readOrganizationTaskContent(t, c, "GET", oldURL, "member", nil)
+			require.Equal(t, 200, status)
+			_, err := model.GetUserCache(c.users["member"].Id)
+			require.NoError(t, err)
+			_, err = model.GetUserSessionCached(c.sids["member"])
+			require.NoError(t, err)
+			if change == "remove" {
+				c.mutate(t, "owner", "DELETE", c.path()+"/members/"+strconv.Itoa(c.users["member"].Id), "remove", map[string]any{"revision": c.revision(t)}, map[string]any{"target_user_id": strconv.Itoa(c.users["member"].Id)}, false)
+			} else {
+				actor, endpoint := "owner", c.path()+"/self-state"
+				if change == "platform_disable" {
+					actor, endpoint = "root", fmt.Sprintf("/api/platform/organizations/%d/state", c.orgA)
+				}
+				c.mutate(t, actor, "POST", endpoint, change, map[string]any{"revision": c.revision(t), "disabled": true, "reason": "task read revocation"}, nil, true)
+			}
+			rows["pending"].Status, rows["pending"].Progress, rows["pending"].FinishTime = model.TaskStatusSuccess, "100%", 2
+			updated, err := rows["pending"].UpdateWithStatus(model.TaskStatusInProgress)
+			require.NoError(t, err)
+			require.True(t, updated)
+			for _, endpoint := range []string{"/api/task/self?org_id=" + strconv.FormatInt(c.orgA, 10), base, base + "/artifacts"} {
+				status, headers, response := c.json(t, "GET", endpoint, "member", nil, "")
+				organizationError(t, status, headers, response, 404, "ORG_NOT_FOUND")
+			}
+			for _, method := range []string{"GET", "HEAD"} {
+				status, headers, body := readOrganizationTaskContent(t, c, method, oldURL, "member", nil)
+				assert.Equal(t, 404, status)
+				assert.NotContains(t, string(body), "artifact-bytes")
+				assert.True(t, organizationPrivateNoStore(headers.Values("Cache-Control")))
+			}
+			if change == "remove" {
+				status, _, _ := c.json(t, "GET", base, "owner", nil, "")
+				assert.Equal(t, 200, status, "departed submitter's task remains with the organization")
+			}
+			personalAccess, err := service.IssueTaskArtifactAccess(rows["personal"].TaskID, "video")
+			require.NoError(t, err)
+			status, _, body := readOrganizationTaskContent(t, c, "GET", "/v1/tasks/"+rows["personal"].TaskID+"/artifacts/video/content?access="+url.QueryEscape(personalAccess), "", nil)
+			assert.Equal(t, 200, status)
+			assert.Equal(t, "abc", string(body))
+			status, _, response = c.json(t, "GET", "/api/task/self", "owner", nil, "")
+			require.Equal(t, 200, status)
+			for _, item := range response["data"].(map[string]any)["items"].([]any) {
+				assert.NotContains(t, item.(map[string]any), "task_row_id", "personal projection remains unchanged")
+			}
+		})
+	}
+
+	for _, outcome := range []string{"plugin", "GET", "HEAD", "304", "416", "disconnect", "upstream_error"} {
+		t.Run("revoked_before_publication_"+outcome, func(t *testing.T) {
+			reached, release := make(chan struct{}), make(chan struct{})
+			var once, reachedOnce sync.Once
+			var mediaRequests atomic.Int64
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/media" {
+					mediaRequests.Add(1)
+				}
+				reachedOnce.Do(func() { close(reached) })
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+				if outcome == "disconnect" {
+					connection, _, err := w.(http.Hijacker).Hijack()
+					if err == nil {
+						_ = connection.Close()
+					}
+					return
+				}
+				w.Header().Set("Content-Type", "video/mp4")
+				w.Header().Set("Location", "https://provider.invalid/private?upstream-secret-canary")
+				status := 200
+				if outcome == "304" {
+					status = 304
+				} else if outcome == "416" {
+					status = 416
+				} else if outcome == "upstream_error" {
+					status = 502
+				}
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte("never-deliver-artifact-canary"))
+			}))
+			t.Cleanup(upstream.Close)
+			c, rows := newOrganizationTaskReadClient(t, upstream.URL)
+			t.Cleanup(func() { once.Do(func() { close(release) }) })
+			if outcome == "plugin" {
+				rows["member"].SetData(map[string]any{"url": upstream.URL + "/media", "lookup": true})
+				updated, err := rows["member"].UpdateWithStatus(model.TaskStatusSuccess)
+				require.NoError(t, err)
+				require.True(t, updated)
+			}
+			method := "GET"
+			if outcome == "HEAD" {
+				method = "HEAD"
+			}
+			type result struct {
+				status int
+				header http.Header
+				body   []byte
+				err    error
+			}
+			request, err := http.NewRequest(method, c.server.URL+c.path()+"/tasks/"+strconv.FormatInt(rows["member"].ID, 10)+"/artifacts/video/content", nil)
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+c.bearer["member"])
+			done := make(chan result, 1)
+			go func() {
+				response, err := c.client.Do(request)
+				if err != nil {
+					done <- result{err: err}
+					return
+				}
+				defer response.Body.Close()
+				body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+				done <- result{response.StatusCode, response.Header, body, err}
+			}()
+			select {
+			case <-reached:
+			case <-time.After(5 * time.Second):
+				t.Fatal("authenticated content request did not reach its upstream barrier")
+			}
+			c.mutate(t, "owner", "DELETE", c.path()+"/members/"+strconv.Itoa(c.users["member"].Id), "remove", map[string]any{"revision": c.revision(t)}, map[string]any{"target_user_id": strconv.Itoa(c.users["member"].Id)}, false)
+			once.Do(func() { close(release) })
+			select {
+			case response := <-done:
+				require.NoError(t, response.err)
+				assert.Equal(t, 404, response.status)
+				assert.NotContains(t, string(response.body), "never-deliver-artifact-canary")
+				assert.NotContains(t, string(response.body), "upstream-secret-canary")
+				assert.Empty(t, response.header.Get("Location"))
+				assert.True(t, organizationPrivateNoStore(response.header.Values("Cache-Control")))
+				if method != "HEAD" {
+					var body map[string]any
+					require.NoError(t, common.Unmarshal(response.body, &body))
+					assert.Equal(t, "ORG_NOT_FOUND", body["code"])
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("revoked content request did not finish after its barrier")
+			}
+			if outcome == "plugin" {
+				assert.Zero(t, mediaRequests.Load(), "revoked plugin lookup must stop before media fetch")
+			}
+		})
+	}
+
+	t.Run("content_timeout_boundary", func(t *testing.T) {
+		// Observe the actual boundary context without waiting thirty seconds.
+		engine := gin.New()
+		engine.Use(middleware.OrganizationSelectionBoundary())
+		for _, route := range []struct{ method, path string }{
+			{"GET", "/api/organizations/:org_id/tasks/:task_row_id"},
+			{"GET", "/api/organizations/:org_id/tasks/:task_row_id/artifacts"},
+			{"GET", "/api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content"},
+			{"HEAD", "/api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content"},
+		} {
+			engine.Handle(route.method, route.path, func(c *gin.Context) {
+				_, bounded := c.Request.Context().Deadline()
+				c.Header("X-Test-Context-Bounded", strconv.FormatBool(bounded))
+				c.Status(204)
+			})
+		}
+		server := httptest.NewServer(engine)
+		t.Cleanup(server.Close)
+		for _, tc := range []struct{ method, suffix, bounded string }{
+			{"GET", "", "true"}, {"GET", "/artifacts", "true"},
+			{"GET", "/artifacts/video/content", "false"}, {"HEAD", "/artifacts/video/content", "false"},
+		} {
+			request, err := http.NewRequest(tc.method, server.URL+"/api/organizations/1/tasks/1"+tc.suffix, nil)
+			require.NoError(t, err)
+			response, err := server.Client().Do(request)
+			require.NoError(t, err)
+			response.Body.Close()
+			assert.Equal(t, 204, response.StatusCode)
+			assert.Equal(t, tc.bounded, response.Header.Get("X-Test-Context-Bounded"))
+		}
+	})
 }
 
 func TestOrganizationLifecycleHistory(t *testing.T) {

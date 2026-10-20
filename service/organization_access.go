@@ -35,6 +35,7 @@ type OrganizationRequestContext struct {
 type OrganizationAccessMember struct {
 	MemberID string `json:"member_id"`
 	UserID   string `json:"user_id"`
+	Username string `json:"username"`
 	Role     string `json:"role"`
 	Revision string `json:"revision"`
 	JoinedAt int64  `json:"joined_at"`
@@ -98,7 +99,7 @@ func OrganizationAccessResponse(identity AuthIdentity, kind model.OrganizationAc
 	case model.OrganizationAccessMembers:
 		out := OrganizationAccessPage[OrganizationAccessMember]{Items: make([]OrganizationAccessMember, 0, len(result.Members)), Limit: page.Limit}
 		for _, v := range result.Members {
-			out.Items = append(out.Items, OrganizationAccessMember{MemberID: strconv.FormatInt(v.ID, 10), UserID: strconv.Itoa(v.UserID), Role: v.Role, Revision: strconv.FormatInt(v.Revision, 10), JoinedAt: v.JoinedAt})
+			out.Items = append(out.Items, OrganizationAccessMember{MemberID: strconv.FormatInt(v.ID, 10), UserID: strconv.Itoa(v.UserID), Username: v.Username, Role: v.Role, Revision: strconv.FormatInt(v.Revision, 10), JoinedAt: v.JoinedAt})
 		}
 		if len(out.Items) == page.Limit {
 			out.NextAfterID = &out.Items[len(out.Items)-1].MemberID

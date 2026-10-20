@@ -11022,7 +11022,7 @@
       "get": {
         "summary": "获取个人或组织任务",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限）\n\nAbsent or canonical 0 selection returns the existing personal task list, including PAT access with usage:read. Organization-owned tasks never appear there. A positive X-Organization-Id header or org_id query returns the selected organization's task view instead. That branch requires a current dashboard Bearer JWT session: a PAT that passes the usage:read route check, or a legacy access token, is rejected with 403 AUTH_SESSION_REQUIRED; a PAT without the exact usage:read scope keeps 403 ACCESS_TOKEN_SCOPE_DENIED; relay API keys and task/artifact capabilities do not authenticate. Root/platform roles do not imply organization membership. Every request rechecks current user/session authority, organization state and membership in the data-read transaction without positive membership caching. Unknown/nonmember/removed/disabled/dissolved organizations share 404 ORG_NOT_FOUND. Owners and admins see every task owned by the organization; members see only their own. Only org_id, p (1..100), page_size (1..100), start_timestamp, end_timestamp, task_id, action, status and platform are accepted, each once; timestamps are empty or canonical nonnegative decimals. Malformed, unknown (including user_id) or duplicate query parameters, duplicate credential/proof/origin headers, an X-Security-Proof, Idempotency-Key or method-override header, and a request body yield 400 ORG_REQUEST_INVALID. Items use the personal projection without channel or upstream data. Organization tasks have no artifact or capability URL; /api/task/{task_id}/artifacts and task content capabilities resolve personal tasks only. Selection is request-local, never stored in cookies or session state, and does not enable task creation, spending or an organization wallet.",
+        "description": "🔐 需要登录（User权限）\n\nAbsent or canonical 0 selection returns the existing personal task list, including PAT access with usage:read. Organization-owned tasks never appear there. A positive X-Organization-Id header or org_id query returns the selected organization's task view instead. That branch requires a current dashboard Bearer JWT session: a PAT that passes the usage:read route check, or a legacy access token, is rejected with 403 AUTH_SESSION_REQUIRED; a PAT without the exact usage:read scope keeps 403 ACCESS_TOKEN_SCOPE_DENIED; relay API keys and task/artifact capabilities do not authenticate. Root/platform roles do not imply organization membership. Every request rechecks current user/session authority, organization state and membership in the data-read transaction without positive membership caching. Unknown/nonmember/removed/disabled/dissolved organizations share 404 ORG_NOT_FOUND. Owners and admins see every task owned by the organization; members see only their own. Only org_id, p (1..100), page_size (1..100), start_timestamp, end_timestamp, task_id, action, status and platform are accepted, each once; timestamps are empty or canonical nonnegative decimals. Malformed, unknown (including user_id) or duplicate query parameters, duplicate credential/proof/origin headers, an X-Security-Proof, Idempotency-Key or method-override header, and a request body yield 400 ORG_REQUEST_INVALID. Items use the personal projection without channel or upstream data. Organization items add task_row_id as a canonical decimal string and clear raw provider fail_reason; task_row_id selects the session-bound organization detail/artifact/content routes. No anonymous capability or provider URL is emitted. /api/task/{task_id}/artifacts and existing task content capabilities continue to resolve personal tasks only. Selection is request-local, never stored in cookies or session state, and does not enable task creation, spending or an organization wallet.",
         "tags": [
           "任务"
         ],
@@ -13959,7 +13959,7 @@
         "tags": [
           "Organizations"
         ],
-        "description": "Requires the internal dashboard Bearer JWT bound to a current login session. Refresh/deprecated cookies, relay API keys and task/artifact capabilities do not authenticate this endpoint. A valid PAT is rejected with 403 AUTH_SESSION_REQUIRED, including wildcard, root and legacy PATs; expired/retired PATs retain their 401 codes. Root/platform roles do not imply organization membership. Every request rechecks current user/session authority in the database, including personal context, empty discovery and unknown organizations. Organization state, membership and role are checked in the data-read transaction without positive membership caching. Unknown/nonmember/removed/disabled/dissolved organizations share 404 ORG_NOT_FOUND; availability is checked before an events-role 403. Only the listed query names are accepted, each once. Malformed, unknown or duplicate query parameters, invalid pagination, any nonempty body (including chunked), and any X-Security-Proof or Idempotency-Key header yield 400 ORG_REQUEST_INVALID after authentication. No proof is consumed. Selector syntax/conflict or discovery-positive errors may precede authentication without organization lookup; rate limiting may also precede authentication. The response is private, no-store, including authentication/domain/limiter failures. Selection is request-local, never stored in cookies or session state. These reads do not enable organization lifecycle writes, resource access, token issuance or spending. Capabilities are advisory snapshots; clients must handle revocation on every request.",
+        "description": "Requires the internal dashboard Bearer JWT bound to a current login session. Refresh/deprecated cookies, relay API keys and task/artifact capabilities do not authenticate this endpoint. A valid PAT is rejected with 403 AUTH_SESSION_REQUIRED, including wildcard, root and legacy PATs; expired/retired PATs retain their 401 codes. Root/platform roles do not imply organization membership. Every request rechecks current user/session authority in the database, including personal context, empty discovery and unknown organizations. Organization state, membership and role are checked in the data-read transaction without positive membership caching. Unknown/nonmember/removed/disabled/dissolved organizations share 404 ORG_NOT_FOUND; availability is checked before an events-role 403. Only the listed query names are accepted, each once. Malformed, unknown or duplicate query parameters, invalid pagination, any nonempty body (including chunked), and any X-Security-Proof or Idempotency-Key header yield 400 ORG_REQUEST_INVALID after authentication. No proof is consumed. Selector syntax/conflict or discovery-positive errors may precede authentication without organization lookup; rate limiting may also precede authentication. The response is private, no-store, including authentication/domain/limiter failures. Selection is request-local, never stored in cookies or session state. These reads do not enable organization lifecycle writes, resource access, token issuance or spending. Capabilities are advisory snapshots; clients must handle revocation on every request. Each member includes its current username. A missing or soft-deleted user yields an empty username while preserving the member entry and pagination cursor; no email or other account fields are included.",
         "security": [
           {
             "DashboardJWT": []
@@ -15326,7 +15326,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "path",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: active owner invites admin/member; admin invites member only; target active nonmember, not actor. Proof policy: required iff role admin; otherwise forbidden.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: active owner invites admin/member; admin invites member only; target active nonmember, not actor. Proof policy: required iff role admin; otherwise forbidden. The success receipt revision is the new organization revision. A stale revision returns 409 ORG_STATE_CHANGED before target/member/invitation checks: refresh organization state before an explicitly chosen retry; errors never include the current revision. With a current revision and authorized inviter, an existing member returns 409 ORG_ALREADY_MEMBER. For a target who is not already a member, an existing invitation slot returns 409 ORG_INVITATION_EXISTS for pending, declined, revoked, expired or accepted slots; use the reissue operation with the slot ID and exact generation. Authorization/visibility and revision checks retain precedence over target-state errors. Provide exactly one of target_user_id or username. The username is matched exactly (including case, accents and trailing spaces), is 1..20 Unicode code points without controls, and may contain @; email is not a selector. Username lookup follows visibility, revision and invitation authority checks. A successful lookup is bound to its stable user ID and rechecked after the normal user locks; a changed username fails with ORG_STATE_CHANGED without re-resolving or retrying. Reissue continues to require target_user_id, invitation ID and generation.",
         "parameters": [
           {
             "name": "org_id",
@@ -15381,7 +15381,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Committed primary-action receipt.",
+            "description": "Committed primary-action receipt. revision is the new organization revision; generation identifies the issued invitation generation.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -15590,7 +15590,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "path",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: same invite authority; target_user_id must equal existing slot target; exact previous generation. Proof policy: required iff role admin; otherwise forbidden.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: same invite authority; target_user_id must equal existing slot target; exact previous generation. Proof policy: required iff role admin; otherwise forbidden. A current-revision request for an existing member returns 409 ORG_ALREADY_MEMBER. Stale organization revisions and mismatched invitation generations retain 409 ORG_STATE_CHANGED: refresh organization state before an explicitly chosen retry; errors never include the current revision. An existing slot remains necessary for reissue, and the exact previous generation is still required for every pending or terminal slot.",
         "parameters": [
           {
             "name": "org_id",
@@ -15653,7 +15653,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Committed primary-action receipt.",
+            "description": "Committed primary-action receipt. revision is the new organization revision; generation is incremented while the invitation slot ID is preserved.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -17276,7 +17276,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "path",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: same exact action preflight; proof-required actions only. Proof policy: forbidden.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: same exact action preflight; proof-required actions only. Proof policy: forbidden. Invitation-related previews use the same authorized target-state errors as writes: ORG_ALREADY_MEMBER or ORG_INVITATION_EXISTS at a current revision, and ORG_STATE_CHANGED for a stale revision or generation mismatch. These errors are returned before proof issuance and never disclose the current revision. Only invite accepts an exact username in place of target_user_id on input. Its returned context always uses the original ID-only schema_version 1 command. Verification and proof rebuild reject raw username contexts; a username reused by another account cannot retarget an existing proof.",
         "parameters": [
           {
             "name": "org_id",
@@ -17506,6 +17506,1136 @@
             }
           }
         }
+      }
+    },
+    "/api/organizations/{org_id}/tasks/{task_row_id}": {
+      "get": {
+        "operationId": "organization_task_detail",
+        "summary": "Read organization task detail",
+        "tags": [
+          "Organizations"
+        ],
+        "description": "Current dashboard Bearer JWT session only. PATs, legacy tokens, relay keys, cookies and artifact capabilities do not authenticate. Query parameters are limited to one optional org_id matching the path; an optional X-Organization-Id must also match the path and cannot accompany the query selector. Duplicate credentials/selectors, unknown query fields (including access), bodies, proof/idempotency/method override headers are rejected. The positive task_row_id is the internal task row ID as a canonical decimal string, obtained from the organization task list; public task_id is never used to select a row. Every lookup binds both organization_id and row ID and rechecks current user/session, membership and organization state in the database. Owners/admins see all organization tasks; members only their own submissions. Unknown, cross-organization, other-member, removed, disabled, dissolved or discarded-result tasks return 404 without task data. Invalid sessions return 401 before organization availability. Platform root is not implicit membership. Responses are private, no-store. Projection contains no persisted upstream snapshot, raw provider error, credential or provider URL. Reads do not create tasks, charge/refund, cancel work or enable anonymous sharing.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Positive canonical organization ID. 0 is invalid. One optional header/query selector must exactly match this value. No membership is implied by knowing the ID."
+          },
+          {
+            "name": "task_row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            },
+            "description": "Positive internal task row ID, never the public task_id. Preserve as a decimal string."
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationHeader"
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationQuery"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Authorized safe task projection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationTaskDetailResult"
+                }
+              }
+            }
+          }
+        },
+        "x-organization-selection": "path",
+        "x-query-allowlist": [
+          "org_id"
+        ],
+        "x-pat-policy": "session-only",
+        "x-forbidden-request-headers": [
+          "X-Security-Proof",
+          "Idempotency-Key"
+        ],
+        "x-request-body-policy": "empty only, including chunked transfer",
+        "x-organization-state-mutation": false,
+        "x-task-identity": "organization_id + internal row ID",
+        "x-anonymous-artifact-access": false,
+        "x-delivery-authorization": "current database authorization immediately before first downstream headers/body publication"
+      }
+    },
+    "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts": {
+      "get": {
+        "operationId": "organization_task_artifacts",
+        "summary": "Read organization task artifacts",
+        "tags": [
+          "Organizations"
+        ],
+        "description": "Current dashboard Bearer JWT session only. PATs, legacy tokens, relay keys, cookies and artifact capabilities do not authenticate. Query parameters are limited to one optional org_id matching the path; an optional X-Organization-Id must also match the path and cannot accompany the query selector. Duplicate credentials/selectors, unknown query fields (including access), bodies, proof/idempotency/method override headers are rejected. The positive task_row_id is the internal task row ID as a canonical decimal string, obtained from the organization task list; public task_id is never used to select a row. Every lookup binds both organization_id and row ID and rechecks current user/session, membership and organization state in the database. Owners/admins see all organization tasks; members only their own submissions. Unknown, cross-organization, other-member, removed, disabled, dissolved or discarded-result tasks return 404 without task data. Invalid sessions return 401 before organization availability. Platform root is not implicit membership. Responses are private, no-store. Projection contains no persisted upstream snapshot, raw provider error, credential or provider URL. Reads do not create tasks, charge/refund, cancel work or enable anonymous sharing. Plugin artifact projection is reused, but links are only relative session-bound host routes. Legacy videos use that content proxy; legacy audio snapshots and unsupported direct-link formats are not projected. No legacy_audio_clips or signed anonymous access URL is returned.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Positive canonical organization ID. 0 is invalid. One optional header/query selector must exactly match this value. No membership is implied by knowing the ID."
+          },
+          {
+            "name": "task_row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            },
+            "description": "Positive internal task row ID, never the public task_id. Preserve as a decimal string."
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationHeader"
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationQuery"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Authorized safe task projection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationTaskArtifactsResult"
+                }
+              }
+            }
+          }
+        },
+        "x-organization-selection": "path",
+        "x-query-allowlist": [
+          "org_id"
+        ],
+        "x-pat-policy": "session-only",
+        "x-forbidden-request-headers": [
+          "X-Security-Proof",
+          "Idempotency-Key"
+        ],
+        "x-request-body-policy": "empty only, including chunked transfer",
+        "x-organization-state-mutation": false,
+        "x-task-identity": "organization_id + internal row ID",
+        "x-anonymous-artifact-access": false,
+        "x-delivery-authorization": "current database authorization immediately before first downstream headers/body publication"
+      }
+    },
+    "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content": {
+      "get": {
+        "operationId": "organization_task_content",
+        "summary": "Read organization task content",
+        "tags": [
+          "Organizations"
+        ],
+        "description": "Current dashboard Bearer JWT session only. PATs, legacy tokens, relay keys, cookies and artifact capabilities do not authenticate. Query parameters are limited to one optional org_id matching the path; an optional X-Organization-Id must also match the path and cannot accompany the query selector. Duplicate credentials/selectors, unknown query fields (including access), bodies, proof/idempotency/method override headers are rejected. The positive task_row_id is the internal task row ID as a canonical decimal string, obtained from the organization task list; public task_id is never used to select a row. Every lookup binds both organization_id and row ID and rechecks current user/session, membership and organization state in the database. Owners/admins see all organization tasks; members only their own submissions. Unknown, cross-organization, other-member, removed, disabled, dissolved or discarded-result tasks return 404 without task data. Invalid sessions return 401 before organization availability. Platform root is not implicit membership. Responses are private, no-store. Projection contains no persisted upstream snapshot, raw provider error, credential or provider URL. Reads do not create tasks, charge/refund, cancel work or enable anonymous sharing. Plugin projection/build-content work and upstream response-header waits finish before a final check of this same session, organization and row. Failure closes the upstream body before the safe denial, without artifact bytes. HEAD, 304, 416 and data URLs use that same publication check. Accepted media redirects are followed inside the host under existing SSRF and credential rules, never returned as Location. Enabled storage backends without a session-bound serving contract fail closed. Once an authorized response begins publication, its existing download may finish; the endpoint does not promise to recall transmitted bytes or cancel an ongoing download. Pending tasks return artifact_not_ready; no task-completion push or long polling is introduced.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Positive canonical organization ID. 0 is invalid. One optional header/query selector must exactly match this value. No membership is implied by knowing the ID."
+          },
+          {
+            "name": "task_row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            },
+            "description": "Positive internal task row ID, never the public task_id. Preserve as a decimal string."
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationHeader"
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationQuery"
+          },
+          {
+            "name": "artifact_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$(?![\\s\\S])"
+            }
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Modified-Since",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Authorized proxied content or conditional/range metadata. No upstream redirect or authentication headers are exposed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "Authorized proxied content or conditional/range metadata. No upstream redirect or authentication headers are exposed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Authorized proxied content or conditional/range metadata. No upstream redirect or authentication headers are exposed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "Authorized proxied content or conditional/range metadata. No upstream redirect or authentication headers are exposed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            }
+          }
+        },
+        "x-organization-selection": "path",
+        "x-query-allowlist": [
+          "org_id"
+        ],
+        "x-pat-policy": "session-only",
+        "x-forbidden-request-headers": [
+          "X-Security-Proof",
+          "Idempotency-Key"
+        ],
+        "x-request-body-policy": "empty only, including chunked transfer",
+        "x-organization-state-mutation": false,
+        "x-task-identity": "organization_id + internal row ID",
+        "x-anonymous-artifact-access": false,
+        "x-delivery-authorization": "current database authorization immediately before first downstream headers/body publication"
+      },
+      "head": {
+        "operationId": "organization_task_content_head",
+        "summary": "Read organization task content",
+        "tags": [
+          "Organizations"
+        ],
+        "description": "Current dashboard Bearer JWT session only. PATs, legacy tokens, relay keys, cookies and artifact capabilities do not authenticate. Query parameters are limited to one optional org_id matching the path; an optional X-Organization-Id must also match the path and cannot accompany the query selector. Duplicate credentials/selectors, unknown query fields (including access), bodies, proof/idempotency/method override headers are rejected. The positive task_row_id is the internal task row ID as a canonical decimal string, obtained from the organization task list; public task_id is never used to select a row. Every lookup binds both organization_id and row ID and rechecks current user/session, membership and organization state in the database. Owners/admins see all organization tasks; members only their own submissions. Unknown, cross-organization, other-member, removed, disabled, dissolved or discarded-result tasks return 404 without task data. Invalid sessions return 401 before organization availability. Platform root is not implicit membership. Responses are private, no-store. Projection contains no persisted upstream snapshot, raw provider error, credential or provider URL. Reads do not create tasks, charge/refund, cancel work or enable anonymous sharing. Plugin projection/build-content work and upstream response-header waits finish before a final check of this same session, organization and row. Failure closes the upstream body before the safe denial, without artifact bytes. HEAD, 304, 416 and data URLs use that same publication check. Accepted media redirects are followed inside the host under existing SSRF and credential rules, never returned as Location. Enabled storage backends without a session-bound serving contract fail closed. Once an authorized response begins publication, its existing download may finish; the endpoint does not promise to recall transmitted bytes or cancel an ongoing download. Pending tasks return artifact_not_ready; no task-completion push or long polling is introduced.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Positive canonical organization ID. 0 is invalid. One optional header/query selector must exactly match this value. No membership is implied by knowing the ID."
+          },
+          {
+            "name": "task_row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            },
+            "description": "Positive internal task row ID, never the public task_id. Preserve as a decimal string."
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationHeader"
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationQuery"
+          },
+          {
+            "name": "artifact_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$(?![\\s\\S])"
+            }
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Modified-Since",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Fixed organization/authentication/artifact error. No upstream URL or task data.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardTaskArtifactError"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Authorized proxied content or conditional/range metadata. No upstream redirect or authentication headers are exposed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "Authorized proxied content or conditional/range metadata. No upstream redirect or authentication headers are exposed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Authorized proxied content or conditional/range metadata. No upstream redirect or authentication headers are exposed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "Authorized proxied content or conditional/range metadata. No upstream redirect or authentication headers are exposed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              }
+            }
+          }
+        },
+        "x-organization-selection": "path",
+        "x-query-allowlist": [
+          "org_id"
+        ],
+        "x-pat-policy": "session-only",
+        "x-forbidden-request-headers": [
+          "X-Security-Proof",
+          "Idempotency-Key"
+        ],
+        "x-request-body-policy": "empty only, including chunked transfer",
+        "x-organization-state-mutation": false,
+        "x-task-identity": "organization_id + internal row ID",
+        "x-anonymous-artifact-access": false,
+        "x-delivery-authorization": "current database authorization immediately before first downstream headers/body publication"
       }
     }
   },
@@ -18778,7 +19908,8 @@
           "user_id",
           "role",
           "revision",
-          "joined_at"
+          "joined_at",
+          "username"
         ],
         "additionalProperties": false,
         "properties": {
@@ -18816,6 +19947,10 @@
             "minimum": 0,
             "maximum": 9007199254740991,
             "description": "Unix seconds; never encode identifiers as numbers"
+          },
+          "username": {
+            "type": "string",
+            "description": "Current username for this member. Empty when the user is missing or soft-deleted; the membership entry and pagination cursor are retained."
           }
         }
       },
@@ -19997,28 +21132,61 @@
         "additionalProperties": false
       },
       "OrganizationLifecycleBodyInvite": {
-        "type": "object",
-        "properties": {
-          "revision": {
-            "$ref": "#/components/schemas/OrganizationLifecycleID"
+        "description": "Provide exactly one selector: target_user_id or exact username. The legacy ID branch is unchanged.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "revision": {
+                "$ref": "#/components/schemas/OrganizationLifecycleID"
+              },
+              "target_user_id": {
+                "$ref": "#/components/schemas/OrganizationLifecycleID"
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "admin",
+                  "member"
+                ]
+              }
+            },
+            "required": [
+              "revision",
+              "target_user_id",
+              "role"
+            ],
+            "additionalProperties": false
           },
-          "target_user_id": {
-            "$ref": "#/components/schemas/OrganizationLifecycleID"
-          },
-          "role": {
-            "type": "string",
-            "enum": [
-              "admin",
-              "member"
-            ]
+          {
+            "type": "object",
+            "properties": {
+              "revision": {
+                "$ref": "#/components/schemas/OrganizationLifecycleID"
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "admin",
+                  "member"
+                ]
+              },
+              "username": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20,
+                "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$(?![\\s\\S])",
+                "description": "Exact existing username, at most 20 Unicode code points. No trimming, case folding, accent folding or Unicode normalization; @ is permitted. This is not an email lookup."
+              }
+            },
+            "required": [
+              "revision",
+              "username",
+              "role"
+            ],
+            "additionalProperties": false
           }
-        },
-        "required": [
-          "revision",
-          "target_user_id",
-          "role"
-        ],
-        "additionalProperties": false
+        ]
       },
       "OrganizationLifecycleCommandInvite": {
         "type": "object",
@@ -20826,6 +21994,25 @@
               },
               "command": {
                 "$ref": "#/components/schemas/OrganizationLifecycleCommandTransferAccept"
+              }
+            },
+            "required": [
+              "action",
+              "command"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "invite"
+                ]
+              },
+              "command": {
+                "$ref": "#/components/schemas/OrganizationLifecyclePreviewInviteUsernameCommand"
               }
             },
             "required": [
@@ -22256,7 +23443,9 @@
             "enum": [
               "ORG_STATE_CHANGED",
               "ORG_DISABLED",
-              "ORG_REQUEST_RESOLVED"
+              "ORG_REQUEST_RESOLVED",
+              "ORG_ALREADY_MEMBER",
+              "ORG_INVITATION_EXISTS"
             ]
           }
         },
@@ -23402,6 +24591,197 @@
             "type": "string"
           }
         ]
+      },
+      "OrganizationLifecyclePreviewInviteUsernameCommand": {
+        "type": "object",
+        "properties": {
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "admin"
+            ]
+          },
+          "username": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20,
+            "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$(?![\\s\\S])",
+            "description": "Exact existing username, at most 20 Unicode code points. No trimming, case folding, accent folding or Unicode normalization; @ is permitted. This is not an email lookup."
+          }
+        },
+        "required": [
+          "organization_id",
+          "revision",
+          "username",
+          "role"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationTaskDetail": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "task_row_id",
+          "task_id",
+          "platform",
+          "action",
+          "status",
+          "progress",
+          "created_at",
+          "submit_time",
+          "start_time",
+          "finished_at"
+        ],
+        "properties": {
+          "task_row_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "task_id": {
+            "type": "string",
+            "maxLength": 191
+          },
+          "platform": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "progress": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "submit_time": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "start_time": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "finished_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "OrganizationTaskArtifacts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "task_row_id",
+          "task_id",
+          "artifacts"
+        ],
+        "properties": {
+          "task_row_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "task_id": {
+            "type": "string",
+            "maxLength": 191
+          },
+          "artifacts": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key",
+                "type",
+                "content_url"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$(?![\\s\\S])"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "video",
+                    "audio",
+                    "image",
+                    "file"
+                  ]
+                },
+                "mime_type": {
+                  "type": "string",
+                  "maxLength": 255
+                },
+                "content_url": {
+                  "type": "string",
+                  "pattern": "^/api/organizations/[1-9][0-9]*/tasks/[1-9][0-9]*/artifacts/[A-Za-z0-9][A-Za-z0-9._~-]{0,127}/content$(?![\\s\\S])",
+                  "description": "Relative host content route. Requires a current dashboard session and current organization membership on every request; contains no anonymous capability or upstream URL."
+                }
+              }
+            }
+          }
+        }
+      },
+      "OrganizationTaskDetailResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/OrganizationTaskDetail"
+          }
+        }
+      },
+      "OrganizationTaskArtifactsResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/OrganizationTaskArtifacts"
+          }
+        }
       }
     },
     "responses": {
@@ -24067,7 +25447,7 @@
         }
       },
       "OrganizationLifecycleError409": {
-        "description": "ORG_STATE_CHANGED; ORG_DISABLED; ORG_REQUEST_RESOLVED",
+        "description": "ORG_STATE_CHANGED (refresh organization state before retrying); ORG_ALREADY_MEMBER; ORG_INVITATION_EXISTS (use reissue); ORG_DISABLED; ORG_REQUEST_RESOLVED",
         "headers": {
           "Cache-Control": {
             "schema": {
@@ -24457,6 +25837,22 @@
       {
         "method": "GET",
         "path": "/api/task/self"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content"
+      },
+      {
+        "method": "HEAD",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content"
       }
     ],
     "positive_resource_selector_routes": [
@@ -25050,5 +26446,32 @@
     ],
     "runtime_verified": false,
     "design_contract_id": "newapi-S3-lifecycle-g6-v1.1"
+  },
+  "x-organization-task-read-contract": {
+    "task_identity": "organization_id + internal row ID",
+    "routes": [
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content"
+      },
+      {
+        "method": "HEAD",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content"
+      }
+    ],
+    "list_row_id_field": "task_row_id",
+    "session_only": true,
+    "anonymous_artifact_access": false,
+    "delivery_authorization": "current database authorization immediately before first downstream headers/body publication",
+    "already_published_downloads": "may finish; no recall or cancellation guarantee",
+    "legacy_audio": "not projected; no provider URL passthrough"
   }
 }

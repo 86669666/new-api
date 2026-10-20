@@ -130,7 +130,7 @@ func VideoProxy(c *gin.Context) {
 	}
 }
 
-func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.TaskContentRequest) error {
+func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.TaskContentRequest, beforePublish ...func() error) error {
 	if descriptor == nil {
 		return &taskMediaProxyError{
 			status: http.StatusInternalServerError, code: "artifact_plugin_error",
@@ -151,7 +151,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 				message: "Artifact request was rejected", err: errTaskMediaRequestRejected,
 			}
 		}
-		if err := writeVideoDataURL(c, rawURL); err != nil {
+		if err := writeVideoDataURL(c, rawURL, beforePublish...); err != nil {
 			return &taskMediaProxyError{
 				status: http.StatusBadGateway, code: "artifact_upstream_error",
 				message: "Failed to decode artifact content", err: err,
@@ -280,6 +280,14 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 	defer resp.Body.Close()
+	// This is the response's authorization point, after all upstream waits and
+	// before publishing even HEAD, 304 or 416 response metadata. The body is
+	// closed before a failed guard can return to the organization handler.
+	if len(beforePublish) > 0 && beforePublish[0] != nil {
+		if err := beforePublish[0](); err != nil {
+			return err
+		}
+	}
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent, http.StatusNotModified, http.StatusRequestedRangeNotSatisfiable:
@@ -564,7 +572,7 @@ func writeTaskMediaProxyError(c *gin.Context, err error) {
 	writeTaskArtifactError(c, proxyErr.status, proxyErr.code, proxyErr.message)
 }
 
-func writeVideoDataURL(c *gin.Context, dataURL string) error {
+func writeVideoDataURL(c *gin.Context, dataURL string, beforePublish ...func() error) error {
 	if len(dataURL) > taskMediaDataURLMaxEncodedBytes {
 		return errTaskMediaRequestRejected
 	}
@@ -602,6 +610,11 @@ func writeVideoDataURL(c *gin.Context, dataURL string) error {
 		return fmt.Errorf("invalid base64 data")
 	}
 
+	if len(beforePublish) > 0 && beforePublish[0] != nil {
+		if err := beforePublish[0](); err != nil {
+			return err
+		}
+	}
 	c.Writer.Header().Set("Content-Type", mimeType)
 	c.Writer.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	setTaskMediaResponseSecurityHeaders(c.Writer.Header())

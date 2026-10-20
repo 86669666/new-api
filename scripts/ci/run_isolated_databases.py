@@ -321,11 +321,11 @@ def terminate_group(process):
     return '; '.join(errors) or None
 
 
-def run(command, *, env=None, timeout=30, safe_failure_output=False, guard=None, final_guard=None):
+def run(command, *, env=None, timeout=30, safe_failure_output=False, guard=None, final_guard=None, binary=False):
     """Bound the child group; only explicitly sanitized gate output may be surfaced."""
     if guard is not None:
         guard()
-    process = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE,
+    process = subprocess.Popen(command, env=env, text=not binary, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, start_new_session=True)
     try:
         stdout, stderr = guarded_communicate(process, timeout=timeout, guard=guard, final_guard=final_guard)
@@ -345,7 +345,7 @@ def run(command, *, env=None, timeout=30, safe_failure_output=False, guard=None,
     return stdout
 
 
-def preflight(docker, engines=('mysql', 'postgres')):
+def preflight(docker, engines=('mysql', 'postgres'), preserve_volumes=None):
     if tuple(engines) not in (('mysql', 'postgres'), ('clickhouse',)):
         raise ValueError('unsupported isolated service profile')
     context = json.loads(run(docker + ['context', 'inspect']))
@@ -355,8 +355,16 @@ def preflight(docker, engines=('mysql', 'postgres')):
     if info['OSType'] != 'linux' or info['Architecture'] not in ('aarch64', 'arm64'):
         raise ValueError('dedicated daemon must be linux/arm64')
     # A stopped container, orphan network or unused volume can still belong to another run.
-    if run(docker + ['ps', '-aq']).strip() or run(docker + ['volume', 'ls', '-q']).strip():
+    if run(docker + ['ps', '-aq']).strip():
         raise ValueError('dedicated daemon contains existing containers or volumes; refusing takeover')
+    volumes = set(run(docker + ['volume', 'ls', '-q']).splitlines())
+    if preserve_volumes is None:
+        if volumes:
+            raise ValueError('dedicated daemon contains existing containers or volumes; refusing takeover')
+    else:
+        if tuple(engines) != ('mysql', 'postgres') or volumes != set(preserve_volumes):
+            raise ValueError('volume set differs from the explicit organization identity baseline')
+        verify_preserved_volumes(docker, preserve_volumes)
     networks = run(docker + ['network', 'ls', '--format', '{{.Name}}']).splitlines()
     if set(networks) != {'bridge', 'host', 'none'}:
         raise ValueError('dedicated daemon contains an existing non-default network')
@@ -468,7 +476,7 @@ def published_loopback_port(data, port):
 
 class OwnedRelay:
     """One foreground SSH process, one immutable owned container target, no port receipts as input."""
-    def __init__(self, docker, project, engine, container, image_receipt, clickhouse_auth=None):
+    def __init__(self, docker, project, engine, container, image_receipt, clickhouse_auth=None, *, organization_metadata=None):
         self.docker, self.project, self.engine, self.container = docker, project, engine, container
         self.process = None
         self.port = None
@@ -480,6 +488,10 @@ class OwnedRelay:
             raise ValueError('unsupported relay engine or owner')
         self.image_receipt = Path(image_receipt)
         self.clickhouse_auth = clickhouse_auth
+        self.organization_metadata = organization_metadata
+        self.organization_image = None
+        if organization_metadata is not None and engine not in IMAGES:
+            raise ValueError('live organization image binding supports MySQL/PostgreSQL only')
         if engine == 'clickhouse':
             if not isinstance(clickhouse_auth, ClickHouseAuth):
                 raise ValueError('ClickHouse requires validated private auth')
@@ -528,6 +540,8 @@ class OwnedRelay:
             owned_container_identity(other, network, self.project, service, peer)
         if data['HostConfig'].get('PortBindings') or any(data['NetworkSettings'].get('Ports', {}).values()):
             raise RelayIdentityError('owned relay containers must not publish host ports')
+        if self.organization_image is not None:
+            identity['mounts'] = data.get('Mounts', [])
         return identity
 
     def start(self):
@@ -536,43 +550,53 @@ class OwnedRelay:
             if len(context) != 1 or context[0]['Endpoints']['docker']['Host'] != SOCKET:
                 raise RelayIdentityError('wrong dedicated Docker socket')
             self.boot = run(['colima', 'ssh', '-p', 'newapi-a03', '--', 'cat', '/proc/sys/kernel/random/boot_id'], timeout=5).strip()
-            # Consume the unchanged, independently reviewed image gate's current-boot receipt.
-            # The launcher must run that gate before this runner; a generic image-inspect pass is insufficient.
-            with self.image_receipt.open('rb') as receipt_file:
-                raw = receipt_file.read(32769)
-            if len(raw) > 32768:
-                raise ValueError('image receipt too large')
-            proof = json.loads(raw)
-            metadata_hash = {
-                'mysql': 'e9be5a831164f8c536fa0b5eb1355b9eb41ee779508861b2789cf3dd47861bdb',
-                'postgres': '3f68f93b0699efc8488e736c6cf876fa181236193769d266777cf3886edb7156',
-                'clickhouse': '6f7289f17ab9509426e76c1729356bbc0017ddc1dd2e58e74d8ea80c90560509',
-            }[self.engine]
-            checks = proof.get('containerd_binding', {}).get('checks', {})
-            required = {'metadata_hash', 'metadata_object', 'verified', 'fixed_image', 'platform', 'manifest_type',
-                        'config_reference', 'rootfs', 'ready', 'ready_boot', 'host', 'recorded_daemon',
-                        'recorded_context', 'live_boot', 'live_context', 'live_daemon', 'receipt_metadata_hash', 'requested_image'}
-            if (proof.get('accepted') is not True or proof.get('identity_mode') != 'containerd-platform-manifest'
-                    or proof.get('config_proof') != 'config_bound_via_verified_manifest'
-                    or proof.get('metadata_sha256') != metadata_hash
-                    or proof.get('image') != RELAY_IMAGES[self.engine] or proof.get('socket') != SOCKET
-                    or proof.get('boot_id') != self.boot.replace('-', '')
-                    or proof.get('containerd_binding', {}).get('accepted') is not True
-                    or not required <= checks.keys() or any(checks[key] is not True for key in required)):
-                raise RelayIdentityError('accepted current-boot full image mapping receipt required')
-            image = json.loads(run(self.docker + ['image', 'inspect', RELAY_IMAGES[self.engine]], timeout=5))[0]
-            fields = proof['fields']
-            repositories = {value.removeprefix('docker.io/').removeprefix('library/') for value in image.get('RepoDigests', [])}
-            expected_repository = RELAY_IMAGES[self.engine].removeprefix('docker.io/').removeprefix('library/')
-            if self.engine == 'clickhouse' and (not image.get('RepoDigests') or not set(image['RepoDigests']) <= {RELAY_IMAGES[self.engine], expected_repository}):
-                raise RelayIdentityError('ClickHouse repository alias differs from fixed identity')
-            if (expected_repository not in repositories or image['Id'] != RELAY_IMAGES[self.engine].split('@')[1]
-                    or image['Descriptor']['digest'] != image['Id']
-                    or image['Descriptor']['mediaType'] != fields['Descriptor.mediaType']['actual']
-                    or image['Os'] != 'linux' or image['Architecture'] != 'arm64'
-                    or image['RootFS']['Type'] != 'layers'
-                    or image['RootFS']['Layers'] != [item['actual'] for item in fields['RootFS.Layers']['actual']]):
-                raise RelayIdentityError('live image no longer matches accepted mapping')
+            if self.organization_metadata is not None:
+                raw = self.image_receipt.read_bytes()
+                if len(raw) > 32768:
+                    raise RelayIdentityError('image receipt too large')
+                proof = json.loads(raw)
+                live = verify_live_organization_image(self.docker, self.engine, self.organization_metadata)
+                if proof != live or live['boot_id'] != self.boot:
+                    raise RelayIdentityError('current live image binding differs from the receipt')
+                self.organization_image = live
+            else:
+                # Consume the unchanged, independently reviewed image gate's current-boot receipt.
+                # The launcher must run that gate before this runner; a generic image-inspect pass is insufficient.
+                with self.image_receipt.open('rb') as receipt_file:
+                    raw = receipt_file.read(32769)
+                if len(raw) > 32768:
+                    raise ValueError('image receipt too large')
+                proof = json.loads(raw)
+                metadata_hash = {
+                    'mysql': 'e9be5a831164f8c536fa0b5eb1355b9eb41ee779508861b2789cf3dd47861bdb',
+                    'postgres': '3f68f93b0699efc8488e736c6cf876fa181236193769d266777cf3886edb7156',
+                    'clickhouse': '6f7289f17ab9509426e76c1729356bbc0017ddc1dd2e58e74d8ea80c90560509',
+                }[self.engine]
+                checks = proof.get('containerd_binding', {}).get('checks', {})
+                required = {'metadata_hash', 'metadata_object', 'verified', 'fixed_image', 'platform', 'manifest_type',
+                            'config_reference', 'rootfs', 'ready', 'ready_boot', 'host', 'recorded_daemon',
+                            'recorded_context', 'live_boot', 'live_context', 'live_daemon', 'receipt_metadata_hash', 'requested_image'}
+                if (proof.get('accepted') is not True or proof.get('identity_mode') != 'containerd-platform-manifest'
+                        or proof.get('config_proof') != 'config_bound_via_verified_manifest'
+                        or proof.get('metadata_sha256') != metadata_hash
+                        or proof.get('image') != RELAY_IMAGES[self.engine] or proof.get('socket') != SOCKET
+                        or proof.get('boot_id') != self.boot.replace('-', '')
+                        or proof.get('containerd_binding', {}).get('accepted') is not True
+                        or not required <= checks.keys() or any(checks[key] is not True for key in required)):
+                    raise RelayIdentityError('accepted current-boot full image mapping receipt required')
+                image = json.loads(run(self.docker + ['image', 'inspect', RELAY_IMAGES[self.engine]], timeout=5))[0]
+                fields = proof['fields']
+                repositories = {value.removeprefix('docker.io/').removeprefix('library/') for value in image.get('RepoDigests', [])}
+                expected_repository = RELAY_IMAGES[self.engine].removeprefix('docker.io/').removeprefix('library/')
+                if self.engine == 'clickhouse' and (not image.get('RepoDigests') or not set(image['RepoDigests']) <= {RELAY_IMAGES[self.engine], expected_repository}):
+                    raise RelayIdentityError('ClickHouse repository alias differs from fixed identity')
+                if (expected_repository not in repositories or image['Id'] != RELAY_IMAGES[self.engine].split('@')[1]
+                        or image['Descriptor']['digest'] != image['Id']
+                        or image['Descriptor']['mediaType'] != fields['Descriptor.mediaType']['actual']
+                        or image['Os'] != 'linux' or image['Architecture'] != 'arm64'
+                        or image['RootFS']['Type'] != 'layers'
+                        or image['RootFS']['Layers'] != [item['actual'] for item in fields['RootFS.Layers']['actual']]):
+                    raise RelayIdentityError('live image no longer matches accepted mapping')
             self.initial = self.snapshot()
             config = Path.home() / '.colima/_lima/colima-newapi-a03/ssh.config'
             alias = 'lima-colima-newapi-a03'
@@ -647,6 +671,10 @@ class OwnedRelay:
             boot = self.read(['colima', 'ssh', '-p', 'newapi-a03', '--', 'cat', '/proc/sys/kernel/random/boot_id'], tick).strip()
             if boot != self.boot:
                 raise RelayIdentityError('VM boot changed during test')
+            if self.organization_image is not None:
+                current = organization_daemon_image(self.docker, self.engine, self.read, tick)
+                if current != self.organization_image['daemon_image']:
+                    raise RelayIdentityError('daemon, socket or fixed image binding changed during test')
         except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             raise RelayIdentityError('owned route identity verification failed') from error
 
@@ -664,6 +692,300 @@ class OwnedRelay:
             self.port = None
 
 
+
+ORGANIZATION_IDENTITY_ROOTS = frozenset(('TestOrganizationLifecycleInvitationIdentity',
+                                        'TestOrganizationLifecycleInvitationConflicts'))
+ORGANIZATION_READ_SUITES = {
+    'organization-identity': (ORGANIZATION_IDENTITY_ROOTS, 'g10-organization-identity'),
+    'organization-task-read': (frozenset(('TestOrganizationTaskReadLifecycle',)), 'g10-organization-task-read'),
+}
+ORGANIZATION_METADATA_SHA = {
+    'mysql': 'e9be5a831164f8c536fa0b5eb1355b9eb41ee779508861b2789cf3dd47861bdb',
+    'postgres': '3f68f93b0699efc8488e736c6cf876fa181236193769d266777cf3886edb7156',
+}
+VOLUME_FIELDS = ('Name', 'Driver', 'Labels', 'Options', 'CreatedAt', 'Scope')
+CONTAINERD = ['colima', 'ssh', '-p', 'newapi-a03', '--', 'sudo', 'ctr',
+              '--address', '/run/containerd/containerd.sock', '--namespace', 'moby']
+
+
+def organization_daemon_image(docker, engine, read=None, tick=None):
+    if engine not in IMAGES:
+        raise ValueError('organization identity supports MySQL/PostgreSQL only')
+    if read is None:
+        read = lambda command, unused: run(command, timeout=5)
+    context = json.loads(read(docker + ['context', 'inspect'], tick))
+    info = json.loads(read(docker + ['info', '--format', '{{json .}}'], tick))
+    image = json.loads(read(docker + ['image', 'inspect', IMAGES[engine]], tick))[0]
+    expected = IMAGES[engine].removeprefix('docker.io/').removeprefix('library/')
+    repositories = {v.removeprefix('docker.io/').removeprefix('library/') for v in image.get('RepoDigests', [])}
+    if (len(context) != 1 or context[0]['Endpoints']['docker']['Host'] != SOCKET
+            or not info.get('ID') or info.get('OSType') != 'linux' or info.get('Architecture') not in ('aarch64', 'arm64')
+            or expected not in repositories or image['Id'] != IMAGES[engine].split('@')[1]
+            or image['Descriptor']['digest'] != image['Id']
+            or image['Descriptor']['mediaType'] != 'application/vnd.oci.image.manifest.v1+json'
+            or image.get('Os') != 'linux' or image.get('Architecture') != 'arm64'
+            or image.get('RootFS', {}).get('Type') != 'layers'):
+        raise RelayIdentityError('dedicated daemon or fixed platform image differs')
+    return {'socket': SOCKET, 'daemon_id': info['ID'], 'image': IMAGES[engine],
+            'descriptor': image['Descriptor'], 'rootfs': image['RootFS'],
+            'volumes': sorted((image.get('Config', {}).get('Volumes') or {}).keys())}
+
+
+def verify_live_organization_image(docker, engine, metadata_file):
+    """Recompute the pinned manifest/config on this boot, without old activation receipts."""
+    metadata_bytes = Path(metadata_file).read_bytes()
+    if len(metadata_bytes) > 65536 or hashlib.sha256(metadata_bytes).hexdigest() != ORGANIZATION_METADATA_SHA[engine]:
+        raise RelayIdentityError('fixed image metadata hash differs')
+    metadata = json.loads(metadata_bytes)
+    if (metadata.get('mode') != 'metadata' or metadata.get('verified') is not True
+            or metadata.get('digest') != IMAGES[engine].split('@')[1]
+            or metadata.get('repository') != 'library/' + engine
+            or metadata.get('platform') != {'os': 'linux', 'architecture': 'arm64'}):
+        raise RelayIdentityError('fixed image metadata identity differs')
+    boot = run(['colima', 'ssh', '-p', 'newapi-a03', '--', 'cat', '/proc/sys/kernel/random/boot_id'], timeout=5).strip()
+    manifest_bytes = run(CONTAINERD + ['content', 'get', metadata['digest']], timeout=10, binary=True)
+    config_bytes = run(CONTAINERD + ['content', 'get', metadata['config_digest']], timeout=10, binary=True)
+    manifest, config = json.loads(manifest_bytes), json.loads(config_bytes)
+    daemon_image = organization_daemon_image(docker, engine)
+    if ('sha256:' + hashlib.sha256(manifest_bytes).hexdigest() != metadata['digest']
+            or manifest != metadata['manifest']
+            or manifest.get('mediaType') != 'application/vnd.oci.image.manifest.v1+json'
+            or manifest['config']['digest'] != metadata['config_digest']
+            or manifest['config']['size'] != len(config_bytes)
+            or 'sha256:' + hashlib.sha256(config_bytes).hexdigest() != metadata['config_digest']
+            or config.get('os') != 'linux' or config.get('architecture') != 'arm64'
+            or config.get('rootfs') != metadata['rootfs']
+            or daemon_image['rootfs'] != {'Type': 'layers', 'Layers': metadata['rootfs']['diff_ids']}
+            or daemon_image['volumes'] != sorted((config.get('config', {}).get('Volumes') or {}).keys())
+            or daemon_image['descriptor'].get('size') != len(manifest_bytes)
+            or run(['colima', 'ssh', '-p', 'newapi-a03', '--', 'cat', '/proc/sys/kernel/random/boot_id'], timeout=5).strip() != boot):
+        raise RelayIdentityError('current containerd manifest/config/rootfs binding differs')
+    return {'format': 'live-fixed-organization-image-v1', 'boot_id': boot,
+            'metadata_sha256': ORGANIZATION_METADATA_SHA[engine],
+            'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+            'config_sha256': hashlib.sha256(config_bytes).hexdigest(),
+            'containerd_socket': '/run/containerd/containerd.sock', 'containerd_namespace': 'moby',
+            'daemon_image': daemon_image}
+
+
+def volume_identity(value):
+    return {field: value[field] for field in VOLUME_FIELDS}
+
+
+def preserved_volume_baseline(path):
+    values = json.loads(path.read_text())
+    if (not isinstance(values, list) or len(values) != 2
+            or any(not isinstance(value, dict) or set(value) != set(VOLUME_FIELDS)
+                   or not re.fullmatch(r'[a-f0-9]{64}', value.get('Name', '')) for value in values)):
+        raise ValueError('exact two-volume preservation baseline required')
+    result = {value['Name']: value for value in values}
+    if len(result) != 2:
+        raise ValueError('duplicate preservation volume')
+    return result
+
+
+def verify_preserved_volumes(docker, baseline):
+    for name, expected in baseline.items():
+        actual = json.loads(run(docker + ['volume', 'inspect', name]))
+        if len(actual) != 1 or volume_identity(actual[0]) != expected:
+            raise ValueError('preserved volume identity changed')
+        if run(docker + ['ps', '-aq', '--filter', 'volume=' + name]).strip():
+            raise ValueError('preserved volume must remain unmounted')
+
+
+def capture_organization_mounts(docker, project, engine, cid, image, preserved, owned):
+    """Only claim anonymous image data volumes seen on our unstarted container."""
+    data = json.loads(run(docker + ['inspect', cid]))[0]
+    labels = data.get('Config', {}).get('Labels', {})
+    if (data.get('Id') != cid or labels.get('com.docker.compose.project') != project
+            or labels.get('com.docker.compose.service') != engine
+            or data['Config'].get('Image') != IMAGES[engine] or data.get('Image') != IMAGES[engine].split('@')[1]
+            or data.get('State', {}).get('Running') or data.get('State', {}).get('StartedAt') != '0001-01-01T00:00:00Z'
+            or data.get('HostConfig', {}).get('Binds') or data['HostConfig'].get('Mounts')
+            or data['HostConfig'].get('VolumesFrom')):
+        raise ValueError('unstarted owned container identity or mount configuration differs')
+    mounts = data.get('Mounts', [])
+    if {mount.get('Destination') for mount in mounts} != set(image['daemon_image']['volumes']) or len(mounts) != len(image['daemon_image']['volumes']):
+        raise ValueError('container mounts differ from fixed image data directories')
+    for mount in mounts:
+        name = mount.get('Name', '')
+        if (mount.get('Type') != 'volume' or mount.get('Driver') != 'local' or mount.get('RW') is not True
+                or not re.fullmatch(r'[a-f0-9]{64}', name) or name in preserved or name in owned):
+            raise ValueError('historical, duplicate or unknown container mount refused before start')
+        value = json.loads(run(docker + ['volume', 'inspect', name]))[0]
+        if (value.get('Name') != name or value.get('Driver') != 'local' or value.get('Scope') != 'local'
+                or value.get('Options') not in (None, {}) or value.get('Labels') != {'com.docker.volume.anonymous': ''}
+                or value.get('Mountpoint') != mount.get('Source')):
+            raise ValueError('new anonymous image volume identity differs')
+        attached = run(docker + ['ps', '-aq', '--no-trunc', '--filter', 'volume=' + name]).splitlines()
+        if attached != [cid]:
+            raise ValueError('new data volume is shared with another container')
+        owned[name] = volume_identity(value)
+    return mounts
+
+
+def cleanup_organization_volumes(docker, preserved, owned):
+    """Never infer ownership from a volume-set difference or remove preserved volumes."""
+    verify_preserved_volumes(docker, preserved)
+    errors = []
+    for name, identity in owned.items():
+        try:
+            if name in preserved:
+                raise ValueError('preserved volume cannot be owned')
+            actual = json.loads(run(docker + ['volume', 'inspect', name]))
+            if len(actual) != 1 or volume_identity(actual[0]) != identity:
+                raise ValueError('owned volume identity changed')
+            if run(docker + ['ps', '-aq', '--filter', 'volume=' + name]).strip():
+                raise ValueError('owned volume remains attached')
+            run(docker + ['volume', 'rm', name])
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+            errors.append(str(error))
+    verify_preserved_volumes(docker, preserved)
+    if set(run(docker + ['volume', 'ls', '-q']).splitlines()) != set(preserved):
+        errors.append('unknown or owned volumes remain; no unrecorded volume was deleted')
+    if errors:
+        raise RuntimeError('; '.join(errors))
+
+
+def validate_organization_identity_events(events, suite='organization-identity'):
+    if suite not in ORGANIZATION_READ_SUITES:
+        raise ValueError('unsupported organization read suite')
+    required, _ = ORGANIZATION_READ_SUITES[suite]
+    package = 'github.com/QuantumNous/new-api/router'
+    if any(event.get('Action') in ('fail', 'skip') for event in events):
+        raise ValueError('organization identity suite failed or skipped')
+    passed = {event.get('Test') for event in events if event.get('Action') == 'pass' and event.get('Package') == package}
+    roots = {name.split('/', 1)[0] for name in passed if name is not None}
+    if roots != required or None not in passed:
+        raise ValueError('both exact HTTP roots and router package must pass')
+    return {'roots': sorted(required), 'passed_tests_and_subtests': len(passed) - 1,
+            'package': package, 'skip': 0, 'fail': 0}
+
+
+def run_organization_identity(args, docker):
+    suite = getattr(args, 'suite', 'organization-identity')
+    if suite not in ORGANIZATION_READ_SUITES:
+        raise ValueError('unsupported organization read suite')
+    required_roots, fixture_owner = ORGANIZATION_READ_SUITES[suite]
+    if args.image_metadata is None or args.preserve_volumes is None or args.go is None:
+        raise ValueError('organization identity requires explicit metadata, preservation baseline and Go paths')
+    if any(value and key.startswith('NEWAPI_S2_') for key, value in os.environ.items()):
+        raise ValueError('inherited organization fixture configuration is forbidden')
+    if args.image_evidence.exists() or args.relay_evidence.exists():
+        raise ValueError('organization image directory and relay evidence must be new')
+    preserved = preserved_volume_baseline(args.preserve_volumes)
+    preflight(docker, preserve_volumes=preserved)
+    compose = docker + ['compose', '-p', args.project, '-f', str(Path(__file__).with_name('database-compose.yml')), '--profile', 'isolated-ci']
+    spec = json.loads(run(compose + ['config', '--format', 'json', 'mysql', 'postgres']))
+    if set(spec['services']) != set(IMAGES) or set(spec['networks']) != {'isolated'} or spec['networks']['isolated'].get('internal') is not True:
+        raise ValueError('organization identity requires exactly the existing isolated MySQL/PostgreSQL profile')
+    for engine, fixed in IMAGES.items():
+        item = spec['services'][engine]
+        allowed = {'profiles', 'image', 'pull_policy', 'platform', 'environment', 'networks', 'healthcheck', 'command', 'entrypoint'}
+        if (set(item) - allowed or item['image'] != fixed or item.get('pull_policy') != 'never'
+                or item.get('platform') != 'linux/arm64' or item.get('command') is not None or item.get('entrypoint') is not None
+                or set(item.get('networks', {})) != {'isolated'}):
+            raise ValueError('organization Compose service differs from fixed no-mount inputs')
+    images = {engine: verify_live_organization_image(docker, engine, args.image_metadata / (engine + '-metadata.json')) for engine in IMAGES}
+    if len({(image['boot_id'], image['daemon_image']['daemon_id']) for image in images.values()}) != 1:
+        raise ValueError('image verification crossed a boot or daemon change')
+    args.image_evidence.mkdir(mode=0o700)
+    for engine, image in images.items():
+        (args.image_evidence / (engine + '.json')).write_text(json.dumps(image, indent=2) + '\n')
+    containers, mounts, owned, relays, results = {}, {}, {}, [], {}
+    primary_error = cleanup_error = process_cleanup_error = None
+    try:
+        # create never starts entrypoints. Inspect all mounts before either DB can write.
+        run(compose + ['create', '--pull', 'never', 'mysql', 'postgres'], timeout=90)
+        for engine in IMAGES:
+            cid = run(compose + ['ps', '-aq', engine]).strip()
+            if not re.fullmatch(r'[a-f0-9]{64}', cid):
+                raise ValueError('one exact owned unstarted container required')
+            containers[engine] = cid
+            mounts[engine] = capture_organization_mounts(docker, args.project, engine, cid, images[engine], preserved, owned)
+        verify_preserved_volumes(docker, preserved)
+        if set(run(docker + ['volume', 'ls', '-q']).splitlines()) != set(preserved) | set(owned):
+            raise ValueError('unrecorded volume appeared before start')
+        run(compose + ['start', '--wait', '--wait-timeout', '180', 'mysql', 'postgres'], timeout=210)
+        endpoints = {}
+        for engine, cid in containers.items():
+            relay = OwnedRelay(docker, args.project, engine, cid, args.image_evidence / (engine + '.json'),
+                               organization_metadata=args.image_metadata / (engine + '-metadata.json'))
+            relays.append(relay)
+            port = relay.start()
+            if relay.initial['mounts'] != mounts[engine]:
+                raise RelayIdentityError('mount identity changed between create and relay start')
+            endpoints[engine] = port
+        args.relay_evidence.write_text(json.dumps([relay.receipt for relay in relays], indent=2) + '\n')
+        root = Path(__file__).resolve().parents[2]
+        for dialect in ('sqlite', 'mysql', 'postgres'):
+            env = dict(os.environ, NEWAPI_TEST_PROFILE='isolated-ci', NEWAPI_S2_OWNED=fixture_owner,
+                       NEWAPI_S2_MAIN=dialect, NEWAPI_S2_LOG=dialect, NEWAPI_S2_CACHE_MODE='none',
+                       NEWAPI_S2_MAIN_DSN='', NEWAPI_S2_LOG_DSN='')
+            if dialect != 'sqlite':
+                port = endpoints[dialect]
+                env['NEWAPI_S2_' + dialect.upper() + '_PORT'] = str(port)
+                env['NEWAPI_S2_MAIN_DSN'] = (f'root@tcp(127.0.0.1:{port})/newapi_ci_contracts?parseTime=true' if dialect == 'mysql'
+                                              else f'postgres://postgres@127.0.0.1:{port}/newapi_ci_contracts?sslmode=disable')
+            command = [str(args.go), '-C', str(root), 'test', '-json', '-count=1', '-timeout=240s',
+                       '-run=^(' + '|'.join(sorted(required_roots)) + ')$', './router']
+            output = run(command, env=env, timeout=270, safe_failure_output=True,
+                         guard=functools.partial(check_relays, relays), final_guard=functools.partial(check_relays, relays, fresh=True))
+            from database_gate import redact_output
+            (args.image_evidence / (dialect + '-http.jsonl')).write_text(redact_output(output, env))
+            events = [json.loads(line) for line in output.splitlines() if line.strip()]
+            results[dialect] = validate_organization_identity_events(events, suite)
+            print(json.dumps({'dialect': dialect, **results[dialect]}), flush=True)
+        if set(results) != {'sqlite', 'mysql', 'postgres'}:
+            raise ValueError('organization identity requires all three real dialects')
+    except (Exception, KeyboardInterrupt) as error:
+        primary_error = f'{type(error).__name__}: {error}'
+        process_cleanup_error = getattr(error, 'process_cleanup_error', None)
+    finally:
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        for sig in saved:
+            signal.signal(sig, signal.SIG_IGN)
+        errors = []
+        for relay in reversed(relays):
+            try:
+                relay.close()
+            except BaseException as error:
+                errors.append(str(error))
+        if errors:
+            process_cleanup_error = '; '.join(errors)
+        try:
+            boot = run(['colima', 'ssh', '-p', 'newapi-a03', '--', 'cat', '/proc/sys/kernel/random/boot_id'], timeout=5).strip()
+            for engine in IMAGES:
+                if boot != images[engine]['boot_id'] or organization_daemon_image(docker, engine) != images[engine]['daemon_image']:
+                    raise RelayIdentityError('cleanup cannot cross a boot, daemon or fixed image change')
+                # A failed create can still have made an unstarted owned service.
+                # Reconcile that exact service before down; unknown mounts stay unclaimed.
+                if engine not in containers:
+                    cid = run(compose + ['ps', '-aq', engine]).strip()
+                    if cid:
+                        if not re.fullmatch(r'[a-f0-9]{64}', cid):
+                            raise ValueError('ambiguous partial-create container')
+                        containers[engine] = cid
+                        capture_organization_mounts(docker, args.project, engine, cid, images[engine], preserved, owned)
+            current = set(run(docker + ['ps', '-aq', '--no-trunc', '--filter', 'label=com.docker.compose.project=' + args.project]).splitlines())
+            if current != set(containers.values()):
+                raise ValueError('unknown project container appeared; refusing project cleanup')
+            # No --volumes: preserved/unknown mounts can never be deleted by Compose.
+            run(compose + ['down', '--timeout', '20'], timeout=90)
+            if run(docker + ['ps', '-aq', '--filter', 'label=com.docker.compose.project=' + args.project]).strip():
+                raise RuntimeError('owned containers remain')
+            if run(docker + ['network', 'ls', '-q', '--filter', 'label=com.docker.compose.project=' + args.project]).strip():
+                raise RuntimeError('owned network remains')
+            cleanup_organization_volumes(docker, preserved, owned)
+        except (Exception, KeyboardInterrupt) as error:
+            cleanup_error = f'{type(error).__name__}: {error}'
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+    print(json.dumps({'suite': suite, 'dialects': results, 'primary_error': primary_error,
+                      'process_cleanup_error': process_cleanup_error, 'cleanup_error': cleanup_error}), flush=True)
+    return int(primary_error is not None or process_cleanup_error is not None or cleanup_error is not None)
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--context', required=True)
@@ -671,11 +993,19 @@ def main(argv=None):
     parser.add_argument('--docker-config', type=Path, required=True)
     parser.add_argument('--image-evidence', type=Path, required=True)
     parser.add_argument('--relay-evidence', type=Path, required=True)
+    parser.add_argument('--suite', choices=('database-contract', 'organization-identity', 'organization-task-read'), default='database-contract')
+    parser.add_argument('--image-metadata', type=Path)
+    parser.add_argument('--preserve-volumes', type=Path)
+    parser.add_argument('--go', type=Path)
     args = parser.parse_args(argv)
     validate_inherited_environment(os.environ)
     if not re.fullmatch(r'newapi-ci-[a-z0-9-]+', args.project):
         raise ValueError('a unique newapi-ci-* project name is required')
     docker = docker_command(args.docker_config, args.context)
+    if args.suite in ORGANIZATION_READ_SUITES:
+        return run_organization_identity(args, docker)
+    if args.image_metadata is not None or args.preserve_volumes is not None or args.go is not None:
+        raise ValueError('organization-only inputs cannot alter the default database gate')
     preflight(docker)
     compose = docker + ['compose', '-p', args.project, '-f', str(Path(__file__).with_name('database-compose.yml')),
                         '--profile', 'isolated-ci']

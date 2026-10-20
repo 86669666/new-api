@@ -42,11 +42,15 @@ func accessTokenScopeRule(scope string) accessTokenRouteRule {
 // DeclareAccessTokenPermissionRoute when they are registered.
 var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	// Organization access is backed only by a live dashboard session.
-	"GET /api/organizations":                 accessTokenSessionRule,
-	"GET /api/organization-context":          accessTokenSessionRule,
-	"GET /api/organizations/:org_id":         accessTokenSessionRule,
-	"GET /api/organizations/:org_id/members": accessTokenSessionRule,
-	"GET /api/organizations/:org_id/events":  accessTokenSessionRule,
+	"GET /api/organizations":                                                             accessTokenSessionRule,
+	"GET /api/organization-context":                                                      accessTokenSessionRule,
+	"GET /api/organizations/:org_id":                                                     accessTokenSessionRule,
+	"GET /api/organizations/:org_id/members":                                             accessTokenSessionRule,
+	"GET /api/organizations/:org_id/events":                                              accessTokenSessionRule,
+	"GET /api/organizations/:org_id/tasks/:task_row_id":                                  accessTokenSessionRule,
+	"GET /api/organizations/:org_id/tasks/:task_row_id/artifacts":                        accessTokenSessionRule,
+	"GET /api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content":  accessTokenSessionRule,
+	"HEAD /api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content": accessTokenSessionRule,
 
 	"POST /api/organizations":                                                                 accessTokenSessionRule,
 	"PATCH /api/organizations/:org_id/name":                                                   accessTokenSessionRule,

@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -21,6 +23,7 @@ type OrganizationCommandDTO struct {
 	Revision           string  `json:"revision,omitempty"`
 	Name               string  `json:"name,omitempty"`
 	TargetUserID       string  `json:"target_user_id,omitempty"`
+	Username           string  `json:"username,omitempty"`
 	Role               string  `json:"role,omitempty"`
 	Disabled           *bool   `json:"disabled,omitempty"`
 	Reason             *string `json:"reason,omitempty"`
@@ -166,14 +169,35 @@ func exactOrganizationFields(data []byte, fields []string) error {
 func DecodeOrganizationCommand(action string, data []byte, full bool, orgID, targetID, objectID string) (OrganizationCommandDTO, model.OrganizationCommand, error) {
 	var wire OrganizationCommandDTO
 	var cmd model.OrganizationCommand
-	if err := exactOrganizationFields(data, organizationCommandFields(action, full)); err != nil {
+	fields := organizationCommandFields(action, full)
+	var rawFields map[string]common.RawMessage
+	if common.Unmarshal(data, &rawFields) != nil {
+		return wire, cmd, model.ErrOrganizationInvalidInput
+	}
+	if _, present := rawFields["username"]; action == "invite" && present {
+		for index, field := range fields {
+			if field == "target_user_id" {
+				fields[index] = "username"
+			}
+		}
+	}
+	if err := exactOrganizationFields(data, fields); err != nil {
 		return wire, cmd, err
 	}
 	if common.UnmarshalStrictObject(data, &wire) != nil {
 		return wire, cmd, model.ErrOrganizationInvalidInput
 	}
-	var rawFields map[string]common.RawMessage
-	_ = common.Unmarshal(data, &rawFields)
+	if _, present := rawFields["username"]; present {
+		if wire.Username == "" || !utf8.ValidString(wire.Username) || utf8.RuneCountInString(wire.Username) > 20 {
+			return wire, cmd, model.ErrOrganizationInvalidInput
+		}
+		for _, r := range wire.Username {
+			if unicode.IsControl(r) {
+				return wire, cmd, model.ErrOrganizationInvalidInput
+			}
+		}
+		cmd.Username = wire.Username
+	}
 	for _, field := range []string{"organization_id", "revision", "target_user_id", "invitation_id", "transfer_id", "generation", "previous_id", "previous_generation"} {
 		if raw, present := rawFields[field]; present {
 			var value string
@@ -266,6 +290,11 @@ func PreviewOrganizationOperation(identity AuthIdentity, action string, wire Org
 }
 
 func PreviewOrganizationOperationWithContext(ctx context.Context, identity AuthIdentity, action string, wire OrganizationCommandDTO, cmd model.OrganizationCommand) (VerificationOperation, *model.OrganizationAuthorizationBinding, string, error) {
+	var err error
+	wire, cmd, err = canonicalOrganizationInvitationCommand(ctx, identity, action, wire, cmd)
+	if err != nil {
+		return VerificationOperation{}, nil, "", err
+	}
 	b, name, err := model.PreviewOrganizationCommandWithContext(ctx, identity, action, cmd)
 	if err != nil {
 		return VerificationOperation{}, nil, "", err
@@ -297,6 +326,11 @@ func RebuildOrganizationOperationWithContext(ctx context.Context, identity AuthI
 		Snapshot      common.RawMessage `json:"snapshot"`
 	}
 	if common.UnmarshalStrictObject(op.Context, &context) != nil || context.SchemaVersion != 1 {
+		return op, cmd, nil, ErrVerificationContextInvalid
+	}
+	// Proof producers and rebuilds accept only the original ID command shape.
+	// The HTTP username selector is resolved before constructing this context.
+	if action == "invite" && exactOrganizationFields(context.Command, organizationCommandFields(action, true)) != nil {
 		return op, cmd, nil, ErrVerificationContextInvalid
 	}
 	wire, cmd, err := DecodeOrganizationCommand(action, context.Command, true, "", "", "")
@@ -575,7 +609,24 @@ func ExecuteOrganizationLifecycle(identity AuthIdentity, action string, wire Org
 	return ExecuteOrganizationLifecycleWithContext(context.Background(), identity, action, wire, cmd, rawProof)
 }
 
+func canonicalOrganizationInvitationCommand(ctx context.Context, identity AuthIdentity, action string, wire OrganizationCommandDTO, cmd model.OrganizationCommand) (OrganizationCommandDTO, model.OrganizationCommand, error) {
+	if action != "invite" || wire.Username == "" {
+		return wire, cmd, nil
+	}
+	resolved, err := model.ResolveOrganizationInvitationTargetWithContext(ctx, identity, action, cmd)
+	if err != nil {
+		return wire, cmd, err
+	}
+	wire.TargetUserID, wire.Username = strconv.Itoa(resolved.TargetUserID), ""
+	return wire, resolved, nil
+}
+
 func ExecuteOrganizationLifecycleWithContext(ctx context.Context, identity AuthIdentity, action string, wire OrganizationCommandDTO, cmd model.OrganizationCommand, rawProof string) (*model.OrganizationMutationReceipt, error) {
+	var err error
+	wire, cmd, err = canonicalOrganizationInvitationCommand(ctx, identity, action, wire, cmd)
+	if err != nil {
+		return nil, err
+	}
 	if action == "create" {
 		if rawProof != "" {
 			return nil, model.ErrOrganizationInvalidInput

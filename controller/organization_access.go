@@ -205,8 +205,93 @@ func serveOrganizationTasks(c *gin.Context, orgID int64) {
 	}
 	pageInfo := &common.PageInfo{Page: int(page), PageSize: int(pageSize)}
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(tasksToDto(items, false, common.RoleCommonUser))
+	projected := tasksToDto(items, false, common.RoleCommonUser)
+	for index, item := range projected {
+		item.TaskRowID = strconv.FormatInt(items[index].ID, 10)
+		// Provider error text is not an organization artifact delivery channel.
+		item.FailReason = ""
+		item.ResultURL = ""
+	}
+	pageInfo.SetItems(projected)
 	common.ApiSuccess(c, pageInfo)
+}
+
+// OrganizationTaskReadHandler serves only the current session's bounded
+// organization task view. All potentially blocking artifact work finishes
+// before the final authoritative check that precedes first response publication.
+func OrganizationTaskReadHandler(kind string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		identity, ok := middleware.RequireOrganizationScopeSession(c)
+		if !ok {
+			return
+		}
+		orgID, selectionError := middleware.OrganizationSelection(c)
+		rowID, valid := middleware.ParseOrganizationDecimal(c.Param("task_row_id"))
+		query, queryError := url.ParseQuery(c.Request.URL.RawQuery)
+		invalid := selectionError != "" || orgID <= 0 || !valid || rowID <= 0 || queryError != nil
+		for name, values := range query {
+			if name != "org_id" || len(values) != 1 {
+				invalid = true
+			}
+		}
+		if invalid || rejectOrganizationReadWriteInputs(c) != nil {
+			writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, model.ErrOrganizationInvalidInput)
+			return
+		}
+		task, actorRole, err := model.ReadOrganizationTaskWithContext(c.Request.Context(), identity, orgID, rowID)
+		if err != nil {
+			writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+			return
+		}
+		beforePublish := func() error {
+			_, role, err := model.ReadOrganizationTaskWithContext(c.Request.Context(), identity, orgID, rowID)
+			actorRole = role
+			return err
+		}
+		switch kind {
+		case "detail":
+			if err := beforePublish(); err != nil {
+				writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+				return
+			}
+			created := task.CreatedAt
+			if created == 0 {
+				created = task.SubmitTime
+			}
+			common.ApiSuccess(c, gin.H{
+				"task_row_id": strconv.FormatInt(task.ID, 10), "task_id": task.TaskID,
+				"platform": task.Platform, "action": task.Action, "status": task.Status,
+				"progress": task.Progress, "created_at": created, "submit_time": task.SubmitTime,
+				"start_time": task.StartTime, "finished_at": task.FinishTime,
+			})
+		case "artifacts":
+			artifacts, projectionError := projectTaskArtifacts(task)
+			if err := beforePublish(); err != nil {
+				writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+				return
+			}
+			if projectionError != nil {
+				writeTaskArtifactProjectionError(c, projectionError)
+				return
+			}
+			items := make([]taskArtifactResponse, 0, len(artifacts)+1)
+			base := "/api/organizations/" + strconv.FormatInt(orgID, 10) + "/tasks/" + strconv.FormatInt(rowID, 10) + "/artifacts/"
+			for _, artifact := range artifacts {
+				items = append(items, taskArtifactResponse{Key: artifact.Key, Type: artifact.Type, MimeType: artifact.MimeType, ContentURL: base + url.PathEscape(artifact.Key) + "/content"})
+			}
+			if legacyVideoAvailable(task) {
+				items = append(items, taskArtifactResponse{Key: "video", Type: "video", ContentURL: base + "video/content"})
+			}
+			// Legacy audio snapshots contain provider URLs and are not projected.
+			common.ApiSuccess(c, gin.H{"task_row_id": strconv.FormatInt(rowID, 10), "task_id": task.TaskID, "artifacts": items})
+		case "content":
+			if err := writeTaskArtifactContent(c, task, beforePublish); err != nil {
+				writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+			}
+		default:
+			writeOrganizationAccessError(c, model.ErrOrganizationInvalidInput)
+		}
+	}
 }
 
 func writeOrganizationAccessError(c *gin.Context, err error) string {

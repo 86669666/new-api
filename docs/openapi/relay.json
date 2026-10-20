@@ -7749,6 +7749,22 @@
       {
         "method": "GET",
         "path": "/api/task/self"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content"
+      },
+      {
+        "method": "HEAD",
+        "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content"
       }
     ],
     "positive_resource_selector_routes": [

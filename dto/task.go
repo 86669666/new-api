@@ -33,6 +33,7 @@ func (t *TaskResponse[T]) IsSuccess() bool {
 
 type TaskDto struct {
 	ID                   int64  `json:"id"`
+	TaskRowID            string `json:"task_row_id,omitempty"`
 	CreatedAt            int64  `json:"created_at"`
 	UpdatedAt            int64  `json:"updated_at"`
 	TaskID               string `json:"task_id"`

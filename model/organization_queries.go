@@ -24,6 +24,7 @@ type OrganizationView struct {
 type OrganizationMemberView struct {
 	ID       int64
 	UserID   int
+	Username string
 	Role     string
 	Revision int64
 	JoinedAt int64
@@ -116,17 +117,43 @@ func ListOrganizationMembersForActor(i AuthSessionIdentity, orgID int64, p Organ
 		if err := s.tx.Where("organization_id = ? AND removed_at = 0 AND id > ?", orgID, p.AfterID).Order("id").Limit(p.Limit).Find(&members).Error; err != nil {
 			return err
 		}
-		for _, m := range members {
-			role := m.Role
-			if m.UserID == s.org.OwnerUserID {
-				role = OrganizationRoleOwner
-			}
-			result = append(result, OrganizationMemberView{ID: m.ID, UserID: m.UserID, Role: role, Revision: m.Revision, JoinedAt: m.JoinedAt})
-		}
-		return nil
+		var err error
+		result, err = s.memberViews(members)
+		return err
 	})
 	return result, err
 }
+
+// memberViews reads names only for the authorized page, without acquiring user
+// locks after organization locks. Missing or soft-deleted users retain their
+// membership entry and cursor with an empty username.
+func (s *organizationState) memberViews(members []OrganizationMember) ([]OrganizationMemberView, error) {
+	result := make([]OrganizationMemberView, 0, len(members))
+	if len(members) == 0 {
+		return result, nil
+	}
+	ids := make([]int, 0, len(members))
+	for _, member := range members {
+		ids = append(ids, member.UserID)
+	}
+	var users []User
+	if err := s.tx.Select("id", "username").Where("id IN ?", ids).Find(&users).Error; err != nil {
+		return nil, err
+	}
+	names := make(map[int]string, len(users))
+	for _, user := range users {
+		names[user.Id] = user.Username
+	}
+	for _, member := range members {
+		role := member.Role
+		if member.UserID == s.org.OwnerUserID {
+			role = OrganizationRoleOwner
+		}
+		result = append(result, OrganizationMemberView{ID: member.ID, UserID: member.UserID, Username: names[member.UserID], Role: role, Revision: member.Revision, JoinedAt: member.JoinedAt})
+	}
+	return result, nil
+}
+
 func ListOrganizationEventsForActor(i AuthSessionIdentity, orgID int64, p OrganizationPage) ([]OrganizationEvent, error) {
 	if !p.valid() {
 		return nil, ErrOrganizationInvalidInput

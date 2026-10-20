@@ -7850,6 +7850,28 @@
     "valid": true
   },
   {
+    "name": "S3 HTTP 409 ORG_ALREADY_MEMBER",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "This user is already a member of the organization.",
+      "code": "ORG_ALREADY_MEMBER"
+    },
+    "valid": true
+  },
+  {
+    "name": "S3 HTTP 409 ORG_INVITATION_EXISTS",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "An invitation already exists for this user. Use reissue to send another invitation.",
+      "code": "ORG_INVITATION_EXISTS"
+    },
+    "valid": true
+  },
+  {
     "name": "S3 HTTP 409 ORG_DISABLED",
     "document": "api",
     "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
@@ -8432,6 +8454,296 @@
     "document": "api",
     "schema": "#/components/schemas/OrganizationCacheControl",
     "value": "private, no-store,",
+    "valid": false
+  },
+  {
+    "name": "organization username invite",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "username": "target@example.test",
+      "role": "member"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization username unicode boundary",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "username": "名名名名名名名名名名名名名名名名名名名名",
+      "role": "member"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization username missing",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "role": "member"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization username plus ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "username": "target@example.test",
+      "role": "member",
+      "target_user_id": "2"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization username null",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "username": null,
+      "role": "member"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization username empty",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "username": "",
+      "role": "member"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization username over boundary",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "username": "名名名名名名名名名名名名名名名名名名名名名",
+      "role": "member"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization username controls",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "username": "target\n",
+      "role": "member"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization email selector",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyInvite",
+    "value": {
+      "revision": "1",
+      "email": "target@example.test",
+      "role": "member"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization username preview input",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecyclePreviewBody1",
+    "value": {
+      "action": "invite",
+      "command": {
+        "organization_id": "1",
+        "revision": "1",
+        "username": "target@example.test",
+        "role": "admin"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization raw username canonical command rejected",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleCommandInvite",
+    "value": {
+      "organization_id": "1",
+      "revision": "1",
+      "username": "target@example.test",
+      "role": "admin"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization reissue username rejected",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleBodyReissue",
+    "value": {
+      "revision": "1",
+      "username": "target@example.test",
+      "role": "member",
+      "generation": "1"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization unavailable member username",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationMember",
+    "value": {
+      "member_id": "1",
+      "user_id": "2",
+      "role": "member",
+      "revision": "1",
+      "joined_at": 1,
+      "username": ""
+    },
+    "valid": true
+  },
+  {
+    "name": "organization task safe detail",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskDetail",
+    "value": {
+      "task_row_id": "9007199254740993",
+      "task_id": "shared-public-id",
+      "platform": "document",
+      "action": "TEXT_TO_VIDEO",
+      "status": "SUCCESS",
+      "progress": "100%",
+      "created_at": 1,
+      "submit_time": 1,
+      "start_time": 1,
+      "finished_at": 2
+    },
+    "valid": true
+  },
+  {
+    "name": "organization task numeric row ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskDetail",
+    "value": {
+      "task_row_id": 9007199254740993,
+      "task_id": "shared-public-id",
+      "platform": "document",
+      "action": "TEXT_TO_VIDEO",
+      "status": "SUCCESS",
+      "progress": "100%",
+      "created_at": 1,
+      "submit_time": 1,
+      "start_time": 1,
+      "finished_at": 2
+    },
+    "valid": false
+  },
+  {
+    "name": "organization task provider URL detail",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskDetail",
+    "value": {
+      "task_row_id": "9007199254740993",
+      "task_id": "shared-public-id",
+      "platform": "document",
+      "action": "TEXT_TO_VIDEO",
+      "status": "SUCCESS",
+      "progress": "100%",
+      "created_at": 1,
+      "submit_time": 1,
+      "start_time": 1,
+      "finished_at": 2,
+      "result_url": "https://provider.invalid/private"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization task private snapshot detail",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskDetail",
+    "value": {
+      "task_row_id": "9007199254740993",
+      "task_id": "shared-public-id",
+      "platform": "document",
+      "action": "TEXT_TO_VIDEO",
+      "status": "SUCCESS",
+      "progress": "100%",
+      "created_at": 1,
+      "submit_time": 1,
+      "start_time": 1,
+      "finished_at": 2,
+      "data": {
+        "private": "hidden"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization task relative artifact",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskArtifacts",
+    "value": {
+      "task_row_id": "9007199254740993",
+      "task_id": "shared-public-id",
+      "artifacts": [
+        {
+          "key": "video",
+          "type": "video",
+          "content_url": "/api/organizations/1/tasks/9007199254740993/artifacts/video/content"
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "organization task empty artifacts",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskArtifacts",
+    "value": {
+      "task_row_id": "9007199254740993",
+      "task_id": "shared-public-id",
+      "artifacts": []
+    },
+    "valid": true
+  },
+  {
+    "name": "organization task provider artifact",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskArtifacts",
+    "value": {
+      "task_row_id": "9007199254740993",
+      "task_id": "shared-public-id",
+      "artifacts": [
+        {
+          "key": "video",
+          "type": "video",
+          "content_url": "https://provider.invalid/private"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "organization task anonymous artifact",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskArtifacts",
+    "value": {
+      "task_row_id": "9007199254740993",
+      "task_id": "shared-public-id",
+      "artifacts": [
+        {
+          "key": "video",
+          "type": "video",
+          "content_url": "/api/organizations/1/tasks/9007199254740993/artifacts/video/content?access=hidden"
+        }
+      ]
+    },
     "valid": false
   }
 ]

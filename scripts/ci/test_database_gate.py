@@ -134,6 +134,215 @@ class DatabaseGateContracts(unittest.TestCase):
             self.assertNotIn('private', str(error.exception))
 
 
+
+class OrganizationIdentityContracts(unittest.TestCase):
+    def setUp(self):
+        self.old = {'a' * 64: self.volume('a' * 64), 'b' * 64: self.volume('b' * 64)}
+        self.new = self.volume('c' * 64)
+
+    @staticmethod
+    def volume(name):
+        return {'Name': name, 'Driver': 'local', 'Labels': {'com.docker.volume.anonymous': ''},
+                'Options': None, 'CreatedAt': '2026-10-21T00:00:00Z', 'Scope': 'local'}
+
+    def test_explicit_baseline_does_not_adopt_extra_volumes(self):
+        base = [json.dumps([{'Endpoints': {'docker': {'Host': runner.SOCKET}}}]),
+                json.dumps({'OSType': 'linux', 'Architecture': 'arm64'}), '',
+                '\n'.join(self.old) + '\nextra-volume\n']
+        with patch.object(runner, 'run', side_effect=base), self.assertRaises(ValueError):
+            runner.preflight(['docker'], preserve_volumes=self.old)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'baseline.json'
+            path.write_text(json.dumps(list(self.old.values())))
+            self.assertEqual(runner.preserved_volume_baseline(path), self.old)
+            path.write_text(json.dumps([self.new]))
+            with self.assertRaises(ValueError):
+                runner.preserved_volume_baseline(path)
+
+    def test_historical_mount_refused_before_start(self):
+        cid = 'd' * 64
+        data = {'Id': cid, 'Config': {'Image': runner.IMAGES['mysql'], 'Labels': {
+                    'com.docker.compose.project': 'newapi-ci-test', 'com.docker.compose.service': 'mysql'}},
+                'Image': runner.IMAGES['mysql'].split('@')[1],
+                'State': {'Running': False, 'StartedAt': '0001-01-01T00:00:00Z'}, 'HostConfig': {},
+                'Mounts': [{'Type': 'volume', 'Name': next(iter(self.old)), 'Driver': 'local', 'RW': True,
+                            'Destination': '/var/lib/mysql', 'Source': '/a'}]}
+        image = {'daemon_image': {'volumes': ['/var/lib/mysql']}}
+        with patch.object(runner, 'run', return_value=json.dumps([data])) as command, self.assertRaises(ValueError):
+            runner.capture_organization_mounts(['docker'], 'newapi-ci-test', 'mysql', cid, image, self.old, {})
+        self.assertEqual(len(command.call_args_list), 1)
+        self.assertNotIn('start', repr(command.call_args_list))
+        data['Mounts'][0].update(Type='bind', Name='c' * 64)
+        with patch.object(runner, 'run', return_value=json.dumps([data])), self.assertRaises(ValueError):
+            runner.capture_organization_mounts(['docker'], 'newapi-ci-test', 'mysql', cid, image, self.old, {})
+
+    def test_only_observed_image_anonymous_volume_is_owned(self):
+        cid, name = 'd' * 64, self.new['Name']
+        data = {'Id': cid, 'Config': {'Image': runner.IMAGES['mysql'], 'Labels': {
+                    'com.docker.compose.project': 'newapi-ci-test', 'com.docker.compose.service': 'mysql'}},
+                'Image': runner.IMAGES['mysql'].split('@')[1],
+                'State': {'Running': False, 'StartedAt': '0001-01-01T00:00:00Z'}, 'HostConfig': {},
+                'Mounts': [{'Type': 'volume', 'Name': name, 'Driver': 'local', 'RW': True,
+                            'Destination': '/var/lib/mysql', 'Source': '/owned'}]}
+        volume = dict(self.new, Mountpoint='/owned')
+        owned = {}
+        def command(argv, **kwargs):
+            if argv[1] == 'inspect':
+                return json.dumps([data])
+            if argv[1:3] == ['volume', 'inspect']:
+                return json.dumps([volume])
+            if argv[1:3] == ['ps', '-aq']:
+                # Docker's default is a 12-character ID, including stopped containers.
+                return (cid if '--no-trunc' in argv else cid[:12]) + '\n'
+            self.fail(argv)
+        with patch.object(runner, 'run', side_effect=command):
+            runner.capture_organization_mounts(['docker'], 'newapi-ci-test', 'mysql', cid,
+                                               {'daemon_image': {'volumes': ['/var/lib/mysql']}}, self.old, owned)
+        self.assertEqual(owned, {name: self.new})
+
+    def test_cleanup_uses_full_project_ids_after_start_refusal(self):
+        from types import SimpleNamespace
+        cids = {'mysql': 'd' * 64, 'postgres': 'e' * 64}
+        spec = {'services': {engine: {'image': image, 'pull_policy': 'never', 'platform': 'linux/arm64',
+                                     'networks': {'isolated': {}}} for engine, image in runner.IMAGES.items()},
+                'networks': {'isolated': {'internal': True}}}
+        image = {'boot_id': 'boot', 'daemon_image': {'daemon_id': 'daemon'}}
+        removed = False
+        def command(argv, **kwargs):
+            nonlocal removed
+            if argv[0] == 'colima':
+                return 'boot'
+            if 'config' in argv:
+                return json.dumps(spec)
+            if 'compose' in argv and 'ps' in argv:
+                return cids[argv[-1]] + '\n'
+            if argv[1:3] == ['volume', 'ls']:
+                return '\n'.join(self.old)
+            if 'start' in argv:
+                raise RuntimeError('test start refused')
+            if 'down' in argv:
+                self.assertNotIn('--volumes', argv)
+                removed = True
+            if argv[1:3] == ['ps', '-aq']:
+                return '' if removed else '\n'.join(cid if '--no-trunc' in argv else cid[:12] for cid in cids.values())
+            return ''
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / 'preserved.json'
+            baseline.write_text(json.dumps(list(self.old.values())))
+            args = SimpleNamespace(image_metadata=root, preserve_volumes=baseline, go=Path('/go'),
+                                   image_evidence=root / 'images', relay_evidence=root / 'relay.json', project='newapi-ci-test')
+            with patch.dict(os.environ, {}, clear=True), patch.object(runner, 'preflight'), \
+                    patch.object(runner, 'verify_live_organization_image', return_value=image), \
+                    patch.object(runner, 'organization_daemon_image', return_value=image['daemon_image']), \
+                    patch.object(runner, 'capture_organization_mounts', return_value=[]), \
+                    patch.object(runner, 'verify_preserved_volumes'), \
+                    patch.object(runner, 'cleanup_organization_volumes') as cleanup, \
+                    patch.object(runner, 'run', side_effect=command), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(runner.run_organization_identity(args, ['docker']), 1)
+                result = json.loads(output.getvalue())
+                self.assertIn('test start refused', result['primary_error'])
+                self.assertIsNone(result['cleanup_error'])
+                self.assertTrue(removed)
+                cleanup.assert_called_once_with(['docker'], self.old, {})
+
+    def test_cleanup_never_deletes_history_changed_or_unknown_volumes(self):
+        name = self.new['Name']
+        for mode in ('owned', 'changed', 'attached', 'unknown'):
+            calls = []
+            def command(argv, **kwargs):
+                calls.append(argv)
+                if argv[1:3] == ['volume', 'inspect']:
+                    value = self.old.get(argv[3], self.new)
+                    if argv[3] == name and mode == 'changed':
+                        value = dict(value, CreatedAt='different')
+                    return json.dumps([value])
+                if argv[1:3] == ['ps', '-aq']:
+                    return 'attached\n' if argv[-1] == 'volume=' + name and mode == 'attached' else ''
+                if argv[1:3] == ['volume', 'rm']:
+                    self.assertEqual(argv[3], name)
+                    return name
+                if argv[1:3] == ['volume', 'ls']:
+                    return '\n'.join([*self.old, *([name] if mode in ('changed', 'attached') else []), *(['unknown'] if mode == 'unknown' else [])])
+                self.fail(argv)
+            with self.subTest(mode=mode), patch.object(runner, 'run', side_effect=command):
+                if mode == 'owned':
+                    runner.cleanup_organization_volumes(['docker'], self.old, {name: self.new})
+                else:
+                    with self.assertRaises(RuntimeError):
+                        runner.cleanup_organization_volumes(['docker'], self.old, {name: self.new})
+                deleted = [argv[3] for argv in calls if argv[1:3] == ['volume', 'rm']]
+                self.assertEqual(deleted, [name] if mode in ('owned', 'unknown') else [])
+                self.assertFalse(set(deleted) & self.old.keys())
+
+    def test_exact_http_roots_and_package_cannot_be_skipped_or_substituted(self):
+        events = [{'Action': 'pass', 'Package': 'github.com/QuantumNous/new-api/router', 'Test': test}
+                  for test in runner.ORGANIZATION_IDENTITY_ROOTS]
+        events.append({'Action': 'pass', 'Package': 'github.com/QuantumNous/new-api/router'})
+        self.assertEqual(runner.validate_organization_identity_events(events)['roots'], sorted(runner.ORGANIZATION_IDENTITY_ROOTS))
+        for candidate in (events[1:], events[:-1], events + [{'Action': 'skip'}], events + [{'Action': 'fail'}],
+                          events + [{'Action': 'pass', 'Package': 'github.com/QuantumNous/new-api/router', 'Test': 'UnrelatedRoot'}],
+                          [dict(event, Package='github.com/QuantumNous/new-api/model') for event in events]):
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate)
+
+    def test_task_read_suite_cannot_run_identity_or_an_unbounded_root_set(self):
+        package = 'github.com/QuantumNous/new-api/router'
+        events = [{'Action': 'pass', 'Package': package, 'Test': 'TestOrganizationTaskReadLifecycle'},
+                  {'Action': 'pass', 'Package': package}]
+        result = runner.validate_organization_identity_events(events, 'organization-task-read')
+        self.assertEqual(result['roots'], ['TestOrganizationTaskReadLifecycle'])
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES['organization-task-read'][1], 'g10-organization-task-read')
+        for candidate in (events[1:], events[:-1], events + [{'Action': 'skip'}], events + [{'Action': 'fail'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': 'TestOrganizationLifecycleInvitationIdentity'}]):
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, 'organization-task-read')
+        with self.assertRaises(ValueError):
+            runner.validate_organization_identity_events(events, 'organization-identity')
+        with self.assertRaises(ValueError):
+            runner.validate_organization_identity_events(events, 'arbitrary')
+
+    def test_live_image_recomputes_bytes_instead_of_trusting_receipt_flags(self):
+        import hashlib
+        config = {'os': 'linux', 'architecture': 'arm64', 'rootfs': {'type': 'layers', 'diff_ids': ['sha256:layer']},
+                  'config': {'Volumes': {'/var/lib/mysql': {}}}}
+        config_bytes = json.dumps(config).encode()
+        config_digest = 'sha256:' + hashlib.sha256(config_bytes).hexdigest()
+        manifest = {'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+                    'config': {'digest': config_digest, 'size': len(config_bytes)}}
+        manifest_bytes = json.dumps(manifest).encode()
+        digest = 'sha256:' + hashlib.sha256(manifest_bytes).hexdigest()
+        metadata = {'mode': 'metadata', 'verified': True, 'repository': 'library/mysql', 'digest': digest,
+                    'platform': {'os': 'linux', 'architecture': 'arm64'}, 'manifest': manifest,
+                    'config_digest': config_digest, 'rootfs': config['rootfs']}
+        metadata_bytes = json.dumps(metadata).encode()
+        daemon = {'descriptor': {'size': len(manifest_bytes)}, 'rootfs': {'Type': 'layers', 'Layers': ['sha256:layer']},
+                  'volumes': ['/var/lib/mysql']}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'metadata.json'
+            path.write_bytes(metadata_bytes)
+            for mutation in ('none', 'manifest', 'config', 'rootfs', 'boot'):
+                current = copy.deepcopy(daemon)
+                if mutation == 'rootfs': current['rootfs']['Layers'] = ['changed']
+                answers = ['boot-1', manifest_bytes + (b' ' if mutation == 'manifest' else b''),
+                           config_bytes + (b' ' if mutation == 'config' else b''), 'boot-2' if mutation == 'boot' else 'boot-1']
+                with self.subTest(mutation=mutation), \
+                        patch.dict(runner.IMAGES, {'mysql': 'docker.io/library/mysql@' + digest}), \
+                        patch.dict(runner.ORGANIZATION_METADATA_SHA, {'mysql': hashlib.sha256(metadata_bytes).hexdigest()}), \
+                        patch.object(runner, 'organization_daemon_image', return_value=current), \
+                        patch.object(runner, 'run', side_effect=answers):
+                    if mutation == 'none':
+                        proof = runner.verify_live_organization_image(['docker'], 'mysql', path)
+                        self.assertEqual(proof['format'], 'live-fixed-organization-image-v1')
+                        self.assertEqual(proof['containerd_socket'], '/run/containerd/containerd.sock')
+                        self.assertNotIn('accepted', proof)
+                    else:
+                        with self.assertRaises(runner.RelayIdentityError):
+                            runner.verify_live_organization_image(['docker'], 'mysql', path)
+            path.write_text(json.dumps({'accepted': True}))
+            with self.assertRaises(runner.RelayIdentityError):
+                runner.verify_live_organization_image(['docker'], 'mysql', path)
+
 class ReleasedDatabaseContracts(unittest.TestCase):
     def test_release_structure_preserves_columns_indexes_and_uniqueness(self):
         old = [{'table':'tokens', 'columns':[{'name':'key','type':'varchar'}],

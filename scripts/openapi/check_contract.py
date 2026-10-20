@@ -250,11 +250,83 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
                     assert len(expected[key]) == len(actual[key]), location
                     for index, value in enumerate(expected[key]):
                         compare_schema(value, actual[key][index], location + '.' + key + str(index))
+        # The current invite input adds one exact username branch. The frozen
+        # ID command, proof contexts and every other gate definition stay intact.
+        username = {
+            'type': 'string', 'minLength': 1, 'maxLength': 20,
+            'pattern': r'^[^\u0000-\u001F\u007F-\u009F]+$(?![\s\S])',
+            'description': 'Exact existing username, at most 20 Unicode code points. No trimming, case folding, accent folding or Unicode normalization; @ is permitted. This is not an email lookup.',
+        }
+        invite = schemas['OrganizationLifecycleBodyInvite']
+        assert set(invite) == {'description', 'oneOf'} and len(invite['oneOf']) == 2
+        username_body = {
+            'type': 'object', 'properties': {
+                'revision': {'$ref': '#/components/schemas/OrganizationLifecycleID'},
+                'role': {'type': 'string', 'enum': ['admin', 'member']},
+                'username': username,
+            }, 'required': ['revision', 'username', 'role'], 'additionalProperties': False,
+        }
+        assert invite['oneOf'][1] == username_body
+        username_command = {
+            'type': 'object', 'properties': {
+                'organization_id': {'$ref': '#/components/schemas/OrganizationLifecycleID'},
+                'revision': {'$ref': '#/components/schemas/OrganizationLifecycleID'},
+                'role': {'type': 'string', 'enum': ['admin']}, 'username': username,
+            }, 'required': ['organization_id', 'revision', 'username', 'role'], 'additionalProperties': False,
+        }
+        assert schemas['OrganizationLifecyclePreviewInviteUsernameCommand'] == username_command
+        preview = schemas['OrganizationLifecyclePreviewBody1']
+        assert set(preview) == {'oneOf'} and len(preview['oneOf']) == 9
+        assert preview['oneOf'][-1] == {
+            'type': 'object', 'properties': {
+                'action': {'type': 'string', 'enum': ['invite']},
+                'command': {'$ref': '#/components/schemas/OrganizationLifecyclePreviewInviteUsernameCommand'},
+            }, 'required': ['action', 'command'], 'additionalProperties': False,
+        }
         for key, expected in gate['$defs'].items():
-            compare_schema(expected, schemas[contract['schema_map'][key]], key)
+            actual = schemas[contract['schema_map'][key]]
+            if key == 'Body_invite':
+                actual = invite['oneOf'][0]
+            elif key == 'PreviewBody_1':
+                actual = {'oneOf': preview['oneOf'][:-1]}
+            compare_schema(expected, actual, key)
         gate_checked = True
     return {'routes': len(routes), 'schemas': len(contract['schema_map']), 'organization_scopes': len(scopes), 'frozen_design_checked': gate_checked, 'design_contract_id': contract['design_contract_id'], 'effective_design_gate_sha256': contract['design_gate_sha256'], 'live_http': False}
 
+
+
+def check_organization_task_reads(api):
+    base = '/api/organizations/{org_id}/tasks/{task_row_id}'
+    expected = [('GET', base), ('GET', base + '/artifacts'),
+                ('GET', base + '/artifacts/{artifact_key}/content'),
+                ('HEAD', base + '/artifacts/{artifact_key}/content')]
+    contract = api['x-organization-task-read-contract']
+    assert contract['routes'] == [{'method': method, 'path': path} for method, path in expected]
+    assert contract['task_identity'] == 'organization_id + internal row ID'
+    assert contract['list_row_id_field'] == 'task_row_id' and contract['session_only'] is True
+    assert contract['anonymous_artifact_access'] is False
+    for method, path in expected:
+        operation = api['paths'][path][method.lower()]
+        assert operation['security'] == [{'DashboardJWT': []}]
+        assert operation['x-query-allowlist'] == ['org_id']
+        assert operation['x-task-identity'] == contract['task_identity']
+        assert operation['x-anonymous-artifact-access'] is False
+        assert operation['x-delivery-authorization'] == contract['delivery_authorization']
+        assert operation['x-organization-state-mutation'] is False
+        assert {'method': method, 'path': path} in api['x-organization-selection-boundary']['positive_selector_allowlist']
+        for response in operation['responses'].values():
+            assert response['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
+    detail = api['components']['schemas']['OrganizationTaskDetail']
+    assert set(detail['properties']) == set(detail['required']) == {
+        'task_row_id', 'task_id', 'platform', 'action', 'status', 'progress',
+        'created_at', 'submit_time', 'start_time', 'finished_at'}
+    assert detail['additionalProperties'] is False
+    assert detail['properties']['task_row_id'] == {'$ref': '#/components/schemas/OrganizationLifecycleID'}
+    artifacts = api['components']['schemas']['OrganizationTaskArtifacts']
+    assert set(artifacts['properties']) == set(artifacts['required']) == {'task_row_id', 'task_id', 'artifacts'}
+    assert artifacts['additionalProperties'] is False
+    assert artifacts['properties']['artifacts']['items']['additionalProperties'] is False
+    return {'routes': len(expected), 'anonymous_access': False, 'live_http': False}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -300,6 +372,7 @@ def main():
         results['specs'][name] = {'oas': '3.0.1', 'paths': len(document['paths']), 'operations': len(ids), 'valid': True}
 
     api, relay = documents['api'], documents['relay']
+    results['organization_task_reads'] = check_organization_task_reads(api)
     # Bind documented PAT scope/session choices to the checked-in route policy.
     rules = re.findall(r'"([A-Z]+) ([^\"]+)":\s+(accessToken[^,\n]+)', (source_root / 'middleware/access_token_routes.go').read_text())
     for method, gin_path, rule in rules:

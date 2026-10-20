@@ -80,10 +80,17 @@ func isAllowedSessionOrigin(request *http.Request, origin string) bool {
 // forwarding headers and the secure-cookie development switch confer no trust.
 func OrganizationOriginAllowed(request *http.Request) bool {
 	if len(request.Header.Values("Origin")) == 0 && len(request.Header.Values("Referer")) == 0 {
-		for key := range request.Header {
-			if strings.HasPrefix(strings.ToLower(key), "sec-fetch-") {
+		// Native fetch clients may send only Sec-Fetch-Mode: cors. It does
+		// not establish browser origin trust or replace session validation.
+		modeSeen := false
+		for key, values := range request.Header {
+			if !strings.HasPrefix(strings.ToLower(key), "sec-fetch-") {
+				continue
+			}
+			if !strings.EqualFold(key, "Sec-Fetch-Mode") || modeSeen || len(values) != 1 || values[0] != "cors" {
 				return false
 			}
+			modeSeen = true
 		}
 		return true
 	}

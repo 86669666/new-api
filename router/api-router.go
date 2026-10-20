@@ -17,7 +17,7 @@ import (
 func SetApiRouter(router *gin.Engine) {
 	apiRouter := router.Group("/api")
 	apiRouter.Use(middleware.RouteTag("api"))
-	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
+	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPathsRegexs([]string{`^/api/organizations/[0-9]+/tasks/[0-9]+/artifacts/[^/]+/content$`})))
 	apiRouter.Use(middleware.AccessTokenAudit())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
@@ -28,6 +28,10 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/organizations/:org_id", middleware.UserAuth(), controller.GetOrganizationAccess)
 		apiRouter.GET("/organizations/:org_id/members", middleware.UserAuth(), controller.ListOrganizationMembers)
 		apiRouter.GET("/organizations/:org_id/events", middleware.UserAuth(), controller.ListOrganizationEvents)
+		apiRouter.GET("/organizations/:org_id/tasks/:task_row_id", middleware.UserAuth(), controller.OrganizationTaskReadHandler("detail"))
+		apiRouter.GET("/organizations/:org_id/tasks/:task_row_id/artifacts", middleware.UserAuth(), controller.OrganizationTaskReadHandler("artifacts"))
+		apiRouter.GET("/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content", middleware.UserAuth(), controller.OrganizationTaskReadHandler("content"))
+		apiRouter.HEAD("/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content", middleware.UserAuth(), controller.OrganizationTaskReadHandler("content"))
 
 		apiRouter.POST("/organizations", middleware.UserAuth(), controller.OrganizationLifecycleHandler("create"))
 		apiRouter.PATCH("/organizations/:org_id/name", middleware.UserAuth(), controller.OrganizationLifecycleHandler("rename"))

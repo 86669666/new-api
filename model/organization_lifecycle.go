@@ -138,6 +138,7 @@ func validateOrganizationCommand(action string, c OrganizationCommand) error {
 	case "invite", "reissue":
 		rest.TargetUserID = 0
 		rest.Username = ""
+		rest.ExpectedUsername = ""
 		rest.Role = ""
 		rest.ObjectID = 0
 		rest.Generation = 0
@@ -158,6 +159,20 @@ func validateOrganizationCommand(action string, c OrganizationCommand) error {
 	}
 	if rest != (OrganizationCommand{}) {
 		return ErrOrganizationInvalidInput
+	}
+	if c.Username != "" || c.ExpectedUsername != "" {
+		username := c.Username
+		if username == "" {
+			username = c.ExpectedUsername
+		}
+		if c.Username != "" && (c.TargetUserID != 0 || c.ExpectedUsername != "") || !utf8.ValidString(username) || utf8.RuneCountInString(username) > 20 {
+			return ErrOrganizationInvalidInput
+		}
+		for _, r := range username {
+			if unicode.IsControl(r) {
+				return ErrOrganizationInvalidInput
+			}
+		}
 	}
 	if action == "self_disable" || action == "platform_disable" {
 		if utf8.RuneCountInString(c.Reason) > 128 || !utf8.ValidString(c.Reason) || !c.Disabled && c.Reason != "" {
@@ -422,6 +437,55 @@ func InviteOrganizationMember(i AuthSessionIdentity, c OrganizationCommand) erro
 func ReissueOrganizationInvitation(i AuthSessionIdentity, c OrganizationCommand) error {
 	return issueOrganizationInvitation(i, c, true)
 }
+
+var errOrganizationInvitationTargetResolved = errors.New("organization invitation target resolved")
+
+// ResolveOrganizationInvitationTargetWithContext resolves a selector only after
+// the same invitation authority and revision checks as the write. Its dedicated
+// sentinel is usable only after an explicitly successful rollback, including the
+// SQLite actor reservation. Target user locks belong to the subsequent command.
+func ResolveOrganizationInvitationTargetWithContext(ctx context.Context, i AuthSessionIdentity, action string, c OrganizationCommand) (OrganizationCommand, error) {
+	if action != "invite" && action != "reissue" || c.Username == "" || c.TargetUserID != 0 || c.ExpectedUsername != "" || c.Authorization != nil || c.Role != OrganizationRoleMember && c.Role != OrganizationRoleAdmin {
+		return OrganizationCommand{}, ErrOrganizationInvalidInput
+	}
+	if err := validateOrganizationCommand(action, c); err != nil {
+		return OrganizationCommand{}, err
+	}
+	var resolved OrganizationCommand
+	err := withOrganizationWithContext(ctx, i, c, true, func(s *organizationState) error {
+		if err := s.requireEnabled(); err != nil {
+			return err
+		}
+		if !s.canInvite(c.Role) {
+			return ErrOrganizationForbidden
+		}
+		var user User
+		if err := s.tx.Select("id", "username").Where("username = ?", c.Username).First(&user).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrOrganizationNotFound
+			}
+			return err
+		}
+		// SQL collations may ignore case, accents or trailing spaces.
+		if user.Username != c.Username {
+			return ErrOrganizationNotFound
+		}
+		if err := s.tx.Rollback().Error; err != nil {
+			return err
+		}
+		resolved = c
+		resolved.TargetUserID, resolved.ExpectedUsername, resolved.Username = user.Id, c.Username, ""
+		return errOrganizationInvitationTargetResolved
+	}, &organizationExecution{ctx: ctx, action: action, preview: true})
+	if !errors.Is(err, errOrganizationInvitationTargetResolved) {
+		if err == nil {
+			err = ErrOrganizationInvalidInput
+		}
+		return OrganizationCommand{}, err
+	}
+	return resolved, nil
+}
+
 func issueOrganizationInvitation(i AuthSessionIdentity, c OrganizationCommand, reissue bool, options ...*organizationExecution) error {
 	action := "invite"
 	if reissue {
@@ -431,17 +495,15 @@ func issueOrganizationInvitation(i AuthSessionIdentity, c OrganizationCommand, r
 		return err
 	}
 	if c.Username != "" {
-		if c.TargetUserID != 0 {
-			return ErrOrganizationInvalidInput
+		ctx := context.Background()
+		if len(options) > 0 && options[0] != nil && options[0].ctx != nil {
+			ctx = options[0].ctx
 		}
-		var u User
-		if err := DB.Where("username = ?", c.Username).First(&u).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrOrganizationNotFound
-			}
+		var err error
+		c, err = ResolveOrganizationInvitationTargetWithContext(ctx, i, action, c)
+		if err != nil {
 			return err
 		}
-		c.TargetUserID = u.Id
 	}
 	if c.TargetUserID <= 0 || c.TargetUserID == i.UserID || c.Role != OrganizationRoleMember && c.Role != OrganizationRoleAdmin {
 		return ErrOrganizationInvalidInput
@@ -456,8 +518,11 @@ func issueOrganizationInvitation(i AuthSessionIdentity, c OrganizationCommand, r
 		if !s.activeUser(c.TargetUserID) {
 			return ErrOrganizationNotFound
 		}
-		if s.member(c.TargetUserID) != nil {
+		if c.ExpectedUsername != "" && s.users[c.TargetUserID].Username != c.ExpectedUsername {
 			return ErrOrganizationConflict
+		}
+		if s.member(c.TargetUserID) != nil {
+			return ErrOrganizationAlreadyMember
 		}
 		var old *OrganizationInvitation
 		for j := range s.invitations {
@@ -467,7 +532,10 @@ func issueOrganizationInvitation(i AuthSessionIdentity, c OrganizationCommand, r
 		}
 		generation := int64(1)
 		if old != nil {
-			if !reissue || old.ID != c.ObjectID || old.Generation != c.Generation {
+			if !reissue {
+				return ErrOrganizationInvitationExists
+			}
+			if old.ID != c.ObjectID || old.Generation != c.Generation {
 				return ErrOrganizationConflict
 			}
 			var err error

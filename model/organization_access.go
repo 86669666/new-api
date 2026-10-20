@@ -1,6 +1,11 @@
 package model
 
-import "gorm.io/gorm"
+import (
+	"context"
+	"errors"
+
+	"gorm.io/gorm"
+)
 
 // OrganizationAccessKind identifies the bounded, read-only access projections.
 // Lifecycle queries intentionally retain their separate recovery semantics.
@@ -61,6 +66,48 @@ func ReadOrganizationTasks(identity AuthSessionIdentity, orgID int64, queryParam
 		return nil, 0, actorRole, err
 	}
 	return tasks, total, actorRole, nil
+}
+
+// ReadOrganizationTaskWithContext binds every lookup to an internal row ID and
+// current organization authority. Repeated delivery checks use this same path;
+// neither public task IDs nor cached membership can authorize a response.
+func ReadOrganizationTaskWithContext(ctx context.Context, identity AuthSessionIdentity, orgID, taskRowID int64) (*Task, int, error) {
+	if orgID <= 0 || taskRowID <= 0 {
+		return nil, 0, ErrOrganizationInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	actorRole, err := organizationActorRole(identity)
+	if err != nil {
+		return nil, actorRole, err
+	}
+	var task Task
+	err = withOrganizationWithContext(ctx, identity, OrganizationCommand{OrganizationID: orgID}, false, func(s *organizationState) error {
+		actorRole = s.users[identity.UserID].Role
+		if s.member(identity.UserID) == nil || s.requireEnabled() != nil {
+			return ErrOrganizationNotFound
+		}
+		query := s.tx.Where("id = ? AND organization_id = ?", taskRowID, orgID)
+		if role := s.role(identity.UserID); role != OrganizationRoleOwner && role != OrganizationRoleAdmin {
+			query = query.Where("user_id = ?", identity.UserID)
+		}
+		if err := query.First(&task).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrOrganizationNotFound
+			}
+			return err
+		}
+		if !task.ResultRetrievable() {
+			return ErrOrganizationNotFound
+		}
+		_, err := validateOrganizationIdentity(s.tx, identity, organizationNow().Unix())
+		return err
+	})
+	if err != nil {
+		return nil, actorRole, err
+	}
+	return &task, actorRole, nil
 }
 
 // organizationActorRole is the preliminary session check that precedes S1's
@@ -152,13 +199,9 @@ func ReadOrganizationAccess(identity AuthSessionIdentity, kind OrganizationAcces
 			if err := s.tx.Where("organization_id = ? AND removed_at = 0 AND id > ?", orgID, page.AfterID).Order("id").Limit(page.Limit).Find(&members).Error; err != nil {
 				return err
 			}
-			result.Members = make([]OrganizationMemberView, 0, len(members))
-			for _, member := range members {
-				role := member.Role
-				if member.UserID == s.org.OwnerUserID {
-					role = OrganizationRoleOwner
-				}
-				result.Members = append(result.Members, OrganizationMemberView{ID: member.ID, UserID: member.UserID, Role: role, Revision: member.Revision, JoinedAt: member.JoinedAt})
+			result.Members, err = s.memberViews(members)
+			if err != nil {
+				return err
 			}
 		case OrganizationAccessEvents:
 			if view.MyRole != OrganizationRoleOwner && view.MyRole != OrganizationRoleAdmin {

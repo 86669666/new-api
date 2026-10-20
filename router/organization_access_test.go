@@ -200,6 +200,14 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 // only by the cleanup registered after that successful CREATE. SQLite is a real file.
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
+	owner := os.Getenv("NEWAPI_S2_OWNED")
+	if owner == "g10-organization-identity" || owner == "g10-organization-task-read" {
+		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
+		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+		require.Equal(t, "none", os.Getenv("NEWAPI_S2_CACHE_MODE"))
+		require.Equal(t, kind, os.Getenv("NEWAPI_S2_MAIN"))
+		require.Equal(t, kind, os.Getenv("NEWAPI_S2_LOG"))
+	}
 	config := &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)}
 	if kind == "sqlite" {
 		p := filepath.Join(t.TempDir(), "organization.db")
@@ -211,7 +219,9 @@ func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 		t.Log("SQLite fixture: temporary file")
 		return db, p
 	}
-	require.Contains(t, []string{"g5-A03", "g6-A03"}, os.Getenv("NEWAPI_S2_OWNED"), "dedicated runtime receipt required")
+	if owner != "g10-organization-identity" && owner != "g10-organization-task-read" {
+		require.Contains(t, []string{"g5-A03", "g6-A03"}, owner, "dedicated runtime receipt required")
+	}
 	require.NoError(t, organizationFixtureDSN(kind, source, os.Getenv("NEWAPI_S2_"+strings.ToUpper(kind)+"_PORT")))
 	// Use one canonical identifier for unquoted CREATE/DROP and the connection DSN.
 	name := "newapi_s2_" + strings.ToLower(strings.ReplaceAll(common.NewRequestId(), "-", ""))
@@ -699,6 +709,10 @@ func TestOrganizationAccessHTTP(t *testing.T) {
 func TestOrganizationSelectionProductionRoutes(t *testing.T) {
 	f := newOrganizationHTTPFixture(t)
 	allow := map[string]bool{"GET /api/organizations": true, "GET /api/organization-context": true, "GET /api/organizations/:org_id": true, "GET /api/organizations/:org_id/members": true, "GET /api/organizations/:org_id/events": true}
+	allow["GET /api/organizations/:org_id/tasks/:task_row_id"] = true
+	allow["GET /api/organizations/:org_id/tasks/:task_row_id/artifacts"] = true
+	allow["GET /api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content"] = true
+	allow["HEAD /api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content"] = true
 	allow["PATCH /api/organizations/:org_id/name"] = true
 	allow["POST /api/organizations/:org_id/self-state"] = true
 	allow["POST /api/platform/organizations/:org_id/state"] = true

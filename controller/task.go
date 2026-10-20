@@ -327,34 +327,63 @@ func TaskArtifactContent(c *gin.Context) {
 		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
 		return
 	}
+	_ = writeTaskArtifactContent(c, task, nil)
+}
+
+func writeTaskArtifactContent(c *gin.Context, task *model.Task, beforePublish func() error) error {
+	if task.OrganizationID != 0 && beforePublish == nil {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		return nil
+	}
+	var authorizationError error
+	authorize := beforePublish
+	if beforePublish != nil {
+		authorize = func() error {
+			authorizationError = beforePublish()
+			return authorizationError
+		}
+	}
 	artifactKey := strings.TrimSpace(c.Param("artifact_key"))
 	if !taskArtifactKeyPattern.MatchString(artifactKey) || !task.ResultRetrievable() {
 		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
-		return
+		return nil
 	}
 	if task.Status != model.TaskStatusSuccess {
 		writeTaskArtifactError(c, http.StatusConflict, "artifact_not_ready", "Task artifacts are not ready")
-		return
+		return nil
 	}
 	if !taskHasPluginExecution(task) {
 		if artifactKey != "video" || !legacyVideoAvailable(task) {
 			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
-			return
+			return nil
 		}
 		descriptor := &relaychannel.TaskContentRequest{
 			URL:            task.GetResultURL(),
 			Method:         c.Request.Method,
 			Credentialless: true,
 		}
-		if err := proxyTaskMedia(c, task, descriptor); err != nil {
+		if err := proxyTaskMedia(c, task, descriptor, authorize); err != nil {
+			if authorizationError != nil {
+				return authorizationError
+			}
+			if authorize != nil {
+				if authorizationError := authorize(); authorizationError != nil {
+					return authorizationError
+				}
+			}
 			writeTaskMediaProxyError(c, err)
 		}
-		return
+		return nil
 	}
 	artifacts, err := projectTaskArtifacts(task)
+	if authorize != nil {
+		if err := authorize(); err != nil {
+			return err
+		}
+	}
 	if err != nil {
 		writeTaskArtifactProjectionError(c, err)
-		return
+		return nil
 	}
 	found := false
 	for _, artifact := range artifacts {
@@ -365,39 +394,59 @@ func TaskArtifactContent(c *gin.Context) {
 	}
 	if !found {
 		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
-		return
+		return nil
 	}
 	artifactStore := service.GetTaskArtifactStore()
-	if ref, resolveErr := artifactStore.Resolve(task, artifactKey); resolveErr == nil && ref != nil {
+	if task.OrganizationID != 0 {
+		// No enabled backend currently provides a session-bound serving contract.
+		if artifactStore.Enabled() {
+			writeTaskArtifactError(c, http.StatusServiceUnavailable, "artifact_plugin_unavailable", "Artifact content plugin is unavailable")
+			return nil
+		}
+	} else if ref, resolveErr := artifactStore.Resolve(task, artifactKey); resolveErr == nil && ref != nil {
 		_ = artifactStore.Serve(c, task, ref)
-		return
+		return nil
 	}
 
 	adaptor, err := initTaskArtifactAdaptor(task)
 	if err != nil {
 		writeTaskArtifactProjectionError(c, err)
-		return
+		return nil
 	}
 	provider, ok := adaptor.(relaychannel.TaskContentRequestProvider)
 	if !ok {
 		writeTaskArtifactError(c, http.StatusServiceUnavailable, "artifact_plugin_unavailable", "Artifact content plugin is unavailable")
-		return
+		return nil
 	}
 	clientRequest := relaychannel.TaskArtifactClientRequest{
 		Method:  c.Request.Method,
 		Headers: taskArtifactClientHeaders(c.Request.Header),
 	}
 	descriptor, err := provider.BuildContentRequest(c.Request.Context(), task, artifactKey, clientRequest)
+	if authorize != nil {
+		if err := authorize(); err != nil {
+			return err
+		}
+	}
 	if err != nil || descriptor == nil {
 		if err != nil {
 			logger.LogWarn(c.Request.Context(), fmt.Sprintf("Failed to resolve plugin %s content for task %s: %v", artifactKey, task.TaskID, err))
 		}
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_plugin_error", "Artifact content plugin failed")
-		return
+		return nil
 	}
-	if err := proxyTaskMedia(c, task, descriptor); err != nil {
+	if err := proxyTaskMedia(c, task, descriptor, authorize); err != nil {
+		if authorizationError != nil {
+			return authorizationError
+		}
+		if authorize != nil {
+			if authorizationError := authorize(); authorizationError != nil {
+				return authorizationError
+			}
+		}
 		writeTaskMediaProxyError(c, err)
 	}
+	return nil
 }
 
 func taskArtifactClientHeaders(headers http.Header) map[string]string {
