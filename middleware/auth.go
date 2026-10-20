@@ -185,6 +185,29 @@ func RequirePersonalResourceOwner(c *gin.Context) (int, bool) {
 	return 0, false
 }
 
+// RequireOrganizationScopeSession is the organization-branch counterpart of
+// RequirePersonalResourceOwner on a route whose personal branch also accepts
+// access tokens. An invalid identity fails exactly as on the personal branch;
+// an access token (scoped or legacy) is refused with the response and audit
+// reason of a session-only route rule.
+func RequireOrganizationScopeSession(c *gin.Context) (service.AuthIdentity, bool) {
+	identity, ok := GetAuthIdentity(c)
+	if !ok || identity.UserID <= 0 {
+		writeDashboardAuthError(c, service.ErrAuthTokenInvalid)
+		return service.AuthIdentity{}, false
+	}
+	if c.GetBool("use_access_token") {
+		setAccessTokenAuditParam(c, "failure_reason", "session_required")
+		abortWithWebMessage(c, http.StatusForbidden, "AUTH_SESSION_REQUIRED", common.NewMessage(accessTokenSessionRequiredMsg))
+		return service.AuthIdentity{}, false
+	}
+	if identity.SessionID == "" || identity.UserAuthVersion <= 0 || identity.SessionVersion <= 0 {
+		writeDashboardAuthError(c, service.ErrAuthTokenInvalid)
+		return service.AuthIdentity{}, false
+	}
+	return identity, true
+}
+
 // GetSessionAuthIdentity returns only identities backed by a live dashboard
 // session. PAT-authenticated requests intentionally fail this check.
 func GetSessionAuthIdentity(c *gin.Context) (service.AuthIdentity, bool) {

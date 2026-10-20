@@ -427,6 +427,10 @@ func GetAllTask(c *gin.Context) {
 }
 
 func GetUserTask(c *gin.Context) {
+	if orgID, code := middleware.OrganizationSelection(c); code == "" && orgID > 0 {
+		serveOrganizationTasks(c, orgID)
+		return
+	}
 	userID, ok := middleware.RequirePersonalResourceOwner(c)
 	if !ok {
 		return

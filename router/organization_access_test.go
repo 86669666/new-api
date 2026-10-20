@@ -724,6 +724,9 @@ func TestOrganizationSelectionProductionRoutes(t *testing.T) {
 	allow["POST /api/organizations/:org_id/authorization-context"] = true
 	allow["POST /api/platform/organizations/:org_id/authorization-context"] = true
 	pathlessS3 := map[string]bool{"POST /api/organizations": true, "GET /api/organization-invitations": true, "GET /api/organization-ownership-transfers": true, "GET /api/verify/methods": true, "POST /api/verify": true, "POST /api/user/passkey/verify/begin": true, "POST /api/user/passkey/verify/finish": true}
+	// Personal resource routes with an organization view enter their own
+	// authentication chain instead of the unsupported-selector rejection.
+	organizationView := map[string]bool{"GET /api/task/self": true}
 
 	registered := map[string]bool{}
 	var writes atomic.Int64
@@ -751,6 +754,9 @@ func TestOrganizationSelectionProductionRoutes(t *testing.T) {
 			if pathlessS3[key] {
 				wantStatus = 400
 			}
+			if organizationView[key] {
+				wantStatus = 401
+			}
 			assert.Equal(t, wantStatus, s)
 			assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
 			assert.Equal(t, before, queries.Load(), "guard must precede database lookup")
@@ -762,6 +768,9 @@ func TestOrganizationSelectionProductionRoutes(t *testing.T) {
 				wantCode := "ORG_RESOURCE_UNSUPPORTED"
 				if pathlessS3[key] {
 					wantCode = "ORG_SELECTOR_NOT_ALLOWED"
+				}
+				if organizationView[key] {
+					wantCode = "AUTH_UNAUTHORIZED"
 				}
 				assert.Equal(t, wantCode, d["code"])
 			} else {
@@ -837,51 +846,56 @@ func TestOrganizationGeneratedConsumer(t *testing.T) {
 func TestOrganizationAccessFreshnessAndFailures(t *testing.T) {
 	f := newOrganizationHTTPFixture(t)
 	a := strconv.FormatInt(f.orgA, 10)
-	t.Run("revoke_before_data_read_barrier", func(t *testing.T) {
-		reached, release := make(chan struct{}), make(chan struct{})
-		var once sync.Once
-		require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register("s2:read_barrier", func(tx *gorm.DB) {
-			if tx.Statement.Table == "users" {
-				once.Do(func() {
-					close(reached)
-					select {
-					case <-release:
-					case <-time.After(5 * time.Second):
-						tx.AddError(fmt.Errorf("bounded barrier deadline"))
-					}
-				})
+	for _, tc := range []struct{ name, actor, path string }{
+		{"revoke_before_data_read_barrier", "member", "/api/organizations/" + a},
+		{"revoke_before_task_read_barrier", "revoked", "/api/task/self?org_id=" + a},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reached, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register("s2:read_barrier", func(tx *gorm.DB) {
+				if tx.Statement.Table == "users" {
+					once.Do(func() {
+						close(reached)
+						select {
+						case <-release:
+						case <-time.After(5 * time.Second):
+							tx.AddError(fmt.Errorf("bounded barrier deadline"))
+						}
+					})
+				}
+			}))
+			defer f.db.Callback().Query().Remove("s2:read_barrier")
+			result := make(chan int, 1)
+			go func() {
+				req, _ := http.NewRequest("GET", f.server.URL+tc.path, nil)
+				req.Header.Set("Authorization", "Bearer "+f.bearer[tc.actor])
+				resp, err := f.client.Do(req)
+				if err != nil {
+					result <- 0
+					return
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				result <- resp.StatusCode
+			}()
+			select {
+			case <-reached:
+			case <-time.After(5 * time.Second):
+				close(release)
+				t.Fatal("formal data-read barrier not reached")
 			}
-		}))
-		defer f.db.Callback().Query().Remove("s2:read_barrier")
-		result := make(chan int, 1)
-		go func() {
-			req, _ := http.NewRequest("GET", f.server.URL+"/api/organizations/"+a, nil)
-			req.Header.Set("Authorization", "Bearer "+f.bearer["member"])
-			resp, err := f.client.Do(req)
-			if err != nil {
-				result <- 0
-				return
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			result <- resp.StatusCode
-		}()
-		select {
-		case <-reached:
-		case <-time.After(5 * time.Second):
+			err := f.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, f.users[tc.actor].Id).Update("removed_at", time.Now().Unix()).Error
 			close(release)
-			t.Fatal("formal data-read barrier not reached")
-		}
-		err := f.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, f.users["member"].Id).Update("removed_at", time.Now().Unix()).Error
-		close(release)
-		require.NoError(t, err)
-		select {
-		case status := <-result:
-			assert.Equal(t, 404, status)
-		case <-time.After(5 * time.Second):
-			t.Fatal("request did not finish after release")
-		}
-	})
+			require.NoError(t, err)
+			select {
+			case status := <-result:
+				assert.Equal(t, 404, status)
+			case <-time.After(5 * time.Second):
+				t.Fatal("request did not finish after release")
+			}
+		})
+	}
 	t.Run("expired_session_and_disabled_user_authority", func(t *testing.T) {
 		for _, tc := range []struct {
 			actor, column string
@@ -1057,6 +1071,181 @@ func TestOrganizationLegacyCapabilityCompatibility(t *testing.T) {
 	assert.NotContains(t, f.logs.snapshot(), capability)
 }
 
+// Organization-owned tasks are reachable only through the selected task view;
+// personal, platform-administrator and capability lookups never resolve them.
+func TestOrganizationTaskAccess(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	oldSecret := common.CryptoSecret
+	common.CryptoSecret = common.SessionSecret
+	t.Cleanup(func() { common.CryptoSecret = oldSecret })
+	a, b := strconv.FormatInt(f.orgA, 10), strconv.FormatInt(f.orgB, 10)
+	now := time.Now().Unix()
+	for i, seed := range []struct {
+		taskID, user string
+		org          int64
+	}{
+		{"s2-p-owner", "owner", 0}, {"s2-p-member", "member", 0},
+		{"s2-a-owner", "owner", f.orgA}, {"s2-a-member", "member", f.orgA}, {"s2-a-revoked", "revoked", f.orgA},
+		{"s2-b-member", "member", f.orgB}, {"s2-b-foreign", "foreign", f.orgB},
+	} {
+		require.NoError(t, f.db.Create(&model.Task{TaskID: seed.taskID, UserId: f.users[seed.user].Id, OrganizationID: seed.org, Platform: "document", Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess, FailReason: "data:video/mp4;base64,YWJj", SubmitTime: now + int64(i), ChannelId: 7, Data: []byte(`{"upstream":"s2-snapshot-canary"}`)}).Error)
+	}
+	list := func(t *testing.T, actor, query string, headers http.Header) ([]string, map[string]any) {
+		t.Helper()
+		s, _, d := f.request(t, "GET", "/api/task/self"+query, actor, "", headers)
+		require.Equal(t, 200, s, "%v", d)
+		raw, err := common.Marshal(d)
+		require.NoError(t, err)
+		assert.NotContains(t, string(raw), "s2-snapshot-canary")
+		data := d["data"].(map[string]any)
+		ids := []string{}
+		for _, item := range data["items"].([]any) {
+			task := item.(map[string]any)
+			assert.EqualValues(t, 0, task["channel_id"], "task lists never expose the channel")
+			ids = append(ids, task["task_id"].(string))
+		}
+		return ids, data
+	}
+
+	t.Run("personal_view_excludes_organization_rows", func(t *testing.T) {
+		for _, query := range []string{"", "?org_id=0"} {
+			ids, _ := list(t, "owner", query, nil)
+			assert.Equal(t, []string{"s2-p-owner"}, ids)
+			ids, _ = list(t, "member", query, nil)
+			assert.Equal(t, []string{"s2-p-member"}, ids)
+			// Organization request hardening applies only to a positive selector.
+			s, h, d := f.request(t, "GET", "/api/task/self"+query, "owner", "", http.Header{"Idempotency-Key": {"s2-key"}, "Origin": {"https://a.example", "https://b.example"}})
+			require.Equal(t, 200, s, "%v", d)
+			assert.Empty(t, h.Get("Cache-Control"))
+		}
+	})
+	t.Run("organization_roles", func(t *testing.T) {
+		orgA := []string{"s2-a-revoked", "s2-a-member", "s2-a-owner"}
+		for _, tc := range []struct {
+			actor, org string
+			want       []string
+		}{
+			{"owner", a, orgA},
+			{"admin", a, orgA},
+			{"member", a, []string{"s2-a-member"}},
+			{"member", b, []string{"s2-b-member"}},
+			{"foreign", b, []string{"s2-b-foreign", "s2-b-member"}},
+		} {
+			ids, data := list(t, tc.actor, "?org_id="+tc.org, nil)
+			assert.Equal(t, tc.want, ids, "%s in %s", tc.actor, tc.org)
+			assert.EqualValues(t, len(tc.want), data["total"])
+		}
+		ids, _ := list(t, "owner", "", http.Header{"X-Organization-Id": {a}})
+		assert.Equal(t, orgA, ids)
+	})
+	t.Run("cross_organization_and_platform_roles_are_not_found", func(t *testing.T) {
+		for _, tc := range []struct{ actor, org string }{{"owner", b}, {"admin", b}, {"foreign", a}, {"root", a}, {"empty", a}} {
+			s, h, d := f.request(t, "GET", "/api/task/self?org_id="+tc.org, tc.actor, "", nil)
+			organizationError(t, s, h, d, 404, "ORG_NOT_FOUND")
+		}
+		ids, data := list(t, "owner", "?org_id="+a+"&task_id=s2-b-member", nil)
+		assert.Empty(t, ids)
+		assert.EqualValues(t, 0, data["total"])
+		ids, _ = list(t, "member", "?org_id="+a+"&task_id=s2-a-owner", nil)
+		assert.Empty(t, ids)
+	})
+	t.Run("strict_bounded_query", func(t *testing.T) {
+		ids, data := list(t, "owner", "?org_id="+a+"&p=2&page_size=2", nil)
+		assert.Equal(t, []string{"s2-a-owner"}, ids)
+		assert.EqualValues(t, 3, data["total"])
+		assert.EqualValues(t, 2, data["page"])
+		assert.EqualValues(t, 2, data["page_size"])
+		ids, _ = list(t, "owner", "?org_id="+a+"&page_size=100&start_timestamp=&end_timestamp=&status=SUCCESS&platform=document", nil)
+		assert.Len(t, ids, 3)
+		ids, _ = list(t, "owner", fmt.Sprintf("?org_id=%s&start_timestamp=%d&end_timestamp=%d", a, now+3, now+4), nil)
+		assert.Equal(t, []string{"s2-a-revoked", "s2-a-member"}, ids)
+		for _, query := range []string{"page_size=0", "page_size=101", "page_size=-1", "page_size=01", "p=0", "p=101", "p=x", "p=1&p=2", "size=10", "ps=10", "user_id=1", "start_timestamp=-1", "task_id=a&task_id=b"} {
+			s, h, d := f.request(t, "GET", "/api/task/self?org_id="+a+"&"+query, "owner", "", nil)
+			organizationError(t, s, h, d, 400, "ORG_REQUEST_INVALID")
+		}
+		for _, extra := range []struct {
+			body    string
+			headers http.Header
+		}{{"", http.Header{"X-Security-Proof": {"s2-proof"}}}, {"{}", nil}} {
+			s, h, d := f.request(t, "GET", "/api/task/self?org_id="+a, "owner", extra.body, extra.headers)
+			organizationError(t, s, h, d, 400, "ORG_REQUEST_INVALID")
+		}
+	})
+	t.Run("credentials", func(t *testing.T) {
+		suffix, err := common.GenerateRandomCharsKey(43)
+		require.NoError(t, err)
+		pat := model.AccessTokenPrefix + suffix
+		row := &model.UserAccessToken{Name: "s2-task-scope", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat)}
+		require.NoError(t, row.SetScopes([]string{"usage:read"}))
+		require.NoError(t, model.CreateUserAccessToken(f.users["owner"].Id, row, service.AccessTokenMaxPerUser))
+		s, h, d := f.request(t, "GET", "/api/task/self?org_id="+a, pat, "", nil)
+		organizationError(t, s, h, d, 403, "AUTH_SESSION_REQUIRED")
+		ids, _ := list(t, pat, "", nil)
+		assert.Equal(t, []string{"s2-p-owner"}, ids)
+		s, h, d = f.request(t, "GET", "/api/task/self?org_id="+a, "relay", "", nil)
+		organizationError(t, s, h, d, 401, "AUTH_UNAUTHORIZED")
+	})
+	t.Run("artifacts_and_capabilities_exclude_organization_rows", func(t *testing.T) {
+		for _, actor := range []string{"owner", "root"} {
+			s, _, d := f.request(t, "GET", "/api/task/s2-a-owner/artifacts", actor, "", nil)
+			assert.Equal(t, 404, s, actor)
+			assert.Equal(t, "artifact_not_found", d["code"], actor)
+		}
+		s, _, _ := f.request(t, "GET", "/api/task/s2-p-owner/artifacts", "owner", "", nil)
+		assert.Equal(t, 200, s)
+		s, h, d := f.request(t, "GET", "/api/task/s2-a-owner/artifacts?org_id="+a, "owner", "", nil)
+		organizationError(t, s, h, d, 403, "ORG_RESOURCE_UNSUPPORTED")
+		for taskID, want := range map[string]int{"s2-a-owner": 404, "s2-p-owner": 200} {
+			capability, err := service.IssueTaskArtifactAccess(taskID, "video")
+			require.NoError(t, err)
+			resp, err := f.client.Get(f.server.URL + "/v1/tasks/" + taskID + "/artifacts/video/content?access=" + url.QueryEscape(capability))
+			require.NoError(t, err)
+			raw, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			require.NoError(t, err)
+			assert.Equal(t, want, resp.StatusCode, taskID)
+			if want == 200 {
+				assert.Equal(t, "abc", string(raw))
+			}
+		}
+	})
+	t.Run("revocation_is_observed_by_the_next_read", func(t *testing.T) {
+		// Warm the caches so cached session and user state cannot mask revocation.
+		for _, actor := range []string{"member", "revoked", "admin"} {
+			_, err := model.GetUserCache(f.users[actor].Id)
+			require.NoError(t, err)
+			_, err = model.GetUserSessionCached(f.sids[actor])
+			require.NoError(t, err)
+		}
+		require.NoError(t, f.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, f.users["member"].Id).Update("removed_at", time.Now().Unix()).Error)
+		s, h, d := f.request(t, "GET", "/api/task/self?org_id="+a, "member", "", nil)
+		organizationError(t, s, h, d, 404, "ORG_NOT_FOUND")
+		ids, _ := list(t, "member", "", nil)
+		assert.Equal(t, []string{"s2-p-member"}, ids)
+		ids, _ = list(t, "member", "?org_id="+b, nil)
+		assert.Equal(t, []string{"s2-b-member"}, ids)
+		ids, _ = list(t, "owner", "?org_id="+a, nil)
+		assert.Contains(t, ids, "s2-a-member", "a departed member's submissions stay with the organization")
+
+		require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["revoked"]).Update("status", model.UserSessionStatusRevoked).Error)
+		for _, org := range []string{a, "999999"} {
+			// A revoked session is refused before any organization lookup.
+			s, h, d = f.request(t, "GET", "/api/task/self?org_id="+org, "revoked", "", nil)
+			organizationError(t, s, h, d, 401, "AUTH_SESSION_REVOKED")
+		}
+
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["admin"].Id).Update("status", common.UserStatusDisabled).Error)
+		s, h, d = f.request(t, "GET", "/api/task/self?org_id="+a, "admin", "", nil)
+		organizationError(t, s, h, d, 401, "AUTH_SESSION_REVOKED")
+
+		require.NoError(t, f.db.Model(&model.Organization{}).Where("id = ?", f.orgA).Update("platform_disabled_at", time.Now().Unix()).Error)
+		s, h, d = f.request(t, "GET", "/api/task/self?org_id="+a, "owner", "", nil)
+		organizationError(t, s, h, d, 404, "ORG_NOT_FOUND")
+		ids, _ = list(t, "owner", "", nil)
+		assert.Equal(t, []string{"s2-p-owner"}, ids)
+	})
+}
+
 func TestOrganizationPersonalLogExport(t *testing.T) {
 	f := newOrganizationHTTPFixture(t)
 	now := time.Now().Unix()
@@ -1091,69 +1280,181 @@ func TestOrganizationDatabaseLockWait(t *testing.T) {
 	if kind != "mysql" && kind != "postgres" {
 		return
 	} // SQLite has the barrier/snapshot test, not row locks.
-	f := newOrganizationHTTPFixture(t)
-	s, _, _ := f.request(t, "GET", "/api/organizations/"+strconv.FormatInt(f.orgA, 10), "owner", "", nil)
-	require.Equal(t, 200, s)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	holder := f.db.WithContext(ctx).Begin()
-	require.NoError(t, holder.Error)
-	defer holder.Rollback()
-	var holderID int64
-	idSQL := "SELECT CONNECTION_ID()"
-	if kind == "postgres" {
-		idSQL = "SELECT pg_backend_pid()"
+	for _, tc := range []struct {
+		name, actor, path string
+		want              int
+	}{
+		{"session_expiry", "owner", "/api/organizations/%d", 401},
+		{"member_removal_task_view", "member", "/api/task/self?org_id=%d", 404},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newOrganizationHTTPFixture(t)
+			path := fmt.Sprintf(tc.path, f.orgA)
+			actorID := f.users[tc.actor].Id
+			s, _, _ := f.request(t, "GET", path, tc.actor, "", nil)
+			require.Equal(t, 200, s)
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			holder := f.db.WithContext(ctx).Begin()
+			require.NoError(t, holder.Error)
+			defer holder.Rollback()
+			var holderID int64
+			idSQL := "SELECT CONNECTION_ID()"
+			if kind == "postgres" {
+				idSQL = "SELECT pg_backend_pid()"
+			}
+			require.NoError(t, holder.Raw(idSQL).Scan(&holderID).Error)
+			require.NoError(t, holder.Model(&model.User{}).Where("id = ?", actorID).UpdateColumn("auth_version", gorm.Expr("auth_version")).Error)
+			done := make(chan int, 1)
+			go func() {
+				req, err := http.NewRequestWithContext(ctx, "GET", f.server.URL+path, nil)
+				if err != nil {
+					done <- 0
+					return
+				}
+				req.Header.Set("Authorization", "Bearer "+f.bearer[tc.actor])
+				resp, err := f.client.Do(req)
+				if err != nil {
+					done <- 0
+					return
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				done <- resp.StatusCode
+			}()
+			waitSQL := `SELECT EXISTS (SELECT 1 FROM performance_schema.data_lock_waits w JOIN performance_schema.threads blocker ON blocker.THREAD_ID=w.BLOCKING_THREAD_ID JOIN performance_schema.data_locks requested ON requested.ENGINE=w.ENGINE AND requested.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID WHERE blocker.PROCESSLIST_ID=? AND requested.OBJECT_SCHEMA=DATABASE() AND requested.OBJECT_NAME='users' AND requested.INDEX_NAME='PRIMARY' AND requested.LOCK_TYPE='RECORD' AND requested.LOCK_STATUS='WAITING' AND requested.LOCK_DATA=?)`
+			args := []any{holderID, fmt.Sprint(actorID)}
+			if kind == "postgres" {
+				waitSQL = `SELECT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname=current_database() AND a.wait_event_type='Lock' AND ? = ANY(pg_blocking_pids(a.pid)) AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=a.pid AND l.relation='users'::regclass AND l.mode='RowShareLock' AND l.granted))`
+				args = []any{holderID}
+			}
+			observed := false
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for !observed {
+				require.NoError(t, f.db.WithContext(ctx).Raw(waitSQL, args...).Scan(&observed).Error)
+				if observed {
+					break
+				}
+				select {
+				case <-ticker.C:
+				case status := <-done:
+					t.Fatalf("request completed before actual lock wait: %d", status)
+				case <-ctx.Done():
+					t.Fatal("actual row lock wait not observed")
+				}
+			}
+			t.Logf("server lock metadata confirmed engine=%s holder=%d table=users", kind, holderID)
+			if tc.want == 401 {
+				require.NoError(t, holder.Model(&model.UserSession{}).Where("sid = ?", f.sids[tc.actor]).Update("expires_at", int64(1)).Error)
+			} else {
+				require.NoError(t, holder.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, actorID).Update("removed_at", time.Now().Unix()).Error)
+			}
+			require.NoError(t, holder.Commit().Error)
+			select {
+			case status := <-done:
+				assert.Equal(t, tc.want, status)
+			case <-ctx.Done():
+				t.Fatal("waiter failed to finish after committed revocation")
+			}
+		})
 	}
-	require.NoError(t, holder.Raw(idSQL).Scan(&holderID).Error)
-	require.NoError(t, holder.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).UpdateColumn("auth_version", gorm.Expr("auth_version")).Error)
-	done := make(chan int, 1)
-	go func() {
-		req, err := http.NewRequestWithContext(ctx, "GET", f.server.URL+"/api/organizations/"+strconv.FormatInt(f.orgA, 10), nil)
-		if err != nil {
-			done <- 0
-			return
+	// The organization task read runs inside the transaction that holds the
+	// membership locks, so a removal cannot commit between the check and the read.
+	t.Run("task_read_holds_membership_lock", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		path := fmt.Sprintf("/api/task/self?org_id=%d", f.orgA)
+		memberID := f.users["member"].Id
+		require.NoError(t, f.db.Create(&model.Task{TaskID: "s2-lock-member", UserId: memberID, OrganizationID: f.orgA, Platform: "document", Status: model.TaskStatusSuccess}).Error)
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		reached, release := make(chan struct{}), make(chan struct{})
+		releaseRead := sync.OnceFunc(func() { close(release) })
+		defer releaseRead()
+		var paused atomic.Bool
+		require.NoError(t, f.db.Callback().Query().After("gorm:query").Register("s2:task_read_lock", func(tx *gorm.DB) {
+			// Pause on the item read itself, not the preceding count.
+			if _, items := tx.Statement.Dest.(*[]*model.Task); items && tx.Statement.Table == "tasks" && paused.CompareAndSwap(false, true) {
+				close(reached)
+				select {
+				case <-release:
+				case <-time.After(10 * time.Second):
+					tx.AddError(fmt.Errorf("task read barrier deadline"))
+				}
+			}
+		}))
+		defer f.db.Callback().Query().Remove("s2:task_read_lock")
+		done := make(chan int, 1)
+		go func() {
+			req, err := http.NewRequestWithContext(ctx, "GET", f.server.URL+path, nil)
+			if err != nil {
+				done <- 0
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+f.bearer["member"])
+			resp, err := f.client.Do(req)
+			if err != nil {
+				done <- 0
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			done <- resp.StatusCode
+		}()
+		select {
+		case <-reached:
+		case status := <-done:
+			t.Fatalf("request completed without reaching the task read: %d", status)
+		case <-ctx.Done():
+			t.Fatal("task read barrier not reached")
 		}
-		req.Header.Set("Authorization", "Bearer "+f.bearer["owner"])
-		resp, err := f.client.Do(req)
-		if err != nil {
-			done <- 0
-			return
+		revoker := f.db.WithContext(ctx).Begin()
+		require.NoError(t, revoker.Error)
+		defer revoker.Rollback()
+		var revokerID int64
+		idSQL, waitSQL := "SELECT CONNECTION_ID()", "SELECT EXISTS (SELECT 1 FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = ? AND trx_state = 'LOCK WAIT')"
+		if kind == "postgres" {
+			idSQL, waitSQL = "SELECT pg_backend_pid()", "SELECT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.pid = ? AND cardinality(pg_blocking_pids(a.pid)) > 0)"
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		done <- resp.StatusCode
-	}()
-	waitSQL := `SELECT EXISTS (SELECT 1 FROM performance_schema.data_lock_waits w JOIN performance_schema.threads blocker ON blocker.THREAD_ID=w.BLOCKING_THREAD_ID JOIN performance_schema.data_locks requested ON requested.ENGINE=w.ENGINE AND requested.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID WHERE blocker.PROCESSLIST_ID=? AND requested.OBJECT_SCHEMA=DATABASE() AND requested.OBJECT_NAME='users' AND requested.INDEX_NAME='PRIMARY' AND requested.LOCK_TYPE='RECORD' AND requested.LOCK_STATUS='WAITING' AND requested.LOCK_DATA=?)`
-	args := []any{holderID, fmt.Sprint(f.users["owner"].Id)}
-	if kind == "postgres" {
-		waitSQL = `SELECT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname=current_database() AND a.wait_event_type='Lock' AND ? = ANY(pg_blocking_pids(a.pid)) AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=a.pid AND l.relation='users'::regclass AND l.mode='RowShareLock' AND l.granted))`
-		args = []any{holderID}
-	}
-	observed := false
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for !observed {
-		require.NoError(t, f.db.WithContext(ctx).Raw(waitSQL, args...).Scan(&observed).Error)
-		if observed {
-			break
+		require.NoError(t, revoker.Raw(idSQL).Scan(&revokerID).Error)
+		removed := make(chan error, 1)
+		go func() {
+			removed <- revoker.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, memberID).Update("removed_at", time.Now().Unix()).Error
+		}()
+		observed := false
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for !observed {
+			require.NoError(t, f.db.WithContext(ctx).Raw(waitSQL, revokerID).Scan(&observed).Error)
+			if observed {
+				break
+			}
+			select {
+			case <-ticker.C:
+			case err := <-removed:
+				t.Fatalf("member removal committed during the organization task read: %v", err)
+			case <-ctx.Done():
+				t.Fatal("member removal never waited on the task read")
+			}
+		}
+		t.Logf("server lock wait confirmed engine=%s waiter=%d (member removal blocked by the open task read)", kind, revokerID)
+		releaseRead()
+		select {
+		case status := <-done:
+			assert.Equal(t, 200, status)
+		case <-ctx.Done():
+			t.Fatal("task read did not finish after release")
 		}
 		select {
-		case <-ticker.C:
-		case status := <-done:
-			t.Fatalf("request completed before actual lock wait: %d", status)
+		case err := <-removed:
+			require.NoError(t, err)
 		case <-ctx.Done():
-			t.Fatal("actual row lock wait not observed")
+			t.Fatal("member removal did not finish after the read")
 		}
-	}
-	t.Logf("server lock metadata confirmed engine=%s holder=%d table=users", kind, holderID)
-	require.NoError(t, holder.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).Update("expires_at", int64(1)).Error)
-	require.NoError(t, holder.Commit().Error)
-	select {
-	case status := <-done:
-		assert.Equal(t, 401, status)
-	case <-ctx.Done():
-		t.Fatal("waiter failed to finish after committed expiry")
-	}
+		require.NoError(t, revoker.Commit().Error)
+		s, h, d := f.request(t, "GET", path, "member", "", nil)
+		organizationError(t, s, h, d, 404, "ORG_NOT_FOUND")
+	})
 }
 
 // F01: the role read must not establish the discovery JOIN's snapshot.
@@ -1412,11 +1713,24 @@ func TestOrganizationCredentialScopeIntersection(t *testing.T) {
 				assert.Equal(t, 403, s)
 			}
 			for _, credential := range []string{pat, actor, "relay"} {
-				for _, path := range []string{"/api/token/", "/api/task/self", "/api/log/self", "/v1/models", "/s2alias/jobs/missing", "/v1/videos/missing/content"} {
+				for _, path := range []string{"/api/token/", "/api/log/self", "/v1/models", "/s2alias/jobs/missing", "/v1/videos/missing/content"} {
 					s, _, _ := f.request(t, "GET", path+"?org_id=1", credential, "", nil)
 					assert.Equal(t, 403, s)
 				}
 			}
+			// The organization task view is session-only: a PAT that passes the
+			// route scope is still refused, a session reaches membership (unknown
+			// organization), and a relay key is not a dashboard credential.
+			patCode := "ACCESS_TOKEN_SCOPE_DENIED"
+			if slices.Contains(scopes, "usage:read") {
+				patCode = "AUTH_SESSION_REQUIRED"
+			}
+			s, h, d := f.request(t, "GET", "/api/task/self?org_id=1", pat, "", nil)
+			organizationError(t, s, h, d, 403, patCode)
+			s, h, d = f.request(t, "GET", "/api/task/self?org_id=1", actor, "", nil)
+			organizationError(t, s, h, d, 404, "ORG_NOT_FOUND")
+			s, h, d = f.request(t, "GET", "/api/task/self?org_id=1", "relay", "", nil)
+			organizationError(t, s, h, d, 401, "AUTH_UNAUTHORIZED")
 		}
 	}
 }

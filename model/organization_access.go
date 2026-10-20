@@ -24,6 +24,60 @@ type OrganizationAccessResult struct {
 	Events        []OrganizationEvent
 }
 
+// ReadOrganizationTasks lists organization-owned tasks under the same locked
+// membership read as the other organization projections, so a committed
+// removal or disable is observed by every later read. Owners and admins see
+// every organization task; members see only their own submissions.
+func ReadOrganizationTasks(identity AuthSessionIdentity, orgID int64, queryParams SyncTaskQueryParams, startIdx, num int) ([]*Task, int64, int, error) {
+	var tasks []*Task
+	var total int64
+	if orgID <= 0 || startIdx < 0 || num < 1 || num > 100 {
+		return nil, 0, 0, ErrOrganizationInvalidInput
+	}
+	actorRole, err := organizationActorRole(identity)
+	if err != nil {
+		return nil, 0, actorRole, err
+	}
+	err = withOrganization(identity, OrganizationCommand{OrganizationID: orgID}, false, func(s *organizationState) error {
+		actorRole = s.users[identity.UserID].Role
+		if s.member(identity.UserID) == nil || s.requireEnabled() != nil {
+			return ErrOrganizationNotFound
+		}
+		query := applyTaskQueryFilters(s.tx.Model(&Task{}).Where("organization_id = ?", orgID), queryParams)
+		if role := s.role(identity.UserID); role != OrganizationRoleOwner && role != OrganizationRoleAdmin {
+			query = query.Where("user_id = ?", identity.UserID)
+		}
+		query = query.Session(&gorm.Session{})
+		if err := query.Count(&total).Error; err != nil {
+			return err
+		}
+		if err := query.Omit("channel_id", "data").Order("id desc").Limit(num).Offset(startIdx).Find(&tasks).Error; err != nil {
+			return err
+		}
+		_, err := validateOrganizationIdentity(s.tx, identity, organizationNow().Unix())
+		return err
+	})
+	if err != nil {
+		return nil, 0, actorRole, err
+	}
+	return tasks, total, actorRole, nil
+}
+
+// organizationActorRole is the preliminary session check that precedes S1's
+// out-of-transaction lock planning: session failures answer 401 before any
+// organization lookup can answer 404. The role is for audit only, never the
+// data grant.
+func organizationActorRole(identity AuthSessionIdentity) (int, error) {
+	var actor User
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := validateOrganizationIdentity(tx, identity, organizationNow().Unix()); err != nil {
+			return err
+		}
+		return tx.Select("role").First(&actor, identity.UserID).Error
+	})
+	return actor.Role, err
+}
+
 // ReadOrganizationAccess keeps authorization and projection in one transaction.
 // The preliminary session check covers S1's out-of-transaction lock planning
 // (including unknown organizations); it is never used as the data grant.
@@ -78,20 +132,12 @@ func ReadOrganizationAccess(identity AuthSessionIdentity, kind OrganizationAcces
 	if orgID == 0 {
 		return result, ErrOrganizationInvalidInput
 	}
-	if err := DB.Transaction(func(tx *gorm.DB) error {
-		if _, err := validateOrganizationIdentity(tx, identity, organizationNow().Unix()); err != nil {
-			return err
-		}
-		var actor User
-		if err := tx.Select("role").First(&actor, identity.UserID).Error; err != nil {
-			return err
-		}
-		result.ActorRole = actor.Role
-		return nil
-	}); err != nil {
+	actorRole, err := organizationActorRole(identity)
+	result.ActorRole = actorRole
+	if err != nil {
 		return result, err
 	}
-	err := withOrganization(identity, OrganizationCommand{OrganizationID: orgID}, false, func(s *organizationState) error {
+	err = withOrganization(identity, OrganizationCommand{OrganizationID: orgID}, false, func(s *organizationState) error {
 		result.ActorRole = s.users[identity.UserID].Role
 		// Availability precedes role checks; outsiders and disabled organizations
 		// have the same 404, including on the restricted events view.

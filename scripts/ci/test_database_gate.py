@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Deterministic refusal and lifecycle contracts; not real database evidence."""
+import collections
 import contextlib
 import copy
+import functools
 from pathlib import Path
 import io
 import json
@@ -513,6 +515,230 @@ class RelayStartupOwnershipContracts(unittest.TestCase):
             self.assertEqual(saved['pid'], 123)
 
 
+class GuardTickContracts(unittest.TestCase):
+    """One guard tick shares identical reads; every relay still checks its own route."""
+    def setUp(self):
+        self.project = 'newapi-ci-tick'
+        self.ids = {'mysql': 'a'*64, 'postgres': 'b'*64}
+        self.net = 'c'*64
+        self.containers = {cid: self.container(cid, engine, ip)
+                           for (engine, cid), ip in zip(self.ids.items(), ('172.19.0.2', '172.19.0.3'))}
+        self.network = {'Id': self.net, 'Name': 'owned', 'Driver': 'bridge', 'Internal': True, 'Options': {},
+            'Labels': {'com.docker.compose.project': self.project, 'com.docker.compose.network': 'isolated'},
+            'Containers': {cid: {'IPv4Address': data['NetworkSettings']['Networks']['owned']['IPAddress'] + '/16'}
+                           for cid, data in self.containers.items()},
+            'IPAM': {'Config': [{'Subnet': '172.19.0.0/16', 'Gateway': '172.19.0.1'}]}}
+        self.boots = ['boot-1']
+        self.commands = []
+
+    def container(self, cid, engine, ip):
+        return {'Id': cid, 'Config': {'Image': runner.IMAGES.get(engine, runner.IMAGES['mysql']), 'Labels': {
+            'com.docker.compose.project': self.project, 'com.docker.compose.service': engine}},
+            'Image': runner.IMAGES.get(engine, runner.IMAGES['mysql']).split('@')[1],
+            'State': {'Running': True, 'Health': {'Status': 'healthy'}},
+            'HostConfig': {'Privileged': False, 'NetworkMode': 'owned'},
+            'NetworkSettings': {'Ports': {}, 'Networks': {'owned': {'NetworkID': self.net, 'IPAddress': ip, 'GlobalIPv6Address': ''}}}}
+
+    def fake_run(self, command, **kwargs):
+        self.commands.append(tuple(command))
+        if command[0] == 'colima':
+            value = self.boots.pop(0) if len(self.boots) > 1 else self.boots[0]
+            if isinstance(value, BaseException):
+                raise value
+            return value + '\n'
+        if command[0] == '/usr/sbin/lsof':
+            pid = int(command[command.index('-p') + 1])
+            return f'p{pid}\nn127.0.0.1:{40000 + pid}\n'
+        if command[-3:-1] == ['network', 'inspect']:
+            return json.dumps([self.network])
+        if command[-2] == 'inspect':
+            return json.dumps([self.containers[command[-1]]])
+        raise AssertionError(command)
+
+    def relays(self):
+        relays = []
+        with patch.object(runner, 'run', side_effect=self.fake_run):
+            for pid, (engine, cid) in enumerate(self.ids.items(), start=1):
+                relay = runner.OwnedRelay(['docker'], self.project, engine, cid, '/unused')
+                relay.process = unittest.mock.Mock(pid=pid)
+                relay.process.poll.return_value = None
+                relay.port, relay.boot = 40000 + pid, 'boot-1'
+                relay.initial = relay.snapshot()
+                relays.append(relay)
+        self.commands.clear()
+        return relays
+
+    def kinds(self):
+        names = {'colima': 'boot', '/usr/sbin/lsof': 'lsof'}
+        return dict(collections.Counter(names.get(c[0], 'network' if 'network' in c else 'inspect') for c in self.commands))
+
+    def routes(self):
+        return patch.object(runner, 'run', side_effect=self.fake_run), patch.object(runner.os, 'getpgid', side_effect=lambda pid: pid)
+
+    def test_one_tick_reads_each_identity_once_and_checks_every_listener(self):
+        relays = self.relays()
+        run, pgid = self.routes()
+        with run, pgid:
+            runner.check_relays(relays)
+        self.assertEqual(self.kinds(), {'lsof': 4, 'inspect': 2, 'network': 1, 'boot': 1})
+        self.assertEqual([c[c.index('-p') + 1] for c in self.commands if c[0] == '/usr/sbin/lsof'], ['1', '2', '1', '2'])
+        self.commands.clear()
+        relays[1].docker = ['docker', '--context', 'other']
+        run, pgid = self.routes()
+        with run, pgid:
+            runner.check_relays(relays)
+        self.assertEqual(self.kinds(), {'lsof': 4, 'inspect': 4, 'network': 2, 'boot': 1})
+
+    def test_guarded_operations_take_a_fresh_sample_every_tick(self):
+        relays = self.relays()
+        stores = released.OwnedStores(Path('/unused'))
+        stores.relays = relays
+        process = unittest.mock.Mock(pid=999, args=['fixture'], returncode=0)
+        process.communicate.side_effect = [subprocess.TimeoutExpired('fixture', 1), (b'ok', b'')]
+        run, pgid = self.routes()
+        with run, pgid, patch.object(released.subprocess, 'Popen', return_value=process), \
+                patch.object(released, 'terminate_group') as cleanup:
+            self.assertEqual(released.execute(['fixture'], guard=stores.check_routes), (0, b'ok', b''))
+        cleanup.assert_not_called()
+        # Pre-spawn, two wait slices and post-completion: four independent ticks.
+        self.assertEqual(self.kinds(), {'lsof': 16, 'inspect': 8, 'network': 4, 'boot': 4})
+        self.commands.clear()
+        process.communicate.side_effect = [subprocess.TimeoutExpired('fixture', 1), ('ok', '')]
+        run, pgid = self.routes()
+        with run, pgid:
+            runner.guarded_communicate(process, timeout=10, guard=functools.partial(runner.check_relays, relays))
+        self.assertEqual(self.kinds(), {'lsof': 12, 'inspect': 6, 'network': 3, 'boot': 3})
+
+    def test_final_sample_bypasses_shared_tick_and_observes_later_relay_change(self):
+        relays = self.relays()
+        self.boots = ['boot-1', 'boot-2']
+        run, pgid = self.routes()
+        with run, pgid, self.assertRaises(runner.RelayIdentityError):
+            runner.check_relays(relays, fresh=True)
+        self.assertEqual(self.kinds(), {'lsof': 4, 'inspect': 6, 'network': 2, 'boot': 2})
+
+    def test_final_guard_failure_after_exit_zero_still_fails_and_settles_child(self):
+        for entry, module, result in ((runner.run, runner, ('ok', '')),
+                                      (released.execute, released, (b'ok', b''))):
+            with self.subTest(entry=entry.__name__):
+                process = unittest.mock.Mock(pid=999, args=['fixture'], returncode=0)
+                process.communicate.return_value = result
+                failure = runner.RelayIdentityError('final identity changed')
+                final = unittest.mock.Mock(side_effect=failure)
+                with patch.object(module.subprocess, 'Popen', return_value=process), \
+                        patch.object(module, 'terminate_group', return_value=None) as cleanup, \
+                        self.assertRaises(runner.RelayIdentityError):
+                    entry(['fixture'], guard=unittest.mock.Mock(), final_guard=final)
+                final.assert_called_once()
+                cleanup.assert_called_once_with(process)
+                process.communicate.assert_called_once()
+
+    def test_final_guard_cannot_extend_the_child_deadline_or_retry_its_timeout(self):
+        for failure_kind in ('deadline', 'timeout'):
+            with self.subTest(failure=failure_kind):
+                now = [0.0]
+                process = unittest.mock.Mock(args=['fixture'], returncode=0)
+                process.communicate.return_value = ('ok', '')
+                def final():
+                    if failure_kind == 'timeout':
+                        raise subprocess.TimeoutExpired('final identity read', 1)
+                    now[0] = 11.0
+                with patch.object(runner.time, 'monotonic', side_effect=lambda: now[0]), \
+                        self.assertRaises(subprocess.TimeoutExpired):
+                    runner.guarded_communicate(process, timeout=10, guard=unittest.mock.Mock(), final_guard=final)
+                process.communicate.assert_called_once()
+
+    def test_failed_identity_read_is_never_memoized(self):
+        relay = self.relays()[0]
+        tick = {}
+        with patch.object(runner, 'run', side_effect=[subprocess.TimeoutExpired('inspect', 5), 'raw']) as read:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                relay.read(['docker', 'inspect', self.ids['mysql']], tick)
+            self.assertEqual(tick, {})
+            self.assertEqual(relay.read(['docker', 'inspect', self.ids['mysql']], tick), 'raw')
+            self.assertEqual(relay.read(['docker', 'inspect', self.ids['mysql']], tick), 'raw')
+            self.assertEqual(read.call_count, 2)
+
+    def test_first_failing_relay_stops_the_tick_with_the_existing_error(self):
+        for case, cause, message in (('boot_changed', runner.RelayIdentityError, 'VM boot changed during test'),
+                                     ('boot_timeout', subprocess.TimeoutExpired, None),
+                                     ('endpoint_changed', runner.RelayIdentityError, 'container/network endpoint changed during test'),
+                                     ('recorded_boot_differs', runner.RelayIdentityError, 'VM boot changed during test')):
+            with self.subTest(case=case):
+                self.setUp()
+                relays = self.relays()
+                if case == 'boot_changed':
+                    self.boots = ['boot-2']
+                elif case == 'boot_timeout':
+                    self.boots = [subprocess.TimeoutExpired('colima', 5)]
+                elif case == 'endpoint_changed':
+                    relays[0].initial = dict(relays[0].initial, ip='172.19.0.9')
+                else:
+                    relays[1].boot = 'boot-0'
+                run, pgid = self.routes()
+                with run, pgid, self.assertRaisesRegex(runner.RelayIdentityError, 'owned route identity verification failed') as caught:
+                    runner.check_relays(relays)
+                self.assertIsInstance(caught.exception.__cause__, cause)
+                if message:
+                    self.assertEqual(str(caught.exception.__cause__), message)
+                listeners = [c[c.index('-p') + 1] for c in self.commands if c[0] == '/usr/sbin/lsof']
+                self.assertEqual(listeners, ['1', '2', '1', '2'] if case == 'recorded_boot_differs' else ['1', '2', '1'])
+
+    def test_failure_after_spawn_still_cleans_the_guarded_child(self):
+        relays = self.relays()
+        stores = released.OwnedStores(Path('/unused'))
+        stores.relays = relays
+        self.boots = ['boot-1', 'boot-2']
+        process = unittest.mock.Mock(pid=999, args=['fixture'], returncode=0)
+        run, pgid = self.routes()
+        with run, pgid, patch.object(released.subprocess, 'Popen', return_value=process) as spawn, \
+                patch.object(released, 'terminate_group', return_value='child cleanup unknown') as cleanup, \
+                self.assertRaisesRegex(runner.RelayIdentityError, 'owned route identity verification failed') as caught:
+            released.execute(['fixture'], guard=stores.check_routes)
+        spawn.assert_called_once(); cleanup.assert_called_once_with(process)
+        process.communicate.assert_not_called()
+        self.assertEqual(caught.exception.process_cleanup_error, 'child cleanup unknown')
+
+    def test_shared_sample_still_rejects_foreign_peers(self):
+        relays = self.relays()
+        foreign = 'd'*64
+        self.containers[foreign] = self.container(foreign, 'redis', '172.19.0.4')
+        self.network['Containers'][foreign] = {'IPv4Address': '172.19.0.4/16'}
+        run, pgid = self.routes()
+        with run, pgid, self.assertRaisesRegex(runner.RelayIdentityError, 'owned route identity verification failed') as caught:
+            runner.check_relays(relays)
+        self.assertEqual(str(caught.exception.__cause__), 'unexpected network peer')
+
+    def test_cleaning_tick_binds_identity_without_route_probes(self):
+        relays = self.relays()
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = released.OwnedStores(Path(tmp))
+            stores.relays = relays
+            stores.relay_records = [{'engine': engine, 'container_id': cid, 'state': 'running', 'cleanup_attempts': []}
+                                    for engine, cid in self.ids.items()]
+            stores.cleaning = True
+            run, pgid = self.routes()
+            with run, pgid:
+                stores.check_routes()
+            self.assertEqual(self.kinds(), {'inspect': 6, 'network': 2})
+            self.commands.clear()
+            stores.cleaning = False
+            stores.containers = dict(self.ids)
+            stores.resources = [{'engine': 'mysql', 'name': 'newapi_ci_tick', 'container': self.ids['mysql'],
+                                 'absent_before_create': True, 'state': 'created'}]
+            relays[1].initial = dict(relays[1].initial, ip='172.19.0.9')
+            run, pgid = self.routes()
+            with run, pgid, patch.object(runner, 'terminate_group', return_value=None), \
+                    patch.object(runner.socket, 'socket') as probe, patch.object(released.subprocess, 'Popen') as spawn:
+                probe.return_value.__enter__.return_value.connect_ex.return_value = 1
+                errors = stores.cleanup()
+            spawn.assert_not_called()
+            self.assertEqual([e['error'] for e in errors], ['owned database identity changed before cleanup'])
+            self.assertEqual(stores.resources[0]['state'], 'cleanup_unknown')
+            self.assertEqual([r['state'] for r in stores.relay_records], ['closed', 'closed'])
+            self.assertEqual(self.kinds(), {'inspect': 6, 'network': 2})
+
+
 class ClickHouseAuthContracts(unittest.TestCase):
     canary = "test-only-canary-0123456789<&/:@'\"abcdef"
 
@@ -879,6 +1105,42 @@ class ClickHouseAuthContracts(unittest.TestCase):
                 with self.subTest(case=case), patch.object(runner,'run',side_effect=[json.dumps([d]),json.dumps([n]),json.dumps([d])]), self.assertRaises((ValueError,runner.RelayIdentityError)) as error:
                     relay.snapshot()
                 self.assertNotIn(self.canary,str(error.exception))
+            auth.close()
+
+    def test_ch_guard_tick_shares_self_inspect_and_keeps_auth_and_sole_peer_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = self.auth(tmp)
+            base = OwnedRelayContracts(); base.setUp()
+            data, network = copy.deepcopy(base.d), copy.deepcopy(base.n)
+            data['Config'].update(Image=runner.CLICKHOUSE_IMAGE, Entrypoint=['/entrypoint.sh'], Cmd=None,
+                Env=['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG=en_US.UTF-8', 'TZ=UTC',
+                     'CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml', 'CLICKHOUSE_PASSWORD_FILE=/run/newapi-clickhouse/password',
+                     'CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=0'])
+            data['Config']['Labels']['com.docker.compose.service']='clickhouse'
+            data['Image']=runner.CLICKHOUSE_IMAGE.split('@')[1]
+            data['NetworkSettings']['Ports']={'9000/tcp':None}
+            data['Mounts']=[{'Destination':'/run/newapi-clickhouse','Type':'bind','Source':str(auth.directory),'RW':False}]
+            relay=runner.OwnedRelay(['docker'],base.project,'clickhouse',base.cid,'/receipt',clickhouse_auth=auth)
+            with patch.object(runner,'run',side_effect=[json.dumps([data]),json.dumps([network]),json.dumps([data])]):
+                relay.initial=relay.snapshot()
+            relay.process=unittest.mock.Mock(pid=7); relay.process.poll.return_value=None
+            relay.port,relay.boot=40007,'boot-1'
+            commands=[]
+            def fake(command, **kwargs):
+                kind={'colima':'boot','/usr/sbin/lsof':'lsof'}.get(command[0],'network' if 'network' in command else 'inspect')
+                commands.append(kind)
+                return {'boot':'boot-1\n','lsof':'p7\nn127.0.0.1:40007\n','network':json.dumps([network])}.get(kind,json.dumps([data]))
+            with patch.object(runner,'run',side_effect=fake), patch.object(runner.os,'getpgid',side_effect=lambda pid: pid), \
+                    patch.object(auth,'validate',wraps=auth.validate) as validate:
+                runner.check_relays([relay])
+            self.assertEqual(collections.Counter(commands),{'lsof':2,'inspect':1,'network':1,'boot':1})
+            validate.assert_called_once()
+            network['Containers']['c'*64]={'IPv4Address':'172.19.0.3/16'}
+            with patch.object(runner,'run',side_effect=fake), patch.object(runner.os,'getpgid',side_effect=lambda pid: pid), \
+                    self.assertRaises(runner.RelayIdentityError) as error:
+                runner.check_relays([relay])
+            self.assertEqual(str(error.exception.__cause__),'ClickHouse profile must be the only network peer')
+            self.assertNotIn(self.canary,str(error.exception))
             auth.close()
 
     def test_current_boot_ch_mapping_starts_only_native_9000_loopback_relay(self):

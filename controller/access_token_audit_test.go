@@ -1481,7 +1481,7 @@ func TestPersonalResourceScopeReadCompatibility(t *testing.T) {
 	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
 		for _, credentialKind := range []string{"session", "pat", "legacy"} {
 			t.Run(fmt.Sprintf("role_%d/%s", role, credentialKind), func(t *testing.T) {
-				user, credential := setupAccessTokenAudit(t, &model.Token{}, &model.Task{})
+				user, credential := setupAccessTokenAudit(t, &model.Token{}, &model.Task{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{})
 				require.NoError(t, model.DB.Model(user).Update("role", role).Error)
 				other := &model.User{Username: "scope-other", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "scope-other"}
 				require.NoError(t, model.DB.Create(other).Error)
@@ -1536,7 +1536,21 @@ func TestPersonalResourceScopeReadCompatibility(t *testing.T) {
 						})
 					}
 					selected := accessTokenRequest(router, http.MethodGet, endpoint.path+"?org_id=999", credential, "", "")
-					assert.Equal(t, http.StatusForbidden, selected.Code)
+					// Only the task list has an organization branch: a session reaches the
+					// membership check (unknown organization), access tokens are refused.
+					wantSelected, wantCode := http.StatusForbidden, "ORG_RESOURCE_UNSUPPORTED"
+					switch {
+					case endpoint.path == "/api/task/self" && credentialKind == "session":
+						wantSelected, wantCode = http.StatusNotFound, "ORG_NOT_FOUND"
+					case endpoint.path == "/api/task/self":
+						wantCode = "AUTH_SESSION_REQUIRED"
+					}
+					assert.Equal(t, wantSelected, selected.Code)
+					var denial struct {
+						Code string `json:"code"`
+					}
+					require.NoError(t, common.Unmarshal(selected.Body.Bytes(), &denial))
+					assert.Equal(t, wantCode, denial.Code)
 				}
 				own := accessTokenRequest(router, http.MethodGet, fmt.Sprintf("/api/token/%d", ownToken.Id), credential, "", "")
 				ownBody := decodeAPIResponse(t, own)

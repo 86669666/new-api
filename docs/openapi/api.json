@@ -11020,27 +11020,45 @@
     },
     "/api/task/self": {
       "get": {
-        "summary": "获取个人任务",
+        "summary": "获取个人或组织任务",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限）",
+        "description": "🔐 需要登录（User权限）\n\nAbsent or canonical 0 selection returns the existing personal task list, including PAT access with usage:read. Organization-owned tasks never appear there. A positive X-Organization-Id header or org_id query returns the selected organization's task view instead. That branch requires a current dashboard Bearer JWT session: a PAT that passes the usage:read route check, or a legacy access token, is rejected with 403 AUTH_SESSION_REQUIRED; a PAT without the exact usage:read scope keeps 403 ACCESS_TOKEN_SCOPE_DENIED; relay API keys and task/artifact capabilities do not authenticate. Root/platform roles do not imply organization membership. Every request rechecks current user/session authority, organization state and membership in the data-read transaction without positive membership caching. Unknown/nonmember/removed/disabled/dissolved organizations share 404 ORG_NOT_FOUND. Owners and admins see every task owned by the organization; members see only their own. Only org_id, p (1..100), page_size (1..100), start_timestamp, end_timestamp, task_id, action, status and platform are accepted, each once; timestamps are empty or canonical nonnegative decimals. Malformed, unknown (including user_id) or duplicate query parameters, duplicate credential/proof/origin headers, an X-Security-Proof, Idempotency-Key or method-override header, and a request body yield 400 ORG_REQUEST_INVALID. Items use the personal projection without channel or upstream data. Organization tasks have no artifact or capability URL; /api/task/{task_id}/artifacts and task content capabilities resolve personal tasks only. Selection is request-local, never stored in cookies or session state, and does not enable task creation, spending or an organization wallet.",
         "tags": [
           "任务"
         ],
         "parameters": [
           {
-            "$ref": "#/components/parameters/PersonalOrganizationHeader"
+            "$ref": "#/components/parameters/OrganizationHeader"
           },
           {
-            "$ref": "#/components/parameters/PersonalOrganizationQuery"
+            "$ref": "#/components/parameters/OrganizationQuery"
           }
         ],
         "responses": {
           "200": {
-            "description": "成功",
-            "headers": {}
+            "description": "Personal task page, or the selected organization's task page; same envelope and item projection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store whenever a positive selector is present, including authentication and domain failures, and on organization-boundary rejections. Absent or 0 selection keeps the existing headers."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/OrganizationAccess400"
           },
           "401": {
-            "description": "Missing/invalid authentication",
+            "description": "Missing/invalid authentication. Organization branch: AUTH_UNAUTHORIZED; AUTH_TOKEN_EXPIRED; AUTH_SESSION_REVOKED; AUTH_USER_DISABLED; AUTH_USER_INVALID; ACCESS_TOKEN_EXPIRED; ACCESS_TOKEN_LEGACY_RETIRED.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store whenever a positive selector is present, including authentication and domain failures, and on organization-boundary rejections. Absent or 0 selection keeps the existing headers."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -11050,32 +11068,31 @@
             }
           },
           "403": {
-            "description": "Role, permission, scope, IP or session restriction Organization boundary: ORG_RESOURCE_UNSUPPORTED. Boundary rejections occur before authentication and return Cache-Control: private, no-store.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/ManagementError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/OrganizationSelectionUnsupportedError"
-                    }
-                  ]
-                }
-              }
-            },
+            "description": "Role, permission, scope, IP or session restriction. A PAT without the exact usage:read scope is ACCESS_TOKEN_SCOPE_DENIED on both branches. Organization branch: a PAT that passes the route scope check, or a legacy access token, is AUTH_SESSION_REQUIRED.",
             "headers": {
               "Cache-Control": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
                 },
-                "description": "private, no-store on organization-boundary rejection; other existing failures retain their own headers."
+                "description": "private, no-store whenever a positive selector is present, including authentication and domain failures, and on organization-boundary rejections. Absent or 0 selection keeps the existing headers."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagementError"
+                }
               }
             }
           },
-          "400": {
-            "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          "404": {
+            "$ref": "#/components/responses/OrganizationAccess404"
+          },
+          "409": {
+            "$ref": "#/components/responses/OrganizationAccess409"
+          },
+          "500": {
+            "$ref": "#/components/responses/OrganizationAccess500"
           }
         },
         "security": [
@@ -11086,10 +11103,15 @@
             "PersonalAccessToken": []
           }
         ],
-        "x-auth-source": "middleware/access_token_routes.go; router/channel-router.go",
+        "x-auth-source": "middleware/access_token_routes.go; router/channel-router.go; middleware/organization_scope.go; controller/organization_access.go; model/organization_access.go",
         "x-pat-scope": "usage:read",
         "operationId": "getApiTaskSelf",
-        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
+        "x-organization-selection": "absent or 0: personal task list; positive: organization-owned task view after authentication, dashboard session only",
+        "x-organization-scope-security": [
+          {
+            "DashboardJWT": []
+          }
+        ]
       }
     },
     "/api/vendors/": {
@@ -24431,6 +24453,20 @@
       {
         "method": "POST",
         "path": "/api/platform/organizations/{org_id}/authorization-context"
+      },
+      {
+        "method": "GET",
+        "path": "/api/task/self"
+      }
+    ],
+    "positive_resource_selector_routes": [
+      {
+        "method": "GET",
+        "path": "/api/task/self",
+        "absent_or_zero": "existing personal task list, headers and errors",
+        "positive": "organization-owned task view; dashboard session only",
+        "guard": "selector syntax and conflicts only; authorization after authentication",
+        "hardening": "positive selector only"
       }
     ],
     "all_other_methods_and_routes": "403 before resource or provider work",

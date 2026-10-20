@@ -7745,6 +7745,20 @@
       {
         "method": "POST",
         "path": "/api/platform/organizations/{org_id}/authorization-context"
+      },
+      {
+        "method": "GET",
+        "path": "/api/task/self"
+      }
+    ],
+    "positive_resource_selector_routes": [
+      {
+        "method": "GET",
+        "path": "/api/task/self",
+        "absent_or_zero": "existing personal task list, headers and errors",
+        "positive": "organization-owned task view; dashboard session only",
+        "guard": "selector syntax and conflicts only; authorization after authentication",
+        "hardening": "positive selector only"
       }
     ],
     "all_other_methods_and_routes": "403 before resource or provider work",

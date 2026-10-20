@@ -142,6 +142,74 @@ func TestGetTaskForProtocolObservationScopesOwnerAndPlatform(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+func TestPersonalTaskLookupsNeverResolveOrganizationRows(t *testing.T) {
+	truncateTables(t)
+	personal := &Task{TaskID: "task_personal_scope", UserId: 7, Platform: "plugin-a", Status: TaskStatusInProgress}
+	organization := &Task{TaskID: "task_org_scope", UserId: 7, OrganizationID: 9007199254740993, Platform: "plugin-a", Status: TaskStatusInProgress}
+	sharedPersonal := &Task{TaskID: "task_shared_scope", UserId: 7, Platform: "plugin-a", Status: TaskStatusInProgress}
+	sharedOrganization := &Task{TaskID: "task_shared_scope", UserId: 8, OrganizationID: 9007199254740993, Platform: "plugin-a", Status: TaskStatusInProgress}
+	for _, task := range []*Task{personal, organization, sharedPersonal, sharedOrganization} {
+		insertTask(t, task)
+	}
+
+	listed := TaskGetAllUserTask(7, 0, 10, SyncTaskQueryParams{})
+	ids := make([]int64, 0, len(listed))
+	for _, task := range listed {
+		ids = append(ids, task.ID)
+	}
+	assert.ElementsMatch(t, []int64{personal.ID, sharedPersonal.ID}, ids)
+	assert.EqualValues(t, 2, TaskCountAllUserTask(7, SyncTaskQueryParams{}))
+	assert.EqualValues(t, 0, TaskCountAllUserTask(7, SyncTaskQueryParams{TaskID: organization.TaskID}))
+
+	_, exists, err := GetByTaskId(7, organization.TaskID)
+	require.NoError(t, err)
+	assert.False(t, exists)
+	got, exists, err := GetByTaskId(7, personal.TaskID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, personal.ID, got.ID)
+
+	batch, err := GetByTaskIdsForPlatforms(7, []constant.TaskPlatform{"plugin-a"}, []string{personal.TaskID, organization.TaskID})
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+	assert.Equal(t, personal.ID, batch[0].ID)
+
+	_, exists, err = GetTaskForProtocolObservation(context.Background(), 7, "plugin-a", organization.TaskID)
+	require.NoError(t, err)
+	assert.False(t, exists)
+
+	// Platform administrators keep personal artifact access only.
+	_, exists, err = GetByOnlyTaskId(organization.TaskID)
+	require.NoError(t, err)
+	assert.False(t, exists)
+	got, exists, err = GetByOnlyTaskId(personal.TaskID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, personal.ID, got.ID)
+
+	// Capability uniqueness still spans every owner before the organization check.
+	for _, taskID := range []string{organization.TaskID, sharedPersonal.TaskID} {
+		_, exists, err = GetUniqueByOnlyTaskId(taskID)
+		require.NoError(t, err)
+		assert.False(t, exists, taskID)
+	}
+	got, exists, err = GetUniqueByOnlyTaskId(personal.TaskID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, personal.ID, got.ID)
+
+	var stored Task
+	require.NoError(t, DB.First(&stored, organization.ID).Error)
+	stored.Progress = "50%"
+	won, err := stored.UpdateWithStatus(TaskStatusInProgress)
+	require.NoError(t, err)
+	require.True(t, won)
+	var reloaded Task
+	require.NoError(t, DB.First(&reloaded, organization.ID).Error)
+	assert.Equal(t, organization.OrganizationID, reloaded.OrganizationID)
+	assert.Equal(t, "50%", reloaded.Progress)
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot / Equal — pure logic tests (no DB)
 // ---------------------------------------------------------------------------

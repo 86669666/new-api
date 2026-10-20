@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -67,19 +68,25 @@ func organizationAccessPage(c *gin.Context, kind model.OrganizationAccessKind) (
 			return page, model.ErrOrganizationInvalidInput
 		}
 	}
+	return page, rejectOrganizationReadWriteInputs(c)
+}
+
+// rejectOrganizationReadWriteInputs refuses inputs that only state-changing
+// organization requests carry: a security proof, an idempotency key or a body.
+func rejectOrganizationReadWriteInputs(c *gin.Context) error {
 	for key := range c.Request.Header {
 		if strings.EqualFold(key, "X-Security-Proof") || strings.EqualFold(key, "Idempotency-Key") {
-			return page, model.ErrOrganizationInvalidInput
+			return model.ErrOrganizationInvalidInput
 		}
 	}
 	if c.Request.Body != nil {
 		// One byte is sufficient, including for chunked/unknown-length bodies.
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1))
 		if err != nil || len(body) > 0 {
-			return page, model.ErrOrganizationInvalidInput
+			return model.ErrOrganizationInvalidInput
 		}
 	}
-	return page, nil
+	return nil
 }
 
 func serveOrganizationAccess(c *gin.Context, kind model.OrganizationAccessKind) {
@@ -103,18 +110,103 @@ func serveOrganizationAccess(c *gin.Context, kind model.OrganizationAccessKind) 
 	}
 	data, actorRole, err := service.OrganizationAccessResponse(identity, kind, orgID, page)
 	if err != nil {
-		code := writeOrganizationAccessError(c, err)
-		if actorRole > 0 && (code == "ORG_NOT_FOUND" || code == "ORG_FORBIDDEN" || code == "ORG_STATE_CHANGED") {
-			recordOrganizationAccessAudit(c, identity.UserID, actorRole, orgID, "organization.access_denied", code, false)
-		} else {
-			logger.LogWarn(c.Request.Context(), common.LogText("organization.access_denied actor=unverified decision=%s", code))
-		}
+		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
 		return
 	}
 	common.ApiSuccess(c, data)
 	if kind == model.OrganizationAccessEvents {
 		recordOrganizationAccessAudit(c, identity.UserID, actorRole, orgID, "organization.events_read", "allowed", true)
 	}
+}
+
+// writeOrganizationAccessDenial audits domain denials only for an actor whose
+// role was read in the authorization transaction.
+func writeOrganizationAccessDenial(c *gin.Context, userID, actorRole int, orgID int64, err error) {
+	code := writeOrganizationAccessError(c, err)
+	if actorRole > 0 && (code == "ORG_NOT_FOUND" || code == "ORG_FORBIDDEN" || code == "ORG_STATE_CHANGED") {
+		recordOrganizationAccessAudit(c, userID, actorRole, orgID, "organization.access_denied", code, false)
+		return
+	}
+	logger.LogWarn(c.Request.Context(), common.LogText("organization.access_denied actor=unverified decision=%s", code))
+}
+
+// organizationTaskListQuery parses the organization branch of GET
+// /api/task/self. It is strictly bounded because the read runs while
+// membership rows are locked.
+func organizationTaskListQuery(c *gin.Context) (params model.SyncTaskQueryParams, page, pageSize int64, err error) {
+	page, pageSize = 1, int64(common.ItemsPerPage)
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		return params, page, pageSize, model.ErrOrganizationInvalidInput
+	}
+	for key, values := range query {
+		if len(values) != 1 {
+			return params, page, pageSize, model.ErrOrganizationInvalidInput
+		}
+		value := values[0]
+		switch key {
+		case "org_id": // The global boundary already validated selection/conflicts.
+		case "p", "page_size":
+			n, valid := middleware.ParseOrganizationDecimal(value)
+			if !valid || n < 1 || n > 100 {
+				return params, page, pageSize, model.ErrOrganizationInvalidInput
+			}
+			if key == "p" {
+				page = n
+			} else {
+				pageSize = n
+			}
+		case "start_timestamp", "end_timestamp":
+			if value == "" {
+				continue
+			}
+			n, valid := middleware.ParseOrganizationDecimal(value)
+			if !valid {
+				return params, page, pageSize, model.ErrOrganizationInvalidInput
+			}
+			if key == "start_timestamp" {
+				params.StartTimestamp = n
+			} else {
+				params.EndTimestamp = n
+			}
+		case "task_id":
+			params.TaskID = value
+		case "action":
+			params.Action = value
+		case "status":
+			params.Status = value
+		case "platform":
+			params.Platform = constant.TaskPlatform(value)
+		default:
+			return params, page, pageSize, model.ErrOrganizationInvalidInput
+		}
+	}
+	return params, page, pageSize, rejectOrganizationReadWriteInputs(c)
+}
+
+// serveOrganizationTasks is the organization branch of GET /api/task/self.
+// Only a dashboard session may read it.
+func serveOrganizationTasks(c *gin.Context, orgID int64) {
+	identity, ok := middleware.RequireOrganizationScopeSession(c)
+	if !ok {
+		return
+	}
+	params, page, pageSize, err := organizationTaskListQuery(c)
+	if err != nil {
+		// The middleware identity may be cached; validation failures carry no
+		// authoritative audit actor.
+		writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, err)
+		return
+	}
+	items, total, actorRole, err := model.ReadOrganizationTasks(identity, orgID, params, int((page-1)*pageSize), int(pageSize))
+	if err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+		return
+	}
+	pageInfo := &common.PageInfo{Page: int(page), PageSize: int(pageSize)}
+	pageInfo.SetTotal(int(total))
+	pageInfo.SetItems(tasksToDto(items, false, common.RoleCommonUser))
+	common.ApiSuccess(c, pageInfo)
 }
 
 func writeOrganizationAccessError(c *gin.Context, err error) string {

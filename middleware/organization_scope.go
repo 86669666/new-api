@@ -182,11 +182,21 @@ var organizationLifecycleRoutes = map[string]bool{
 	"POST /api/platform/organizations/:org_id/authorization-context":                          true,
 }
 
+// Existing personal resource routes that also serve an organization-owned view.
+// Organization hardening applies only when a positive selector is present, so
+// unselected and explicit-zero requests keep their legacy behavior.
+var organizationResourceRoutes = map[string]bool{
+	"GET /api/task/self": true,
+}
+
 // OrganizationSelectionBoundary must be registered before every application
 // route and NoRoute dispatcher. Only an exact method/template pair is eligible.
 func OrganizationSelectionBoundary() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		isAccess, pathSelection, discovery := false, false, false
+		if selection := organizationRequestSelection(c); selection.code == "" && selection.id > 0 && organizationResourceRoutes[c.Request.Method+" "+c.FullPath()] {
+			isAccess = true
+		}
 		if c.Request.Method == http.MethodGet {
 			switch c.FullPath() {
 			case "/api/organizations":

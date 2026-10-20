@@ -5,6 +5,7 @@ Only exported source copies receive the generated test entry. Each phase is a ne
 process. A missing engine/phase is an incomplete matrix, even if SQLite passes.
 """
 import argparse
+import functools
 import hashlib
 import io
 import json
@@ -22,7 +23,7 @@ from urllib.parse import urlsplit, unquote, quote
 
 from run_isolated_databases import (terminate_group, guarded_communicate, docker_command,
                                     OwnedRelay, RelayIdentityError, ClickHouseAuth, CLICKHOUSE_IMAGE, CLICKHOUSE_CLIENT,
-                                    validate_inherited_environment)
+                                    validate_inherited_environment, check_relays)
 
 RELEASE = '633b4c5b190dc1af99a2814391354d86948e7943'
 COMBINATIONS = (('sqlite', 'same'), ('mysql', 'same'), ('postgres', 'same'),
@@ -637,13 +638,14 @@ CANDIDATE_FIXTURE = CANDIDATE_FIXTURE.replace('"data": data, "schema_main":',
 
 
 
-def execute(command, *, cwd=None, env=None, timeout=300, input_bytes=None, guard=None):
+def execute(command, *, cwd=None, env=None, timeout=300, input_bytes=None, guard=None, final_guard=None):
     if guard is not None:
         guard()
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
-        stdout, stderr = guarded_communicate(process, timeout=timeout, input_bytes=input_bytes, guard=guard)
+        stdout, stderr = guarded_communicate(process, timeout=timeout, input_bytes=input_bytes,
+                                             guard=guard, final_guard=final_guard)
     except BaseException as error:
         cleanup = terminate_group(process)
         error.process_cleanup_error = '; '.join(filter(None, [getattr(error, 'process_cleanup_error', None), cleanup])) or None
@@ -836,16 +838,16 @@ class OwnedStores:
         self.relay_receipt.write_text(json.dumps({'relays': self.relay_records,
             'initialization_error': self.relay_initialization_error}, indent=2))
 
-    def check_routes(self):
+    def check_routes(self, *, fresh=False):
         if self.clickhouse_auth is not None:
             self.clickhouse_auth.validate()
+        if not self.cleaning:
+            check_relays(self.relays, fresh=fresh)
+            return
         for relay in self.relays:
-            if self.cleaning:
-                # Cleanup uses Docker exec, but must still bind the original container/network.
-                if relay.snapshot() != relay.initial:
-                    raise RelayIdentityError('owned database identity changed before cleanup')
-            else:
-                relay.check()
+            # Cleanup uses Docker exec, but must still bind the original container/network.
+            if relay.snapshot() != relay.initial:
+                raise RelayIdentityError('owned database identity changed before cleanup')
 
     def close_relays(self):
         errors = []
@@ -950,7 +952,8 @@ class OwnedStores:
                 if any(auth.redact(str(part), secrets) != str(part) or 'clickhouse://' in str(part)
                        for part in command):
                     raise ValueError('ClickHouse credentials must never appear in argv')
-            code, out, err = execute(command, cwd=cwd, env=env, timeout=timeout, guard=self.check_routes)
+            code, out, err = execute(command, cwd=cwd, env=env, timeout=timeout, guard=self.check_routes,
+                                     final_guard=functools.partial(self.check_routes, fresh=True))
         except BaseException as error:
             if auth:
                 auth.sanitize_error(error, secrets)
@@ -967,7 +970,8 @@ class OwnedStores:
             self.clickhouse_auth.validate()
         try:
             code,out,err=execute(self.docker+args,timeout=timeout,input_bytes=data,
-                                 guard=self.check_routes if self.relays else None)
+                                 guard=self.check_routes if self.relays else None,
+                                 final_guard=functools.partial(self.check_routes, fresh=True) if self.relays else None)
         except BaseException as error:
             if self.clickhouse_auth:
                 self.clickhouse_auth.sanitize_error(error)
@@ -1156,7 +1160,8 @@ def run_phase(binary, phase, main, log, stores, main_db, log_db, evidence, label
     auth = stores.clickhouse_auth
     if auth is None:
         # Keep the accepted non-CH execution and evidence path unchanged.
-        code,out,err=execute(command,cwd=stores.runtime,env=env,timeout=135,guard=stores.check_routes)
+        code,out,err=execute(command,cwd=stores.runtime,env=env,timeout=135,guard=stores.check_routes,
+                            final_guard=functools.partial(stores.check_routes, fresh=True))
         text=(out+err).decode(errors='replace')
         for key in ('SQL_DSN','LOG_SQL_DSN'):
             if env.get(key) and env[key]!='local':text=text.replace(env[key],'[owned-dsn]')

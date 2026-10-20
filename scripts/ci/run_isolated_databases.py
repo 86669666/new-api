@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the bounded A03 database contract suite on its dedicated Colima daemon."""
 import argparse
+import functools
 import json
 import hashlib
 import ipaddress
@@ -320,14 +321,14 @@ def terminate_group(process):
     return '; '.join(errors) or None
 
 
-def run(command, *, env=None, timeout=30, safe_failure_output=False, guard=None):
+def run(command, *, env=None, timeout=30, safe_failure_output=False, guard=None, final_guard=None):
     """Bound the child group; only explicitly sanitized gate output may be surfaced."""
     if guard is not None:
         guard()
     process = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, start_new_session=True)
     try:
-        stdout, stderr = guarded_communicate(process, timeout=timeout, guard=guard)
+        stdout, stderr = guarded_communicate(process, timeout=timeout, guard=guard, final_guard=final_guard)
     except BaseException as error:
         cleanup = terminate_group(process)
         error.process_cleanup_error = '; '.join(filter(None, [getattr(error, 'process_cleanup_error', None), cleanup])) or None
@@ -371,22 +372,41 @@ class RelayIdentityError(RuntimeError):
     """The owned route is no longer safe; abort all dependent phases."""
 
 
-def guarded_communicate(process, *, timeout, guard=None, input_bytes=None):
-    if guard is None:
+def check_relays(relays, *, fresh=False):
+    """One guard tick: every relay verifies its own route; identical reads are taken once."""
+    tick = None if fresh else {}
+    for relay in relays:
+        relay.check_listener()
+    for relay in relays:
+        relay.check(tick)
+
+
+def guarded_communicate(process, *, timeout, guard=None, input_bytes=None, final_guard=None):
+    if guard is None and final_guard is None:
         return process.communicate(input_bytes, timeout=timeout)
     deadline = time.monotonic() + timeout
     first = True
     while True:
-        guard()
+        if guard is not None:
+            guard()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired(process.args, timeout)
         try:
             result = process.communicate(input_bytes if first else None, timeout=min(1, remaining))
-            guard()
-            return result
         except subprocess.TimeoutExpired:
             first = False
+            continue
+        # A final check is part of the same child budget. Its failures must not
+        # be mistaken for a communicate polling timeout and retried.
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        check = final_guard if final_guard is not None else guard
+        if check is not None:
+            check()
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        return result
 
 
 def docker_command(config, context):
@@ -465,8 +485,18 @@ class OwnedRelay:
                 raise ValueError('ClickHouse requires validated private auth')
             clickhouse_auth.validate()
 
-    def snapshot(self):
-        data = json.loads(run(self.docker + ['inspect', self.container], timeout=5))[0]
+    def read(self, command, tick):
+        # A tick memo lives only for one check_relays/cleaning pass and holds raw
+        # stdout of reads that completed; every consumer parses its own copy.
+        if tick is None:
+            return run(command, timeout=5)
+        key = tuple(command)
+        if key not in tick:
+            tick[key] = run(command, timeout=5)
+        return tick[key]
+
+    def snapshot(self, tick=None):
+        data = json.loads(self.read(self.docker + ['inspect', self.container], tick))[0]
         if self.engine == 'clickhouse':
             self.clickhouse_auth.validate()
             expected_env = {'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
@@ -485,13 +515,13 @@ class OwnedRelay:
         if len(endpoints) != 1:
             raise RelayIdentityError('container must have exactly one internal network')
         network_id = next(iter(endpoints.values()))['NetworkID']
-        network = json.loads(run(self.docker + ['network', 'inspect', network_id], timeout=5))[0]
+        network = json.loads(self.read(self.docker + ['network', 'inspect', network_id], tick))[0]
         identity = owned_container_identity(data, network, self.project, self.engine, self.container)
         if self.engine == 'clickhouse' and identity['peers'] != [self.container]:
             raise RelayIdentityError('ClickHouse profile must be the only network peer')
         # The shared internal network may contain the other explicitly owned engine only.
         for peer in identity['peers']:
-            other = json.loads(run(self.docker + ['inspect', peer], timeout=5))[0]
+            other = json.loads(self.read(self.docker + ['inspect', peer], tick))[0]
             service = other['Config'].get('Labels', {}).get('com.docker.compose.service')
             if service not in (('clickhouse',) if self.engine == 'clickhouse' else IMAGES):
                 raise RelayIdentityError('unexpected network peer')
@@ -609,12 +639,12 @@ class OwnedRelay:
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             raise RelayIdentityError('relay listener verification failed') from error
 
-    def check(self):
+    def check(self, tick=None):
         self.check_listener()
         try:
-            if self.snapshot() != self.initial:
+            if self.snapshot(tick) != self.initial:
                 raise RelayIdentityError('container/network endpoint changed during test')
-            boot = run(['colima', 'ssh', '-p', 'newapi-a03', '--', 'cat', '/proc/sys/kernel/random/boot_id'], timeout=5).strip()
+            boot = self.read(['colima', 'ssh', '-p', 'newapi-a03', '--', 'cat', '/proc/sys/kernel/random/boot_id'], tick).strip()
             if boot != self.boot:
                 raise RelayIdentityError('VM boot changed during test')
         except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
@@ -681,10 +711,9 @@ def main(argv=None):
                         else f'postgres://postgres@{address}/newapi_ci_contracts?sslmode=disable')
             print(f'{service}: {address}, owned container={identity}', flush=True)
         args.relay_evidence.write_text(json.dumps([relay.receipt for relay in relays], indent=2))
-        def guard():
-            for relay in relays:
-                relay.check()
-        print(run([sys.executable, str(Path(__file__).with_name('database_gate.py'))], env=env, timeout=1230, safe_failure_output=True, guard=guard), end='')
+        print(run([sys.executable, str(Path(__file__).with_name('database_gate.py'))], env=env, timeout=1230,
+                  safe_failure_output=True, guard=functools.partial(check_relays, relays),
+                  final_guard=functools.partial(check_relays, relays, fresh=True)), end='')
     except (Exception, KeyboardInterrupt) as error:
         primary_error = f'{type(error).__name__}: {error}'
         process_cleanup_error = getattr(error, 'process_cleanup_error', None)
