@@ -307,6 +307,10 @@ func withOrganizationWithContext(parent context.Context, identity AuthSessionIde
 			return ErrOrganizationConflict
 		}
 		if mutate && s.org.Revision != c.Revision {
+			if s.execution != nil && (s.execution.action == "invite" || s.execution.action == "reissue") &&
+				s.requireEnabled() == nil && s.canInvite(c.Role) && s.session.ExpiresAt > organizationNow().Unix() {
+				return &OrganizationRevisionConflictError{Revision: s.org.Revision}
+			}
 			return ErrOrganizationConflict
 		}
 		for _, v := range s.invitations {

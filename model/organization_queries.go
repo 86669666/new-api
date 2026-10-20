@@ -38,6 +38,8 @@ type OrganizationRequestResult struct {
 	Kind                 string
 	FromUserID           int
 	TargetUserID         int
+	FromUsername         string
+	TargetUsername       string
 	Role                 string
 	Status               string
 	ExpiresAt            int64
@@ -272,6 +274,20 @@ func organizationRequestResultWithContext(ctx context.Context, i AuthSessionIden
 			return ErrOrganizationNotFound
 		}
 		result = OrganizationRequestResult{OrganizationID: orgID, ObjectID: id, Generation: generation, Kind: kind, FromUserID: first.ActorUserID, TargetUserID: first.SubjectUserID, Role: first.Role, Status: last.AfterState, ExpiresAt: first.ExpiresAt, ReasonCode: last.ReasonCode}
+		if kind == "invitation" {
+			var users []User
+			if err := s.tx.Select("id", "username").Where("id IN ?", []int{first.ActorUserID, first.SubjectUserID}).Find(&users).Error; err != nil {
+				return err
+			}
+			for _, user := range users {
+				if user.Id == first.ActorUserID {
+					result.FromUsername = user.Username
+				}
+				if user.Id == first.SubjectUserID {
+					result.TargetUsername = user.Username
+				}
+			}
+		}
 		if result.Status == OrganizationPending {
 			if s.now >= result.ExpiresAt {
 				result.Status = OrganizationExpired

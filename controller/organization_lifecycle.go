@@ -37,6 +37,10 @@ func writeOrganizationLifecycleError(c *gin.Context, err error) {
 		c.Header("Retry-After", strconv.Itoa(budget.RetryAfter))
 	case errors.Is(err, model.ErrOrganizationInvalidInput):
 		status, code, message = 400, "ORG_REQUEST_INVALID", "Invalid organization request."
+	case errors.Is(err, model.ErrOrganizationSelfInvite):
+		status, code, message = 400, "ORG_SELF_INVITE", "You cannot invite yourself to an organization."
+	case errors.Is(err, service.ErrOrganizationEmailInviteUnsupported):
+		status, code, message = 400, "ORG_EMAIL_INVITE_UNSUPPORTED", service.ErrOrganizationEmailInviteUnsupported.Error()
 	case errors.Is(err, service.ErrVerificationContextInvalid):
 		status, code, message = 400, "SECURITY_CONTEXT_INVALID", service.ErrVerificationContextInvalid.Error()
 	case errors.Is(err, model.ErrOrganizationUnauthenticated), errors.Is(err, model.ErrUserSessionInactive), errors.Is(err, service.ErrLoginSessionRevoked):
@@ -79,7 +83,12 @@ func writeOrganizationLifecycleError(c *gin.Context, err error) {
 		status, code, message = 403, "SECURITY_PROOF_INVALID", "Security proof is invalid."
 	}
 	c.Header("Cache-Control", "private, no-store")
-	common.ApiErrorStatus(c, status, common.NewMessage(message), gin.H{"code": code})
+	fields := gin.H{"code": code}
+	var revisionConflict *model.OrganizationRevisionConflictError
+	if errors.As(err, &revisionConflict) {
+		fields["data"] = gin.H{"revision": strconv.FormatInt(revisionConflict.Revision, 10)}
+	}
+	common.ApiErrorStatus(c, status, common.NewMessage(message), fields)
 	c.Abort()
 }
 
@@ -148,7 +157,14 @@ func organizationRequest(c *gin.Context, allowProof, paged bool, bodyLimit int64
 		return identity, nil, page, &organizationHTTPError{403, "AUTH_SESSION_REQUIRED", "A dashboard session is required."}
 	}
 	if !middleware.OrganizationOriginAllowed(c.Request) {
-		return identity, nil, page, &organizationHTTPError{403, "AUTH_ORIGIN_FORBIDDEN", "request origin is not allowed"}
+		message := "Fetch metadata is not allowed without an Origin or Referer header."
+		for key := range c.Request.Header {
+			if strings.EqualFold(key, "Origin") || strings.EqualFold(key, "Referer") {
+				message = "request origin is not allowed"
+				break
+			}
+		}
+		return identity, nil, page, &organizationHTTPError{403, "AUTH_ORIGIN_FORBIDDEN", message}
 	}
 	if c.Request.Method == http.MethodGet {
 		if c.Request.Body != nil {
@@ -242,7 +258,10 @@ func OrganizationPreviewHandler(platform bool) gin.HandlerFunc {
 		}
 		wire, cmd, err := service.DecodeOrganizationCommand(request.Action, request.Command, true, "", "", "")
 		if err != nil || wire.OrganizationID != c.Param("org_id") {
-			writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
+			if wire.OrganizationID != c.Param("org_id") || !errors.Is(err, service.ErrOrganizationEmailInviteUnsupported) {
+				err = model.ErrOrganizationInvalidInput
+			}
+			writeOrganizationLifecycleError(c, err)
 			return
 		}
 		op, b, name, err := service.PreviewOrganizationOperationWithContext(c.Request.Context(), identity, request.Action, wire, cmd)
@@ -285,7 +304,11 @@ func organizationRequestView(v *model.OrganizationRequestResult) any {
 	if v.ResolvedAt != 0 {
 		resolved = v.ResolvedAt
 	}
-	return gin.H{"organization_id": strconv.FormatInt(v.OrganizationID, 10), "organization_name": v.OrganizationName, "organization_revision": revision, "object_id": strconv.FormatInt(v.ObjectID, 10), "generation": strconv.FormatInt(v.Generation, 10), "kind": v.Kind, "from_user_id": strconv.Itoa(v.FromUserID), "target_user_id": strconv.Itoa(v.TargetUserID), "role": role, "status": v.Status, "expires_at": v.ExpiresAt, "resolved_at": resolved, "reason_code": v.ReasonCode}
+	result := gin.H{"organization_id": strconv.FormatInt(v.OrganizationID, 10), "organization_name": v.OrganizationName, "organization_revision": revision, "object_id": strconv.FormatInt(v.ObjectID, 10), "generation": strconv.FormatInt(v.Generation, 10), "kind": v.Kind, "from_user_id": strconv.Itoa(v.FromUserID), "target_user_id": strconv.Itoa(v.TargetUserID), "role": role, "status": v.Status, "expires_at": v.ExpiresAt, "resolved_at": resolved, "reason_code": v.ReasonCode}
+	if v.Kind == "invitation" {
+		result["from_username"], result["target_username"] = v.FromUsername, v.TargetUsername
+	}
+	return result
 }
 func OrganizationLifecycleQuery(kind string) gin.HandlerFunc {
 	return func(c *gin.Context) {

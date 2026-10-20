@@ -174,17 +174,31 @@ func DecodeOrganizationCommand(action string, data []byte, full bool, orgID, tar
 	if common.Unmarshal(data, &rawFields) != nil {
 		return wire, cmd, model.ErrOrganizationInvalidInput
 	}
-	if _, present := rawFields["username"]; action == "invite" && present {
+	_, emailPresent := rawFields["email"]
+	emailInvite := action == "invite" && emailPresent
+	if _, present := rawFields["username"]; action == "invite" && (present || emailInvite) {
 		for index, field := range fields {
 			if field == "target_user_id" {
 				fields[index] = "username"
+				if emailInvite {
+					fields[index] = "email"
+				}
 			}
 		}
 	}
 	if err := exactOrganizationFields(data, fields); err != nil {
 		return wire, cmd, err
 	}
-	if common.UnmarshalStrictObject(data, &wire) != nil {
+	if emailInvite {
+		var input struct {
+			OrganizationCommandDTO
+			Email string `json:"email"`
+		}
+		if common.UnmarshalStrictObject(data, &input) != nil || input.Email == "" {
+			return wire, cmd, model.ErrOrganizationInvalidInput
+		}
+		wire = input.OrganizationCommandDTO
+	} else if common.UnmarshalStrictObject(data, &wire) != nil {
 		return wire, cmd, model.ErrOrganizationInvalidInput
 	}
 	if _, present := rawFields["username"]; present {
@@ -265,6 +279,12 @@ func DecodeOrganizationCommand(action string, data []byte, full bool, orgID, tar
 	}
 	if wire.Replace != nil {
 		cmd.Replace = *wire.Replace
+	}
+	if emailInvite {
+		if cmd.Role != model.OrganizationRoleMember && cmd.Role != model.OrganizationRoleAdmin {
+			return wire, cmd, model.ErrOrganizationInvalidInput
+		}
+		return wire, cmd, ErrOrganizationEmailInviteUnsupported
 	}
 	return wire, cmd, nil
 }
@@ -658,3 +678,4 @@ func ExecuteOrganizationLifecycleWithContext(ctx context.Context, identity AuthI
 }
 
 var ErrOrganizationProofRequired = errors.New("Security proof is required.")
+var ErrOrganizationEmailInviteUnsupported = errors.New("Email invitations are not supported. Use a user ID or username.")

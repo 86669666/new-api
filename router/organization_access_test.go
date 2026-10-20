@@ -201,7 +201,8 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	if owner == "g10-organization-identity" || owner == "g10-organization-task-read" {
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation"}, owner)
+	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
 		require.Equal(t, "none", os.Getenv("NEWAPI_S2_CACHE_MODE"))
@@ -219,7 +220,7 @@ func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 		t.Log("SQLite fixture: temporary file")
 		return db, p
 	}
-	if owner != "g10-organization-identity" && owner != "g10-organization-task-read" {
+	if !boundedSuite {
 		require.Contains(t, []string{"g5-A03", "g6-A03"}, owner, "dedicated runtime receipt required")
 	}
 	require.NoError(t, organizationFixtureDSN(kind, source, os.Getenv("NEWAPI_S2_"+strings.ToUpper(kind)+"_PORT")))
@@ -458,7 +459,17 @@ func organizationError(t *testing.T, status int, h http.Header, b map[string]any
 	assert.Empty(t, h.Values("Set-Cookie"))
 	assert.Equal(t, code, b["code"])
 	assert.Equal(t, false, b["success"])
-	assert.NotContains(t, slices.Collect(maps.Keys(b)), "data")
+	if data, present := b["data"]; present && code == "ORG_STATE_CHANGED" {
+		revision, ok := data.(map[string]any)
+		require.True(t, ok)
+		require.Len(t, revision, 1)
+		value, ok := revision["revision"].(string)
+		require.True(t, ok)
+		_, valid := middleware.ParseOrganizationDecimal(value)
+		assert.True(t, valid)
+	} else {
+		assert.NotContains(t, slices.Collect(maps.Keys(b)), "data")
+	}
 }
 
 func TestOrganizationAccessHTTP(t *testing.T) {

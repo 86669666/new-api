@@ -133,6 +133,31 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
     samples = {f['contract_id']: f for f in fixtures if f.get('kind') == 's3_operation'}
     assert set(samples) == expected_ids
     schemas = api['components']['schemas']
+    assert 'ORG_SELF_INVITE' in schemas['OrganizationLifecycleError400']['properties']['code']['enum']
+    assert 'ORG_EMAIL_INVITE_UNSUPPORTED' in schemas['OrganizationLifecycleError400']['properties']['code']['enum']
+    request_view = schemas['OrganizationLifecycleRequestView']
+    for field in ['from_username', 'target_username']:
+        assert request_view['properties'][field]['type'] == 'string'
+        assert request_view['properties'][field]['maxLength'] == 20
+    assert request_view['oneOf'] == [
+        {'properties': {'kind': {'enum': ['invitation']}}, 'required': ['from_username', 'target_username']},
+        {'properties': {'kind': {'enum': ['transfer']}},
+         'not': {'anyOf': [{'required': ['from_username']}, {'required': ['target_username']}]}},
+    ]
+    conflict = schemas['OrganizationLifecycleError409']
+    assert conflict['properties']['data']['properties'] == {'revision': {'$ref': '#/components/schemas/OrganizationLifecycleID'}}
+    assert conflict['properties']['data']['required'] == ['revision']
+    assert conflict['properties']['data']['additionalProperties'] is False
+    assert conflict['oneOf'] == [
+        {'properties': {'code': {'enum': ['ORG_STATE_CHANGED']}}},
+        {'properties': {'code': {'enum': [value for value in conflict['properties']['code']['enum'] if value != 'ORG_STATE_CHANGED']}},
+         'not': {'required': ['data']}},
+    ]
+    for path in ['/api/organizations/{org_id}/invitations', '/api/organizations/{org_id}/invitations/{invitation_id}/reissue']:
+        operation = api['paths'][path]['post']
+        assert 'errors never include the current revision.' not in operation['description']
+        assert 'only an authorized stale invite/reissue may include data.revision observed under the existing locks; other conflicts omit it.' in operation['description']
+        assert operation['x-organization-invitation-conflicts']['self_invite'] == {'code': 'ORG_SELF_INVITE', 'status': 400, 'retry': 'choose another user'}
     scopes = schemas['OrganizationLifecycleProofResult']['properties']['scope']['enum']
     assert len(scopes) == len(set(scopes)) == 9
     assert 'platform.organization.disable' in scopes
@@ -289,6 +314,13 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
                 actual = invite['oneOf'][0]
             elif key == 'PreviewBody_1':
                 actual = {'oneOf': preview['oneOf'][:-1]}
+            elif key == 'RequestView':
+                # Preserve the frozen shared view and strictly check the two
+                # invitation-only display fields above; proof schemas stay exact.
+                actual = dict(actual)
+                actual['properties'] = {name: value for name, value in actual['properties'].items()
+                                        if name not in ('from_username', 'target_username')}
+                del actual['oneOf']
             compare_schema(expected, actual, key)
         gate_checked = True
     return {'routes': len(routes), 'schemas': len(contract['schema_map']), 'organization_scopes': len(scopes), 'frozen_design_checked': gate_checked, 'design_contract_id': contract['design_contract_id'], 'effective_design_gate_sha256': contract['design_gate_sha256'], 'live_http': False}

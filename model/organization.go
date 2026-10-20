@@ -33,10 +33,21 @@ var (
 	ErrOrganizationConflict         = errors.New("organization state changed")
 	ErrOrganizationAlreadyMember    = errors.New("user is already an organization member")
 	ErrOrganizationInvitationExists = errors.New("organization invitation already exists")
+	ErrOrganizationSelfInvite       = errors.New("cannot invite yourself to an organization")
 	ErrOrganizationExpired          = errors.New("organization request expired")
 	ErrOrganizationTerminal         = errors.New("organization request is already resolved")
 	ErrOrganizationMembershipActive = common.NewMessage(OrganizationMembershipMessage)
 )
+
+// OrganizationRevisionConflictError exposes only a revision observed under the
+// existing locks after the caller's invitation authority has been established.
+// Other state conflicts deliberately retain ErrOrganizationConflict alone.
+type OrganizationRevisionConflictError struct {
+	Revision int64
+}
+
+func (e *OrganizationRevisionConflictError) Error() string { return ErrOrganizationConflict.Error() }
+func (e *OrganizationRevisionConflictError) Unwrap() error { return ErrOrganizationConflict }
 
 type Organization struct {
 	ID                     int64  `gorm:"primaryKey"`

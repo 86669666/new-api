@@ -381,6 +381,8 @@ func TestOrganizationLifecycleStrictTransport(t *testing.T) {
 		{"origin_list", valid, http.Header{"Origin": {"https://example.com, https://example.com"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
 		{"duplicate_origin", valid, http.Header{"Origin": {"https://example.com", "https://example.com"}}, 400, "ORG_REQUEST_INVALID"},
 		{"invalid_referer", valid, http.Header{"Referer": {"not-an-absolute-url"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
+		{"empty_referer", valid, http.Header{"Referer": {""}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
+		{"duplicate_referer", valid, http.Header{"Referer": {"https://example.com/a", "https://example.com/b"}}, 400, "ORG_REQUEST_INVALID"},
 		{"fetch_without_origin", valid, http.Header{"Sec-Fetch-Site": {"same-site"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
 		{"fetch_destination_without_origin", valid, http.Header{"Sec-Fetch-Dest": {"empty"}}, 403, "AUTH_ORIGIN_FORBIDDEN"},
 		{"idempotency", valid, http.Header{"Idempotency-Key": {"unsupported"}}, 400, "ORG_REQUEST_INVALID"},
@@ -394,8 +396,20 @@ func TestOrganizationLifecycleStrictTransport(t *testing.T) {
 			}
 			status, headers, b := c.request(t, "PATCH", c.path()+"/name", "owner", tc.body, h)
 			organizationError(t, status, headers, b, tc.status, tc.code)
+			if tc.code == "AUTH_ORIGIN_FORBIDDEN" {
+				message := "request origin is not allowed"
+				if tc.headers.Values("Origin") == nil && tc.headers.Values("Referer") == nil {
+					message = "Fetch metadata is not allowed without an Origin or Referer header."
+				}
+				assert.Equal(t, message, b["message"])
+				assert.Equal(t, message, b["message_key"])
+			}
 		})
 	}
+	status, _, body := c.request(t, "PATCH", c.path()+"/name", "owner", valid,
+		http.Header{"Content-Type": {"application/json"}, "Origin": {c.server.URL}, "Sec-Fetch-Mode": {"cors"}, "Sec-Fetch-Site": {"same-origin"}})
+	require.Equal(t, 200, status)
+	assert.Equal(t, true, body["success"])
 }
 
 func TestOrganizationLifecycleNativeFetchOrigin(t *testing.T) {
@@ -594,6 +608,9 @@ func TestOrganizationLifecycleInvitationConflicts(t *testing.T) {
 		{"stale revision before missing target", "owner", path, initialRevision, "999999999", "ORG_STATE_CHANGED", "Organization state changed. Refresh the organization state before retrying.", 409},
 		{"current revision missing target", "owner", path, currentRevision, "999999999", "ORG_NOT_FOUND", "", 404},
 		{"member cannot inspect invitation", "member", path, currentRevision, target, "ORG_FORBIDDEN", "", 403},
+		{"stale member cannot inspect revision", "member", path, initialRevision, target, "ORG_STATE_CHANGED", "", 409},
+		{"stale root nonmember cannot inspect revision", "root", path, initialRevision, target, "ORG_NOT_FOUND", "", 404},
+		{"stale nonmember cannot inspect revision", "empty", path, initialRevision, target, "ORG_NOT_FOUND", "", 404},
 		{"member cannot inspect membership", "member", path, currentRevision, strconv.Itoa(c.users["admin"].Id), "ORG_FORBIDDEN", "", 403},
 		{"nonmember cannot inspect invitation", "empty", path, currentRevision, target, "ORG_NOT_FOUND", "", 404},
 		{"foreign cannot inspect membership", "foreign", path, currentRevision, strconv.Itoa(c.users["member"].Id), "ORG_NOT_FOUND", "", 404},
@@ -603,6 +620,11 @@ func TestOrganizationLifecycleInvitationConflicts(t *testing.T) {
 			status, h, b := c.json(t, "POST", tc.endpoint, tc.actor, map[string]any{"revision": tc.revision, "target_user_id": tc.target, "role": "member"}, "")
 			organizationError(t, status, h, b, tc.status, tc.code)
 			assert.NotContains(t, b, "revision")
+			if tc.code == "ORG_STATE_CHANGED" && tc.actor == "owner" {
+				assert.Equal(t, map[string]any{"revision": currentRevision}, b["data"])
+			} else {
+				assert.NotContains(t, b, "data")
+			}
 			if tc.message != "" {
 				assert.Equal(t, tc.message, b["message"])
 			}
@@ -616,7 +638,50 @@ func TestOrganizationLifecycleInvitationConflicts(t *testing.T) {
 		command := map[string]any{"organization_id": strconv.FormatInt(c.orgA, 10), "revision": tc.revision, "target_user_id": tc.target, "role": "admin"}
 		status, h, b := c.json(t, "POST", c.path()+"/authorization-context", "owner", map[string]any{"action": "invite", "command": command}, "")
 		organizationError(t, status, h, b, 409, tc.code)
+		if tc.code == "ORG_STATE_CHANGED" {
+			assert.Equal(t, map[string]any{"revision": currentRevision}, b["data"])
+		} else {
+			assert.NotContains(t, b, "data")
+		}
 	}
+	for _, actor := range []string{"owner", "admin"} {
+		for _, selector := range []string{"target_user_id", "username"} {
+			t.Run("stale "+actor+" "+selector, func(t *testing.T) {
+				value := "999999999"
+				if selector == "username" {
+					value = "missing-org-user"
+				}
+				status, h, b := c.json(t, "POST", path, actor, map[string]any{"revision": initialRevision, selector: value, "role": "member"}, "")
+				organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+				assert.Equal(t, map[string]any{"revision": currentRevision}, b["data"])
+			})
+		}
+	}
+	for _, tc := range []struct{ selector, target string }{{"target_user_id", strconv.Itoa(c.users["owner"].Id)}, {"username", c.users["owner"].Username}} {
+		t.Run("self invite "+tc.selector, func(t *testing.T) {
+			status, h, b := c.json(t, "POST", path, "owner", map[string]any{"revision": currentRevision, tc.selector: tc.target, "role": "member"}, "")
+			organizationError(t, status, h, b, 400, "ORG_SELF_INVITE")
+			assert.Equal(t, "You cannot invite yourself to an organization.", b["message"])
+		})
+	}
+	for _, actor := range []string{"owner", "admin"} {
+		status, h, b := c.json(t, "POST", path+"/"+invitation["object_id"].(string)+"/reissue", actor,
+			map[string]any{"revision": initialRevision, "generation": "999", "target_user_id": target, "role": "member"}, "")
+		organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+		assert.Equal(t, map[string]any{"revision": currentRevision}, b["data"])
+	}
+	for _, endpoint := range []string{path, path + "/" + invitation["object_id"].(string) + "/reissue"} {
+		body := map[string]any{"revision": initialRevision, "target_user_id": target, "role": "admin"}
+		if strings.HasSuffix(endpoint, "/reissue") {
+			body["generation"] = invitation["generation"]
+		}
+		status, h, b := c.json(t, "POST", endpoint, "admin", body, "")
+		organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+		assert.NotContains(t, b, "data")
+	}
+	status, h, b := c.json(t, "PATCH", c.path()+"/name", "owner", map[string]any{"revision": initialRevision, "name": "must-not-rename"}, "")
+	organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+	assert.NotContains(t, b, "data")
 	// Concurrent repeats observe the same existing slot; neither may add an
 	// invitation/event or advance the revision. Existing lock/CAS tests remain.
 	raw, err := common.Marshal(map[string]any{"revision": currentRevision, "target_user_id": target, "role": "member"})
@@ -686,6 +751,7 @@ func TestOrganizationLifecycleInvitationConflicts(t *testing.T) {
 			reissue := map[string]any{"revision": c.revision(t), "generation": "999", "target_user_id": target, "role": "member"}
 			status, h, b = c.json(t, "POST", slot+"/reissue", "owner", reissue, "")
 			organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+			assert.NotContains(t, b, "data")
 			reissue["generation"] = invitation["generation"]
 			next := c.mutate(t, "owner", "POST", slot+"/reissue", "reissue", reissue, nil, false)
 			assert.Equal(t, invitation["object_id"], next["object_id"])
@@ -694,6 +760,41 @@ func TestOrganizationLifecycleInvitationConflicts(t *testing.T) {
 			assert.Equal(t, strconv.FormatInt(generation+1, 10), next["generation"])
 			assert.Equal(t, "pending", next["status"])
 			invitation = next
+		})
+	}
+	t.Run("platform root joins as member", func(t *testing.T) {
+		target := strconv.Itoa(c.users["root"].Id)
+		invite := c.mutate(t, "owner", "POST", path, "invite", map[string]any{"revision": c.revision(t), "target_user_id": target, "role": "member"}, nil, false)
+		c.mutate(t, "root", "POST", path+"/"+invite["object_id"].(string)+"/accept", "invitation_accept", map[string]any{"revision": c.revision(t), "generation": invite["generation"]}, nil, false)
+		status, _, b := c.json(t, "GET", c.path(), "root", nil, "")
+		require.Equal(t, 200, status)
+		assert.Equal(t, "member", b["data"].(map[string]any)["my_role"])
+		status, h, b := c.json(t, "POST", path, "root", map[string]any{"revision": c.revision(t), "target_user_id": strconv.Itoa(c.users["empty"].Id), "role": "member"}, "")
+		organizationError(t, status, h, b, 403, "ORG_FORBIDDEN")
+		status, h, b = c.json(t, "POST", path, "root", map[string]any{"revision": initialRevision, "target_user_id": strconv.Itoa(c.users["empty"].Id), "role": "member"}, "")
+		organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+		assert.NotContains(t, b, "data")
+	})
+	for _, state := range []string{"disabled", "revoked", "expired"} {
+		t.Run("no revision after "+state, func(t *testing.T) {
+			f := newOrganizationLifecycleClient(t)
+			stale := f.revision(t)
+			if state == "disabled" {
+				f.mutate(t, "owner", "POST", f.path()+"/self-state", "self_disable", map[string]any{"revision": stale, "disabled": true, "reason": ""}, nil, true)
+			} else if state == "revoked" {
+				revoked, err := model.RevokeUserSession(f.users["owner"].Id, f.sids["owner"], "invitation_revision_test")
+				require.NoError(t, err)
+				require.True(t, revoked)
+			} else {
+				require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).Update("expires_at", time.Now().Unix()-1).Error)
+			}
+			status, h, b := f.json(t, "POST", f.path()+"/invitations", "owner", map[string]any{"revision": stale, "target_user_id": strconv.Itoa(f.users["foreign"].Id), "role": "member"}, "")
+			if state == "disabled" {
+				organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+			} else {
+				organizationError(t, status, h, b, 401, "AUTH_SESSION_REVOKED")
+			}
+			assert.NotContains(t, b, "data")
 		})
 	}
 }
@@ -764,7 +865,11 @@ func TestOrganizationLifecycleInvitationIdentity(t *testing.T) {
 			body := maps.Clone(tc.body)
 			body["revision"], body["role"] = c.revision(t), "member"
 			status, h, b := c.json(t, "POST", path, "owner", body, "")
-			organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+			code := "ORG_REQUEST_INVALID"
+			if tc.name == "email field" {
+				code = "ORG_EMAIL_INVITE_UNSUPPORTED"
+			}
+			organizationError(t, status, h, b, 400, code)
 		})
 	}
 	for _, username := range []string{"TARGET@example.test", "tárget@example.test", atUsername + " "} {
@@ -904,6 +1009,164 @@ func TestOrganizationLifecycleInvitationIdentity(t *testing.T) {
 
 // This fixture writes owned rows through the real task writer. It deliberately
 // does not submit organization work, invoke a provider or exercise billing.
+func TestOrganizationInvitationPresentation(t *testing.T) {
+	c := newOrganizationLifecycleClient(t)
+	path := c.path() + "/invitations"
+	username := "target@example.test"
+	require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["foreign"].Id).Update("username", username).Error)
+	c.users["foreign"].Username = username
+	first := c.mutate(t, "owner", "POST", path, "invite", map[string]any{"revision": c.revision(t), "username": username, "role": "member"}, nil, false)
+	second := c.mutate(t, "admin", "POST", path, "invite", map[string]any{"revision": c.revision(t), "target_user_id": strconv.Itoa(c.users["empty"].Id), "role": "member"}, nil, false)
+	adminBody := map[string]any{"revision": c.revision(t), "target_user_id": strconv.Itoa(c.users["root"].Id), "role": "admin"}
+	operation := c.operation(t, "owner", "invite", adminBody, nil)
+	context := operation["context"].(map[string]any)
+	assert.NotContains(t, context["command"], "from_username")
+	assert.NotContains(t, context["command"], "target_username")
+	assert.NotContains(t, context["snapshot"], "from_username")
+	assert.NotContains(t, context["snapshot"], "target_username")
+	c.mutate(t, "owner", "POST", path, "invite", adminBody, nil, true)
+	firstID, secondID := first["object_id"].(string), second["object_id"].(string)
+	firstResult := path + "/" + firstID + "/generations/1"
+
+	t.Run("authorized pages and single generation", func(t *testing.T) {
+		for _, tc := range []struct{ endpoint, from, target, objectID string }{
+			{path + "?limit=1", "owner", "foreign", firstID},
+			{path + "?limit=1&after_id=" + firstID, "admin", "empty", secondID},
+		} {
+			status, headers, body := c.json(t, "GET", tc.endpoint, "owner", nil, "")
+			require.Equal(t, 200, status)
+			assert.True(t, organizationPrivateNoStore(headers.Values("Cache-Control")))
+			page := body["data"].(map[string]any)
+			items := page["items"].([]any)
+			require.Len(t, items, 1)
+			item := items[0].(map[string]any)
+			assert.Len(t, item, 15)
+			assert.Equal(t, tc.objectID, item["object_id"])
+			assert.Equal(t, tc.objectID, page["next_after_id"])
+			assert.Equal(t, strconv.Itoa(c.users[tc.from].Id), item["from_user_id"])
+			assert.Equal(t, c.users[tc.from].Username, item["from_username"])
+			assert.Equal(t, c.users[tc.target].Username, item["target_username"])
+		}
+		status, _, body := c.json(t, "GET", firstResult, "foreign", nil, "")
+		require.Equal(t, 200, status)
+		assert.Equal(t, c.users["owner"].Username, body["data"].(map[string]any)["from_username"])
+		assert.Equal(t, username, body["data"].(map[string]any)["target_username"])
+		status, _, body = c.json(t, "GET", "/api/organization-invitations", "foreign", nil, "")
+		require.Equal(t, 200, status)
+		items := body["data"].(map[string]any)["items"].([]any)
+		require.Len(t, items, 1)
+		assert.Equal(t, c.users["owner"].Username, items[0].(map[string]any)["from_username"])
+		status, _, body = c.json(t, "GET", path, "admin", nil, "")
+		require.Equal(t, 200, status)
+		items = body["data"].(map[string]any)["items"].([]any)
+		require.Len(t, items, 2, "administrators see member invitations only")
+		for _, tc := range []struct {
+			actor, endpoint, code string
+			status                int
+		}{
+			{"member", path, "ORG_FORBIDDEN", 403}, {"root", path, "ORG_NOT_FOUND", 404},
+			{"empty", firstResult, "ORG_NOT_FOUND", 404},
+			{"owner", fmt.Sprintf("/api/organizations/%d/invitations", c.orgB), "ORG_NOT_FOUND", 404},
+		} {
+			status, headers, body := c.json(t, "GET", tc.endpoint, tc.actor, nil, "")
+			organizationError(t, status, headers, body, tc.status, tc.code)
+		}
+	})
+
+	t.Run("generation identity and current name snapshot", func(t *testing.T) {
+		c.mutate(t, "admin", "POST", path+"/"+firstID+"/reissue", "reissue", map[string]any{"revision": c.revision(t), "generation": "1", "target_user_id": strconv.Itoa(c.users["foreign"].Id), "role": "member"}, nil, false)
+		for actor, name := range map[string]string{"owner": "renamed-owner", "admin": "renamed-admin", "foreign": "renamed-target"} {
+			require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users[actor].Id).Update("username", name).Error)
+			c.users[actor].Username = name
+		}
+		for _, tc := range []struct{ generation, actor string }{{"1", "owner"}, {"2", "admin"}} {
+			status, _, body := c.json(t, "GET", path+"/"+firstID+"/generations/"+tc.generation, "owner", nil, "")
+			require.Equal(t, 200, status)
+			item := body["data"].(map[string]any)
+			assert.Equal(t, strconv.Itoa(c.users[tc.actor].Id), item["from_user_id"])
+			assert.Equal(t, c.users[tc.actor].Username, item["from_username"])
+			assert.Equal(t, strconv.Itoa(c.users["foreign"].Id), item["target_user_id"])
+			assert.Equal(t, "renamed-target", item["target_username"])
+		}
+	})
+
+	t.Run("transfer projection and proof stay unchanged", func(t *testing.T) {
+		c.mutate(t, "owner", "POST", c.path()+"/ownership-transfers", "transfer_initiate", map[string]any{"revision": c.revision(t), "target_user_id": strconv.Itoa(c.users["member"].Id), "previous_id": "0", "previous_generation": "0", "replace": false}, nil, true)
+		status, _, body := c.json(t, "GET", c.path()+"/ownership-transfer", "owner", nil, "")
+		require.Equal(t, 200, status)
+		assert.Len(t, body["data"], 13)
+		assert.NotContains(t, body["data"], "from_username")
+		assert.NotContains(t, body["data"], "target_username")
+		malformed := maps.Clone(context)
+		command := maps.Clone(context["command"].(map[string]any))
+		delete(command, "target_user_id")
+		command["email"] = "not-searched@example.test"
+		malformed["command"] = command
+		var before, after int64
+		require.NoError(t, c.db.Model(&model.AuthFlow{}).Count(&before).Error)
+		status, headers, body := c.json(t, "POST", "/api/verify", "owner", map[string]any{"scope": operation["scope"], "context": malformed, "method": "password", "password": c.passwords["owner"]}, "")
+		organizationError(t, status, headers, body, 400, "SECURITY_CONTEXT_INVALID")
+		require.NoError(t, c.db.Model(&model.AuthFlow{}).Count(&after).Error)
+		assert.Equal(t, before, after)
+	})
+
+	t.Run("missing names retain invitation and cursor", func(t *testing.T) {
+		require.NoError(t, c.db.Delete(&model.User{}, c.users["admin"].Id).Error)
+		require.NoError(t, c.db.Delete(&model.User{}, c.users["foreign"].Id).Error)
+		require.NoError(t, c.db.Unscoped().Delete(&model.User{}, c.users["empty"].Id).Error)
+		for _, tc := range []struct{ after, id string }{{"0", firstID}, {firstID, secondID}} {
+			status, _, body := c.json(t, "GET", path+"?limit=1&after_id="+tc.after, "owner", nil, "")
+			require.Equal(t, 200, status)
+			page := body["data"].(map[string]any)
+			items := page["items"].([]any)
+			require.Len(t, items, 1)
+			item := items[0].(map[string]any)
+			assert.Equal(t, tc.id, item["object_id"])
+			assert.Equal(t, tc.id, page["next_after_id"])
+			assert.Equal(t, "", item["from_username"])
+			assert.Equal(t, "", item["target_username"])
+		}
+	})
+
+	t.Run("email unsupported retains strict input rejection", func(t *testing.T) {
+		revision := c.revision(t)
+		for _, tc := range []struct{ name, body, code string }{
+			{"email only", `{"revision":%q,"email":"nobody@example.test","role":"member"}`, "ORG_EMAIL_INVITE_UNSUPPORTED"},
+			{"empty email", `{"revision":%q,"email":"","role":"member"}`, "ORG_REQUEST_INVALID"},
+			{"null email", `{"revision":%q,"email":null,"role":"member"}`, "ORG_REQUEST_INVALID"},
+			{"numeric email", `{"revision":%q,"email":123,"role":"member"}`, "ORG_REQUEST_INVALID"},
+			{"two selectors", `{"revision":%q,"email":"nobody@example.test","username":"someone","role":"member"}`, "ORG_REQUEST_INVALID"},
+			{"ID and email", `{"revision":%q,"email":"nobody@example.test","target_user_id":"1","role":"member"}`, "ORG_REQUEST_INVALID"},
+			{"unknown field", `{"revision":%q,"email":"nobody@example.test","role":"member","extra":true}`, "ORG_REQUEST_INVALID"},
+			{"duplicate email", `{"revision":%q,"email":"one@example.test","email":"two@example.test","role":"member"}`, "ORG_REQUEST_INVALID"},
+			{"empty role", `{"revision":%q,"email":"nobody@example.test","role":""}`, "ORG_REQUEST_INVALID"},
+			{"invalid revision", `{"revision":%q,"email":"nobody@example.test","role":"member"}`, "ORG_REQUEST_INVALID"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				value := revision
+				if tc.name == "invalid revision" {
+					value = "0"
+				}
+				status, headers, body := c.request(t, "POST", path, "owner", fmt.Sprintf(tc.body, value), http.Header{"Content-Type": {"application/json"}})
+				organizationError(t, status, headers, body, 400, tc.code)
+				if tc.code == "ORG_EMAIL_INVITE_UNSUPPORTED" {
+					assert.Equal(t, "Email invitations are not supported. Use a user ID or username.", body["message"])
+				}
+			})
+		}
+		command := map[string]any{"organization_id": strconv.FormatInt(c.orgA, 10), "revision": revision, "email": "nobody@example.test", "role": "admin"}
+		status, headers, body := c.json(t, "POST", c.path()+"/authorization-context", "owner", map[string]any{"action": "invite", "command": command}, "")
+		organizationError(t, status, headers, body, 400, "ORG_EMAIL_INVITE_UNSUPPORTED")
+		for _, orgID := range []string{"0", strconv.FormatInt(c.orgB, 10)} {
+			command["organization_id"] = orgID
+			status, headers, body = c.json(t, "POST", c.path()+"/authorization-context", "owner", map[string]any{"action": "invite", "command": command}, "")
+			organizationError(t, status, headers, body, 400, "ORG_REQUEST_INVALID")
+		}
+		status, headers, body = c.json(t, "POST", path+"/"+firstID+"/reissue", "owner", map[string]any{"revision": revision, "generation": "2", "email": "nobody@example.test", "role": "member"}, "")
+		organizationError(t, status, headers, body, 400, "ORG_REQUEST_INVALID")
+	})
+}
+
 func newOrganizationTaskReadClient(t *testing.T, upstream string) (*organizationLifecycleClient, map[string]*model.Task) {
 	t.Helper()
 	c := newOrganizationLifecycleClient(t)

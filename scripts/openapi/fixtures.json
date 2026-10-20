@@ -3093,7 +3093,9 @@
         "status": "pending",
         "expires_at": 0,
         "resolved_at": null,
-        "reason_code": ""
+        "reason_code": "",
+        "from_username": "fixture-inviter",
+        "target_username": "fixture-target"
       }
     },
     "response_schema": "#/components/schemas/OrganizationLifecycleQ05Result",
@@ -3127,7 +3129,9 @@
         "status": "pending",
         "expires_at": 0,
         "resolved_at": null,
-        "reason_code": ""
+        "reason_code": "",
+        "from_username": "fixture-inviter",
+        "target_username": "fixture-target"
       }
     },
     "valid": true
@@ -3160,7 +3164,9 @@
         "status": "pending",
         "expires_at": 0,
         "resolved_at": null,
-        "reason_code": ""
+        "reason_code": "",
+        "from_username": "fixture-inviter",
+        "target_username": "fixture-target"
       }
     },
     "response_schema": "#/components/schemas/OrganizationLifecycleQ06Result",
@@ -3194,7 +3200,9 @@
         "status": "pending",
         "expires_at": 0,
         "resolved_at": null,
-        "reason_code": ""
+        "reason_code": "",
+        "from_username": "fixture-inviter",
+        "target_username": "fixture-target"
       }
     },
     "valid": true
@@ -8745,5 +8753,270 @@
       ]
     },
     "valid": false
+  },
+  {
+    "name": "organization followup self invitation",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "You cannot invite yourself to an organization.",
+      "code": "ORG_SELF_INVITE"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization followup metadata rejection",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError403/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Fetch metadata is not allowed without an Origin or Referer header.",
+      "code": "AUTH_ORIGIN_FORBIDDEN"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization followup authorized stale revision",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Organization state changed. Refresh the organization state before retrying.",
+      "code": "ORG_STATE_CHANGED",
+      "data": {
+        "revision": "9007199254740993"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization followup revision must be string",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Organization state changed. Refresh the organization state before retrying.",
+      "code": "ORG_STATE_CHANGED",
+      "data": {
+        "revision": 9007199254740993
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization followup revision must fit int64",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Organization state changed. Refresh the organization state before retrying.",
+      "code": "ORG_STATE_CHANGED",
+      "data": {
+        "revision": "9223372036854775808"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization followup revision data required field",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Organization state changed. Refresh the organization state before retrying.",
+      "code": "ORG_STATE_CHANGED",
+      "data": {}
+    },
+    "valid": false
+  },
+  {
+    "name": "organization followup revision data closed fields",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Organization state changed. Refresh the organization state before retrying.",
+      "code": "ORG_STATE_CHANGED",
+      "data": {
+        "revision": "2",
+        "target_user_id": "3"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization followup membership business error has no revision",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Organization state changed. Refresh the organization state before retrying.",
+      "code": "ORG_ALREADY_MEMBER",
+      "data": {
+        "revision": "2"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization followup invitation business error has no revision",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError409/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Organization state changed. Refresh the organization state before retrying.",
+      "code": "ORG_INVITATION_EXISTS",
+      "data": {
+        "revision": "2"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization invitation display names",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleRequestView",
+    "value": {
+      "organization_id": "1",
+      "organization_name": "fixture-org",
+      "organization_revision": "2",
+      "object_id": "3",
+      "generation": "1",
+      "kind": "invitation",
+      "from_user_id": "4",
+      "target_user_id": "5",
+      "role": "member",
+      "status": "pending",
+      "expires_at": 1900000000,
+      "resolved_at": null,
+      "reason_code": "",
+      "from_username": "fixture-inviter",
+      "target_username": "fixture-target"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization missing inviter name",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleRequestView",
+    "value": {
+      "organization_id": "1",
+      "organization_name": "fixture-org",
+      "organization_revision": "2",
+      "object_id": "3",
+      "generation": "1",
+      "kind": "invitation",
+      "from_user_id": "4",
+      "target_user_id": "5",
+      "role": "member",
+      "status": "pending",
+      "expires_at": 1900000000,
+      "resolved_at": null,
+      "reason_code": "",
+      "target_username": "fixture-target"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization null target name",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleRequestView",
+    "value": {
+      "organization_id": "1",
+      "organization_name": "fixture-org",
+      "organization_revision": "2",
+      "object_id": "3",
+      "generation": "1",
+      "kind": "invitation",
+      "from_user_id": "4",
+      "target_user_id": "5",
+      "role": "member",
+      "status": "pending",
+      "expires_at": 1900000000,
+      "resolved_at": null,
+      "reason_code": "",
+      "from_username": "fixture-inviter",
+      "target_username": null
+    },
+    "valid": false
+  },
+  {
+    "name": "organization invitation names may be empty",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleRequestView",
+    "value": {
+      "organization_id": "1",
+      "organization_name": "fixture-org",
+      "organization_revision": "2",
+      "object_id": "3",
+      "generation": "1",
+      "kind": "invitation",
+      "from_user_id": "4",
+      "target_user_id": "5",
+      "role": "member",
+      "status": "pending",
+      "expires_at": 1900000000,
+      "resolved_at": null,
+      "reason_code": "",
+      "from_username": "",
+      "target_username": ""
+    },
+    "valid": true
+  },
+  {
+    "name": "organization transfer has no display fields",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleRequestView",
+    "value": {
+      "organization_id": "1",
+      "organization_name": "fixture-org",
+      "organization_revision": "2",
+      "object_id": "3",
+      "generation": "1",
+      "kind": "transfer",
+      "from_user_id": "4",
+      "target_user_id": "5",
+      "role": "member",
+      "status": "pending",
+      "expires_at": 1900000000,
+      "resolved_at": null,
+      "reason_code": ""
+    },
+    "valid": true
+  },
+  {
+    "name": "organization transfer cannot add display fields",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleRequestView",
+    "value": {
+      "organization_id": "1",
+      "organization_name": "fixture-org",
+      "organization_revision": "2",
+      "object_id": "3",
+      "generation": "1",
+      "kind": "transfer",
+      "from_user_id": "4",
+      "target_user_id": "5",
+      "role": "member",
+      "status": "pending",
+      "expires_at": 1900000000,
+      "resolved_at": null,
+      "reason_code": "",
+      "from_username": "fixture-inviter",
+      "target_username": "fixture-target"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization unsupported email invitation error",
+    "document": "api",
+    "schema": "#/components/responses/OrganizationLifecycleError400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Email invitations are not supported. Use a user ID or username.",
+      "code": "ORG_EMAIL_INVITE_UNSUPPORTED"
+    },
+    "valid": true
   }
 ]

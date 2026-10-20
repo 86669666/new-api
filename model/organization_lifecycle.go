@@ -505,8 +505,11 @@ func issueOrganizationInvitation(i AuthSessionIdentity, c OrganizationCommand, r
 			return err
 		}
 	}
-	if c.TargetUserID <= 0 || c.TargetUserID == i.UserID || c.Role != OrganizationRoleMember && c.Role != OrganizationRoleAdmin {
+	if c.TargetUserID <= 0 || c.Role != OrganizationRoleMember && c.Role != OrganizationRoleAdmin {
 		return ErrOrganizationInvalidInput
+	}
+	if c.TargetUserID == i.UserID {
+		return ErrOrganizationSelfInvite
 	}
 	return withOrganization(i, c, true, func(s *organizationState) error {
 		if err := s.requireEnabled(); err != nil {

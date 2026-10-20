@@ -15326,7 +15326,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "path",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: active owner invites admin/member; admin invites member only; target active nonmember, not actor. Proof policy: required iff role admin; otherwise forbidden. The success receipt revision is the new organization revision. A stale revision returns 409 ORG_STATE_CHANGED before target/member/invitation checks: refresh organization state before an explicitly chosen retry; errors never include the current revision. With a current revision and authorized inviter, an existing member returns 409 ORG_ALREADY_MEMBER. For a target who is not already a member, an existing invitation slot returns 409 ORG_INVITATION_EXISTS for pending, declined, revoked, expired or accepted slots; use the reissue operation with the slot ID and exact generation. Authorization/visibility and revision checks retain precedence over target-state errors. Provide exactly one of target_user_id or username. The username is matched exactly (including case, accents and trailing spaces), is 1..20 Unicode code points without controls, and may contain @; email is not a selector. Username lookup follows visibility, revision and invitation authority checks. A successful lookup is bound to its stable user ID and rechecked after the normal user locks; a changed username fails with ORG_STATE_CHANGED without re-resolving or retrying. Reissue continues to require target_user_id, invitation ID and generation.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: active owner invites admin/member; admin invites member only; target active nonmember, not actor. Proof policy: required iff role admin; otherwise forbidden. The success receipt revision is the new organization revision. A stale revision returns 409 ORG_STATE_CHANGED before target/member/invitation checks: refresh organization state before an explicitly chosen retry; only an authorized stale invite/reissue may include data.revision observed under the existing locks; other conflicts omit it. With a current revision and authorized inviter, an existing member returns 409 ORG_ALREADY_MEMBER. For a target who is not already a member, an existing invitation slot returns 409 ORG_INVITATION_EXISTS for pending, declined, revoked, expired or accepted slots; use the reissue operation with the slot ID and exact generation. Authorization/visibility and revision checks retain precedence over target-state errors. Provide exactly one of target_user_id or username. The username is matched exactly (including case, accents and trailing spaces), is 1..20 Unicode code points without controls, and may contain @; email is not a selector. Username lookup follows visibility, revision and invitation authority checks. A successful lookup is bound to its stable user ID and rechecked after the normal user locks; a changed username fails with ORG_STATE_CHANGED without re-resolving or retrying. Reissue continues to require target_user_id, invitation ID and generation. Successful data.revision is the newly committed organization version. An authorized stale invite/reissue may return the lock-observed version as string data.revision; other STATE_CHANGED conflicts omit it. Review the current state before submitting again; sensitive commands require a newly matched preview and proof, with no automatic retry. Inviting yourself returns ORG_SELF_INVITE. Platform administrators, including root, may be invited as ordinary organization members; platform role does not grant organization management permissions. Initial invite requests and invite authorization-context commands support user ID or exact username only. A complete otherwise-valid email selector receives ORG_EMAIL_INVITE_UNSUPPORTED; no email parsing, lookup or user discovery is performed. Malformed, duplicate, unknown or mixed selector fields retain ORG_REQUEST_INVALID. Signed proof contexts remain ID-only.",
         "parameters": [
           {
             "name": "org_id",
@@ -15437,6 +15437,28 @@
                 "$ref": "#/components/schemas/OrganizationLifecycleBodyInvite"
               }
             }
+          }
+        },
+        "x-organization-invitation-conflicts": {
+          "stale_revision": {
+            "code": "ORG_STATE_CHANGED",
+            "status": 409,
+            "revision": "optional data.revision string from the authorized locked observation; no automatic retry"
+          },
+          "already_member": {
+            "code": "ORG_ALREADY_MEMBER",
+            "status": 409,
+            "retry": "do not retry as a revision conflict"
+          },
+          "existing_invitation": {
+            "code": "ORG_INVITATION_EXISTS",
+            "status": 409,
+            "retry": "use reissue with the invitation ID and generation"
+          },
+          "self_invite": {
+            "code": "ORG_SELF_INVITE",
+            "status": 400,
+            "retry": "choose another user"
           }
         }
       },
@@ -15590,7 +15612,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "path",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: same invite authority; target_user_id must equal existing slot target; exact previous generation. Proof policy: required iff role admin; otherwise forbidden. A current-revision request for an existing member returns 409 ORG_ALREADY_MEMBER. Stale organization revisions and mismatched invitation generations retain 409 ORG_STATE_CHANGED: refresh organization state before an explicitly chosen retry; errors never include the current revision. An existing slot remains necessary for reissue, and the exact previous generation is still required for every pending or terminal slot.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: same invite authority; target_user_id must equal existing slot target; exact previous generation. Proof policy: required iff role admin; otherwise forbidden. A current-revision request for an existing member returns 409 ORG_ALREADY_MEMBER. Stale organization revisions and mismatched invitation generations retain 409 ORG_STATE_CHANGED: refresh organization state before an explicitly chosen retry; only an authorized stale invite/reissue may include data.revision observed under the existing locks; other conflicts omit it. An existing slot remains necessary for reissue, and the exact previous generation is still required for every pending or terminal slot. Successful data.revision is the newly committed organization version. An authorized stale invite/reissue may return the lock-observed version as string data.revision; other STATE_CHANGED conflicts omit it. Review the current state before submitting again; sensitive commands require a newly matched preview and proof, with no automatic retry. Inviting yourself returns ORG_SELF_INVITE. Platform administrators, including root, may be invited as ordinary organization members; platform role does not grant organization management permissions.",
         "parameters": [
           {
             "name": "org_id",
@@ -15709,6 +15731,28 @@
                 "$ref": "#/components/schemas/OrganizationLifecycleBodyReissue"
               }
             }
+          }
+        },
+        "x-organization-invitation-conflicts": {
+          "stale_revision": {
+            "code": "ORG_STATE_CHANGED",
+            "status": 409,
+            "revision": "optional data.revision string from the authorized locked observation; no automatic retry"
+          },
+          "already_member": {
+            "code": "ORG_ALREADY_MEMBER",
+            "status": 409,
+            "retry": "do not retry as a revision conflict"
+          },
+          "existing_invitation": {
+            "code": "ORG_INVITATION_EXISTS",
+            "status": 409,
+            "retry": "use reissue with the invitation ID and generation"
+          },
+          "self_invite": {
+            "code": "ORG_SELF_INVITE",
+            "status": 400,
+            "retry": "choose another user"
           }
         }
       }
@@ -17276,7 +17320,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "path",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: same exact action preflight; proof-required actions only. Proof policy: forbidden. Invitation-related previews use the same authorized target-state errors as writes: ORG_ALREADY_MEMBER or ORG_INVITATION_EXISTS at a current revision, and ORG_STATE_CHANGED for a stale revision or generation mismatch. These errors are returned before proof issuance and never disclose the current revision. Only invite accepts an exact username in place of target_user_id on input. Its returned context always uses the original ID-only schema_version 1 command. Verification and proof rebuild reject raw username contexts; a username reused by another account cannot retarget an existing proof.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: same exact action preflight; proof-required actions only. Proof policy: forbidden. Invitation-related previews use the same authorized target-state errors as writes: ORG_ALREADY_MEMBER or ORG_INVITATION_EXISTS at a current revision, and ORG_STATE_CHANGED for a stale revision or generation mismatch. These errors are returned before proof issuance and never disclose the current revision. Only invite accepts an exact username in place of target_user_id on input. Its returned context always uses the original ID-only schema_version 1 command. Verification and proof rebuild reject raw username contexts; a username reused by another account cannot retarget an existing proof. Initial invite requests and invite authorization-context commands support user ID or exact username only. A complete otherwise-valid email selector receives ORG_EMAIL_INVITE_UNSUPPORTED; no email parsing, lookup or user discovery is performed. Malformed, duplicate, unknown or mixed selector fields retain ORG_REQUEST_INVALID. Signed proof contexts remain ID-only.",
         "parameters": [
           {
             "name": "org_id",
@@ -20381,6 +20425,16 @@
           "reason_code": {
             "type": "string",
             "x-source": "fixed S1 reason enum only; empty pending; never free-form reason"
+          },
+          "from_username": {
+            "type": "string",
+            "maxLength": 20,
+            "description": "Invitation only: current username in this read snapshot for the stable user ID from this generation event; empty if missing or soft-deleted. Display data only, never a selector or proof field."
+          },
+          "target_username": {
+            "type": "string",
+            "maxLength": 20,
+            "description": "Invitation only: current username in this read snapshot for the stable user ID from this generation event; empty if missing or soft-deleted. Display data only, never a selector or proof field."
           }
         },
         "required": [
@@ -20399,7 +20453,45 @@
           "reason_code"
         ],
         "additionalProperties": false,
-        "description": "Organization name/revision are present only for a currently actionable pending request; both are null otherwise, including historical requests and former members. Exact generation lookup returns an expired result with HTTP 200; an authorized expired action returns 410. reason_code is a fixed S1 reason, never a private free-form reason."
+        "description": "Organization name/revision are present only for a currently actionable pending request; both are null otherwise, including historical requests and former members. Exact generation lookup returns an expired result with HTTP 200; an authorized expired action returns 410. reason_code is a fixed S1 reason, never a private free-form reason. Invitation projections also include from_username and target_username as current read snapshots selected by the generation event actor and subject IDs, including historical generations; these are not historical names, selector inputs or signed proof/snapshot fields. Missing or soft-deleted users have empty strings and do not remove the invitation or change pagination. Transfer projections omit these fields.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "invitation"
+                ]
+              }
+            },
+            "required": [
+              "from_username",
+              "target_username"
+            ]
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "transfer"
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "from_username"
+                  ]
+                },
+                {
+                  "required": [
+                    "target_username"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
       },
       "OrganizationLifecycleRequestPage": {
         "type": "object",
@@ -21132,7 +21224,7 @@
         "additionalProperties": false
       },
       "OrganizationLifecycleBodyInvite": {
-        "description": "Provide exactly one selector: target_user_id or exact username. The legacy ID branch is unchanged.",
+        "description": "Provide exactly one selector: target_user_id or exact username. The legacy ID branch is unchanged. Email invitations are unsupported: a complete otherwise-valid email selector receives 400 ORG_EMAIL_INVITE_UNSUPPORTED. Empty, null, nonstring, duplicate, mixed or extra fields remain ORG_REQUEST_INVALID. Reissue and signed proof contexts retain their original ID-only shapes.",
         "oneOf": [
           {
             "type": "object",
@@ -23325,7 +23417,9 @@
               "ORG_SELECTOR_INVALID",
               "ORG_SELECTOR_CONFLICT",
               "ORG_SELECTOR_NOT_ALLOWED",
-              "SECURITY_CONTEXT_INVALID"
+              "SECURITY_CONTEXT_INVALID",
+              "ORG_SELF_INVITE",
+              "ORG_EMAIL_INVITE_UNSUPPORTED"
             ]
           }
         },
@@ -23447,12 +23541,53 @@
               "ORG_ALREADY_MEMBER",
               "ORG_INVITATION_EXISTS"
             ]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "revision": {
+                "$ref": "#/components/schemas/OrganizationLifecycleID"
+              }
+            },
+            "required": [
+              "revision"
+            ],
+            "additionalProperties": false,
+            "description": "Present only for an authorized invite/reissue request whose revision differs from the organization revision observed under the existing locks. A current enabled organization, sufficient invitation role and an unexpired locked session are required. This is an observation, not a reservation or an automatic retry instruction."
           }
         },
         "required": [
           "success",
           "message",
           "code"
+        ],
+        "oneOf": [
+          {
+            "properties": {
+              "code": {
+                "enum": [
+                  "ORG_STATE_CHANGED"
+                ]
+              }
+            }
+          },
+          {
+            "properties": {
+              "code": {
+                "enum": [
+                  "ORG_DISABLED",
+                  "ORG_REQUEST_RESOLVED",
+                  "ORG_ALREADY_MEMBER",
+                  "ORG_INVITATION_EXISTS"
+                ]
+              }
+            },
+            "not": {
+              "required": [
+                "data"
+              ]
+            }
+          }
         ]
       },
       "OrganizationLifecycleError410": {
@@ -25368,7 +25503,7 @@
         }
       },
       "OrganizationLifecycleError400": {
-        "description": "ORG_REQUEST_INVALID; ORG_SELECTOR_INVALID; ORG_SELECTOR_CONFLICT; ORG_SELECTOR_NOT_ALLOWED; SECURITY_CONTEXT_INVALID",
+        "description": "ORG_REQUEST_INVALID; ORG_SELECTOR_INVALID; ORG_SELECTOR_CONFLICT; ORG_SELECTOR_NOT_ALLOWED; SECURITY_CONTEXT_INVALID; ORG_SELF_INVITE (the actor cannot invite themselves); ORG_EMAIL_INVITE_UNSUPPORTED (only a complete otherwise-valid initial invite/preview email selector; use target_user_id or username; malformed or mixed selectors remain ORG_REQUEST_INVALID)",
         "headers": {
           "Cache-Control": {
             "schema": {
@@ -25411,7 +25546,7 @@
         }
       },
       "OrganizationLifecycleError403": {
-        "description": "AUTH_SESSION_REQUIRED; ORG_FORBIDDEN; AUTH_ORIGIN_FORBIDDEN; SECURITY_METHOD_UNAVAILABLE; SECURITY_VERIFICATION_FAILED; SECURITY_VERIFICATION_LOCKED; SECURITY_PROOF_REQUIRED; SECURITY_PROOF_INVALID; SECURITY_PROOF_EXPIRED; SECURITY_PROOF_CONSUMED; SECURITY_PROOF_SCOPE_MISMATCH; SECURITY_PROOF_CONTEXT_MISMATCH; SECURITY_PROOF_METHOD_MISMATCH",
+        "description": "AUTH_SESSION_REQUIRED; ORG_FORBIDDEN; AUTH_ORIGIN_FORBIDDEN; SECURITY_METHOD_UNAVAILABLE; SECURITY_VERIFICATION_FAILED; SECURITY_VERIFICATION_LOCKED; SECURITY_PROOF_REQUIRED; SECURITY_PROOF_INVALID; SECURITY_PROOF_EXPIRED; SECURITY_PROOF_CONSUMED; SECURITY_PROOF_SCOPE_MISMATCH; SECURITY_PROOF_CONTEXT_MISMATCH; SECURITY_PROOF_METHOD_MISMATCH; AUTH_ORIGIN_FORBIDDEN retains its code and uses a Fetch Metadata message only when both Origin and Referer headers are absent, otherwise an origin rejection message.",
         "headers": {
           "Cache-Control": {
             "schema": {
@@ -25447,7 +25582,7 @@
         }
       },
       "OrganizationLifecycleError409": {
-        "description": "ORG_STATE_CHANGED (refresh organization state before retrying); ORG_ALREADY_MEMBER; ORG_INVITATION_EXISTS (use reissue); ORG_DISABLED; ORG_REQUEST_RESOLVED",
+        "description": "ORG_STATE_CHANGED may include data.revision only for authorized invite/reissue revision mismatches. Generation, participant lock-plan, username binding and CAS conflicts, and other actions do not include it. A supplied revision may change again; refresh and confirm the operation and obtain a new matching proof when required. No automatic retry or reuse of a consumed proof. ORG_ALREADY_MEMBER and ORG_INVITATION_EXISTS are business conflicts, not stale revisions; use reissue for an existing invitation slot. ORG_DISABLED; ORG_REQUEST_RESOLVED.",
         "headers": {
           "Cache-Control": {
             "schema": {

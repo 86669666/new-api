@@ -226,6 +226,52 @@ func TestOrganizationLifecycleDatabaseMatrix(t *testing.T) {
 			t.Run("transfer_replacement_rollback", func(t *testing.T) { testOrganizationTransferRollback(t, organizationDatabase(t, dialect)) })
 			t.Run("read_permissions", func(t *testing.T) { testOrganizationReads(t, organizationDatabase(t, dialect)) })
 			t.Run("schema", func(t *testing.T) { testOrganizationSchema(t, organizationDatabase(t, dialect)) })
+			t.Run("invitation_revision_disclosure", func(t *testing.T) {
+				f := organizationDatabase(t, dialect)
+				base := time.Now().Unix()
+				deadline := base + 120
+				var clock atomic.Int64
+				clock.Store(base)
+				organizationNow = func() time.Time { return time.Unix(clock.Load(), 0) }
+				t.Cleanup(func() { organizationNow = time.Now })
+				o := f.org(0)
+				command := f.command(o.ID)
+				rename := command
+				rename.Name = "advanced revision"
+				require.NoError(t, RenameOrganization(f.identities[0], rename))
+				current := f.command(o.ID).Revision
+				command.TargetUserID, command.Role = f.identities[1].UserID, OrganizationRoleMember
+				require.NoError(t, DB.Model(&UserSession{}).Where("sid = ?", f.identities[0].SessionID).Update("expires_at", deadline).Error)
+				_, err := ExecuteOrganizationCommandWithContext(t.Context(), f.identities[0], "invite", command)
+				require.ErrorIs(t, err, ErrOrganizationConflict)
+				var disclosed *OrganizationRevisionConflictError
+				require.ErrorAs(t, err, &disclosed)
+				assert.Equal(t, current, disclosed.Revision)
+				var eventsBefore int64
+				require.NoError(t, DB.Model(&OrganizationEvent{}).Where("organization_id = ?", o.ID).Count(&eventsBefore).Error)
+				var expired atomic.Bool
+				const callback = "organization:invitation_revision_expiry"
+				require.NoError(t, DB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+					organization, selected := tx.Statement.Dest.(*Organization)
+					_, inTransaction := tx.Statement.ConnPool.(gorm.TxCommitter)
+					if selected && inTransaction && organization.ID == o.ID && expired.CompareAndSwap(false, true) {
+						// Identity/session were valid and locked before this organization
+						// read. Advance past expiry as a completed lock wait would.
+						clock.Store(deadline)
+					}
+				}))
+				t.Cleanup(func() { _ = DB.Callback().Query().Remove(callback) })
+				_, err = ExecuteOrganizationCommandWithContext(t.Context(), f.identities[0], "invite", command)
+				require.ErrorIs(t, err, ErrOrganizationConflict)
+				var hidden *OrganizationRevisionConflictError
+				assert.False(t, errors.As(err, &hidden), "session expiry after identity validation must suppress revision disclosure")
+				assert.True(t, expired.Load(), "the clock must advance after the transactional organization read")
+				var eventsAfter, invitations int64
+				require.NoError(t, DB.Model(&OrganizationEvent{}).Where("organization_id = ?", o.ID).Count(&eventsAfter).Error)
+				require.NoError(t, DB.Model(&OrganizationInvitation{}).Where("organization_id = ?", o.ID).Count(&invitations).Error)
+				assert.Equal(t, eventsBefore, eventsAfter)
+				assert.Zero(t, invitations)
+			})
 			if dialect == "mysql" || dialect == "postgres" {
 				for _, subject := range []string{"session", "authorization", "invitation", "transfer"} {
 					t.Run("row_lock_expiry/"+subject, func(t *testing.T) {
