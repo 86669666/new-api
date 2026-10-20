@@ -398,7 +398,44 @@ def check_organization_task_reads(api):
         if '$ref' in response:
             response = pointer(api, response['$ref'])
         assert response['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
-    return {'routes': len(expected), 'batch_routes': 1, 'anonymous_access': False, 'live_http': False}
+    export_contract = api['x-organization-task-export-contract']
+    export_path = '/api/organizations/{org_id}/tasks/export'
+    assert export_contract['route'] == {'method': 'GET', 'path': export_path}
+    assert export_contract['format'] == 'json' and export_contract['filename'] == 'organization-task-states.json'
+    attachment = 'attachment; filename="organization-task-states.json"'
+    assert export_contract['content_disposition'] == attachment
+    assert export_contract['max_ids'] == batch_contract['max_ids']
+    assert export_contract['max_decoded_bytes'] == batch_contract['max_decoded_bytes']
+    assert export_contract['session_only'] is True and export_contract['all_or_nothing'] is True
+    assert export_contract['projection'] == batch_contract['projection']
+    assert export_contract['result_schema'] == '#/components/schemas/OrganizationTaskBatchResult'
+    assert export_contract['publication_recheck'] == batch_contract['publication_recheck']
+    assert export_contract['error_content_disposition'] == 'absent'
+    export = api['paths'][export_path]
+    assert set(export) == {'get'}
+    download = export['get']
+    for key in ['security', 'parameters', 'x-query-allowlist', 'x-pat-policy', 'x-forbidden-request-headers',
+                'x-request-body-policy', 'x-task-identity', 'x-delivery-authorization',
+                'x-batch-authorization-recheck', 'x-batch-order', 'x-batch-partial-results',
+                'x-organization-state-mutation', 'x-anonymous-artifact-access']:
+        assert download[key] == operation[key], key
+    assert download['x-export-format'] == 'json'
+    assert download['x-export-serialization'] == export_contract['serialization'] == 'complete in memory before final authorization recheck'
+    assert download['x-error-content-disposition'] == 'absent'
+    assert export_contract['route'] in api['x-organization-selection-boundary']['positive_selector_allowlist']
+    disposition = api['components']['schemas']['OrganizationTaskExportContentDisposition']
+    assert disposition == {'type': 'string', 'enum': [attachment]}
+    success = download['responses']['200']
+    assert success['content'] == operation['responses']['200']['content']
+    assert success['headers']['Content-Disposition']['schema'] == {'$ref': '#/components/schemas/OrganizationTaskExportContentDisposition'}
+    for status, response in download['responses'].items():
+        if status != '200':
+            assert response == operation['responses'][status]
+        if '$ref' in response:
+            response = pointer(api, response['$ref'])
+        assert response['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
+        assert ('Content-Disposition' in response['headers']) == (status == '200')
+    return {'routes': len(expected), 'batch_routes': 1, 'export_routes': 1, 'anonymous_access': False, 'live_http': False}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

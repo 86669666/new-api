@@ -1521,6 +1521,238 @@ func TestOrganizationTaskBatchRead(t *testing.T) {
 	}
 }
 
+func TestOrganizationTaskExport(t *testing.T) {
+	var upstreamRequests atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamRequests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(func() {
+		upstream.Close()
+		assert.Zero(t, upstreamRequests.Load(), "state export must not invoke a plugin or upstream")
+	})
+
+	t.Run("download_projection_isolation_and_strict_input", func(t *testing.T) {
+		c, rows := newOrganizationTaskReadClient(t, upstream.URL)
+		endpoint := c.path() + "/tasks/export"
+		ordered := []*model.Task{rows["failed"], rows["member"], rows["owner"], rows["pending"], rows["same_org_duplicate"], rows["admin"], rows["legacy_video"], rows["legacy_audio"]}
+		for index := range 12 {
+			task := *rows["member"]
+			task.ID, task.TaskID = 0, fmt.Sprintf("export-extra-%d", index)
+			require.NoError(t, task.InsertWithContext(t.Context()))
+			ordered = append(ordered, &task)
+		}
+		slices.Reverse(ordered)
+		allIDs := make([]string, 0, len(ordered))
+		for _, task := range ordered {
+			allIDs = append(allIDs, strconv.FormatInt(task.ID, 10))
+		}
+		revision := c.revision(t)
+		var eventsBefore, eventsAfter int64
+		require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Count(&eventsBefore).Error)
+		for _, tc := range []struct {
+			actor string
+			rows  []*model.Task
+		}{
+			{"owner", ordered}, {"admin", []*model.Task{rows["owner"]}},
+			{"member", []*model.Task{rows["pending"], rows["member"]}},
+		} {
+			ids := make([]string, 0, len(tc.rows))
+			for _, task := range tc.rows {
+				ids = append(ids, strconv.FormatInt(task.ID, 10))
+			}
+			query := "?task_row_ids=" + url.QueryEscape(strings.Join(ids, ","))
+			status, headers, response := c.json(t, "GET", endpoint+query, tc.actor, nil, "")
+			require.Equal(t, 200, status)
+			assert.Equal(t, `attachment; filename="organization-task-states.json"`, headers.Get("Content-Disposition"))
+			assert.Equal(t, "application/json; charset=utf-8", headers.Get("Content-Type"))
+			assert.Equal(t, "private, no-store", headers.Get("Cache-Control"))
+			assert.Empty(t, headers.Values("Set-Cookie"))
+			data := response["data"].(map[string]any)
+			require.Len(t, data, 1)
+			items := data["items"].([]any)
+			require.Len(t, items, len(tc.rows))
+			for index, item := range items {
+				projected := item.(map[string]any)
+				require.Len(t, projected, 10)
+				assert.Equal(t, ids[index], projected["task_row_id"])
+				assert.Equal(t, tc.rows[index].TaskID, projected["task_id"])
+				assert.Equal(t, string(tc.rows[index].Status), projected["status"])
+			}
+			encoded, err := common.Marshal(response)
+			require.NoError(t, err)
+			for _, secret := range []string{"raw-error-canary", "raw-result-canary", "org-private-canary", "audio-secret-canary", "fixture-provider-key"} {
+				assert.NotContains(t, string(encoded), secret)
+			}
+			if tc.actor == "owner" {
+				status, batchHeaders, batch := c.json(t, "GET", c.path()+"/tasks/batch"+query, tc.actor, nil, "")
+				require.Equal(t, 200, status)
+				assert.Equal(t, response, batch, "download preserves the existing batch envelope and projection")
+				assert.Empty(t, batchHeaders.Get("Content-Disposition"))
+			}
+		}
+		memberID := strconv.FormatInt(rows["member"].ID, 10)
+		for _, tc := range []struct{ actor, row string }{
+			{"owner", "other_org"}, {"owner", "personal_duplicate"}, {"owner", "discarded"},
+			{"member", "owner"}, {"foreign", "member"}, {"root", "member"},
+		} {
+			value := memberID + "," + strconv.FormatInt(rows[tc.row].ID, 10)
+			if tc.row == "member" {
+				value = memberID
+			}
+			status, headers, response := c.json(t, "GET", endpoint+"?task_row_ids="+value, tc.actor, nil, "")
+			organizationError(t, status, headers, response, 404, "ORG_NOT_FOUND")
+			assert.Empty(t, headers.Get("Content-Disposition"))
+		}
+		status, headers, response := c.json(t, "GET", endpoint+"?task_row_ids="+memberID+",9223372036854775807", "owner", nil, "")
+		organizationError(t, status, headers, response, 404, "ORG_NOT_FOUND")
+		assert.Empty(t, headers.Get("Content-Disposition"))
+		status, _, _ = c.json(t, "GET", fmt.Sprintf("/api/organizations/%d/tasks/export?task_row_ids=%d", c.orgB, rows["other_org"].ID), "member", nil, "")
+		require.Equal(t, 200, status)
+		for _, suffix := range []string{"", "?task_row_ids=", "?task_row_ids=01", "?task_row_ids=" + memberID + "," + memberID,
+			"?task_row_ids=" + strings.Join(append(append([]string{}, allIDs...), "1"), ","),
+			"?task_row_ids=" + memberID + "&task_row_ids=" + memberID, "?task_row_ids=" + memberID + "&format=csv"} {
+			status, headers, response := c.json(t, "GET", endpoint+suffix, "owner", nil, "")
+			organizationError(t, status, headers, response, 400, "ORG_REQUEST_INVALID")
+			assert.Empty(t, headers.Get("Content-Disposition"))
+		}
+		for _, route := range []string{"batch", "export"} {
+			status, headers, response := c.json(t, "GET", c.path()+"/tasks/"+route+"?task_row_ids="+memberID+","+memberID, "owner", nil, "")
+			organizationError(t, status, headers, response, 400, "ORG_REQUEST_INVALID")
+			assert.Empty(t, headers.Get("Content-Disposition"))
+		}
+		for _, tc := range []struct {
+			body    string
+			headers http.Header
+		}{
+			{"{}", nil}, {"", http.Header{"X-Security-Proof": {"unused"}}},
+			{"", http.Header{"Idempotency-Key": {"unused"}}}, {"", http.Header{"X-Http-Method-Override": {"POST"}}},
+		} {
+			status, headers, response := c.request(t, "GET", endpoint+"?task_row_ids="+memberID, "owner", tc.body, tc.headers)
+			assert.Equal(t, 400, status)
+			assert.Empty(t, headers.Get("Content-Disposition"))
+			assert.NotContains(t, response, "data")
+		}
+		patSuffix, err := common.GenerateRandomCharsKey(43)
+		require.NoError(t, err)
+		pat := model.AccessTokenPrefix + patSuffix
+		grant := &model.UserAccessToken{Name: "organization-task-export", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat)}
+		require.NoError(t, grant.SetScopes([]string{"*"}))
+		require.NoError(t, model.CreateUserAccessToken(c.users["root"].Id, grant, service.AccessTokenMaxPerUser))
+		for _, tc := range []struct {
+			credential, code string
+			status           int
+		}{{pat, "AUTH_SESSION_REQUIRED", 403}, {"", "AUTH_UNAUTHORIZED", 401}, {c.bearer["relay"], "AUTH_UNAUTHORIZED", 401}} {
+			status, headers, response := c.json(t, "GET", endpoint+"?task_row_ids="+memberID, tc.credential, nil, "")
+			organizationError(t, status, headers, response, tc.status, tc.code)
+			assert.Empty(t, headers.Get("Content-Disposition"))
+		}
+		callback := "test:organization-task-export-error"
+		require.NoError(t, c.db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Table == "tasks" {
+				tx.AddError(errors.New("export-internal-canary"))
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, c.db.Callback().Query().Remove(callback)) })
+		status, headers, response = c.json(t, "GET", endpoint+"?task_row_ids="+memberID, "owner", nil, "")
+		organizationError(t, status, headers, response, 500, "ORG_INTERNAL_ERROR")
+		assert.Empty(t, headers.Get("Content-Disposition"))
+		encoded, err := common.Marshal(response)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), "export-internal-canary")
+		assert.Equal(t, revision, c.revision(t))
+		require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Count(&eventsAfter).Error)
+		assert.Equal(t, eventsBefore, eventsAfter)
+	})
+
+	for _, change := range []string{"remove", "platform_disable", "session_revoke"} {
+		t.Run("revoked_before_publication_"+change, func(t *testing.T) {
+			c, rows := newOrganizationTaskReadClient(t, upstream.URL)
+			actor := "member"
+			if change == "platform_disable" {
+				actor = "owner"
+			} else if change == "session_revoke" {
+				actor = "admin"
+			}
+			pool := &organizationTaskBatchPublicationPool{ConnPool: c.db.ConnPool, entered: make(chan struct{}), release: make(chan struct{})}
+			originalPool, originalStatementPool := c.db.ConnPool, c.db.Statement.ConnPool
+			c.db.ConnPool, c.db.Statement.ConnPool = pool, pool
+			callback := "test:organization-task-export-publication"
+			require.NoError(t, c.db.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "tasks" && tx.Error == nil {
+					if transaction, ok := tx.Statement.ConnPool.(*organizationTaskBatchPublicationTx); ok {
+						transaction.taskRead = true
+					}
+				}
+			}))
+			var release sync.Once
+			t.Cleanup(func() {
+				release.Do(func() { close(pool.release) })
+				c.server.Close()
+				c.db.ConnPool, c.db.Statement.ConnPool = originalPool, originalStatementPool
+				require.NoError(t, c.db.Callback().Query().Remove(callback))
+			})
+			endpoint := fmt.Sprintf("%s/tasks/export?task_row_ids=%d,%d", c.path(), rows["member"].ID, rows["pending"].ID)
+			request, err := http.NewRequest("GET", c.server.URL+endpoint, nil)
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+c.bearer[actor])
+			type result struct {
+				status  int
+				headers http.Header
+				body    []byte
+				err     error
+			}
+			done := make(chan result, 1)
+			go func() {
+				response, err := c.client.Do(request)
+				if err != nil {
+					done <- result{err: err}
+					return
+				}
+				defer response.Body.Close()
+				body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+				done <- result{response.StatusCode, response.Header, body, err}
+			}()
+			select {
+			case <-pool.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("export did not reach its committed publication barrier")
+			}
+			want, code := 404, "ORG_NOT_FOUND"
+			switch change {
+			case "remove":
+				c.mutate(t, "owner", "DELETE", c.path()+"/members/"+strconv.Itoa(c.users["member"].Id), "remove", map[string]any{"revision": c.revision(t)}, map[string]any{"target_user_id": strconv.Itoa(c.users["member"].Id)}, false)
+			case "platform_disable":
+				c.mutate(t, "root", "POST", fmt.Sprintf("/api/platform/organizations/%d/state", c.orgA), change, map[string]any{"revision": c.revision(t), "disabled": true, "reason": "task export revocation"}, nil, true)
+			case "session_revoke":
+				revoked, err := model.RevokeUserSession(c.users[actor].Id, c.sids[actor], "organization_task_export")
+				require.NoError(t, err)
+				require.True(t, revoked)
+				want, code = 401, "AUTH_SESSION_REVOKED"
+			}
+			release.Do(func() { close(pool.release) })
+			select {
+			case response := <-done:
+				require.NoError(t, response.err)
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(response.body, &body))
+				organizationError(t, response.status, response.headers, body, want, code)
+				assert.Empty(t, response.headers.Get("Content-Disposition"))
+			case <-time.After(5 * time.Second):
+				t.Fatal("revoked export did not finish after its barrier")
+			}
+			status, headers, response := c.json(t, "GET", endpoint, actor, nil, "")
+			organizationError(t, status, headers, response, want, code)
+			assert.Empty(t, headers.Get("Content-Disposition"))
+			if change == "remove" {
+				status, headers, _ := c.json(t, "GET", endpoint, "owner", nil, "")
+				assert.Equal(t, 200, status, "organization retains removed members' task states")
+				assert.Equal(t, `attachment; filename="organization-task-states.json"`, headers.Get("Content-Disposition"))
+			}
+		})
+	}
+}
+
 func TestOrganizationTaskReadLifecycle(t *testing.T) {
 	t.Run("isolation_permissions_and_artifacts", func(t *testing.T) {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

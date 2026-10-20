@@ -29,6 +29,7 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/organizations/:org_id/members", middleware.UserAuth(), controller.ListOrganizationMembers)
 		apiRouter.GET("/organizations/:org_id/events", middleware.UserAuth(), controller.ListOrganizationEvents)
 		apiRouter.GET("/organizations/:org_id/tasks/batch", middleware.UserAuth(), controller.GetOrganizationTaskBatch)
+		apiRouter.GET("/organizations/:org_id/tasks/export", middleware.UserAuth(), controller.ExportOrganizationTaskBatch)
 		apiRouter.GET("/organizations/:org_id/tasks/:task_row_id", middleware.UserAuth(), controller.OrganizationTaskReadHandler("detail"))
 		apiRouter.GET("/organizations/:org_id/tasks/:task_row_id/artifacts", middleware.UserAuth(), controller.OrganizationTaskReadHandler("artifacts"))
 		apiRouter.GET("/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content", middleware.UserAuth(), controller.OrganizationTaskReadHandler("content"))

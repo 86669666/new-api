@@ -203,7 +203,7 @@ func OrganizationSelectionBoundary() gin.HandlerFunc {
 				isAccess, discovery = true, true
 			case "/api/organization-context":
 				isAccess = true
-			case "/api/organizations/:org_id", "/api/organizations/:org_id/members", "/api/organizations/:org_id/events", "/api/organizations/:org_id/tasks/batch":
+			case "/api/organizations/:org_id", "/api/organizations/:org_id/members", "/api/organizations/:org_id/events", "/api/organizations/:org_id/tasks/batch", "/api/organizations/:org_id/tasks/export":
 				isAccess, pathSelection = true, true
 			}
 		}

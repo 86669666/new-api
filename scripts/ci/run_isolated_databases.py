@@ -700,6 +700,7 @@ ORGANIZATION_READ_SUITES = {
     'organization-task-read': (frozenset(('TestOrganizationTaskReadLifecycle',)), 'g10-organization-task-read'),
     'organization-invitation-presentation': (frozenset(('TestOrganizationInvitationPresentation',)), 'g11-organization-invitation-presentation'),
     'organization-task-batch': (frozenset(('TestOrganizationTaskBatchRead',)), 'g12-organization-task-batch'),
+    'organization-task-export': (frozenset(('TestOrganizationTaskExport',)), 'g13-organization-task-export'),
 }
 ORGANIZATION_METADATA_SHA = {
     'mysql': 'e9be5a831164f8c536fa0b5eb1355b9eb41ee779508861b2789cf3dd47861bdb',
@@ -995,7 +996,7 @@ def main(argv=None):
     parser.add_argument('--docker-config', type=Path, required=True)
     parser.add_argument('--image-evidence', type=Path, required=True)
     parser.add_argument('--relay-evidence', type=Path, required=True)
-    parser.add_argument('--suite', choices=('database-contract', 'organization-identity', 'organization-task-read', 'organization-invitation-presentation', 'organization-task-batch'), default='database-contract')
+    parser.add_argument('--suite', choices=('database-contract', 'organization-identity', 'organization-task-read', 'organization-invitation-presentation', 'organization-task-batch', 'organization-task-export'), default='database-contract')
     parser.add_argument('--image-metadata', type=Path)
     parser.add_argument('--preserve-volumes', type=Path)
     parser.add_argument('--go', type=Path)

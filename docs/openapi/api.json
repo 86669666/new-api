@@ -17653,6 +17653,116 @@
         "x-batch-partial-results": false
       }
     },
+    "/api/organizations/{org_id}/tasks/export": {
+      "get": {
+        "operationId": "organization_task_export",
+        "summary": "Download selected organization task states as JSON",
+        "tags": [
+          "Organizations"
+        ],
+        "description": "Downloads the same success JSON envelope and ten safe task fields as the batch state endpoint, with a fixed ASCII attachment filename organization-task-states.json. JSON is the only format; no format selector, CSV, complete-history export, pagination, asynchronous job, server file, storage object or persistent download capability is provided. The complete JSON response is serialized in memory before the final complete batch database authorization check. Only after that check succeeds are the attachment header and response body published. Every rejection, including serialization/internal errors and final authorization failure, is a fixed JSON error with no Content-Disposition, partial data or raw error text. Previously published downloads can be retained by the client; later revocation prevents new requests and not-yet-published responses but does not recall downloaded files. Current dashboard Bearer JWT session only. task_row_ids is required exactly once as one comma-separated query value, decoded once, containing 1 to 20 unique canonical positive int64 row ID strings, with at most 399 decoded bytes. Empty elements, whitespace, signs, leading zeroes, overflow, public task IDs and repeated query parameters are invalid. One optional org_id must match the path; an optional X-Organization-Id must also match and cannot accompany the query selector. Unknown query fields, bodies, proof/idempotency/method override headers are rejected. Every row is selected by organization_id and internal row ID in one database authorization snapshot. Owners/admins see all organization tasks; members only their own submissions. Platform root is not implicit membership. Missing, cross-organization, personal, other-member or discarded rows make the entire batch return the same 404 without data or an indication of which ID is unavailable. Removed membership and disabled or dissolved organizations also return 404; invalid sessions return 401 before organization availability. The response contains only the same ten safe metadata fields as single-task detail, in request ID order, with row IDs encoded as strings. No persisted data, raw provider error, credential, upstream URL or artifact capability is returned. After constructing the metadata snapshot, one complete batch database authorization check immediately precedes JSON publication; committed revocation is observed there. Metadata may change between the first snapshot and publication. Reads are private, no-store and do not mutate tasks or organization state, invoke plugins/upstreams, charge/refund, cancel work or enable anonymous sharing.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Positive canonical organization ID. 0 is invalid. One optional header/query selector must exactly match this value. No membership is implied by knowing the ID."
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationHeader"
+          },
+          {
+            "$ref": "#/components/parameters/OrganizationQuery"
+          },
+          {
+            "name": "task_row_ids",
+            "in": "query",
+            "required": true,
+            "style": "form",
+            "explode": false,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationTaskBatchRowIDs"
+            },
+            "description": "One CSV value after one URL decode. Unique canonical internal row IDs only; at most 399 decoded bytes. Results follow this order; any unavailable row rejects the whole batch."
+          }
+        ],
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/OrganizationAccess400"
+          },
+          "401": {
+            "$ref": "#/components/responses/OrganizationAccess401"
+          },
+          "403": {
+            "$ref": "#/components/responses/OrganizationAccess403"
+          },
+          "404": {
+            "$ref": "#/components/responses/OrganizationAccess404"
+          },
+          "429": {
+            "$ref": "#/components/responses/OrganizationAccess429"
+          },
+          "500": {
+            "$ref": "#/components/responses/OrganizationAccess500"
+          },
+          "200": {
+            "description": "Complete ordered JSON attachment, with the same envelope as batch state read.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                }
+              },
+              "Content-Disposition": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationTaskExportContentDisposition"
+                },
+                "description": "Fixed ASCII filename. Set only after serialization and the final current-session/object authorization check succeed."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationTaskBatchResult"
+                }
+              }
+            }
+          }
+        },
+        "x-organization-selection": "path",
+        "x-query-allowlist": [
+          "org_id",
+          "task_row_ids"
+        ],
+        "x-pat-policy": "session-only",
+        "x-forbidden-request-headers": [
+          "X-Security-Proof",
+          "Idempotency-Key"
+        ],
+        "x-request-body-policy": "empty only, including chunked transfer",
+        "x-organization-state-mutation": false,
+        "x-task-identity": "organization_id + internal row ID",
+        "x-anonymous-artifact-access": false,
+        "x-delivery-authorization": "current database authorization immediately before first downstream headers/body publication",
+        "x-batch-authorization-recheck": "one complete batch immediately before JSON publication",
+        "x-batch-order": "request ID order",
+        "x-batch-partial-results": false,
+        "x-export-format": "json",
+        "x-export-serialization": "complete in memory before final authorization recheck",
+        "x-error-content-disposition": "absent"
+      }
+    },
     "/api/organizations/{org_id}/tasks/{task_row_id}": {
       "get": {
         "operationId": "organization_task_detail",
@@ -25069,6 +25179,12 @@
             }
           }
         }
+      },
+      "OrganizationTaskExportContentDisposition": {
+        "type": "string",
+        "enum": [
+          "attachment; filename=\"organization-task-states.json\""
+        ]
       }
     },
     "responses": {
@@ -26131,6 +26247,10 @@
       },
       {
         "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/export"
+      },
+      {
+        "method": "GET",
         "path": "/api/organizations/{org_id}/tasks/{task_row_id}"
       },
       {
@@ -26783,5 +26903,24 @@
     "projection": "#/components/schemas/OrganizationTaskDetail",
     "publication_recheck": "one complete batch immediately before JSON publication",
     "metadata_snapshot": "initial authorized snapshot; no cross-request consistency guarantee"
+  },
+  "x-organization-task-export-contract": {
+    "route": {
+      "method": "GET",
+      "path": "/api/organizations/{org_id}/tasks/export"
+    },
+    "format": "json",
+    "filename": "organization-task-states.json",
+    "content_disposition": "attachment; filename=\"organization-task-states.json\"",
+    "max_ids": 20,
+    "max_decoded_bytes": 399,
+    "session_only": true,
+    "all_or_nothing": true,
+    "projection": "#/components/schemas/OrganizationTaskDetail",
+    "result_schema": "#/components/schemas/OrganizationTaskBatchResult",
+    "publication_recheck": "one complete batch immediately before JSON publication",
+    "serialization": "complete in memory before final authorization recheck",
+    "error_content_disposition": "absent",
+    "already_published_downloads": "may be retained by the client; no recall guarantee"
   }
 }

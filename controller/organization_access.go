@@ -232,11 +232,7 @@ func organizationTaskDetail(task *model.Task) gin.H {
 	}
 }
 
-func GetOrganizationTaskBatch(c *gin.Context) {
-	identity, ok := middleware.RequireOrganizationScopeSession(c)
-	if !ok {
-		return
-	}
+func organizationTaskBatchQuery(c *gin.Context) (int64, []int64, error) {
 	orgID, selectionError := middleware.OrganizationSelection(c)
 	query, queryError := url.ParseQuery(c.Request.URL.RawQuery)
 	invalid := selectionError != "" || orgID <= 0 || queryError != nil
@@ -247,19 +243,30 @@ func GetOrganizationTaskBatch(c *gin.Context) {
 	}
 	value := query.Get("task_row_ids")
 	if invalid || len(value) < 1 || len(value) > 399 || rejectOrganizationReadWriteInputs(c) != nil {
-		writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, model.ErrOrganizationInvalidInput)
-		return
+		return orgID, nil, model.ErrOrganizationInvalidInput
 	}
 	rowIDs := make([]int64, 0, 20)
 	seen := make(map[int64]bool, 20)
 	for part := range strings.SplitSeq(value, ",") {
 		id, valid := middleware.ParseOrganizationDecimal(part)
 		if !valid || id <= 0 || seen[id] || len(rowIDs) == 20 {
-			writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, model.ErrOrganizationInvalidInput)
-			return
+			return orgID, nil, model.ErrOrganizationInvalidInput
 		}
 		seen[id] = true
 		rowIDs = append(rowIDs, id)
+	}
+	return orgID, rowIDs, nil
+}
+
+func GetOrganizationTaskBatch(c *gin.Context) {
+	identity, ok := middleware.RequireOrganizationScopeSession(c)
+	if !ok {
+		return
+	}
+	orgID, rowIDs, err := organizationTaskBatchQuery(c)
+	if err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, err)
+		return
 	}
 	tasks, actorRole, err := model.ReadOrganizationTaskBatchWithContext(c.Request.Context(), identity, orgID, rowIDs)
 	if err != nil {
@@ -275,6 +282,38 @@ func GetOrganizationTaskBatch(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, gin.H{"items": items})
+}
+
+func ExportOrganizationTaskBatch(c *gin.Context) {
+	identity, ok := middleware.RequireOrganizationScopeSession(c)
+	if !ok {
+		return
+	}
+	orgID, rowIDs, err := organizationTaskBatchQuery(c)
+	if err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, err)
+		return
+	}
+	tasks, actorRole, err := model.ReadOrganizationTaskBatchWithContext(c.Request.Context(), identity, orgID, rowIDs)
+	if err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+		return
+	}
+	items := make([]gin.H, 0, len(tasks))
+	for _, task := range tasks {
+		items = append(items, organizationTaskDetail(task))
+	}
+	encoded, err := common.Marshal(gin.H{"success": true, "message": "", "data": gin.H{"items": items}})
+	if err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+		return
+	}
+	if _, actorRole, err = model.ReadOrganizationTaskBatchWithContext(c.Request.Context(), identity, orgID, rowIDs); err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="organization-task-states.json"`)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", encoded)
 }
 
 func OrganizationTaskReadHandler(kind string) gin.HandlerFunc {

@@ -48,6 +48,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/organizations/:org_id/members":                                             accessTokenSessionRule,
 	"GET /api/organizations/:org_id/events":                                              accessTokenSessionRule,
 	"GET /api/organizations/:org_id/tasks/batch":                                         accessTokenSessionRule,
+	"GET /api/organizations/:org_id/tasks/export":                                        accessTokenSessionRule,
 	"GET /api/organizations/:org_id/tasks/:task_row_id":                                  accessTokenSessionRule,
 	"GET /api/organizations/:org_id/tasks/:task_row_id/artifacts":                        accessTokenSessionRule,
 	"GET /api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content":  accessTokenSessionRule,

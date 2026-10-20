@@ -7756,6 +7756,10 @@
       },
       {
         "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/export"
+      },
+      {
+        "method": "GET",
         "path": "/api/organizations/{org_id}/tasks/{task_row_id}"
       },
       {

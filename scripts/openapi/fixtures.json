@@ -9199,5 +9199,67 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "organization task export fixed attachment filename",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskExportContentDisposition",
+    "value": "attachment; filename=\"organization-task-states.json\"",
+    "valid": true
+  },
+  {
+    "name": "organization task export missing download header",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskExportContentDisposition",
+    "value": "",
+    "valid": false
+  },
+  {
+    "name": "organization task export inline response",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskExportContentDisposition",
+    "value": "inline",
+    "valid": false
+  },
+  {
+    "name": "organization task export caller controlled filename",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskExportContentDisposition",
+    "value": "attachment; filename=\"caller.json\"",
+    "valid": false
+  },
+  {
+    "name": "organization task export download header newline",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskExportContentDisposition",
+    "value": "attachment; filename=\"organization-task-states.json\"\r\nX-Untrusted: value",
+    "valid": false
+  },
+  {
+    "name": "organization task export fixed error without data",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationAccessError",
+    "value": {
+      "success": false,
+      "code": "ORG_NOT_FOUND",
+      "message": "Organization not found.",
+      "message_key": "Organization not found."
+    },
+    "valid": true
+  },
+  {
+    "name": "organization task export rejects partial error data",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationAccessError",
+    "value": {
+      "success": false,
+      "code": "ORG_NOT_FOUND",
+      "message": "Organization not found.",
+      "message_key": "Organization not found.",
+      "data": {
+        "items": []
+      }
+    },
+    "valid": false
   }
 ]
