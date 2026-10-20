@@ -219,6 +219,64 @@ func serveOrganizationTasks(c *gin.Context, orgID int64) {
 // OrganizationTaskReadHandler serves only the current session's bounded
 // organization task view. All potentially blocking artifact work finishes
 // before the final authoritative check that precedes first response publication.
+func organizationTaskDetail(task *model.Task) gin.H {
+	created := task.CreatedAt
+	if created == 0 {
+		created = task.SubmitTime
+	}
+	return gin.H{
+		"task_row_id": strconv.FormatInt(task.ID, 10), "task_id": task.TaskID,
+		"platform": task.Platform, "action": task.Action, "status": task.Status,
+		"progress": task.Progress, "created_at": created, "submit_time": task.SubmitTime,
+		"start_time": task.StartTime, "finished_at": task.FinishTime,
+	}
+}
+
+func GetOrganizationTaskBatch(c *gin.Context) {
+	identity, ok := middleware.RequireOrganizationScopeSession(c)
+	if !ok {
+		return
+	}
+	orgID, selectionError := middleware.OrganizationSelection(c)
+	query, queryError := url.ParseQuery(c.Request.URL.RawQuery)
+	invalid := selectionError != "" || orgID <= 0 || queryError != nil
+	for name, values := range query {
+		if name != "task_row_ids" && name != "org_id" || len(values) != 1 {
+			invalid = true
+		}
+	}
+	value := query.Get("task_row_ids")
+	if invalid || len(value) < 1 || len(value) > 399 || rejectOrganizationReadWriteInputs(c) != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, model.ErrOrganizationInvalidInput)
+		return
+	}
+	rowIDs := make([]int64, 0, 20)
+	seen := make(map[int64]bool, 20)
+	for part := range strings.SplitSeq(value, ",") {
+		id, valid := middleware.ParseOrganizationDecimal(part)
+		if !valid || id <= 0 || seen[id] || len(rowIDs) == 20 {
+			writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, model.ErrOrganizationInvalidInput)
+			return
+		}
+		seen[id] = true
+		rowIDs = append(rowIDs, id)
+	}
+	tasks, actorRole, err := model.ReadOrganizationTaskBatchWithContext(c.Request.Context(), identity, orgID, rowIDs)
+	if err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+		return
+	}
+	items := make([]gin.H, 0, len(tasks))
+	for _, task := range tasks {
+		items = append(items, organizationTaskDetail(task))
+	}
+	if _, actorRole, err = model.ReadOrganizationTaskBatchWithContext(c.Request.Context(), identity, orgID, rowIDs); err != nil {
+		writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"items": items})
+}
+
 func OrganizationTaskReadHandler(kind string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		identity, ok := middleware.RequireOrganizationScopeSession(c)
@@ -254,16 +312,7 @@ func OrganizationTaskReadHandler(kind string) gin.HandlerFunc {
 				writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
 				return
 			}
-			created := task.CreatedAt
-			if created == 0 {
-				created = task.SubmitTime
-			}
-			common.ApiSuccess(c, gin.H{
-				"task_row_id": strconv.FormatInt(task.ID, 10), "task_id": task.TaskID,
-				"platform": task.Platform, "action": task.Action, "status": task.Status,
-				"progress": task.Progress, "created_at": created, "submit_time": task.SubmitTime,
-				"start_time": task.StartTime, "finished_at": task.FinishTime,
-			})
+			common.ApiSuccess(c, organizationTaskDetail(task))
 		case "artifacts":
 			artifacts, projectionError := projectTaskArtifacts(task)
 			if err := beforePublish(); err != nil {

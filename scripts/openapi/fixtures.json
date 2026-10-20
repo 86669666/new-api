@@ -9018,5 +9018,186 @@
       "code": "ORG_EMAIL_INVITE_UNSUPPORTED"
     },
     "valid": true
+  },
+  {
+    "name": "organization task batch one exact row ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      "9007199254740993"
+    ],
+    "valid": true
+  },
+  {
+    "name": "organization task batch twenty max length row IDs",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      "9223372036854775807",
+      "9223372036854775806",
+      "9223372036854775805",
+      "9223372036854775804",
+      "9223372036854775803",
+      "9223372036854775802",
+      "9223372036854775801",
+      "9223372036854775800",
+      "9223372036854775799",
+      "9223372036854775798",
+      "9223372036854775797",
+      "9223372036854775796",
+      "9223372036854775795",
+      "9223372036854775794",
+      "9223372036854775793",
+      "9223372036854775792",
+      "9223372036854775791",
+      "9223372036854775790",
+      "9223372036854775789",
+      "9223372036854775788"
+    ],
+    "valid": true
+  },
+  {
+    "name": "organization task batch empty batch",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [],
+    "valid": false
+  },
+  {
+    "name": "organization task batch repeated row ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      "1",
+      "1"
+    ],
+    "valid": false
+  },
+  {
+    "name": "organization task batch too many row IDs",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9",
+      "10",
+      "11",
+      "12",
+      "13",
+      "14",
+      "15",
+      "16",
+      "17",
+      "18",
+      "19",
+      "20",
+      "21"
+    ],
+    "valid": false
+  },
+  {
+    "name": "organization task batch numeric row ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      1
+    ],
+    "valid": false
+  },
+  {
+    "name": "organization task batch noncanonical row ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      "01"
+    ],
+    "valid": false
+  },
+  {
+    "name": "organization task batch zero row ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      "0"
+    ],
+    "valid": false
+  },
+  {
+    "name": "organization task batch overflow row ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      "9223372036854775808"
+    ],
+    "valid": false
+  },
+  {
+    "name": "organization task batch public task ID",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchRowIDs",
+    "value": [
+      "shared-public-task-id"
+    ],
+    "valid": false
+  },
+  {
+    "name": "organization task batch safe response",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "items": [
+          {
+            "task_row_id": "9007199254740993",
+            "task_id": "shared-public-task-id",
+            "platform": "fixture",
+            "action": "TEXT_TO_VIDEO",
+            "status": "IN_PROGRESS",
+            "progress": "20%",
+            "created_at": 1,
+            "submit_time": 1,
+            "start_time": 2,
+            "finished_at": 0
+          }
+        ]
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization task batch rejects provider fields",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationTaskBatchResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "items": [
+          {
+            "task_row_id": "9007199254740993",
+            "task_id": "shared-public-task-id",
+            "platform": "fixture",
+            "action": "TEXT_TO_VIDEO",
+            "status": "IN_PROGRESS",
+            "progress": "20%",
+            "created_at": 1,
+            "submit_time": 1,
+            "start_time": 2,
+            "finished_at": 0,
+            "result_url": "https://provider.invalid/private"
+          }
+        ]
+      }
+    },
+    "valid": false
   }
 ]

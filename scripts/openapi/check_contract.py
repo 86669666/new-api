@@ -358,7 +358,47 @@ def check_organization_task_reads(api):
     assert set(artifacts['properties']) == set(artifacts['required']) == {'task_row_id', 'task_id', 'artifacts'}
     assert artifacts['additionalProperties'] is False
     assert artifacts['properties']['artifacts']['items']['additionalProperties'] is False
-    return {'routes': len(expected), 'anonymous_access': False, 'live_http': False}
+    batch_path = '/api/organizations/{org_id}/tasks/batch'
+    batch_contract = api['x-organization-task-batch-contract']
+    assert batch_contract['route'] == {'method': 'GET', 'path': batch_path}
+    assert batch_contract['task_identity'] == contract['task_identity']
+    assert batch_contract['query_parameter'] == 'task_row_ids'
+    assert batch_contract['encoding'] == 'single CSV query value, URL-decoded once'
+    assert batch_contract['max_ids'] == 20 and batch_contract['max_decoded_bytes'] == 399
+    assert all(batch_contract[key] is True for key in ['unique_ids', 'request_order', 'all_or_nothing', 'session_only'])
+    assert batch_contract['unavailable_status'] == 404
+    assert batch_contract['projection'] == '#/components/schemas/OrganizationTaskDetail'
+    batch = api['paths'][batch_path]
+    assert set(batch) == {'get'}
+    operation = batch['get']
+    assert operation['security'] == [{'DashboardJWT': []}]
+    assert operation['x-query-allowlist'] == ['org_id', 'task_row_ids']
+    assert operation['x-task-identity'] == contract['task_identity']
+    assert operation['x-organization-state-mutation'] is False
+    assert operation['x-anonymous-artifact-access'] is False
+    assert operation['x-batch-partial-results'] is False
+    assert operation['x-batch-order'] == 'request ID order'
+    assert operation['x-batch-authorization-recheck'] == batch_contract['publication_recheck']
+    assert batch_contract['route'] in api['x-organization-selection-boundary']['positive_selector_allowlist']
+    parameter = next(item for item in operation['parameters'] if item.get('name') == 'task_row_ids')
+    assert parameter['in'] == 'query' and parameter['required'] is True
+    assert parameter['style'] == 'form' and parameter['explode'] is False
+    assert parameter['schema'] == {'$ref': '#/components/schemas/OrganizationTaskBatchRowIDs'}
+    ids = api['components']['schemas']['OrganizationTaskBatchRowIDs']
+    assert ids['type'] == 'array' and ids['minItems'] == 1 and ids['maxItems'] == 20
+    assert ids['uniqueItems'] is True and ids['x-decoded-max-bytes'] == 399
+    assert ids['items'] == {'$ref': '#/components/schemas/OrganizationLifecycleID'}
+    result = api['components']['schemas']['OrganizationTaskBatchResult']['properties']['data']
+    assert result['additionalProperties'] is False and result['required'] == ['items']
+    assert set(result['properties']) == {'items'}
+    assert result['properties']['items'] == {'type': 'array', 'minItems': 1, 'maxItems': 20,
+                                            'items': {'$ref': '#/components/schemas/OrganizationTaskDetail'}}
+    assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OrganizationTaskBatchResult'}
+    for response in operation['responses'].values():
+        if '$ref' in response:
+            response = pointer(api, response['$ref'])
+        assert response['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
+    return {'routes': len(expected), 'batch_routes': 1, 'anonymous_access': False, 'live_http': False}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

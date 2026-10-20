@@ -110,6 +110,63 @@ func ReadOrganizationTaskWithContext(ctx context.Context, identity AuthSessionId
 	return &task, actorRole, nil
 }
 
+// ReadOrganizationTaskBatchWithContext authorizes the complete set in one
+// organization snapshot. Hidden, absent and discarded rows are indistinguishable;
+// callers either receive every requested row in input order or no rows at all.
+func ReadOrganizationTaskBatchWithContext(ctx context.Context, identity AuthSessionIdentity, orgID int64, taskRowIDs []int64) ([]*Task, int, error) {
+	if orgID <= 0 || len(taskRowIDs) < 1 || len(taskRowIDs) > 20 {
+		return nil, 0, ErrOrganizationInvalidInput
+	}
+	seen := make(map[int64]bool, len(taskRowIDs))
+	for _, id := range taskRowIDs {
+		if id <= 0 || seen[id] {
+			return nil, 0, ErrOrganizationInvalidInput
+		}
+		seen[id] = true
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	actorRole, err := organizationActorRole(identity)
+	if err != nil {
+		return nil, actorRole, err
+	}
+	tasks := make([]*Task, 0, len(taskRowIDs))
+	err = withOrganizationWithContext(ctx, identity, OrganizationCommand{OrganizationID: orgID}, false, func(s *organizationState) error {
+		actorRole = s.users[identity.UserID].Role
+		if s.member(identity.UserID) == nil || s.requireEnabled() != nil {
+			return ErrOrganizationNotFound
+		}
+		query := s.tx.Where("id IN ? AND organization_id = ?", taskRowIDs, orgID)
+		if role := s.role(identity.UserID); role != OrganizationRoleOwner && role != OrganizationRoleAdmin {
+			query = query.Where("user_id = ?", identity.UserID)
+		}
+		var rows []*Task
+		if err := query.Omit("data").Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) != len(taskRowIDs) {
+			return ErrOrganizationNotFound
+		}
+		byID := make(map[int64]*Task, len(rows))
+		for _, task := range rows {
+			if !task.ResultRetrievable() {
+				return ErrOrganizationNotFound
+			}
+			byID[task.ID] = task
+		}
+		for _, id := range taskRowIDs {
+			tasks = append(tasks, byID[id])
+		}
+		_, err := validateOrganizationIdentity(s.tx, identity, organizationNow().Unix())
+		return err
+	})
+	if err != nil {
+		return nil, actorRole, err
+	}
+	return tasks, actorRole, nil
+}
+
 // organizationActorRole is the preliminary session check that precedes S1's
 // out-of-transaction lock planning: session failures answer 401 before any
 // organization lookup can answer 404. The role is for audit only, never the

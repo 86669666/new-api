@@ -7752,6 +7752,10 @@
       },
       {
         "method": "GET",
+        "path": "/api/organizations/{org_id}/tasks/batch"
+      },
+      {
+        "method": "GET",
         "path": "/api/organizations/{org_id}/tasks/{task_row_id}"
       },
       {

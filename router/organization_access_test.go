@@ -201,7 +201,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -720,6 +720,7 @@ func TestOrganizationAccessHTTP(t *testing.T) {
 func TestOrganizationSelectionProductionRoutes(t *testing.T) {
 	f := newOrganizationHTTPFixture(t)
 	allow := map[string]bool{"GET /api/organizations": true, "GET /api/organization-context": true, "GET /api/organizations/:org_id": true, "GET /api/organizations/:org_id/members": true, "GET /api/organizations/:org_id/events": true}
+	allow["GET /api/organizations/:org_id/tasks/batch"] = true
 	allow["GET /api/organizations/:org_id/tasks/:task_row_id"] = true
 	allow["GET /api/organizations/:org_id/tasks/:task_row_id/artifacts"] = true
 	allow["GET /api/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content"] = true
