@@ -153,12 +153,21 @@ func validateOrganizationCommand(action string, c OrganizationCommand) error {
 	case "transfer_accept", "transfer_decline", "transfer_cancel":
 		rest.ObjectID = 0
 		rest.Generation = 0
+	case "wallet_credit", "wallet_reverse":
+		rest.WalletRequestID = ""
+		rest.WalletAmount = 0
+		rest.WalletCreditID = 0
+		rest.WalletReference = ""
+		rest.Reason = ""
 	case "leave", "dissolve", "invite_expire", "transfer_expire":
 	default:
 		return ErrOrganizationInvalidInput
 	}
 	if rest != (OrganizationCommand{}) {
 		return ErrOrganizationInvalidInput
+	}
+	if action == "wallet_credit" || action == "wallet_reverse" {
+		return validateOrganizationWalletCommand(action, c)
 	}
 	if c.Username != "" || c.ExpectedUsername != "" {
 		username := c.Username
@@ -331,8 +340,19 @@ func mutateOrganization(i AuthSessionIdentity, c OrganizationCommand, action str
 			if s.org.PlatformDisabledAt != 0 {
 				return ErrOrganizationDisabled
 			}
+			var wallet OrganizationWallet
+			if err := lockForUpdate(s.tx).Where("organization_id = ?", s.org.ID).Find(&wallet).Error; err != nil {
+				return err
+			}
+			s.now = organizationNow().Unix()
+			if _, err := validateOrganizationIdentity(s.tx, i, s.now); err != nil {
+				return err
+			}
 			if err := s.authorize(action, c, b); err != nil {
 				return err
+			}
+			if wallet.Balance != 0 || wallet.Reserved != 0 {
+				return ErrOrganizationWalletNotEmpty
 			}
 			if err := s.advance(c); err != nil {
 				return err
@@ -899,6 +919,7 @@ type OrganizationMutationReceipt struct {
 	ObjectID       int64
 	Generation     int64
 	Status         string
+	WalletEntry    *OrganizationWalletEntry
 }
 type organizationExecution struct {
 	ctx     context.Context
@@ -960,6 +981,8 @@ func executeOrganizationCommand(i AuthSessionIdentity, c OrganizationCommand, op
 		return resolveOrganizationTransfer(i, c, OrganizationDeclined, op)
 	case "transfer_cancel":
 		return resolveOrganizationTransfer(i, c, OrganizationCancelled, op)
+	case "wallet_credit", "wallet_reverse":
+		return mutateOrganizationWallet(i, c, op.action, op)
 	default:
 		return ErrOrganizationInvalidInput
 	}

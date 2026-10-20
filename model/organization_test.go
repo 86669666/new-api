@@ -82,7 +82,7 @@ func organizationDatabase(t *testing.T, dialect string) *organizationFixture {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(6)
 	sqlDB.SetMaxIdleConns(6)
-	tables := []any{&User{}, &UserSession{}, &AuthFlow{}, &UserAccessToken{}, &ExternalIdentityClaim{}, &Token{}, &PasskeyCredential{}, &TwoFA{}, &TwoFABackupCode{}, &UserOAuthBinding{}, &Organization{}, &OrganizationMember{}, &OrganizationInvitation{}, &OrganizationOwnershipTransfer{}, &OrganizationEvent{}}
+	tables := []any{&User{}, &UserSession{}, &AuthFlow{}, &UserAccessToken{}, &ExternalIdentityClaim{}, &Token{}, &PasskeyCredential{}, &TwoFA{}, &TwoFABackupCode{}, &UserOAuthBinding{}, &Organization{}, &OrganizationMember{}, &OrganizationInvitation{}, &OrganizationOwnershipTransfer{}, &OrganizationEvent{}, &OrganizationWallet{}, &OrganizationWalletEntry{}}
 	owned := dialect == "sqlite"
 	t.Cleanup(func() {
 		if dialect != "sqlite" && owned {
@@ -757,7 +757,7 @@ func testOrganizationConcurrency(t *testing.T, f *organizationFixture) {
 	}
 }
 func testOrganizationSchema(t *testing.T, f *organizationFixture) {
-	tables := []any{&Organization{}, &OrganizationMember{}, &OrganizationInvitation{}, &OrganizationOwnershipTransfer{}, &OrganizationEvent{}}
+	tables := []any{&Organization{}, &OrganizationMember{}, &OrganizationInvitation{}, &OrganizationOwnershipTransfer{}, &OrganizationEvent{}, &OrganizationWallet{}, &OrganizationWalletEntry{}}
 	require.NoError(t, DB.AutoMigrate(tables...))
 	require.NoError(t, DB.AutoMigrate(tables...))
 	o := f.org(0)

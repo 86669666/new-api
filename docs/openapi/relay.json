@@ -7773,6 +7773,22 @@
       {
         "method": "HEAD",
         "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/wallet"
+      },
+      {
+        "method": "GET",
+        "path": "/api/platform/organizations/{org_id}/wallet"
+      },
+      {
+        "method": "POST",
+        "path": "/api/platform/organizations/{org_id}/wallet/credits"
+      },
+      {
+        "method": "POST",
+        "path": "/api/platform/organizations/{org_id}/wallet/credits/{credit_id}/reverse"
       }
     ],
     "positive_resource_selector_routes": [

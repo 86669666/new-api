@@ -9420,5 +9420,265 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "organization wallet credit",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": "100",
+      "reference": "ticket-17",
+      "reason": "Manual credit"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization wallet invalid amount 0",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": "0",
+      "reference": "ticket-17",
+      "reason": "Manual credit"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet invalid amount 9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": "9007199254740992",
+      "reference": "ticket-17",
+      "reason": "Manual credit"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet invalid amount 1",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": 1,
+      "reference": "ticket-17",
+      "reason": "Manual credit"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet invalid amount 1.0",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": "1.0",
+      "reference": "ticket-17",
+      "reason": "Manual credit"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet invalid request_id not-a-uuid",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "not-a-uuid",
+      "amount": "100",
+      "reference": "ticket-17",
+      "reason": "Manual credit"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet invalid reference bad\nreference",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": "100",
+      "reference": "bad\nreference",
+      "reason": "Manual credit"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet invalid reason ",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": "100",
+      "reference": "ticket-17",
+      "reason": ""
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet unknown field",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": "100",
+      "reference": "ticket-17",
+      "reason": "Manual credit",
+      "extra": true
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet maximum amount",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyCredit",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "amount": "9007199254740991",
+      "reference": "ticket-17",
+      "reason": "Manual credit"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization wallet reverse",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyReverse",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "reason": "Correct credit"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization wallet reverse supplied amount",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBodyReverse",
+    "value": {
+      "revision": "1",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "reason": "Correct credit",
+      "amount": "100"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet zero unopened balance",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBalance",
+    "value": {
+      "organization_id": "1",
+      "opened": false,
+      "balance": "0",
+      "reserved": "0",
+      "available": "0"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization wallet negative balance",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletBalance",
+    "value": {
+      "organization_id": "1",
+      "opened": true,
+      "balance": "-1",
+      "reserved": "0",
+      "available": "0"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization wallet Credit operation",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletOperationCredit",
+    "value": {
+      "scope": "platform.organization.wallet_credit",
+      "context": {
+        "schema_version": 1,
+        "command": {
+          "organization_id": "1",
+          "revision": "1",
+          "request_id": "00000000-0000-4000-8000-000000000001",
+          "amount": "100",
+          "reference": "ticket-17",
+          "reason": "Manual credit"
+        },
+        "snapshot": {
+          "wallet_amount": "100"
+        }
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization wallet Reverse operation",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletOperationReverse",
+    "value": {
+      "scope": "platform.organization.wallet_reverse",
+      "context": {
+        "schema_version": 1,
+        "command": {
+          "organization_id": "1",
+          "revision": "1",
+          "request_id": "00000000-0000-4000-8000-000000000001",
+          "reason": "Correct credit",
+          "credit_id": "2"
+        },
+        "snapshot": {
+          "wallet_amount": "100"
+        }
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization wallet amount trailing newline",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletAmount",
+    "value": "100\n",
+    "valid": false
+  },
+  {
+    "name": "organization wallet quota trailing newline",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletQuota",
+    "value": "0\n",
+    "valid": false
+  },
+  {
+    "name": "organization wallet request ID trailing newline",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletRequestID",
+    "value": "00000000-0000-4000-8000-000000000001\n",
+    "valid": false
+  },
+  {
+    "name": "organization wallet text trailing newline",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletText",
+    "value": "Manual credit\n",
+    "valid": false
+  },
+  {
+    "name": "organization wallet text embedded control",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationWalletText",
+    "value": "Manual\u0000credit",
+    "valid": false
   }
 ]

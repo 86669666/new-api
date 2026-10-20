@@ -5,12 +5,13 @@ Only exported source copies receive the generated test entry. Each phase is a ne
 process. A missing engine/phase is an incomplete matrix, even if SQLite passes.
 """
 import argparse
+import copy
 import functools
 import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import signal
@@ -26,6 +27,8 @@ from run_isolated_databases import (terminate_group, guarded_communicate, docker
                                     validate_inherited_environment, check_relays)
 
 RELEASE = '633b4c5b190dc1af99a2814391354d86948e7943'
+WALLET_RELEASE = '6cf0d90b5ff27f901697dddd61e0c28aba8efefc'
+WALLET_PHASES = ('fresh_start', 'fresh_restart', 'release_seed', 'candidate_upgrade_1', 'candidate_upgrade_2')
 COMBINATIONS = (('sqlite', 'same'), ('mysql', 'same'), ('postgres', 'same'),
                 ('mysql', 'sqlite'), ('sqlite', 'mysql'), ('sqlite', 'postgres'), ('sqlite', 'clickhouse'))
 PHASES = ('fresh_seed', 'fresh_restart', 'release_seed', 'backup', 'candidate_start_1',
@@ -637,6 +640,131 @@ CANDIDATE_FIXTURE = CANDIDATE_FIXTURE.replace('"data": data, "schema_main":',
     '"organization": organization, "data": data, "schema_main":') + ORGANIZATION_FIXTURE
 
 
+WALLET_LEGACY_FIXTURE = r'''
+// Typed released writers create inert representatives; no payment is settled.
+func walletLegacyState(t *testing.T, phase string) map[string]string {
+ t.Helper()
+ if phase == "seed" {
+  var user model.User; require.NoError(t, model.DB.Where("username = ?", "fixture-zero").First(&user).Error)
+  task := model.Task{TaskID:"wallet-migration-personal",UserId:user.Id,Platform:"fixture",Action:"generate",Status:model.TaskStatusSuccess,Quota:17,SubmitTime:1700000000,StartTime:1700000001,FinishTime:1700000002,Progress:"100%"}
+  task.SetData(map[string]any{"fixture":"legacy task 中文","zero":0})
+  require.NoError(t, task.Insert())
+  require.NoError(t, (&model.TopUp{UserId:user.Id,Amount:17,Money:1.25,TradeNo:"wallet-migration-personal",PaymentMethod:"fixture",PaymentProvider:"fixture",CreateTime:1700000000,CompleteTime:0,Status:"pending"}).Insert())
+ }
+ result := map[string]string{}
+ for _, table := range []string{"users","tokens","tasks","top_ups"} {
+  var rows []map[string]any
+  require.NoError(t, model.DB.Table(table).Order("id").Find(&rows).Error)
+  expected := 1; if table == "users" { expected = 2 }; require.Len(t, rows, expected)
+  for _, row := range rows {
+   // This is the only approved new column on a released table. The public
+   // task ID and every pre-existing persisted column remain in the digest.
+   if table == "tasks" { delete(row,"organization_id") }
+  }
+  encoded, err := common.Marshal(rows); require.NoError(t, err)
+  result[table] = fmt.Sprintf("%x", sha256.Sum256(encoded))
+ }
+ return result
+}
+
+// Physical identities are compared only across restarts of this same database.
+// They are separate from schema_main, which is also compared across fresh/upgrade DBs.
+func walletPhysicalState(t *testing.T, kind string) any {
+ t.Helper()
+ switch kind {
+ case "sqlite":
+  var rows []struct { Name string; Type string; RootPage int64 `gorm:"column:rootpage"`; SQL *string }
+  require.NoError(t, model.DB.Raw("SELECT name,type,rootpage,sql FROM sqlite_master WHERE type IN ('table','index') AND name <> 'sqlite_sequence' ORDER BY name").Scan(&rows).Error)
+  return rows
+ case "mysql":
+  tables, indexes := "INNODB_TABLES", "INNODB_INDEXES"
+  var count int64
+  require.NoError(t,model.DB.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'information_schema' AND table_name = ?",tables).Scan(&count).Error)
+  if count == 0 { tables, indexes = "INNODB_SYS_TABLES", "INNODB_SYS_INDEXES" }
+  var rows []struct { TableName string; TableID int64 `gorm:"column:table_id"`; IndexName string; IndexID int64 `gorm:"column:index_id"` }
+  // Both possible catalog identifiers above are fixed, never user supplied.
+  query := "SELECT SUBSTRING(t.NAME, LOCATE('/',t.NAME)+1) AS table_name,t.TABLE_ID AS table_id,i.NAME AS index_name,i.INDEX_ID AS index_id FROM information_schema."+tables+" t JOIN information_schema."+indexes+" i ON i.TABLE_ID=t.TABLE_ID WHERE SUBSTRING_INDEX(t.NAME,'/',1)=DATABASE() ORDER BY table_name,index_name"
+  require.NoError(t,model.DB.Raw(query).Scan(&rows).Error); require.NotEmpty(t,rows)
+  return rows
+ case "postgres":
+  tables, err := model.DB.Migrator().GetTables(); require.NoError(t,err); sort.Strings(tables)
+  result := map[string]any{}
+  for _, table := range tables {
+   identity, rows, err := collectPostgresIndexes(model.DB,table,io.Discard); require.NoError(t,err)
+   indexes := map[string]any{}
+   for _, row := range rows { indexes[row.IndexName] = map[string]any{"index_oid":row.IndexOID,"constraint_id":row.ConstraintID} }
+   result[table] = map[string]any{"table_oid":identity.TableOID,"indexes":indexes}
+  }
+  return result
+ default:
+  t.Fatal("wallet migration requires SQLite/MySQL/PostgreSQL"); return nil
+ }
+}
+'''
+
+WALLET_STATE_FIXTURE = r'''
+func walletState(t *testing.T, phase string) map[string]any {
+ t.Helper()
+ models := []any{&model.OrganizationWallet{},&model.OrganizationWalletEntry{}}
+ for _, value := range models {
+  stmt := &gorm.Statement{DB:model.DB}; require.NoError(t,stmt.Parse(value))
+  columns, err := model.DB.Migrator().ColumnTypes(value); require.NoError(t,err)
+  names := []string{}; for _, column := range columns { names=append(names,column.Name()) }
+  require.ElementsMatch(t,stmt.Schema.DBNames,names)
+  indexes,err := fixtureIndexes(model.DB,stmt.Table);require.NoError(t,err)
+  actual := map[string]gorm.Index{}
+  for _, index := range indexes { primary,known:=index.PrimaryKey(); if !known || !primary { actual[index.Name()]=index } }
+  expected := stmt.Schema.ParseIndexes();require.Len(t,actual,len(expected))
+  for _, index := range expected {
+   got,exists:=actual[index.Name];require.True(t,exists,"missing wallet index %s",index.Name)
+   columns:=[]string{};for _,field:=range index.Fields { columns=append(columns,field.DBName) }
+   require.Equal(t,columns,got.Columns());unique,known:=got.Unique();require.True(t,known);require.Equal(t,index.Class=="UNIQUE",unique)
+  }
+ }
+ if phase == "seed" || phase == "upgrade_seed" {
+  for _,value:=range models { var count int64;require.NoError(t,model.DB.Model(value).Count(&count).Error);require.Zero(t,count) }
+  require.NoError(t,model.DB.Create(&model.OrganizationWallet{OrganizationID:4101,Balance:7,Reserved:0,CreatedAt:1700000000,UpdatedAt:1700000003}).Error)
+  credit:=model.OrganizationWalletEntry{OrganizationID:4101,RequestID:"00000000-0000-4000-8000-000000000001",Kind:"credit",Amount:100,ActorUserID:1,OrganizationRevision:7,Reference:"migration-credit",Reason:"original immutable credit",BalanceAfter:100,CreatedAt:1700000001}
+  require.NoError(t,model.DB.Create(&credit).Error)
+  reverse:=model.OrganizationWalletEntry{OrganizationID:4101,RequestID:"00000000-0000-4000-8000-000000000002",Kind:"reverse",Amount:100,ReversalOfID:&credit.ID,ActorUserID:1,OrganizationRevision:7,Reference:"migration-credit",Reason:"complete reversal",BalanceAfter:0,CreatedAt:1700000002}
+  require.NoError(t,model.DB.Create(&reverse).Error)
+  retained:=model.OrganizationWalletEntry{OrganizationID:4101,RequestID:"00000000-0000-4000-8000-000000000003",Kind:"credit",Amount:7,ActorUserID:1,OrganizationRevision:7,Reference:"migration-nonzero",Reason:"retained balance",BalanceAfter:7,CreatedAt:1700000003}
+  require.NoError(t,model.DB.Create(&retained).Error)
+ }
+ var wallets []model.OrganizationWallet;var entries []model.OrganizationWalletEntry
+ require.NoError(t,model.DB.Order("id").Find(&wallets).Error);require.Len(t,wallets,1)
+ require.NoError(t,model.DB.Order("id").Find(&entries).Error);require.Len(t,entries,3)
+ require.EqualValues(t,7,wallets[0].Balance);require.Zero(t,wallets[0].Reserved)
+ require.Nil(t,entries[0].ReversalOfID);require.Nil(t,entries[2].ReversalOfID)
+ require.NotNil(t,entries[1].ReversalOfID);require.Equal(t,entries[0].ID,*entries[1].ReversalOfID)
+ require.EqualValues(t,100,entries[0].Amount);require.EqualValues(t,100,entries[1].Amount);require.EqualValues(t,7,entries[2].Amount)
+ duplicate:=entries[0];duplicate.ID=0;require.Error(t,model.DB.Create(&duplicate).Error,"organization request identity must stay unique")
+ duplicate=entries[1];duplicate.ID=0;duplicate.RequestID="00000000-0000-4000-8000-000000000004"
+ require.Error(t,model.DB.Create(&duplicate).Error,"one full reversal per credit must stay unique")
+ var count int64;require.NoError(t,model.DB.Model(&model.OrganizationWalletEntry{}).Count(&count).Error);require.EqualValues(t,3,count)
+ var task model.Task;require.NoError(t,model.DB.Where("task_id = ?","wallet-migration-personal").First(&task).Error);require.Zero(t,task.OrganizationID)
+ return map[string]any{"wallets":wallets,"entries":entries}
+}
+'''
+
+
+def wallet_fixture(base, *, candidate):
+    """Reuse released startup/catalog checks, with a closed wallet persistence fixture."""
+    before = '\tvar users []model.User'
+    after = '\tlegacy := walletLegacyState(t, phase)\n' + ('\twallet := walletState(t, phase)\n' if candidate else '') + before
+    if base.count(before) != 1 or base.count('"data": data, "schema_main":') != 1:
+        raise ValueError('wallet fixture instrumentation no longer matches startup entry')
+    value = base.replace('\t"database/sql"', '\t"crypto/sha256"\n\t"database/sql"')
+    value = value.replace(before, after).replace('"data": data, "schema_main":',
+        '"legacy_data": legacy, "physical_main": walletPhysicalState(t, kind), ' +
+        ('"wallet": wallet, ' if candidate else '') + '"data": data, "schema_main":')
+    return value + WALLET_LEGACY_FIXTURE + (WALLET_STATE_FIXTURE if candidate else '')
+
+
+WALLET_RELEASE_FIXTURE = wallet_fixture(FIXTURE, candidate=False)
+WALLET_CANDIDATE_FIXTURE = wallet_fixture(CANDIDATE_FIXTURE, candidate=True)
+
+
 
 def execute(command, *, cwd=None, env=None, timeout=300, input_bytes=None, guard=None, final_guard=None):
     if guard is not None:
@@ -653,15 +781,57 @@ def execute(command, *, cwd=None, env=None, timeout=300, input_bytes=None, guard
     return process.returncode, stdout, stderr
 
 
-def export_sources(source, destination, revision=None):
+def extract_git_archive(tar, destination):
+    """Python 3.9 fallback for a new empty export; never materialize archive links."""
+    if destination.is_symlink() or not destination.is_dir() or any(destination.iterdir()):
+        raise ValueError('archive export requires a new empty directory')
+    root, members = destination.resolve(), {}
+    for member in tar.getmembers():
+        if (member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
+                or member.sparse is not None or member.linkname or member.size < 0):
+            raise ValueError('archive export permits only ordinary files and directories')
+        name = member.name.removesuffix('/') if member.isdir() else member.name
+        parts = tuple(name.split('/'))
+        if (any(part in ('', '.', '..') for part in parts) or '\\' in name or '\x00' in name
+                or PureWindowsPath(name).drive or parts in members):
+            raise ValueError('archive export contains an unsafe or duplicate path')
+        try:
+            root.joinpath(*parts).resolve().relative_to(root)
+        except ValueError:
+            raise ValueError('archive export path escapes its destination') from None
+        members[parts] = member
+    # Check the full inventory before creating even the first file. This also
+    # rejects a file used as a directory, regardless of archive member order.
+    for parts in members:
+        for length in range(1, len(parts)):
+            parent = members.get(parts[:length])
+            if parent is not None and not parent.isdir():
+                raise ValueError('archive export contains a file/directory conflict')
+    for parts, member in members.items():
+        target = root.joinpath(*parts)
+        if member.isdir():
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tar.extractfile(member) as content, target.open('xb') as output:
+            shutil.copyfileobj(content, output)
+        if target.stat().st_size != member.size:
+            raise ValueError('archive export contains an incomplete file')
+        target.chmod(0o755 if member.mode & 0o100 else 0o644)
+
+
+def export_sources(source, destination, revision=None, *, fixture_source=None):
     if destination.exists():
         raise ValueError('export destination already exists; refusing overwrite')
-    destination.mkdir(parents=True)
+    destination.mkdir(mode=0o700, parents=True)
     code, archive, error = execute(['git', 'archive', revision or 'HEAD'], cwd=source)
     if code:
         raise RuntimeError('git archive failed')
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-        tar.extractall(destination, filter='data')
+        if callable(getattr(tarfile, 'data_filter', None)):
+            tar.extractall(destination, filter='data')
+        else:
+            extract_git_archive(tar, destination)
     if revision is None:
         code, data, _ = execute(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=source)
         if code:
@@ -678,7 +848,8 @@ def export_sources(source, destination, revision=None):
                 target.unlink()
     fixture = destination / 'a03fixture'
     fixture.mkdir()
-    (fixture / 'released_test.go').write_text(FIXTURE if revision is not None else CANDIDATE_FIXTURE)
+    (fixture / 'released_test.go').write_text(fixture_source if fixture_source is not None else
+                                           FIXTURE if revision is not None else CANDIDATE_FIXTURE)
 
 
 def required_manifest():
@@ -701,7 +872,7 @@ def fixture_input_identity(source):
     return files
 
 
-def validate_built_fixture(runtime, kind, source):
+def validate_built_fixture(runtime, kind, source, *, release_commit=RELEASE, fixture_source=None):
     receipt_path = runtime / (kind + '-fixture.receipt.json')
     receipt = json.loads(receipt_path.read_text())
     binary = runtime / (kind + '-fixture')
@@ -710,19 +881,22 @@ def validate_built_fixture(runtime, kind, source):
     exported = runtime / (kind + '-source')
     if fixture_input_identity(exported) != receipt['build_inputs']:
         raise ValueError('exported source, embed resources or module locks differ from build receipt')
-    if (exported / 'a03fixture/released_test.go').read_text() != (FIXTURE if kind == 'release' else CANDIDATE_FIXTURE):
+    expected_fixture = fixture_source if fixture_source is not None else FIXTURE if kind == 'release' else CANDIDATE_FIXTURE
+    if (exported / 'a03fixture/released_test.go').read_text() != expected_fixture:
         raise ValueError('fixture source differs from this harness')
     if kind == 'candidate':
         current = fixture_input_identity(source)
         built = {k:v for k,v in receipt['build_inputs'].items() if not k.startswith('a03fixture/')}
         if current != built:
             raise ValueError('candidate source, embed resources or module locks changed since fixture build')
-    if receipt['release_commit'] != RELEASE:
+    if receipt['release_commit'] != release_commit:
         raise ValueError('release build provenance mismatch')
 
 
-def build_fixture(source, output, evidence, go):
+def build_fixture(source, output, evidence, go, *, release_commit=RELEASE):
     env = dict(clean_environment(), GOWORK='off', GOFLAGS='-mod=readonly')
+    if release_commit == WALLET_RELEASE:
+        env['GOENV'] = 'off'
     before = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in ('go.mod', 'go.sum')}
     cmd = [str(go), 'test', '-c', '-o', str(output), './a03fixture']
     code, out, err = execute(cmd, cwd=source, env=env, timeout=600)
@@ -732,7 +906,7 @@ def build_fixture(source, output, evidence, go):
     (evidence / (output.name + '.build.json')).write_text(json.dumps({'command':cmd,'exit_code':code,'locks_before':before,'locks_after':after}, indent=2))
     if code or before != after:
         raise RuntimeError('fixture build failed or module locks changed: ' + output.name)
-    receipt = {'release_commit':RELEASE, 'source':str(source), 'binary_sha256':hashlib.sha256(output.read_bytes()).hexdigest(), 'build_inputs':fixture_input_identity(source)}
+    receipt = {'release_commit':release_commit, 'source':str(source), 'binary_sha256':hashlib.sha256(output.read_bytes()).hexdigest(), 'build_inputs':fixture_input_identity(source)}
     output.with_name(output.name + '.receipt.json').write_text(json.dumps(receipt,indent=2))
 
 
@@ -752,6 +926,7 @@ class OwnedStores:
         self.relay_initialization_error = None
         self.cleaning = False
         self.clickhouse_auth = None
+        self.owns_relays = True
         if binding is None:
             return
         validate_inherited_environment(os.environ)
@@ -818,6 +993,35 @@ class OwnedStores:
                 error.process_cleanup_error = '; '.join(filter(None, [original_cleanup, str(failures)]))
             raise
 
+    @classmethod
+    def organization_wallet(cls, runtime, docker, project, containers, relays):
+        """Borrow this suite's already verified pair; the outer suite alone closes it."""
+        if set(containers) != {'mysql', 'postgres'} or len(relays) != 2:
+            raise ValueError('wallet migrations require the exact current organization relay pair')
+        check_relays(relays, fresh=True)
+        stores = cls(runtime)
+        stores.docker, stores.containers = list(docker), dict(containers)
+        stores.owns_relays = False
+        for engine in ('mysql', 'postgres'):
+            matches = [relay for relay in relays if relay.engine == engine]
+            if len(matches) != 1:
+                raise ValueError('wallet migration relay engine is missing or repeated')
+            relay = matches[0]
+            if (relay.docker != docker or relay.project != project or relay.container != containers[engine]
+                    or relay.organization_image is None or relay.organization_metadata is None
+                    or not isinstance(relay.port, int) or relay.process is None or relay.process.poll() is not None):
+                raise ValueError('wallet migration cannot adopt an unverified or foreign relay')
+            stores.relays.append(relay)
+            stores.ports[engine] = relay.port
+            stores.relay_records.append({'engine': engine, 'container_id': relay.container, 'project': project,
+                                         'state': 'running', 'cleanup_attempts': [], 'ownership': 'borrowed',
+                                         'cleanup_owner': 'run_organization_identity'})
+        stores.relay_receipt = runtime / 'borrowed-relays.json'
+        with stores.relay_receipt.open('x') as output:
+            json.dump({'relays': [], 'initialization_error': None}, output)
+        stores.save_relay_ownership()
+        return stores
+
     def save_relay_ownership(self):
         """Keep allocated identities after close clears the live process and port fields."""
         if self.relay_receipt is None:
@@ -841,7 +1045,7 @@ class OwnedStores:
     def check_routes(self, *, fresh=False):
         if self.clickhouse_auth is not None:
             self.clickhouse_auth.validate()
-        if not self.cleaning:
+        if not self.cleaning or not self.owns_relays:
             check_relays(self.relays, fresh=fresh)
             return
         for relay in self.relays:
@@ -850,6 +1054,8 @@ class OwnedStores:
                 raise RelayIdentityError('owned database identity changed before cleanup')
 
     def close_relays(self):
+        if not self.owns_relays:
+            return []
         errors = []
         for relay, record in reversed(list(zip(self.relays, self.relay_records))):
             if record['state'] == 'closed':
@@ -1146,7 +1352,156 @@ def verify_release_schema(old, current, organization_reference=None):
                 raise ValueError('unapproved schema addition: '+name+'.'+field)
 
 
-def run_phase(binary, phase, main, log, stores, main_db, log_db, evidence, label):
+WALLET_TABLES = frozenset(('organization_wallets', 'organization_wallet_entries'))
+
+
+def required_wallet_manifest():
+    return [{'main': engine, 'log': 'same', 'phase': phase}
+            for engine in ('sqlite', 'mysql', 'postgres') for phase in WALLET_PHASES]
+
+
+def validate_wallet_migration_results(records):
+    if ([{key: record.get(key) for key in ('main', 'log', 'phase')} for record in records] != required_wallet_manifest()
+            or any(record.get('passed') is not True or not record.get('version') for record in records)):
+        raise ValueError('every exact wallet migration phase must pass on all three real engines')
+    return {'passed_phases': len(records), 'engines': ['sqlite', 'mysql', 'postgres']}
+
+
+def wallet_logical_schema(schema):
+    # Column position can differ when the one approved task column is appended
+    # on upgrade. Physical IDs live in a separate snapshot, never removed here.
+    value = copy.deepcopy(schema)
+    for table in value:
+        table['columns'].sort(key=lambda item: item['name'])
+        table['indexes'].sort(key=lambda item: item['name'])
+    return sorted(value, key=lambda table: table['table'])
+
+
+def verify_wallet_release_schema(old, current, fresh):
+    """rc45 -> existing organization/task additions -> exactly two wallet tables."""
+    before = {table['table']: table for table in wallet_logical_schema(old)}
+    after = {table['table']: table for table in wallet_logical_schema(current)}
+    reference = {table['table']: table for table in wallet_logical_schema(fresh)}
+    added = ORGANIZATION_TABLES | WALLET_TABLES
+    if before.keys() & added or after.keys() != before.keys() | added or after != reference:
+        raise ValueError('wallet upgrade must match fresh schema and the fixed rc45 table additions')
+    for table, previous in before.items():
+        for field in ('columns', 'indexes'):
+            old_items = {item['name']: item for item in previous[field]}
+            new_items = {item['name']: item for item in after[table][field]}
+            allowed = ({'organization_id'} if field == 'columns' else {'idx_tasks_organization_user'}) if table == 'tasks' else set()
+            if new_items.keys() != old_items.keys() | allowed or old_items.keys() & allowed:
+                raise ValueError('unapproved wallet migration schema difference: '+table+'.'+field)
+            for name, item in old_items.items():
+                if new_items[name] != item:
+                    raise ValueError('released column/index/constraint changed: '+table+'.'+name)
+
+
+def verify_wallet_restart(before, after):
+    for key in ('data', 'legacy_data', 'organization', 'wallet', 'schema_main', 'schema_log', 'physical_main', 'engine_version', 'log_version'):
+        if before[key] != after[key]:
+            raise ValueError('wallet restart changed persisted data or schema identity: '+key)
+
+
+def run_organization_wallet_migrations(source, runtime, evidence, go, docker, project, containers, relays):
+    """Five new processes per engine, borrowing the live pair until HTTP finishes."""
+    source, runtime, evidence = Path(source), Path(runtime), Path(evidence)
+    if (not runtime.is_absolute() or runtime.resolve() != runtime or runtime.exists()
+            or not runtime.parent.is_dir() or runtime == source or source in runtime.parents or evidence.exists()):
+        raise ValueError('wallet runtime/evidence must be new explicit paths outside the source checkout')
+    runtime.mkdir(mode=0o700)
+    evidence.mkdir(mode=0o700)
+    manifest, records, stores = required_wallet_manifest(), [], None
+    primary, cleanup = None, []
+    try:
+        code, commit, _ = execute(['git', 'rev-parse', WALLET_RELEASE + '^{commit}'], cwd=source)
+        if code or commit.decode().strip() != WALLET_RELEASE:
+            raise ValueError('exact latest-release commit is unavailable locally')
+        for kind, fixture in (('release', WALLET_RELEASE_FIXTURE), ('candidate', WALLET_CANDIDATE_FIXTURE)):
+            exported = runtime / (kind + '-source')
+            export_sources(source, exported, WALLET_RELEASE if kind == 'release' else None, fixture_source=fixture)
+            locks = {str(path.relative_to(exported)): hashlib.sha256(path.read_bytes()).hexdigest()
+                     for path in exported.rglob('*') if path.is_file() and path.name in ('go.mod', 'go.sum')}
+            build_fixture(exported, runtime / (kind + '-fixture'), evidence, go, release_commit=WALLET_RELEASE)
+            after = {str(path.relative_to(exported)): hashlib.sha256(path.read_bytes()).hexdigest()
+                     for path in exported.rglob('*') if path.is_file() and path.name in ('go.mod', 'go.sum')}
+            if locks != after:
+                raise ValueError('wallet fixture build changed a module dependency lock')
+            validate_built_fixture(runtime, kind, source, release_commit=WALLET_RELEASE, fixture_source=fixture)
+        stores = OwnedStores.organization_wallet(runtime, docker, project, containers, relays)
+        run_id = hashlib.sha256(str(runtime).encode()).hexdigest()[:12]
+        for engine in ('sqlite', 'mysql', 'postgres'):
+            fresh_db = stores.create(engine, 'newapi_ci_wallet_' + run_id + '_' + engine + '_fresh')
+            upgrade_db = stores.create(engine, 'newapi_ci_wallet_' + run_id + '_' + engine + '_upgrade')
+            snapshots = {}
+            for phase in WALLET_PHASES:
+                released = phase == 'release_seed'
+                kind = 'release' if released else 'candidate'
+                fixture = WALLET_RELEASE_FIXTURE if released else WALLET_CANDIDATE_FIXTURE
+                validate_built_fixture(runtime, kind, source, release_commit=WALLET_RELEASE, fixture_source=fixture)
+                startup_phase = ('seed' if phase in ('fresh_start', 'release_seed') else
+                                 'upgrade_seed' if phase == 'candidate_upgrade_1' else 'restart')
+                database = fresh_db if phase.startswith('fresh_') else upgrade_db
+                snapshot = run_phase(runtime / (kind + '-fixture'), startup_phase, engine, 'same', stores,
+                                     database, database, evidence, engine + '-' + phase, strict_owned=True)
+                if snapshot.get('phase') != startup_phase or not snapshot.get('physical_main'):
+                    raise ValueError('wallet phase omitted real startup or physical schema identity')
+                snapshots[phase] = snapshot
+                if phase == 'fresh_restart':
+                    verify_wallet_restart(snapshots['fresh_start'], snapshot)
+                elif phase == 'candidate_upgrade_1':
+                    old = snapshots['release_seed']
+                    if old['data'] != snapshot['data'] or old['legacy_data'] != snapshot['legacy_data']:
+                        raise ValueError('released User/Token/Task/TopUp data changed on wallet upgrade')
+                    verify_wallet_release_schema(old['schema_main'], snapshot['schema_main'], snapshots['fresh_start']['schema_main'])
+                elif phase == 'candidate_upgrade_2':
+                    verify_wallet_restart(snapshots['candidate_upgrade_1'], snapshot)
+                records.append({'main': engine, 'log': 'same', 'phase': phase, 'passed': True,
+                                'version': snapshot['engine_version']})
+                (evidence / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
+        validate_wallet_migration_results(records)
+        for kind, fixture in (('release', WALLET_RELEASE_FIXTURE), ('candidate', WALLET_CANDIDATE_FIXTURE)):
+            validate_built_fixture(runtime, kind, source, release_commit=WALLET_RELEASE, fixture_source=fixture)
+    except BaseException as error:
+        primary = {'type': type(error).__name__, 'error': str(error),
+                   'process_cleanup_error': getattr(error, 'process_cleanup_error', None)}
+    finally:
+        if stores is not None:
+            try:
+                cleanup = stores.cleanup()
+            except BaseException as error:
+                cleanup.append({'operation': 'owned_database_cleanup', 'error_type': type(error).__name__,
+                                'error': str(error), 'process_cleanup_error': getattr(error, 'process_cleanup_error', None)})
+            # SQLite is private to this newly created runtime. No external path
+            # or pre-existing file is adopted; retain only its snapshots/logs.
+            for engine, name in stores.created:
+                if engine != 'sqlite':
+                    continue
+                try:
+                    path = Path(name)
+                    if path.parent != runtime or path.resolve() != path:
+                        raise ValueError('wallet SQLite cleanup lost its owned path')
+                    for suffix in ('', '-journal', '-wal', '-shm'):
+                        owned = Path(name + suffix)
+                        if owned.is_symlink():
+                            raise ValueError('wallet SQLite cleanup refuses a symlink')
+                        owned.unlink(missing_ok=True)
+                except BaseException as error:
+                    cleanup.append({'engine': engine, 'error_type': type(error).__name__, 'error': str(error)})
+    result = {'suite': 'organization-wallet', 'release_commit': WALLET_RELEASE, 'required': manifest,
+              'phases': records, 'primary_error': primary, 'cleanup_errors': cleanup,
+              'relay_cleanup_owner': 'run_organization_identity',
+              'passed': primary is None and not cleanup and len(records) == len(manifest)}
+    (evidence / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+    if not result['passed']:
+        error = RuntimeError('organization wallet migration failed; see ' + str(evidence / 'result.json'))
+        if primary is not None:
+            error.process_cleanup_error = primary['process_cleanup_error']
+        raise error
+    return result
+
+
+def run_phase(binary, phase, main, log, stores, main_db, log_db, evidence, label, *, strict_owned=False):
     env=dict(clean_environment(),NEWAPI_TEST_PROFILE='isolated-ci',A03_ENGINE=main,A03_LOG_ENGINE=log,
              A03_PHASE=phase,A03_RESULT=str(evidence/(label+'.snapshot.json')),NODE_TYPE='master',
              PASSWORD_LOGIN_ENCRYPTION_ENABLED='false',SQL_MAX_OPEN_CONNS='2',SQL_MAX_IDLE_CONNS='1',
@@ -1160,8 +1515,11 @@ def run_phase(binary, phase, main, log, stores, main_db, log_db, evidence, label
     auth = stores.clickhouse_auth
     if auth is None:
         # Keep the accepted non-CH execution and evidence path unchanged.
-        code,out,err=execute(command,cwd=stores.runtime,env=env,timeout=135,guard=stores.check_routes,
-                            final_guard=functools.partial(stores.check_routes, fresh=True))
+        if strict_owned:
+            code,out,err=stores.run_test(command,cwd=stores.runtime,env=env,timeout=135)
+        else:
+            code,out,err=execute(command,cwd=stores.runtime,env=env,timeout=135,guard=stores.check_routes,
+                                final_guard=functools.partial(stores.check_routes, fresh=True))
         text=(out+err).decode(errors='replace')
         for key in ('SQL_DSN','LOG_SQL_DSN'):
             if env.get(key) and env[key]!='local':text=text.replace(env[key],'[owned-dsn]')

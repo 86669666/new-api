@@ -143,6 +143,10 @@ type OrganizationCommand struct {
 	ObjectID         int64
 	Generation       int64
 	Replace          bool
+	WalletRequestID  string
+	WalletAmount     int64
+	WalletCreditID   int64
+	WalletReference  string
 	Authorization    *OrganizationAuthorization
 }
 

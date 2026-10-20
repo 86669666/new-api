@@ -392,6 +392,91 @@ class OrganizationIdentityContracts(unittest.TestCase):
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                 runner.validate_organization_identity_events(candidate, suite)
 
+    def test_organization_wallet_suite_and_migration_manifest_are_closed(self):
+        import hashlib
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        suite, root, package = 'organization-wallet', 'TestOrganizationWalletLifecycle', 'github.com/QuantumNous/new-api/router'
+        leaves = ('proof_expired', 'root_role_revoked', 'credit_reversal_idempotency_and_retained_history',
+                  'quota_ceiling_reserved_protection_and_atomic_rollback', 'concurrent_request_identity',
+                  'credit_and_dissolution_serialize', 'publication_governance_removed', 'publication_session_revoked')
+        names = [root] + [root + '/' + name for name in leaves]
+        events = [{'Action': 'pass', 'Package': package, 'Test': name} for name in names] + [{'Action': 'pass', 'Package': package}]
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite][1], 'g17-organization-wallet')
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['passed_tests_and_subtests'], 9)
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:], events + [{'Action': 'skip'}],
+                          events + [{'Action': 'fail'}], events + [{'Action': 'pass', 'Package': package, 'Test': root + '/unexpected'}]):
+            with self.subTest(http=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+        self.assertEqual(released.WALLET_RELEASE, '6cf0d90b5ff27f901697dddd61e0c28aba8efefc')
+        self.assertEqual(released.RELEASE, '633b4c5b190dc1af99a2814391354d86948e7943')
+        manifest = [{'main': engine, 'log': 'same', 'phase': phase} for engine in ('sqlite', 'mysql', 'postgres')
+                    for phase in ('fresh_start', 'fresh_restart', 'release_seed', 'candidate_upgrade_1', 'candidate_upgrade_2')]
+        self.assertEqual(released.required_wallet_manifest(), manifest)
+        records = [dict(record, passed=True, version='actual fixture version') for record in manifest]
+        self.assertEqual(released.validate_wallet_migration_results(records)['passed_phases'], 15)
+        for candidate in (records[:-1], records + records[:1], list(reversed(records)),
+                          [dict(record, passed=False) if i == 0 else record for i, record in enumerate(records)],
+                          [dict(record, version='') if i == 0 else record for i, record in enumerate(records)]):
+            with self.subTest(phases=candidate), self.assertRaises(ValueError):
+                released.validate_wallet_migration_results(candidate)
+
+        old = [{'table': 'tasks', 'columns': [{'name': 'id', 'type': 'integer'}, {'name': 'user_id', 'type': 'integer'}],
+                'indexes': [{'name': 'idx_tasks_user_id', 'columns': ['user_id'], 'unique': False}]}]
+        fresh = copy.deepcopy(old)
+        fresh[0]['columns'].append({'name': 'organization_id', 'type': 'integer', 'nullable': False, 'default': '0'})
+        fresh[0]['indexes'].append({'name': 'idx_tasks_organization_user', 'columns': ['organization_id', 'user_id'], 'unique': False})
+        fresh += [{'table': table, 'columns': [{'name': 'id', 'type': 'integer'}], 'indexes': []}
+                  for table in sorted(released.ORGANIZATION_TABLES | released.WALLET_TABLES)]
+        released.verify_wallet_release_schema(old, fresh, fresh)
+        for mutation in ('unknown_column', 'changed_column', 'lost_index', 'foreign_table', 'missing_wallet'):
+            current = copy.deepcopy(fresh)
+            if mutation == 'unknown_column': current[0]['columns'].append({'name': 'unapproved'})
+            elif mutation == 'changed_column': current[0]['columns'][0]['type'] = 'text'
+            elif mutation == 'lost_index': current[0]['indexes'].pop(0)
+            elif mutation == 'foreign_table': current.append({'table': 'unapproved', 'columns': [], 'indexes': []})
+            else: current = [table for table in current if table['table'] != 'organization_wallet_entries']
+            with self.subTest(schema=mutation), self.assertRaises(ValueError):
+                released.verify_wallet_release_schema(old, current, current)
+        snapshot = {key: [] for key in ('data', 'legacy_data', 'organization', 'wallet', 'schema_main', 'schema_log', 'engine_version', 'log_version')}
+        snapshot['physical_main'] = {'table_oid': 17, 'index_oid': 19}
+        released.verify_wallet_restart(snapshot, copy.deepcopy(snapshot))
+        for key in ('legacy_data', 'wallet', 'physical_main'):
+            changed = dict(snapshot, **{key: 'changed'})
+            with self.subTest(restart=key), self.assertRaises(ValueError):
+                released.verify_wallet_restart(snapshot, changed)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            exported = runtime / 'release-source' / 'a03fixture'
+            exported.mkdir(parents=True)
+            (exported / 'released_test.go').write_text(released.WALLET_RELEASE_FIXTURE)
+            binary = runtime / 'release-fixture'; binary.write_bytes(b'inert fixture identity')
+            receipt = {'release_commit': released.WALLET_RELEASE, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+                       'build_inputs': released.fixture_input_identity(exported.parent)}
+            receipt_path = runtime / 'release-fixture.receipt.json'; receipt_path.write_text(json.dumps(receipt))
+            released.validate_built_fixture(runtime, 'release', runtime, release_commit=released.WALLET_RELEASE, fixture_source=released.WALLET_RELEASE_FIXTURE)
+            receipt['release_commit'] = released.RELEASE; receipt_path.write_text(json.dumps(receipt))
+            with self.assertRaises(ValueError):
+                released.validate_built_fixture(runtime, 'release', runtime, release_commit=released.WALLET_RELEASE, fixture_source=released.WALLET_RELEASE_FIXTURE)
+            relays = []
+            containers = {'mysql': 'c' * 64, 'postgres': 'd' * 64}
+            for index, (engine, container) in enumerate(containers.items()):
+                process = Mock(pid=2000 + index); process.poll.return_value = None
+                relays.append(SimpleNamespace(docker=['docker'], project='newapi-ci-wallet-test', engine=engine,
+                    container=container, organization_image={'boot_id': 'same-boot'}, organization_metadata=runtime / 'metadata.json',
+                    port=20000 + index, process=process, receipt={}, initial={}, boot='same-boot', close=Mock()))
+            with patch.object(released, 'check_relays') as checked:
+                stores = released.OwnedStores.organization_wallet(runtime, ['docker'], 'newapi-ci-wallet-test', containers, relays)
+                checked.assert_called_once_with(relays, fresh=True)
+                self.assertFalse(stores.owns_relays)
+                self.assertEqual(stores.cleanup(), [])
+                for relay in relays: relay.close.assert_not_called()
+                relays[0].organization_image = None
+                with self.assertRaises(ValueError):
+                    released.OwnedStores.organization_wallet(runtime, ['docker'], 'newapi-ci-wallet-test', containers, relays)
+
     def test_live_image_recomputes_bytes_instead_of_trusting_receipt_flags(self):
         import hashlib
         config = {'os': 'linux', 'architecture': 'arm64', 'rootfs': {'type': 'layers', 'diff_ids': ['sha256:layer']},
@@ -434,6 +519,59 @@ class OrganizationIdentityContracts(unittest.TestCase):
                 runner.verify_live_organization_image(['docker'], 'mysql', path)
 
 class ReleasedDatabaseContracts(unittest.TestCase):
+    def test_python39_archive_export_is_bounded(self):
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / 'outside'; outside.write_bytes(b'preserved')
+            ordinary = ('src/plain.go', tarfile.REGTYPE, b'package fixture\n', 0o666, '')
+            executable = ('tool', tarfile.REGTYPE, b'fixture executable\n', 0o6755, '')
+            cases = [
+                ('regular_and_executable', [('src/', tarfile.DIRTYPE, b'', 0o7777, ''), ordinary, executable], True),
+                ('absolute', [(str(outside), tarfile.REGTYPE, b'changed', 0o644, '')], False),
+                ('parent', [('../outside', tarfile.REGTYPE, b'changed', 0o644, '')], False),
+                ('nested_parent', [('src/../../outside', tarfile.REGTYPE, b'changed', 0o644, '')], False),
+                ('noncanonical', [('src/./plain.go', tarfile.REGTYPE, b'changed', 0o644, '')], False),
+                ('windows_absolute', [('C:/outside', tarfile.REGTYPE, b'changed', 0o644, '')], False),
+                ('backslash', [('src\\outside', tarfile.REGTYPE, b'changed', 0o644, '')], False),
+                ('symlink', [('link', tarfile.SYMTYPE, b'', 0o777, str(outside))], False),
+                ('hardlink', [('link', tarfile.LNKTYPE, b'', 0o777, str(outside))], False),
+                ('device', [('device', tarfile.CHRTYPE, b'', 0o777, '')], False),
+                ('fifo', [('fifo', tarfile.FIFOTYPE, b'', 0o777, '')], False),
+                ('sparse', [('sparse', tarfile.GNUTYPE_SPARSE, b'', 0o644, '')], False),
+                ('duplicate', [ordinary, ordinary], False),
+                ('directory_file_collision', [('src', tarfile.DIRTYPE, b'', 0o755, ''), ('src', tarfile.REGTYPE, b'changed', 0o644, '')], False),
+                ('parent_file_first', [('src', tarfile.REGTYPE, b'changed', 0o644, ''), ordinary], False),
+                ('parent_file_last', [ordinary, ('src', tarfile.REGTYPE, b'changed', 0o644, '')], False),
+            ]
+            for name, entries, valid in cases:
+                with self.subTest(archive=name):
+                    data = io.BytesIO()
+                    with tarfile.open(fileobj=data, mode='w') as archive:
+                        for path, kind, content, mode, link in [('safe-first', tarfile.REGTYPE, b'validated before writes', 0o644, '')] + entries:
+                            member = tarfile.TarInfo(path); member.type = kind; member.mode = mode; member.linkname = link
+                            member.size = len(content)
+                            archive.addfile(member, io.BytesIO(content))
+                    destination = root / name
+                    # The fixed executor is Python 3.9. This forces the same
+                    # absent-filter branch on newer interpreters as well.
+                    with patch.object(released.tarfile, 'data_filter', None, create=True), \
+                            patch.object(released.tarfile.TarFile, 'extractall', side_effect=AssertionError('unfiltered extractall forbidden')), \
+                            patch.object(released, 'execute', return_value=(0, data.getvalue(), b'')):
+                        if valid:
+                            released.export_sources(root, destination, released.WALLET_RELEASE, fixture_source=released.WALLET_RELEASE_FIXTURE)
+                            self.assertEqual((destination / 'src/plain.go').read_bytes(), ordinary[2])
+                            self.assertEqual((destination / 'src/plain.go').stat().st_mode & 0o7777, 0o644)
+                            self.assertEqual((destination / 'tool').read_bytes(), executable[2])
+                            self.assertEqual((destination / 'tool').stat().st_mode & 0o7777, 0o755)
+                            self.assertEqual((destination / 'a03fixture/released_test.go').read_text(), released.WALLET_RELEASE_FIXTURE)
+                        else:
+                            with self.assertRaises(ValueError):
+                                released.export_sources(root, destination, released.WALLET_RELEASE, fixture_source=released.WALLET_RELEASE_FIXTURE)
+                            self.assertEqual(list(destination.iterdir()), [], 'validate every member before any archive write')
+                    self.assertEqual(outside.read_bytes(), b'preserved')
+
     def test_release_structure_preserves_columns_indexes_and_uniqueness(self):
         old = [{'table':'tokens', 'columns':[{'name':'key','type':'varchar'}],
                 'indexes':[{'name':'idx_tokens_key','columns':['key'],'unique':True,'known':True}]},

@@ -99,6 +99,12 @@ export function compileContractCalls() {
   OrganizationsService.getOrganizationAccess({ orgId: '9007199254740993', queryOrgId: '9007199254740993' });
   OrganizationsService.listOrganizationMembers({ orgId: '9007199254740993', xOrganizationId: '9007199254740993', limit: 1 });
   OrganizationsService.listOrganizationEvents({ orgId: '9007199254740993', afterId: '0' });
+  OrganizationsService.organizationWalletBalance({ orgId: '1' });
+  OrganizationsService.platformOrganizationWalletBalance({ orgId: '1' });
+  OrganizationsService.organizationWalletCredit({ orgId: '1', xSecurityProof: 'fixture-proof', requestBody: { revision: '1', request_id: '00000000-0000-4000-8000-000000000001', amount: '100', reference: 'ticket-17', reason: 'Manual credit' } });
+  OrganizationsService.organizationWalletReverse({ orgId: '1', creditId: '2', xSecurityProof: 'fixture-proof', requestBody: { revision: '1', request_id: '00000000-0000-4000-8000-000000000002', reason: 'Correct credit' } });
+  // @ts-expect-error wallet amounts remain decimal strings
+  OrganizationsService.organizationWalletCredit({ orgId: '1', xSecurityProof: 'fixture-proof', requestBody: { revision: '1', request_id: 'fixture', amount: 100, reference: 'fixture', reason: 'fixture' } });
   const personal: RequestAccessContext = { actor_user_id: '7', org_id: '0', scope_kind: 'personal', organization: null };
   // @ts-expect-error contents must be an array
   GeminiService.streamGeminiContent({ model: 'fixture', requestBody: { contents: 'invalid' } });
@@ -342,4 +348,31 @@ assert.equal(networkAttempts, 1);
 globalThis.fetch = savedFetch;
 await writeFile(path.join(output, 'lifecycle-client-results.json'), JSON.stringify({ operations: invocationMap.length, typed_positive_calls: invocationMap.length + 2, typed_negative_calls: lifecycleTypeNegatives, stubbed_requests: lifecycleStubbedRequests, network_failure_attempts: networkAttempts, live_http: false, server_authorization_verified: false }, null, 2) + '\n');
 const imageClient = await readFile(path.join(output, 'generated/relay/services/ImagesService.ts'), 'utf8');
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 9, typed_consumer_negative_calls: 9, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+
+const beforeWalletRequests = calls.length;
+// Exact generated wallet transport; this stub is not authorization/runtime proof.
+responseStatus = 200;
+responseBody = { success: true, message: '', data: { organization_id: '1', opened: false, balance: '0', reserved: '0', available: '0' } };
+for (const [method, endpoint] of [['organizationWalletBalance', '/api/organizations/1/wallet'], ['platformOrganizationWalletBalance', '/api/platform/organizations/1/wallet']]) {
+  await api.OrganizationsService[method]({ orgId: '1' });
+  assert.equal(calls.at(-1).url, api.OpenAPI.BASE + endpoint);
+  assert.equal(calls.at(-1).init.method, 'GET');
+  assert.equal(calls.at(-1).init.body, undefined);
+  assert.equal(new Headers(calls.at(-1).init.headers).has('X-Security-Proof'), false);
+}
+for (const [method, endpoint, requestBody, extra] of [
+  ['organizationWalletCredit', '/api/platform/organizations/1/wallet/credits', { revision: '1', request_id: '00000000-0000-4000-8000-000000000001', amount: '100', reference: 'ticket-17', reason: 'Manual credit' }, {}],
+  ['organizationWalletReverse', '/api/platform/organizations/1/wallet/credits/2/reverse', { revision: '1', request_id: '00000000-0000-4000-8000-000000000002', reason: 'Correct credit' }, { creditId: '2' }],
+]) {
+  responseBody = { success: true, message: '', data: { organization_id: '1', entry_id: '2', amount: '100', balance_after: '100' } };
+  await api.OrganizationsService[method]({ orgId: '1', xSecurityProof: 'fixture-proof', requestBody, ...extra });
+  assert.equal(calls.at(-1).url, api.OpenAPI.BASE + endpoint);
+  assert.equal(calls.at(-1).init.method, 'POST');
+  assert.deepEqual(JSON.parse(calls.at(-1).init.body), requestBody);
+  assert.equal(new Headers(calls.at(-1).init.headers).get('X-Security-Proof'), 'fixture-proof');
+  responseStatus = 409;
+  responseBody = { success: false, code: 'ORG_WALLET_REQUEST_CONFLICT', message: 'This wallet request ID was already used with different details.' };
+  await assert.rejects(api.OrganizationsService[method]({ orgId: '1', xSecurityProof: 'fixture-proof', requestBody, ...extra }), error => error.status === 409 && error.body.code === 'ORG_WALLET_REQUEST_CONFLICT');
+  responseStatus = 200;
+}
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 13, typed_consumer_negative_calls: 10, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: calls.length - beforeWalletRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));

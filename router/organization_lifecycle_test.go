@@ -431,7 +431,7 @@ func (c *organizationLifecycleClient) operation(t *testing.T, actor, action stri
 		command[k] = v
 	}
 	path := c.path() + "/authorization-context"
-	if action == "platform_disable" {
+	if action == "platform_disable" || action == "wallet_credit" || action == "wallet_reverse" {
 		path = fmt.Sprintf("/api/platform/organizations/%d/authorization-context", c.orgA)
 	}
 	status, h, b := c.json(t, "POST", path, actor, map[string]any{"action": action, "command": command}, "")
@@ -3866,6 +3866,517 @@ func TestOrganizationLifecycleRedisAuthorityFaults(t *testing.T) {
 				assert.Equal(t, next, stored, "late snapshot must not overwrite committed authority")
 				status, h, body := c.json(t, "GET", c.path()+"/self-state", "owner", nil, "")
 				organizationError(t, status, h, body, 401, "AUTH_SESSION_REVOKED")
+			}
+		})
+	}
+}
+
+// Wallet operations use real sessions and the public preview/factor producers.
+// Direct rows below establish only otherwise-unreachable reserved/corrupt fixtures.
+func TestOrganizationWalletLifecycle(t *testing.T) {
+	for _, change := range []string{"proof_expired", "root_role_revoked"} {
+		t.Run(change, func(t *testing.T) {
+			c := newOrganizationLifecycleClient(t)
+			revision := c.revision(t)
+			credit := map[string]any{"revision": revision, "request_id": "00000000-0000-4000-8000-000000000041", "amount": "17", "reference": "rejected-fixture", "reason": "authorization changed"}
+			op := c.operation(t, "root", "wallet_credit", credit, nil)
+			proof := c.proof(t, "root", op, "password", "")
+			var flow model.AuthFlow
+			require.NoError(t, c.db.Where("purpose = ? AND session_id = ?", model.AuthFlowPurposeSecurityProof, c.sids["root"]).First(&flow).Error)
+			want := "ORG_FORBIDDEN"
+			if change == "proof_expired" {
+				require.NoError(t, c.db.Model(&flow).Update("expires_at", time.Now().Add(-time.Second)).Error)
+				want = "SECURITY_PROOF_EXPIRED"
+			} else {
+				require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["root"].Id).Update("role", common.RoleCommonUser).Error)
+			}
+			status, headers, body := c.json(t, "POST", fmt.Sprintf("/api/platform/organizations/%d/wallet/credits", c.orgA), "root", credit, proof)
+			organizationError(t, status, headers, body, 403, want)
+			for _, table := range []any{&model.OrganizationWallet{}, &model.OrganizationWalletEntry{}} {
+				var count int64
+				require.NoError(t, c.db.Model(table).Count(&count).Error)
+				assert.Zero(t, count)
+			}
+			var count int64
+			require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Where("object_kind = ?", "wallet_entry").Count(&count).Error)
+			assert.Zero(t, count)
+			assert.Equal(t, revision, c.revision(t))
+			require.NoError(t, c.db.First(&flow, flow.Id).Error)
+			assert.Nil(t, flow.ConsumedAt)
+		})
+	}
+
+	t.Run("credit_reversal_idempotency_and_retained_history", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		platform := fmt.Sprintf("/api/platform/organizations/%d", c.orgA)
+		creditPath := platform + "/wallet/credits"
+		var before []struct {
+			ID           int
+			Quota        int
+			UsedQuota    int
+			RequestCount int
+			Group        string
+		}
+		require.NoError(t, c.db.Model(&model.User{}).Select("id", "quota", "used_quota", "request_count", "group").Order("id").Find(&before).Error)
+		for _, actor := range []string{"owner", "admin"} {
+			status, headers, body := c.json(t, "GET", c.path()+"/wallet", actor, nil, "")
+			require.Equal(t, 200, status)
+			assert.True(t, organizationPrivateNoStore(headers.Values("Cache-Control")))
+			assert.Equal(t, map[string]any{"organization_id": strconv.FormatInt(c.orgA, 10), "opened": false, "balance": "0", "reserved": "0", "available": "0"}, body["data"])
+		}
+		for _, actor := range []string{"member", "foreign", "root"} {
+			status, headers, body := c.json(t, "GET", c.path()+"/wallet", actor, nil, "")
+			organizationError(t, status, headers, body, 404, "ORG_NOT_FOUND")
+		}
+		status, headers, body := c.json(t, "GET", platform+"/wallet", "owner", nil, "")
+		organizationError(t, status, headers, body, 403, "ORG_FORBIDDEN")
+		suffix, err := common.GenerateRandomCharsKey(43)
+		require.NoError(t, err)
+		pat := model.AccessTokenPrefix + suffix
+		access := &model.UserAccessToken{Name: "wallet-fixture", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat)}
+		require.NoError(t, access.SetScopes([]string{"*"}))
+		require.NoError(t, model.CreateUserAccessToken(c.users["root"].Id, access, service.AccessTokenMaxPerUser))
+		for _, method := range []string{"GET", "POST"} {
+			endpoint, raw := platform+"/wallet", ""
+			if method == "POST" {
+				endpoint, raw = creditPath, `{}`
+			}
+			status, headers, body = c.request(t, method, endpoint, pat, raw, http.Header{"Content-Type": {"application/json"}})
+			organizationError(t, status, headers, body, 403, "AUTH_SESSION_REQUIRED")
+		}
+		var wallets int64
+		require.NoError(t, c.db.Model(&model.OrganizationWallet{}).Count(&wallets).Error)
+		assert.Zero(t, wallets, "read must not open an account")
+
+		// A proof issued while empty must not bypass a credit committed afterward.
+		dissolveOp := c.operation(t, "owner", "dissolve", map[string]any{"revision": c.revision(t)}, nil)
+		dissolveProof := c.proof(t, "owner", dissolveOp, "password", "")
+		initialRevision := c.revision(t)
+		credit := map[string]any{"revision": initialRevision, "request_id": "00000000-0000-4000-8000-000000000001", "amount": "100", "reference": "ticket-17", "reason": "fixture financial detail"}
+		op := c.operation(t, "root", "wallet_credit", credit, nil)
+		require.NoError(t, c.db.Model(&model.OrganizationWallet{}).Count(&wallets).Error)
+		assert.Zero(t, wallets, "preview must roll back without opening an account")
+		proof := c.proof(t, "root", op, "password", "")
+		status, headers, body = c.json(t, "POST", creditPath, "root", credit, proof)
+		require.Equal(t, 200, status)
+		require.Equal(t, true, body["success"])
+		assert.True(t, organizationPrivateNoStore(headers.Values("Cache-Control")))
+		receipt := body["data"].(map[string]any)
+		assert.Equal(t, "100", receipt["balance_after"])
+		assert.Equal(t, strconv.Itoa(c.users["root"].Id), receipt["actor_user_id"])
+		assert.Equal(t, initialRevision, c.revision(t), "wallet writes do not change governance revision")
+		status, headers, body = c.json(t, "POST", creditPath, "root", credit, proof)
+		organizationError(t, status, headers, body, 403, "SECURITY_PROOF_CONSUMED")
+		status, headers, body = c.json(t, "POST", c.path()+"/dissolve", "owner", map[string]any{"revision": initialRevision}, dissolveProof)
+		organizationError(t, status, headers, body, 409, "ORG_WALLET_NOT_EMPTY")
+
+		// Refreshing governance revision and proof must preserve business identity.
+		c.mutate(t, "owner", "PATCH", c.path()+"/name", "rename", map[string]any{"revision": c.revision(t), "name": "wallet renamed"}, nil, false)
+		credit["revision"] = c.revision(t)
+		op = c.operation(t, "root", "wallet_credit", credit, nil)
+		proof = c.proof(t, "root", op, "password", "")
+		status, _, body = c.json(t, "POST", creditPath, "root", credit, proof)
+		require.Equal(t, 200, status)
+		assert.Equal(t, receipt, body["data"])
+		changed := maps.Clone(credit)
+		changed["amount"] = "101"
+		status, headers, body = c.json(t, "POST", creditPath, "root", changed, "")
+		organizationError(t, status, headers, body, 409, "ORG_WALLET_REQUEST_CONFLICT")
+		for _, actor := range []string{"owner", "admin", "member"} {
+			status, headers, body = c.json(t, "POST", creditPath, actor, credit, "")
+			organizationError(t, status, headers, body, 403, "ORG_FORBIDDEN")
+		}
+		for _, bad := range []map[string]any{
+			{"amount": "0"}, {"amount": "-1"}, {"amount": "1.0"}, {"amount": "9007199254740992"},
+			{"request_id": "not-a-uuid"}, {"reason": ""}, {"reference": "line\nbreak"}, {"extra": true},
+		} {
+			input := maps.Clone(credit)
+			for key, value := range bad {
+				input[key] = value
+			}
+			status, headers, body = c.json(t, "POST", creditPath, "root", input, "")
+			organizationError(t, status, headers, body, 400, "ORG_REQUEST_INVALID")
+		}
+
+		creditID := receipt["entry_id"].(string)
+		var otherOrg model.Organization
+		require.NoError(t, c.db.First(&otherOrg, c.orgB).Error)
+		status, headers, body = c.json(t, "POST", fmt.Sprintf("/api/platform/organizations/%d/wallet/credits/%s/reverse", c.orgB, creditID), "root", map[string]any{"revision": strconv.FormatInt(otherOrg.Revision, 10), "request_id": "00000000-0000-4000-8000-000000000004", "reason": "cross organization"}, "")
+		organizationError(t, status, headers, body, 404, "ORG_NOT_FOUND")
+		var original model.OrganizationWalletEntry
+		require.NoError(t, c.db.First(&original, creditID).Error)
+		c.mutate(t, "owner", "POST", c.path()+"/self-state", "self_disable", map[string]any{"revision": c.revision(t), "disabled": true, "reason": "financial recovery"}, nil, true)
+		credit["revision"] = c.revision(t)
+		status, headers, body = c.json(t, "POST", creditPath, "root", credit, "")
+		organizationError(t, status, headers, body, 409, "ORG_DISABLED")
+		status, _, body = c.json(t, "GET", c.path()+"/wallet", "owner", nil, "")
+		require.Equal(t, 200, status)
+		assert.Equal(t, "100", body["data"].(map[string]any)["available"])
+		reverse := map[string]any{"revision": c.revision(t), "request_id": "00000000-0000-4000-8000-000000000002", "reason": "correct original credit"}
+		op = c.operation(t, "root", "wallet_reverse", reverse, map[string]any{"credit_id": creditID})
+		assert.Equal(t, "100", op["context"].(map[string]any)["snapshot"].(map[string]any)["wallet_amount"])
+		forged := maps.Clone(op["context"].(map[string]any))
+		forged["snapshot"] = map[string]any{"wallet_amount": "99"}
+		status, headers, body = c.json(t, "POST", "/api/verify", "root", map[string]any{"scope": op["scope"], "context": forged, "method": "password", "password": c.passwords["root"]}, "")
+		organizationError(t, status, headers, body, 403, "SECURITY_PROOF_CONTEXT_MISMATCH")
+		proof = c.proof(t, "root", op, "password", "")
+		reversePath := creditPath + "/" + creditID + "/reverse"
+		status, _, body = c.json(t, "POST", reversePath, "root", reverse, proof)
+		require.Equal(t, 200, status)
+		reversal := body["data"]
+		assert.Equal(t, "0", reversal.(map[string]any)["balance_after"])
+		// The second preview must succeed even though the original is now reversed
+		// and the wallet has no available balance.
+		op = c.operation(t, "root", "wallet_reverse", reverse, map[string]any{"credit_id": creditID})
+		proof = c.proof(t, "root", op, "password", "")
+		status, _, body = c.json(t, "POST", reversePath, "root", reverse, proof)
+		require.Equal(t, 200, status)
+		assert.Equal(t, reversal, body["data"])
+		other := maps.Clone(reverse)
+		other["request_id"] = "00000000-0000-4000-8000-000000000003"
+		status, headers, body = c.json(t, "POST", reversePath, "root", other, "")
+		organizationError(t, status, headers, body, 409, "ORG_WALLET_ALREADY_REVERSED")
+		var afterOriginal model.OrganizationWalletEntry
+		require.NoError(t, c.db.First(&afterOriginal, creditID).Error)
+		assert.Equal(t, original, afterOriginal, "reversal never edits the credit")
+		var entries, events int64
+		require.NoError(t, c.db.Model(&model.OrganizationWalletEntry{}).Count(&entries).Error)
+		require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Where("object_kind = ?", "wallet_entry").Count(&events).Error)
+		assert.EqualValues(t, 2, entries)
+		assert.EqualValues(t, 2, events)
+		var walletEvents []model.OrganizationEvent
+		require.NoError(t, c.db.Where("object_kind = ?", "wallet_entry").Order("id").Find(&walletEvents).Error)
+		encoded, err := common.Marshal(walletEvents)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), "fixture financial detail")
+		assert.NotContains(t, string(encoded), "ticket-17")
+		c.mutate(t, "owner", "POST", c.path()+"/dissolve", "dissolve", map[string]any{"revision": c.revision(t)}, nil, true)
+		status, _, body = c.json(t, "GET", platform+"/wallet", "root", nil, "")
+		require.Equal(t, 200, status)
+		assert.Equal(t, true, body["data"].(map[string]any)["opened"])
+		assert.Equal(t, "0", body["data"].(map[string]any)["balance"])
+		status, headers, body = c.json(t, "GET", c.path()+"/wallet", "owner", nil, "")
+		organizationError(t, status, headers, body, 404, "ORG_NOT_FOUND")
+		reverse["revision"] = c.revision(t)
+		status, headers, body = c.json(t, "POST", reversePath, "root", reverse, "")
+		organizationError(t, status, headers, body, 409, "ORG_REQUEST_RESOLVED")
+		require.NoError(t, c.db.Model(&model.OrganizationWalletEntry{}).Count(&entries).Error)
+		assert.EqualValues(t, 2, entries)
+		var after []struct {
+			ID           int
+			Quota        int
+			UsedQuota    int
+			RequestCount int
+			Group        string
+		}
+		require.NoError(t, c.db.Model(&model.User{}).Select("id", "quota", "used_quota", "request_count", "group").Order("id").Find(&after).Error)
+		assert.Equal(t, before, after, "organization accounting must not change personal funds or group")
+	})
+
+	t.Run("quota_ceiling_reserved_protection_and_atomic_rollback", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		path := fmt.Sprintf("/api/platform/organizations/%d/wallet/credits", c.orgA)
+		credit := map[string]any{"revision": c.revision(t), "request_id": "00000000-0000-4000-8000-000000000011", "amount": "9007199254740991", "reference": "ceiling-fixture", "reason": "quota ceiling"}
+		op := c.operation(t, "root", "wallet_credit", credit, nil)
+		proof := c.proof(t, "root", op, "password", "")
+		// Force failure after the wallet and ledger writes; every domain write must roll back.
+		callback := "test:organization-wallet-event-failure"
+		require.NoError(t, c.db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+			if event, ok := tx.Statement.Dest.(*model.OrganizationEvent); ok && event.ObjectKind == "wallet_entry" {
+				tx.AddError(errors.New("owned wallet event failure"))
+			}
+		}))
+		status, headers, body := c.json(t, "POST", path, "root", credit, proof)
+		organizationError(t, status, headers, body, 500, "ORG_INTERNAL_ERROR")
+		require.NoError(t, c.db.Callback().Create().Remove(callback))
+		for _, table := range []any{&model.OrganizationWallet{}, &model.OrganizationWalletEntry{}} {
+			var count int64
+			require.NoError(t, c.db.Model(table).Count(&count).Error)
+			assert.Zero(t, count)
+		}
+		status, headers, body = c.json(t, "POST", path, "root", credit, proof)
+		organizationError(t, status, headers, body, 403, "SECURITY_PROOF_CONSUMED")
+		op = c.operation(t, "root", "wallet_credit", credit, nil)
+		proof = c.proof(t, "root", op, "password", "")
+		status, _, body = c.json(t, "POST", path, "root", credit, proof)
+		require.Equal(t, 200, status)
+		receipt := body["data"]
+		creditID := receipt.(map[string]any)["entry_id"].(string)
+		// The successful key remains usable at the ceiling with a new proof.
+		op = c.operation(t, "root", "wallet_credit", credit, nil)
+		proof = c.proof(t, "root", op, "password", "")
+		status, _, body = c.json(t, "POST", path, "root", credit, proof)
+		require.Equal(t, 200, status)
+		assert.Equal(t, receipt, body["data"])
+		other := maps.Clone(credit)
+		other["request_id"], other["amount"] = "00000000-0000-4000-8000-000000000012", "1"
+		status, headers, body = c.json(t, "POST", path, "root", other, "")
+		organizationError(t, status, headers, body, 409, "ORG_WALLET_LIMIT_EXCEEDED")
+		require.NoError(t, c.db.Model(&model.OrganizationWallet{}).Where("organization_id = ?", c.orgA).Update("reserved", 1).Error)
+		reverse := map[string]any{"revision": c.revision(t), "request_id": "00000000-0000-4000-8000-000000000013", "reason": "reserved protection"}
+		status, headers, body = c.json(t, "POST", path+"/"+creditID+"/reverse", "root", reverse, "")
+		organizationError(t, status, headers, body, 409, "ORG_WALLET_INSUFFICIENT_AVAILABLE")
+		status, headers, body = c.json(t, "POST", c.path()+"/authorization-context", "owner", map[string]any{"action": "dissolve", "command": map[string]any{"organization_id": strconv.FormatInt(c.orgA, 10), "revision": c.revision(t)}}, "")
+		organizationError(t, status, headers, body, 409, "ORG_WALLET_NOT_EMPTY")
+		var saved model.OrganizationWallet
+		require.NoError(t, c.db.Where("organization_id = ?", c.orgA).First(&saved).Error)
+		assert.EqualValues(t, common.MaxWalletQuota, saved.Balance)
+		assert.EqualValues(t, 1, saved.Reserved)
+	})
+
+	t.Run("concurrent_request_identity", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["empty"].Id).Update("role", common.RoleRootUser).Error)
+		c.login(t, "empty")
+		credit := map[string]any{"revision": c.revision(t), "request_id": "00000000-0000-4000-8000-000000000021", "amount": "7", "reference": "concurrent-fixture", "reason": "same business request"}
+		requests := make([]*http.Request, 0, 2)
+		for _, actor := range []string{"root", "empty"} {
+			op := c.operation(t, actor, "wallet_credit", credit, nil)
+			proof := c.proof(t, actor, op, "password", "")
+			data, err := common.Marshal(credit)
+			require.NoError(t, err)
+			request, err := http.NewRequest("POST", fmt.Sprintf("%s/api/platform/organizations/%d/wallet/credits", c.server.URL, c.orgA), bytes.NewReader(data))
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+c.bearer[actor])
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Security-Proof", proof)
+			requests = append(requests, request)
+		}
+		type result struct {
+			status int
+			body   map[string]any
+			err    error
+		}
+		done := make(chan result, 2)
+		start := make(chan struct{})
+		for _, request := range requests {
+			go func() {
+				<-start
+				response, err := c.client.Do(request)
+				if err != nil {
+					done <- result{err: err}
+					return
+				}
+				defer response.Body.Close()
+				var body map[string]any
+				err = common.DecodeJson(response.Body, &body)
+				done <- result{response.StatusCode, body, err}
+			}()
+		}
+		close(start)
+		first, second := <-done, <-done
+		require.NoError(t, first.err)
+		require.NoError(t, second.err)
+		require.Equal(t, 200, first.status)
+		require.Equal(t, 200, second.status)
+		assert.Equal(t, first.body, second.body)
+		var count int64
+		require.NoError(t, c.db.Model(&model.OrganizationWalletEntry{}).Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+		require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Where("object_kind = ?", "wallet_entry").Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+		status, _, body := c.json(t, "GET", c.path()+"/wallet", "owner", nil, "")
+		require.Equal(t, 200, status)
+		assert.Equal(t, "7", body["data"].(map[string]any)["balance"])
+
+		creditID := first.body["data"].(map[string]any)["entry_id"].(string)
+		var original model.OrganizationWalletEntry
+		require.NoError(t, c.db.First(&original, creditID).Error)
+		requests = requests[:0]
+		for index, actor := range []string{"root", "empty"} {
+			reverse := map[string]any{"revision": c.revision(t), "request_id": fmt.Sprintf("00000000-0000-4000-8000-%012d", 22+index), "reason": "concurrent full reversal"}
+			op := c.operation(t, actor, "wallet_reverse", reverse, map[string]any{"credit_id": creditID})
+			proof := c.proof(t, actor, op, "password", "")
+			data, err := common.Marshal(reverse)
+			require.NoError(t, err)
+			request, err := http.NewRequest("POST", fmt.Sprintf("%s/api/platform/organizations/%d/wallet/credits/%s/reverse", c.server.URL, c.orgA, creditID), bytes.NewReader(data))
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+c.bearer[actor])
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Security-Proof", proof)
+			requests = append(requests, request)
+		}
+		start = make(chan struct{})
+		for _, request := range requests {
+			go func() {
+				<-start
+				response, err := c.client.Do(request)
+				if err != nil {
+					done <- result{err: err}
+					return
+				}
+				defer response.Body.Close()
+				var decoded map[string]any
+				err = common.DecodeJson(response.Body, &decoded)
+				done <- result{response.StatusCode, decoded, err}
+			}()
+		}
+		close(start)
+		first, second = <-done, <-done
+		require.NoError(t, first.err)
+		require.NoError(t, second.err)
+		if first.status != 200 {
+			first, second = second, first
+		}
+		require.Equal(t, 200, first.status)
+		assert.Equal(t, "0", first.body["data"].(map[string]any)["balance_after"])
+		require.Equal(t, 409, second.status)
+		assert.Equal(t, "ORG_WALLET_ALREADY_REVERSED", second.body["code"])
+		assert.NotContains(t, second.body, "data")
+		require.NoError(t, c.db.Model(&model.OrganizationWalletEntry{}).Count(&count).Error)
+		assert.EqualValues(t, 2, count)
+		require.NoError(t, c.db.Model(&model.OrganizationEvent{}).Where("object_kind = ?", "wallet_entry").Count(&count).Error)
+		assert.EqualValues(t, 2, count)
+		var saved model.OrganizationWallet
+		require.NoError(t, c.db.Where("organization_id = ?", c.orgA).First(&saved).Error)
+		assert.Zero(t, saved.Balance)
+		assert.Zero(t, saved.Reserved)
+		var savedCredit model.OrganizationWalletEntry
+		require.NoError(t, c.db.First(&savedCredit, creditID).Error)
+		assert.Equal(t, original, savedCredit)
+	})
+
+	t.Run("credit_and_dissolution_serialize", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		body := map[string]any{"revision": c.revision(t)}
+		dissolveOp := c.operation(t, "owner", "dissolve", body, nil)
+		dissolveProof := c.proof(t, "owner", dissolveOp, "password", "")
+		credit := map[string]any{"revision": c.revision(t), "request_id": "00000000-0000-4000-8000-000000000031", "amount": "11", "reference": "dissolve-race", "reason": "credit race"}
+		creditOp := c.operation(t, "root", "wallet_credit", credit, nil)
+		creditProof := c.proof(t, "root", creditOp, "password", "")
+		type result struct {
+			action string
+			status int
+			body   map[string]any
+			err    error
+		}
+		done := make(chan result, 2)
+		start := make(chan struct{})
+		for _, operation := range []struct {
+			action, actor, endpoint, proof string
+			body                           map[string]any
+		}{
+			{"credit", "root", fmt.Sprintf("/api/platform/organizations/%d/wallet/credits", c.orgA), creditProof, credit},
+			{"dissolve", "owner", c.path() + "/dissolve", dissolveProof, body},
+		} {
+			encoded, err := common.Marshal(operation.body)
+			require.NoError(t, err)
+			request, err := http.NewRequest("POST", c.server.URL+operation.endpoint, bytes.NewReader(encoded))
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+c.bearer[operation.actor])
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Security-Proof", operation.proof)
+			go func() {
+				<-start
+				response, err := c.client.Do(request)
+				if err != nil {
+					done <- result{action: operation.action, err: err}
+					return
+				}
+				defer response.Body.Close()
+				var decoded map[string]any
+				err = common.DecodeJson(response.Body, &decoded)
+				done <- result{operation.action, response.StatusCode, decoded, err}
+			}()
+		}
+		close(start)
+		results := map[string]result{}
+		for range 2 {
+			select {
+			case r := <-done:
+				require.NoError(t, r.err)
+				results[r.action] = r
+			case <-time.After(10 * time.Second):
+				t.Fatal("owned credit/dissolve race did not finish")
+			}
+		}
+		var org model.Organization
+		require.NoError(t, c.db.First(&org, c.orgA).Error)
+		var wallet model.OrganizationWallet
+		require.NoError(t, c.db.Where("organization_id = ?", c.orgA).Find(&wallet).Error)
+		if results["credit"].status == 200 {
+			assert.Equal(t, 409, results["dissolve"].status)
+			assert.Equal(t, "ORG_WALLET_NOT_EMPTY", results["dissolve"].body["code"])
+			assert.Zero(t, org.DissolvedAt)
+			assert.EqualValues(t, 11, wallet.Balance)
+		} else {
+			require.Equal(t, 200, results["dissolve"].status)
+			assert.Equal(t, 409, results["credit"].status)
+			assert.Equal(t, "ORG_STATE_CHANGED", results["credit"].body["code"])
+			assert.Positive(t, org.DissolvedAt)
+			assert.Zero(t, wallet.Balance)
+		}
+	})
+
+	for _, change := range []string{"governance_removed", "session_revoked"} {
+		t.Run("publication_"+change, func(t *testing.T) {
+			c := newOrganizationLifecycleClient(t)
+			require.NoError(t, c.db.Create(&model.OrganizationWallet{OrganizationID: c.orgA, Balance: 321}).Error)
+			actor, endpoint := "admin", c.path()+"/wallet"
+			if change == "session_revoked" {
+				actor, endpoint = "root", fmt.Sprintf("/api/platform/organizations/%d/wallet", c.orgA)
+			}
+			pool := &organizationTaskBatchPublicationPool{ConnPool: c.db.ConnPool, entered: make(chan struct{}), release: make(chan struct{})}
+			originalPool, originalStatementPool := c.db.ConnPool, c.db.Statement.ConnPool
+			c.db.ConnPool, c.db.Statement.ConnPool = pool, pool
+			callback := "test:organization-wallet-publication"
+			require.NoError(t, c.db.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "organization_wallets" && tx.Error == nil {
+					if transaction, ok := tx.Statement.ConnPool.(*organizationTaskBatchPublicationTx); ok {
+						transaction.taskRead = true
+					}
+				}
+			}))
+			var release sync.Once
+			t.Cleanup(func() {
+				release.Do(func() { close(pool.release) })
+				c.server.Close()
+				c.db.ConnPool, c.db.Statement.ConnPool = originalPool, originalStatementPool
+				require.NoError(t, c.db.Callback().Query().Remove(callback))
+			})
+			request, err := http.NewRequest("GET", c.server.URL+endpoint, nil)
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+c.bearer[actor])
+			type result struct {
+				status  int
+				headers http.Header
+				body    map[string]any
+				err     error
+			}
+			done := make(chan result, 1)
+			go func() {
+				response, err := c.client.Do(request)
+				if err != nil {
+					done <- result{err: err}
+					return
+				}
+				defer response.Body.Close()
+				var body map[string]any
+				err = common.DecodeJson(response.Body, &body)
+				done <- result{response.StatusCode, response.Header, body, err}
+			}()
+			select {
+			case <-pool.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("wallet read did not reach committed publication barrier")
+			}
+			want, code := 404, "ORG_NOT_FOUND"
+			if change == "session_revoked" {
+				revoked, err := model.RevokeUserSession(c.users[actor].Id, c.sids[actor], "wallet_publication")
+				require.NoError(t, err)
+				require.True(t, revoked)
+				want, code = 401, "AUTH_SESSION_REVOKED"
+			} else {
+				c.mutate(t, "owner", "PATCH", c.path()+"/members/"+strconv.Itoa(c.users["admin"].Id)+"/role", "change_role", map[string]any{"revision": c.revision(t), "role": "member"}, map[string]any{"target_user_id": strconv.Itoa(c.users["admin"].Id)}, true)
+			}
+			release.Do(func() { close(pool.release) })
+			select {
+			case response := <-done:
+				require.NoError(t, response.err)
+				organizationError(t, response.status, response.headers, response.body, want, code)
+				assert.NotContains(t, response.body, "data")
+			case <-time.After(5 * time.Second):
+				t.Fatal("wallet response did not finish after revocation")
 			}
 		})
 	}

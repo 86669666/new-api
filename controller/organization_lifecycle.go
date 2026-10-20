@@ -55,6 +55,16 @@ func writeOrganizationLifecycleError(c *gin.Context, err error) {
 		status, code, message = 409, "ORG_ALREADY_MEMBER", "This user is already a member of the organization."
 	case errors.Is(err, model.ErrOrganizationInvitationExists):
 		status, code, message = 409, "ORG_INVITATION_EXISTS", "An invitation already exists for this user. Use reissue to send another invitation."
+	case errors.Is(err, model.ErrOrganizationWalletRequestConflict):
+		status, code, message = 409, "ORG_WALLET_REQUEST_CONFLICT", model.ErrOrganizationWalletRequestConflict.Error()
+	case errors.Is(err, model.ErrOrganizationWalletAlreadyReversed):
+		status, code, message = 409, "ORG_WALLET_ALREADY_REVERSED", model.ErrOrganizationWalletAlreadyReversed.Error()
+	case errors.Is(err, model.ErrOrganizationWalletInsufficient):
+		status, code, message = 409, "ORG_WALLET_INSUFFICIENT_AVAILABLE", model.ErrOrganizationWalletInsufficient.Error()
+	case errors.Is(err, model.ErrOrganizationWalletLimit):
+		status, code, message = 409, "ORG_WALLET_LIMIT_EXCEEDED", model.ErrOrganizationWalletLimit.Error()
+	case errors.Is(err, model.ErrOrganizationWalletNotEmpty):
+		status, code, message = 409, "ORG_WALLET_NOT_EMPTY", model.ErrOrganizationWalletNotEmpty.Error()
 	case errors.Is(err, model.ErrOrganizationDisabled):
 		status, code, message = 409, "ORG_DISABLED", "Organization is disabled."
 	case errors.Is(err, model.ErrOrganizationTerminal):
@@ -212,6 +222,9 @@ func OrganizationLifecycleHandler(action string) gin.HandlerFunc {
 		if objectID == "" {
 			objectID = c.Param("transfer_id")
 		}
+		if action == "wallet_reverse" {
+			objectID = c.Param("credit_id")
+		}
 		wire, cmd, err := service.DecodeOrganizationCommand(action, data, false, c.Param("org_id"), c.Param("user_id"), objectID)
 		if err != nil {
 			writeOrganizationLifecycleError(c, err)
@@ -224,6 +237,19 @@ func OrganizationLifecycleHandler(action string) gin.HandlerFunc {
 		receipt, err := service.ExecuteOrganizationLifecycleWithContext(c.Request.Context(), identity, action, wire, cmd, c.GetHeader("X-Security-Proof"))
 		if err != nil {
 			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		if entry := receipt.WalletEntry; entry != nil {
+			var creditID any
+			if entry.ReversalOfID != nil {
+				creditID = strconv.FormatInt(*entry.ReversalOfID, 10)
+			}
+			common.ApiSuccess(c, gin.H{"organization_id": strconv.FormatInt(entry.OrganizationID, 10), "entry_id": strconv.FormatInt(entry.ID, 10),
+				"request_id": entry.RequestID, "kind": entry.Kind, "amount": strconv.FormatInt(entry.Amount, 10), "credit_id": creditID,
+				"balance_after": strconv.FormatInt(entry.BalanceAfter, 10), "actor_user_id": strconv.Itoa(entry.ActorUserID), "created_at": entry.CreatedAt,
+				"reference": entry.Reference, "reason": entry.Reason})
+			// The immutable main-database ledger and event are the authoritative audit.
+			// Do not copy free-text financial details into generic security logs.
 			return
 		}
 		var generation, status any
@@ -252,7 +278,8 @@ func OrganizationPreviewHandler(platform bool) gin.HandlerFunc {
 			Action  string            `json:"action"`
 			Command common.RawMessage `json:"command"`
 		}
-		if common.ValidateJSONObjectFields(data, []string{"action", "command"}, nil) != nil || common.UnmarshalStrictObject(data, &request) != nil || request.Action == "" || platform != (request.Action == "platform_disable") {
+		if common.ValidateJSONObjectFields(data, []string{"action", "command"}, nil) != nil || common.UnmarshalStrictObject(data, &request) != nil || request.Action == "" ||
+			platform != (request.Action == "platform_disable" || request.Action == "wallet_credit" || request.Action == "wallet_reverse") {
 			writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
 			return
 		}
@@ -287,7 +314,41 @@ func OrganizationPreviewHandler(platform bool) gin.HandlerFunc {
 		if wire.Replace != nil {
 			replace = *wire.Replace
 		}
-		common.ApiSuccess(c, gin.H{"operation": op, "methods": methods.Methods, "password_encryption_enabled": methods.PasswordEncryptionEnabled, "display": gin.H{"organization_name": name, "target_user_id": target, "target_role": role, "disabled": disabled, "replace": replace}})
+		display := gin.H{"organization_name": name, "target_user_id": target, "target_role": role, "disabled": disabled, "replace": replace}
+		if request.Action == "wallet_credit" || request.Action == "wallet_reverse" {
+			display["amount"], display["request_id"], display["credit_id"] = strconv.FormatInt(b.WalletAmount, 10), wire.RequestID, wire.CreditID
+			display["reference"], display["reason"] = wire.Reference, cmd.Reason
+		}
+		common.ApiSuccess(c, gin.H{"operation": op, "methods": methods.Methods, "password_encryption_enabled": methods.PasswordEncryptionEnabled, "display": display})
+	}
+}
+
+func OrganizationWalletReadHandler(platform bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		identity, _, _, err := organizationRequest(c, false, false, 0, false)
+		if err != nil {
+			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		orgID, err := service.OrganizationDecimal(c.Param("org_id"), false)
+		if err != nil {
+			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		wallet, err := model.ReadOrganizationWalletWithContext(c.Request.Context(), identity, orgID, platform)
+		if err != nil {
+			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		data := gin.H{"organization_id": strconv.FormatInt(orgID, 10), "opened": wallet.ID != 0,
+			"balance": strconv.FormatInt(wallet.Balance, 10), "reserved": strconv.FormatInt(wallet.Reserved, 10),
+			"available": strconv.FormatInt(wallet.Balance-wallet.Reserved, 10)}
+		// Protect the prepared financial snapshot from committed role/session changes.
+		if _, err := model.ReadOrganizationWalletWithContext(c.Request.Context(), identity, orgID, platform); err != nil {
+			writeOrganizationLifecycleError(c, err)
+			return
+		}
+		common.ApiSuccess(c, data)
 	}
 }
 func organizationRequestView(v *model.OrganizationRequestResult) any {

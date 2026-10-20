@@ -348,6 +348,8 @@ func migrateDB() error {
 		&OrganizationInvitation{},
 		&OrganizationOwnershipTransfer{},
 		&OrganizationEvent{},
+		&OrganizationWallet{},
+		&OrganizationWalletEntry{},
 		&UserSession{},
 		&AuthFlow{},
 		&ExternalIdentityClaim{},

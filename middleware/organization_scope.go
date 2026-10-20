@@ -153,6 +153,10 @@ func rejectOrganizationSelection(c *gin.Context, code string) {
 
 // Exact lifecycle routes and whether their selector is bound to an org path.
 var organizationLifecycleRoutes = map[string]bool{
+	"GET /api/organizations/:org_id/wallet":                                                   true,
+	"GET /api/platform/organizations/:org_id/wallet":                                          true,
+	"POST /api/platform/organizations/:org_id/wallet/credits":                                 true,
+	"POST /api/platform/organizations/:org_id/wallet/credits/:credit_id/reverse":              true,
 	"POST /api/organizations":                                                                 false,
 	"PATCH /api/organizations/:org_id/name":                                                   true,
 	"POST /api/organizations/:org_id/self-state":                                              true,

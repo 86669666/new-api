@@ -33,6 +33,10 @@ type OrganizationCommandDTO struct {
 	PreviousID         string  `json:"previous_id,omitempty"`
 	PreviousGeneration string  `json:"previous_generation,omitempty"`
 	Replace            *bool   `json:"replace,omitempty"`
+	RequestID          string  `json:"request_id,omitempty"`
+	Amount             string  `json:"amount,omitempty"`
+	Reference          string  `json:"reference,omitempty"`
+	CreditID           string  `json:"credit_id,omitempty"`
 }
 type OrganizationSnapshot struct {
 	TargetRole         string `json:"target_role,omitempty"`
@@ -42,6 +46,7 @@ type OrganizationSnapshot struct {
 	OwnershipVersion   string `json:"ownership_version,omitempty"`
 	FromMemberRevision string `json:"from_member_revision,omitempty"`
 	ToMemberRevision   string `json:"to_member_revision,omitempty"`
+	WalletAmount       string `json:"wallet_amount,omitempty"`
 }
 type OrganizationContext struct {
 	SchemaVersion int                    `json:"schema_version"`
@@ -67,6 +72,8 @@ func OrganizationScope(action string) string {
 	switch action {
 	case "platform_disable":
 		return "platform.organization.disable"
+	case "wallet_credit", "wallet_reverse":
+		return "platform.organization." + action
 	case "self_disable", "dissolve", "change_role", "remove", "invite", "reissue", "transfer_initiate", "transfer_accept":
 		return "organization." + action
 	default:
@@ -76,6 +83,9 @@ func OrganizationScope(action string) string {
 func OrganizationAction(scope string) string {
 	if scope == "platform.organization.disable" {
 		return "platform_disable"
+	}
+	if scope == "platform.organization.wallet_credit" || scope == "platform.organization.wallet_reverse" {
+		return strings.TrimPrefix(scope, "platform.organization.")
 	}
 	action := strings.TrimPrefix(scope, "organization.")
 	if OrganizationScope(action) == scope {
@@ -110,6 +120,13 @@ func organizationCommandFields(action string, full bool) []string {
 	case "self_disable", "platform_disable":
 		fields = append(fields, "disabled", "reason")
 	case "dissolve", "leave":
+	case "wallet_credit":
+		fields = append(fields, "request_id", "amount", "reference", "reason")
+	case "wallet_reverse":
+		fields = append(fields, "request_id", "reason")
+		if full {
+			fields = append(fields, "credit_id")
+		}
 	case "change_role":
 		fields = append(fields, "role")
 		if full {
@@ -212,7 +229,7 @@ func DecodeOrganizationCommand(action string, data []byte, full bool, orgID, tar
 		}
 		cmd.Username = wire.Username
 	}
-	for _, field := range []string{"organization_id", "revision", "target_user_id", "invitation_id", "transfer_id", "generation", "previous_id", "previous_generation"} {
+	for _, field := range []string{"organization_id", "revision", "target_user_id", "invitation_id", "transfer_id", "generation", "previous_id", "previous_generation", "amount", "credit_id"} {
 		if raw, present := rawFields[field]; present {
 			var value string
 			if common.Unmarshal(raw, &value) != nil {
@@ -233,6 +250,9 @@ func DecodeOrganizationCommand(action string, data []byte, full bool, orgID, tar
 		}
 		if action == "transfer_accept" || action == "transfer_decline" || action == "transfer_cancel" {
 			wire.TransferID = objectID
+		}
+		if action == "wallet_reverse" {
+			wire.CreditID = objectID
 		}
 	}
 	var err error
@@ -257,7 +277,7 @@ func DecodeOrganizationCommand(action string, data []byte, full bool, orgID, tar
 		value string
 		dest  *int64
 		zero  bool
-	}{{wire.InvitationID, &cmd.ObjectID, false}, {wire.TransferID, &cmd.ObjectID, false}, {wire.Generation, &cmd.Generation, false}, {wire.PreviousID, &cmd.ObjectID, true}, {wire.PreviousGeneration, &cmd.Generation, true}} {
+	}{{wire.InvitationID, &cmd.ObjectID, false}, {wire.TransferID, &cmd.ObjectID, false}, {wire.Generation, &cmd.Generation, false}, {wire.PreviousID, &cmd.ObjectID, true}, {wire.PreviousGeneration, &cmd.Generation, true}, {wire.Amount, &cmd.WalletAmount, false}, {wire.CreditID, &cmd.WalletCreditID, false}} {
 		if p.value != "" {
 			*p.dest, err = OrganizationDecimal(p.value, p.zero)
 			if err != nil {
@@ -271,6 +291,7 @@ func DecodeOrganizationCommand(action string, data []byte, full bool, orgID, tar
 	cmd.Name = strings.TrimSpace(wire.Name)
 	wire.Name = cmd.Name
 	cmd.Role = wire.Role
+	cmd.WalletRequestID, cmd.WalletReference = wire.RequestID, wire.Reference
 	if wire.Disabled != nil {
 		cmd.Disabled = *wire.Disabled
 	}
@@ -290,6 +311,9 @@ func DecodeOrganizationCommand(action string, data []byte, full bool, orgID, tar
 }
 func organizationSnapshot(action string, b *model.OrganizationAuthorizationBinding) OrganizationSnapshot {
 	s := OrganizationSnapshot{}
+	if action == "wallet_credit" || action == "wallet_reverse" {
+		s.WalletAmount = strconv.FormatInt(b.WalletAmount, 10)
+	}
 	if action == "remove" {
 		s.TargetRole = b.Role
 	}

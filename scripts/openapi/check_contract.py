@@ -6,6 +6,7 @@ positive/negative protocol fixtures. This does not prove server/provider runtime
 behavior or full route coverage. It never calls the gateway or a provider.
 """
 import argparse
+import copy
 import hashlib
 import json
 import re
@@ -126,6 +127,7 @@ def check_conditional_authorization(source_root):
 
 
 def check_organization_lifecycle(api, relay, fixtures, design_gate):
+    check_organization_wallet(api, relay)
     contract = api['x-organization-lifecycle-contract']
     routes = contract['routes']
     expected_ids = {f'W{i:02}' for i in range(1, 18)} | {f'Q{i:02}' for i in range(1, 9)} | {'A01', 'A02', 'P01', 'P02', 'P03', 'P04'}
@@ -159,7 +161,7 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
         assert 'only an authorized stale invite/reissue may include data.revision observed under the existing locks; other conflicts omit it.' in operation['description']
         assert operation['x-organization-invitation-conflicts']['self_invite'] == {'code': 'ORG_SELF_INVITE', 'status': 400, 'retry': 'choose another user'}
     scopes = schemas['OrganizationLifecycleProofResult']['properties']['scope']['enum']
-    assert len(scopes) == len(set(scopes)) == 9
+    assert len(scopes) == len(set(scopes)) == 11
     assert 'platform.organization.disable' in scopes
     assert len(contract['schema_map']) == 66
     for route in routes:
@@ -321,10 +323,102 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
                 actual['properties'] = {name: value for name, value in actual['properties'].items()
                                         if name not in ('from_username', 'target_username')}
                 del actual['oneOf']
+            elif contract['schema_map'][key] in ('OrganizationLifecyclePreviewBody2', 'OrganizationLifecycleVerificationOperation',
+                                                  'OrganizationLifecycleProofResult', 'OrganizationLifecycleMethods', 'OrganizationLifecyclePreviewResult'):
+                # The wallet branches are checked exactly above; compare the
+                # original closed lifecycle structures against the frozen gate.
+                actual = copy.deepcopy(actual)
+                name = contract['schema_map'][key]
+                if name in ('OrganizationLifecyclePreviewBody2', 'OrganizationLifecycleVerificationOperation'):
+                    actual['oneOf'] = actual['oneOf'][:-2]
+                elif name in ('OrganizationLifecycleProofResult', 'OrganizationLifecycleMethods'):
+                    actual['properties']['scope']['enum'] = actual['properties']['scope']['enum'][:-2]
+                else:
+                    for field in ('amount', 'request_id', 'credit_id', 'reference', 'reason'):
+                        del actual['properties']['display']['properties'][field]
+                    del actual['oneOf']
             compare_schema(expected, actual, key)
         gate_checked = True
     return {'routes': len(routes), 'schemas': len(contract['schema_map']), 'organization_scopes': len(scopes), 'frozen_design_checked': gate_checked, 'design_contract_id': contract['design_contract_id'], 'effective_design_gate_sha256': contract['design_gate_sha256'], 'live_http': False}
 
+
+
+def check_organization_wallet(api, relay):
+    schemas = api['components']['schemas']
+    contract = api['x-organization-wallet-contract']
+    base = '/api/platform/organizations/{org_id}'
+    expected = [('GET', '/api/organizations/{org_id}/wallet', 'organization_wallet_balance', 'owner/admin'),
+                ('GET', base + '/wallet', 'platform_organization_wallet_balance', 'root'),
+                ('POST', base + '/wallet/credits', 'organization_wallet_credit', 'root'),
+                ('POST', base + '/wallet/credits/{credit_id}/reverse', 'organization_wallet_reverse', 'root')]
+    assert contract['routes'] == [dict(method=m, path=p, operationId=o, permission=r) for m, p, o, r in expected]
+    assert contract['tables'] == ['organization_wallets', 'organization_wallet_entries']
+    assert contract['consumption_enabled'] is False and contract['personal_funds_fallback'] is False
+    assert contract['disabled'] == {'credit': False, 'reverse': True, 'owner_admin_read': True}
+    assert contract['dissolved'] == {'write': False, 'owner_admin_read': False, 'platform_root_read': True}
+    assert contract['maximum_quota'] == '9007199254740991'
+    scopes = ['platform.organization.wallet_credit', 'platform.organization.wallet_reverse']
+    assert contract['scopes'] == schemas['OrganizationLifecycleProofResult']['properties']['scope']['enum'][-2:] == scopes
+    assert schemas['OrganizationLifecycleMethods']['properties']['scope']['enum'] == schemas['OrganizationLifecycleProofResult']['properties']['scope']['enum']
+    for kind, scope in zip(('Credit', 'Reverse'), scopes):
+        body = schemas['OrganizationWalletBody' + kind]
+        fields = {'revision', 'request_id', 'reason'} | ({'amount', 'reference'} if kind == 'Credit' else set())
+        assert set(body['properties']) == set(body['required']) == fields and body['additionalProperties'] is False
+        command = schemas['OrganizationWalletCommand' + kind]
+        full = fields | {'organization_id'} | ({'credit_id'} if kind == 'Reverse' else set())
+        assert set(command['properties']) == set(command['required']) == full and command['additionalProperties'] is False
+        context = schemas['OrganizationWalletContext' + kind]
+        assert context['properties']['command'] == {'$ref': '#/components/schemas/OrganizationWalletCommand' + kind}
+        assert context['properties']['snapshot'] == {
+            'type': 'object', 'properties': {'wallet_amount': {'$ref': '#/components/schemas/OrganizationWalletAmount'}},
+            'required': ['wallet_amount'], 'additionalProperties': False}
+        assert schemas['OrganizationWalletOperation' + kind] == {
+            'type': 'object', 'properties': {'scope': {'type': 'string', 'enum': [scope]},
+            'context': {'$ref': '#/components/schemas/OrganizationWalletContext' + kind}},
+            'required': ['scope', 'context'], 'additionalProperties': False}
+        assert schemas['OrganizationLifecycleVerificationOperation']['oneOf'][-2 + ('Credit', 'Reverse').index(kind)] == {
+            '$ref': '#/components/schemas/OrganizationWalletOperation' + kind}
+        assert schemas['OrganizationLifecyclePreviewBody2']['oneOf'][-2 + ('Credit', 'Reverse').index(kind)] == {
+            'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['wallet_' + kind.lower()]},
+            'command': {'$ref': '#/components/schemas/OrganizationWalletCommand' + kind}},
+            'required': ['action', 'command'], 'additionalProperties': False}
+    assert len(schemas['OrganizationLifecyclePreviewBody2']['oneOf']) == 3
+    assert len(schemas['OrganizationLifecycleVerificationOperation']['oneOf']) == 11
+    display = schemas['OrganizationLifecyclePreviewResult']['properties']['display']
+    assert set(display['properties']) - set(display['required']) == {'amount', 'request_id', 'credit_id', 'reference', 'reason'}
+    wallet_display = {
+        'amount': {'$ref': '#/components/schemas/OrganizationWalletAmount'},
+        'request_id': {'$ref': '#/components/schemas/OrganizationWalletRequestID'},
+        'credit_id': {'oneOf': [{'type': 'string', 'enum': ['']}, {'$ref': '#/components/schemas/OrganizationLifecycleID'}]},
+        'reference': {'oneOf': [{'type': 'string', 'enum': ['']}, {'$ref': '#/components/schemas/OrganizationWalletText'}]},
+        'reason': {'$ref': '#/components/schemas/OrganizationWalletText'},
+    }
+    assert {field: display['properties'][field] for field in wallet_display} == wallet_display
+    previous_scopes = ['organization.self_disable', 'platform.organization.disable', 'organization.dissolve',
+                       'organization.change_role', 'organization.remove', 'organization.invite',
+                       'organization.reissue', 'organization.transfer_initiate', 'organization.transfer_accept']
+    assert schemas['OrganizationLifecyclePreviewResult']['oneOf'] == [
+        {'properties': {'operation': {'properties': {'scope': {'enum': previous_scopes}}},
+                        'display': {'not': {'anyOf': [{'required': [field]} for field in wallet_display]}}}},
+        {'properties': {'operation': {'properties': {'scope': {'enum': scopes}}},
+                        'display': {'required': list(wallet_display)}}},
+    ]
+    for method, path, operation_id, permission in expected:
+        operation = api['paths'][path][method.lower()]
+        assert operation['operationId'] == operation_id and operation['security'] == [{'DashboardJWT': []}]
+        assert operation['x-organization-wallet-permission'] == permission and operation['x-automatic-retry'] is False
+        assert {'method': method, 'path': path} in api['x-organization-selection-boundary']['positive_selector_allowlist']
+        assert path not in relay['paths']
+        if method == 'GET':
+            assert 'requestBody' not in operation and operation['x-security-proof-policy'] == 'forbidden'
+            expected_permission = ('current active owner/admin membership; disabled organization may be read'
+                                   if permission == 'owner/admin' else 'current DB root only; no delegated platform permission')
+            assert operation['x-organization-permission'] == expected_permission
+            assert operation['responses']['200']['description'] == 'Current authorized organization wallet balance snapshot; reading does not open an account.'
+        else:
+            assert operation['x-security-proof-policy'] == 'required'
+            assert next(p for p in operation['parameters'] if p.get('name') == 'X-Security-Proof')['required'] is True
+    return {'routes': 4, 'consumption_enabled': False, 'live_http': False}
 
 
 def check_organization_task_reads(api):

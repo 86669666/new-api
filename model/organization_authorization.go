@@ -42,6 +42,7 @@ type OrganizationAuthorizationBinding struct {
 	OwnershipVersion   int64
 	FromMemberRevision int64
 	ToMemberRevision   int64
+	WalletAmount       int64
 }
 
 // Server clock dependency is private; tests advance it only in serial fixtures.
@@ -268,7 +269,7 @@ func withOrganizationWithContext(parent context.Context, identity AuthSessionIde
 		if s.execution != nil {
 			a := s.execution.action
 			visible := s.member(identity.UserID) != nil
-			if a == "platform_disable" {
+			if a == "platform_disable" || a == "wallet_credit" || a == "wallet_reverse" {
 				if s.users[identity.UserID].Role != common.RoleRootUser {
 					return ErrOrganizationForbidden
 				}

@@ -3358,7 +3358,9 @@
           "organization.invite",
           "organization.reissue",
           "organization.transfer_initiate",
-          "organization.transfer_accept"
+          "organization.transfer_accept",
+          "platform.organization.wallet_credit",
+          "platform.organization.wallet_reverse"
         ],
         "x-organization-request-schema": {
           "$ref": "#/components/schemas/OrganizationLifecyclePasskeyBegin"
@@ -3563,7 +3565,9 @@
           "organization.invite",
           "organization.reissue",
           "organization.transfer_initiate",
-          "organization.transfer_accept"
+          "organization.transfer_accept",
+          "platform.organization.wallet_credit",
+          "platform.organization.wallet_reverse"
         ],
         "x-organization-request-schema": {
           "$ref": "#/components/schemas/OrganizationLifecyclePasskeyFinish"
@@ -6071,7 +6075,9 @@
           "organization.invite",
           "organization.reissue",
           "organization.transfer_initiate",
-          "organization.transfer_accept"
+          "organization.transfer_accept",
+          "platform.organization.wallet_credit",
+          "platform.organization.wallet_reverse"
         ],
         "x-organization-request-schema": {
           "$ref": "#/components/schemas/OrganizationLifecycleOrganizationVerifyRequest"
@@ -13070,7 +13076,9 @@
           "organization.invite",
           "organization.reissue",
           "organization.transfer_initiate",
-          "organization.transfer_accept"
+          "organization.transfer_accept",
+          "platform.organization.wallet_credit",
+          "platform.organization.wallet_reverse"
         ],
         "x-organization-request-schema": null,
         "x-organization-response-data-schema": {
@@ -14794,7 +14802,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "path",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: owner; no platform disable; self-disabled allowed. Proof policy: required.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: owner; no platform disable; self-disabled allowed. Proof policy: required. Dissolution additionally locks the organization wallet and rejects any nonzero balance or reserved quota with ORG_WALLET_NOT_EMPTY. Zero-balance accounts and immutable entries are retained.",
         "parameters": [
           {
             "name": "org_id",
@@ -18907,6 +18915,508 @@
         "x-anonymous-artifact-access": false,
         "x-delivery-authorization": "current database authorization immediately before first downstream headers/body publication"
       }
+    },
+    "/api/organizations/{org_id}/wallet": {
+      "get": {
+        "operationId": "organization_wallet_balance",
+        "summary": "Read organization wallet balance",
+        "tags": [
+          "Organizations"
+        ],
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "x-organization-permission": "current active owner/admin membership; disabled organization may be read",
+        "x-security-proof-policy": "forbidden",
+        "x-organization-selector-policy": "path_with_S2_matching_optional_single_selector",
+        "x-automatic-retry": false,
+        "x-organization-body-limit-bytes": 16384,
+        "x-organization-selection": "path",
+        "description": "Dashboard session only. Owner/admin may read while disabled; root uses the platform route and may read retained state after dissolution. No implicit account creation. The prepared balance snapshot is released only after a final current permission/session check.",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            }
+          },
+          {
+            "name": "X-Organization-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "x-int64-maximum": "9223372036854775807",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Optional single selector; never supply both header and query. Must equal path org_id."
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "x-int64-maximum": "9223372036854775807",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Optional single selector; never supply both header and query. Must equal path org_id."
+          }
+        ],
+        "x-query-allowlist": [
+          "org_id"
+        ],
+        "x-forbidden-request-headers": [
+          "Idempotency-Key",
+          "X-Security-Proof"
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized organization wallet balance snapshot; reading does not open an account.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Organization lifecycle/organization-scope responses, including errors, are private, no-store. Existing personal flows retain their own headers."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationWalletBalanceResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/OrganizationLifecycleError400"
+          },
+          "401": {
+            "$ref": "#/components/responses/OrganizationLifecycleError401"
+          },
+          "403": {
+            "$ref": "#/components/responses/OrganizationLifecycleError403"
+          },
+          "404": {
+            "$ref": "#/components/responses/OrganizationLifecycleError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/OrganizationLifecycleError409"
+          },
+          "410": {
+            "$ref": "#/components/responses/OrganizationLifecycleError410"
+          },
+          "413": {
+            "$ref": "#/components/responses/OrganizationLifecycleError413"
+          },
+          "415": {
+            "$ref": "#/components/responses/OrganizationLifecycleError415"
+          },
+          "429": {
+            "$ref": "#/components/responses/OrganizationLifecycleError429"
+          },
+          "500": {
+            "$ref": "#/components/responses/OrganizationLifecycleError500"
+          }
+        },
+        "x-organization-wallet-permission": "owner/admin"
+      }
+    },
+    "/api/platform/organizations/{org_id}/wallet": {
+      "get": {
+        "operationId": "platform_organization_wallet_balance",
+        "summary": "Read organization wallet balance",
+        "tags": [
+          "Organizations"
+        ],
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "x-organization-permission": "current DB root only; no delegated platform permission",
+        "x-security-proof-policy": "forbidden",
+        "x-organization-selector-policy": "path_with_S2_matching_optional_single_selector",
+        "x-automatic-retry": false,
+        "x-organization-body-limit-bytes": 16384,
+        "x-organization-selection": "path",
+        "description": "Dashboard session only. Owner/admin may read while disabled; root uses the platform route and may read retained state after dissolution. No implicit account creation. The prepared balance snapshot is released only after a final current permission/session check.",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            }
+          },
+          {
+            "name": "X-Organization-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "x-int64-maximum": "9223372036854775807",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Optional single selector; never supply both header and query. Must equal path org_id."
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "x-int64-maximum": "9223372036854775807",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Optional single selector; never supply both header and query. Must equal path org_id."
+          }
+        ],
+        "x-query-allowlist": [
+          "org_id"
+        ],
+        "x-forbidden-request-headers": [
+          "Idempotency-Key",
+          "X-Security-Proof"
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized organization wallet balance snapshot; reading does not open an account.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Organization lifecycle/organization-scope responses, including errors, are private, no-store. Existing personal flows retain their own headers."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationWalletBalanceResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/OrganizationLifecycleError400"
+          },
+          "401": {
+            "$ref": "#/components/responses/OrganizationLifecycleError401"
+          },
+          "403": {
+            "$ref": "#/components/responses/OrganizationLifecycleError403"
+          },
+          "404": {
+            "$ref": "#/components/responses/OrganizationLifecycleError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/OrganizationLifecycleError409"
+          },
+          "410": {
+            "$ref": "#/components/responses/OrganizationLifecycleError410"
+          },
+          "413": {
+            "$ref": "#/components/responses/OrganizationLifecycleError413"
+          },
+          "415": {
+            "$ref": "#/components/responses/OrganizationLifecycleError415"
+          },
+          "429": {
+            "$ref": "#/components/responses/OrganizationLifecycleError429"
+          },
+          "500": {
+            "$ref": "#/components/responses/OrganizationLifecycleError500"
+          }
+        },
+        "x-organization-wallet-permission": "root"
+      }
+    },
+    "/api/platform/organizations/{org_id}/wallet/credits": {
+      "post": {
+        "operationId": "organization_wallet_credit",
+        "summary": "Credit an organization wallet",
+        "tags": [
+          "Organizations"
+        ],
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "x-organization-permission": "current DB root only; no delegated platform permission",
+        "x-security-proof-policy": "required",
+        "x-organization-selector-policy": "path_with_S2_matching_optional_single_selector",
+        "x-automatic-retry": false,
+        "x-organization-body-limit-bytes": 16384,
+        "x-organization-selection": "path",
+        "description": "Platform root with a current dashboard session and a fresh single-use proof binding the exact organization, governance revision, request UUID and transaction details. Same request UUID and business details return the immutable original receipt; changed details conflict. Each retry still requires current authority and a new proof. Governance revision is an authorization precondition, not business idempotency payload. Credit requires active state; reversal allows disabled state but neither write allows dissolved state. Reversal amount is taken from the immutable original credit and included in the proof snapshot. No personal funds, payment provider, reservation or spending integration.",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            }
+          },
+          {
+            "name": "X-Organization-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "x-int64-maximum": "9223372036854775807",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Optional single selector; never supply both header and query. Must equal path org_id."
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "x-int64-maximum": "9223372036854775807",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Optional single selector; never supply both header and query. Must equal path org_id."
+          },
+          {
+            "in": "header",
+            "name": "X-Security-Proof",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-query-allowlist": [
+          "org_id"
+        ],
+        "x-forbidden-request-headers": [
+          "Idempotency-Key"
+        ],
+        "responses": {
+          "200": {
+            "description": "Committed primary-action receipt.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Organization lifecycle/organization-scope responses, including errors, are private, no-store. Existing personal flows retain their own headers."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationWalletMutationResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/OrganizationLifecycleError400"
+          },
+          "401": {
+            "$ref": "#/components/responses/OrganizationLifecycleError401"
+          },
+          "403": {
+            "$ref": "#/components/responses/OrganizationLifecycleError403"
+          },
+          "404": {
+            "$ref": "#/components/responses/OrganizationLifecycleError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/OrganizationLifecycleError409"
+          },
+          "410": {
+            "$ref": "#/components/responses/OrganizationLifecycleError410"
+          },
+          "413": {
+            "$ref": "#/components/responses/OrganizationLifecycleError413"
+          },
+          "415": {
+            "$ref": "#/components/responses/OrganizationLifecycleError415"
+          },
+          "429": {
+            "$ref": "#/components/responses/OrganizationLifecycleError429"
+          },
+          "500": {
+            "$ref": "#/components/responses/OrganizationLifecycleError500"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrganizationWalletBodyCredit"
+              }
+            }
+          }
+        },
+        "x-organization-wallet-permission": "root"
+      }
+    },
+    "/api/platform/organizations/{org_id}/wallet/credits/{credit_id}/reverse": {
+      "post": {
+        "operationId": "organization_wallet_reverse",
+        "summary": "Reverse one original wallet credit in full",
+        "tags": [
+          "Organizations"
+        ],
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "x-organization-permission": "current DB root only; no delegated platform permission",
+        "x-security-proof-policy": "required",
+        "x-organization-selector-policy": "path_with_S2_matching_optional_single_selector",
+        "x-automatic-retry": false,
+        "x-organization-body-limit-bytes": 16384,
+        "x-organization-selection": "path",
+        "description": "Platform root with a current dashboard session and a fresh single-use proof binding the exact organization, governance revision, request UUID and transaction details. Same request UUID and business details return the immutable original receipt; changed details conflict. Each retry still requires current authority and a new proof. Governance revision is an authorization precondition, not business idempotency payload. Credit requires active state; reversal allows disabled state but neither write allows dissolved state. Reversal amount is taken from the immutable original credit and included in the proof snapshot. No personal funds, payment provider, reservation or spending integration.",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            }
+          },
+          {
+            "in": "path",
+            "name": "credit_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationLifecycleID"
+            }
+          },
+          {
+            "name": "X-Organization-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "x-int64-maximum": "9223372036854775807",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Optional single selector; never supply both header and query. Must equal path org_id."
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+              "x-int64-maximum": "9223372036854775807",
+              "maxLength": 19,
+              "x-maximum-decimal-value": "9223372036854775807"
+            },
+            "description": "Optional single selector; never supply both header and query. Must equal path org_id."
+          },
+          {
+            "in": "header",
+            "name": "X-Security-Proof",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-query-allowlist": [
+          "org_id"
+        ],
+        "x-forbidden-request-headers": [
+          "Idempotency-Key"
+        ],
+        "responses": {
+          "200": {
+            "description": "Committed primary-action receipt.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Organization lifecycle/organization-scope responses, including errors, are private, no-store. Existing personal flows retain their own headers."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationWalletMutationResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/OrganizationLifecycleError400"
+          },
+          "401": {
+            "$ref": "#/components/responses/OrganizationLifecycleError401"
+          },
+          "403": {
+            "$ref": "#/components/responses/OrganizationLifecycleError403"
+          },
+          "404": {
+            "$ref": "#/components/responses/OrganizationLifecycleError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/OrganizationLifecycleError409"
+          },
+          "410": {
+            "$ref": "#/components/responses/OrganizationLifecycleError410"
+          },
+          "413": {
+            "$ref": "#/components/responses/OrganizationLifecycleError413"
+          },
+          "415": {
+            "$ref": "#/components/responses/OrganizationLifecycleError415"
+          },
+          "429": {
+            "$ref": "#/components/responses/OrganizationLifecycleError429"
+          },
+          "500": {
+            "$ref": "#/components/responses/OrganizationLifecycleError500"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrganizationWalletBodyReverse"
+              }
+            }
+          }
+        },
+        "x-organization-wallet-permission": "root"
+      }
     }
   },
   "components": {
@@ -20865,7 +21375,9 @@
               "organization.invite",
               "organization.reissue",
               "organization.transfer_initiate",
-              "organization.transfer_accept"
+              "organization.transfer_accept",
+              "platform.organization.wallet_credit",
+              "platform.organization.wallet_reverse"
             ]
           },
           "methods": {
@@ -22046,6 +22558,12 @@
           },
           {
             "$ref": "#/components/schemas/OrganizationLifecycleOperationTransferAccept"
+          },
+          {
+            "$ref": "#/components/schemas/OrganizationWalletOperationCredit"
+          },
+          {
+            "$ref": "#/components/schemas/OrganizationWalletOperationReverse"
           }
         ]
       },
@@ -22097,6 +22615,41 @@
               "replace": {
                 "type": "boolean",
                 "nullable": true
+              },
+              "amount": {
+                "$ref": "#/components/schemas/OrganizationWalletAmount"
+              },
+              "request_id": {
+                "$ref": "#/components/schemas/OrganizationWalletRequestID"
+              },
+              "credit_id": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      ""
+                    ]
+                  },
+                  {
+                    "$ref": "#/components/schemas/OrganizationLifecycleID"
+                  }
+                ]
+              },
+              "reference": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      ""
+                    ]
+                  },
+                  {
+                    "$ref": "#/components/schemas/OrganizationWalletText"
+                  }
+                ]
+              },
+              "reason": {
+                "$ref": "#/components/schemas/OrganizationWalletText"
               }
             },
             "required": [
@@ -22116,7 +22669,84 @@
           "display"
         ],
         "additionalProperties": false,
-        "description": "Server canonical operation/context plus safe display fields; no command_hash. Echo the returned operation to the factor ceremony. The issuer rebuilds current state and the consumer independently rebuilds the actual command. Preview is advisory and never grants permission."
+        "description": "Server canonical operation/context plus safe display fields; no command_hash. Echo the returned operation to the factor ceremony. The issuer rebuilds current state and the consumer independently rebuilds the actual command. Preview is advisory and never grants permission.",
+        "oneOf": [
+          {
+            "properties": {
+              "operation": {
+                "properties": {
+                  "scope": {
+                    "enum": [
+                      "organization.self_disable",
+                      "platform.organization.disable",
+                      "organization.dissolve",
+                      "organization.change_role",
+                      "organization.remove",
+                      "organization.invite",
+                      "organization.reissue",
+                      "organization.transfer_initiate",
+                      "organization.transfer_accept"
+                    ]
+                  }
+                }
+              },
+              "display": {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "amount"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "request_id"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "credit_id"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "reference"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "reason"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "properties": {
+              "operation": {
+                "properties": {
+                  "scope": {
+                    "enum": [
+                      "platform.organization.wallet_credit",
+                      "platform.organization.wallet_reverse"
+                    ]
+                  }
+                }
+              },
+              "display": {
+                "required": [
+                  "amount",
+                  "request_id",
+                  "credit_id",
+                  "reference",
+                  "reason"
+                ]
+              }
+            }
+          }
+        ]
       },
       "OrganizationLifecycleProofResult": {
         "type": "object",
@@ -22148,7 +22778,9 @@
               "organization.invite",
               "organization.reissue",
               "organization.transfer_initiate",
-              "organization.transfer_accept"
+              "organization.transfer_accept",
+              "platform.organization.wallet_credit",
+              "platform.organization.wallet_reverse"
             ]
           },
           "auth_bundle": {
@@ -22353,6 +22985,44 @@
               },
               "command": {
                 "$ref": "#/components/schemas/OrganizationLifecycleCommandPlatformDisable"
+              }
+            },
+            "required": [
+              "action",
+              "command"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "wallet_credit"
+                ]
+              },
+              "command": {
+                "$ref": "#/components/schemas/OrganizationWalletCommandCredit"
+              }
+            },
+            "required": [
+              "action",
+              "command"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "wallet_reverse"
+                ]
+              },
+              "command": {
+                "$ref": "#/components/schemas/OrganizationWalletCommandReverse"
               }
             },
             "required": [
@@ -23764,7 +24434,12 @@
               "ORG_DISABLED",
               "ORG_REQUEST_RESOLVED",
               "ORG_ALREADY_MEMBER",
-              "ORG_INVITATION_EXISTS"
+              "ORG_INVITATION_EXISTS",
+              "ORG_WALLET_REQUEST_CONFLICT",
+              "ORG_WALLET_ALREADY_REVERSED",
+              "ORG_WALLET_INSUFFICIENT_AVAILABLE",
+              "ORG_WALLET_LIMIT_EXCEEDED",
+              "ORG_WALLET_NOT_EMPTY"
             ]
           },
           "data": {
@@ -23803,7 +24478,12 @@
                   "ORG_DISABLED",
                   "ORG_REQUEST_RESOLVED",
                   "ORG_ALREADY_MEMBER",
-                  "ORG_INVITATION_EXISTS"
+                  "ORG_INVITATION_EXISTS",
+                  "ORG_WALLET_REQUEST_CONFLICT",
+                  "ORG_WALLET_ALREADY_REVERSED",
+                  "ORG_WALLET_INSUFFICIENT_AVAILABLE",
+                  "ORG_WALLET_LIMIT_EXCEEDED",
+                  "ORG_WALLET_NOT_EMPTY"
                 ]
               }
             },
@@ -25199,6 +25879,399 @@
         "enum": [
           "attachment; filename=\"organization-task-states.json\""
         ]
+      },
+      "OrganizationWalletAmount": {
+        "type": "string",
+        "pattern": "^(?:[1-9][0-9]{0,14}|[1-8][0-9]{15}|900[0-6][0-9]{12}|90070[0-9]{11}|90071[0-8][0-9]{10}|900719[0-8][0-9]{9}|9007199[0-1][0-9]{8}|90071992[0-4][0-9]{7}|900719925[0-3][0-9]{6}|9007199254[0-6][0-9]{5}|90071992547[0-3][0-9]{4}|9007199254740[0-8][0-9]{2}|90071992547409[0-8][0-9]{1}|9007199254740990|9007199254740991)$(?![\\s\\S])",
+        "maxLength": 16,
+        "x-maximum-decimal-value": "9007199254740991",
+        "description": "Positive integer quota units, at most common.MaxWalletQuota. No floating-point or currency conversion."
+      },
+      "OrganizationWalletQuota": {
+        "type": "string",
+        "pattern": "^(?:0|[1-9][0-9]{0,14}|[1-8][0-9]{15}|900[0-6][0-9]{12}|90070[0-9]{11}|90071[0-8][0-9]{10}|900719[0-8][0-9]{9}|9007199[0-1][0-9]{8}|90071992[0-4][0-9]{7}|900719925[0-3][0-9]{6}|9007199254[0-6][0-9]{5}|90071992547[0-3][0-9]{4}|9007199254740[0-8][0-9]{2}|90071992547409[0-8][0-9]{1}|9007199254740990|9007199254740991)$(?![\\s\\S])",
+        "maxLength": 16,
+        "x-maximum-decimal-value": "9007199254740991",
+        "description": "Nonnegative quota units, at most common.MaxWalletQuota."
+      },
+      "OrganizationWalletRequestID": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+        "minLength": 36,
+        "maxLength": 36,
+        "description": "Canonical lowercase UUID; unique within the organization across credit and reversal actions."
+      },
+      "OrganizationWalletText": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^(?![\\s\\S]*[\\u0000-\\u001f\\u007f-\\u009f])\\S(?:[\\s\\S]*\\S)?$(?![\\s\\S])",
+        "description": "Exact valid UTF-8 text, at most 128 Unicode code points, with no control characters or leading/trailing whitespace."
+      },
+      "OrganizationWalletBalance": {
+        "type": "object",
+        "properties": {
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "opened": {
+            "type": "boolean"
+          },
+          "balance": {
+            "$ref": "#/components/schemas/OrganizationWalletQuota"
+          },
+          "reserved": {
+            "$ref": "#/components/schemas/OrganizationWalletQuota"
+          },
+          "available": {
+            "$ref": "#/components/schemas/OrganizationWalletQuota"
+          }
+        },
+        "required": [
+          "organization_id",
+          "opened",
+          "balance",
+          "reserved",
+          "available"
+        ],
+        "additionalProperties": false,
+        "description": "Balance includes reserved quota; available = balance - reserved. GET never opens an account. This snapshot is not a reservation or spending authorization."
+      },
+      "OrganizationWalletReceipt": {
+        "type": "object",
+        "properties": {
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "entry_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/OrganizationWalletRequestID"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "credit",
+              "reverse"
+            ]
+          },
+          "amount": {
+            "$ref": "#/components/schemas/OrganizationWalletAmount"
+          },
+          "credit_id": {
+            "type": "string",
+            "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "x-int64-maximum": "9223372036854775807",
+            "maxLength": 19,
+            "x-maximum-decimal-value": "9223372036854775807",
+            "nullable": true
+          },
+          "balance_after": {
+            "$ref": "#/components/schemas/OrganizationWalletQuota"
+          },
+          "actor_user_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reference": {
+            "oneOf": [
+              {
+                "type": "string",
+                "enum": [
+                  ""
+                ]
+              },
+              {
+                "$ref": "#/components/schemas/OrganizationWalletText"
+              }
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/OrganizationWalletText"
+          }
+        },
+        "required": [
+          "organization_id",
+          "entry_id",
+          "request_id",
+          "kind",
+          "amount",
+          "credit_id",
+          "balance_after",
+          "actor_user_id",
+          "created_at",
+          "reference",
+          "reason"
+        ],
+        "additionalProperties": false,
+        "description": "Immutable original entry receipt, including original actor and balance_after at commit. A retry returns this original receipt, not the current balance. Reverse adds a new full-amount entry linked to the original credit; no original row is edited or deleted."
+      },
+      "OrganizationWalletBalanceResult": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/OrganizationWalletBalance"
+          }
+        },
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletMutationResult": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/OrganizationWalletReceipt"
+          }
+        },
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletBodyCredit": {
+        "type": "object",
+        "properties": {
+          "revision": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/OrganizationWalletRequestID"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/OrganizationWalletAmount"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/OrganizationWalletText"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/OrganizationWalletText"
+          }
+        },
+        "required": [
+          "revision",
+          "request_id",
+          "amount",
+          "reference",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletCommandCredit": {
+        "type": "object",
+        "properties": {
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/OrganizationWalletRequestID"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/OrganizationWalletAmount"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/OrganizationWalletText"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/OrganizationWalletText"
+          }
+        },
+        "required": [
+          "organization_id",
+          "revision",
+          "request_id",
+          "amount",
+          "reference",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletContextCredit": {
+        "type": "object",
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "command": {
+            "$ref": "#/components/schemas/OrganizationWalletCommandCredit"
+          },
+          "snapshot": {
+            "type": "object",
+            "properties": {
+              "wallet_amount": {
+                "$ref": "#/components/schemas/OrganizationWalletAmount"
+              }
+            },
+            "required": [
+              "wallet_amount"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "schema_version",
+          "command",
+          "snapshot"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletOperationCredit": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "platform.organization.wallet_credit"
+            ]
+          },
+          "context": {
+            "$ref": "#/components/schemas/OrganizationWalletContextCredit"
+          }
+        },
+        "required": [
+          "scope",
+          "context"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletBodyReverse": {
+        "type": "object",
+        "properties": {
+          "revision": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/OrganizationWalletRequestID"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/OrganizationWalletText"
+          }
+        },
+        "required": [
+          "revision",
+          "request_id",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletCommandReverse": {
+        "type": "object",
+        "properties": {
+          "organization_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/OrganizationWalletRequestID"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/OrganizationWalletText"
+          },
+          "credit_id": {
+            "$ref": "#/components/schemas/OrganizationLifecycleID"
+          }
+        },
+        "required": [
+          "organization_id",
+          "revision",
+          "request_id",
+          "reason",
+          "credit_id"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletContextReverse": {
+        "type": "object",
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "command": {
+            "$ref": "#/components/schemas/OrganizationWalletCommandReverse"
+          },
+          "snapshot": {
+            "type": "object",
+            "properties": {
+              "wallet_amount": {
+                "$ref": "#/components/schemas/OrganizationWalletAmount"
+              }
+            },
+            "required": [
+              "wallet_amount"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "schema_version",
+          "command",
+          "snapshot"
+        ],
+        "additionalProperties": false
+      },
+      "OrganizationWalletOperationReverse": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "platform.organization.wallet_reverse"
+            ]
+          },
+          "context": {
+            "$ref": "#/components/schemas/OrganizationWalletContextReverse"
+          }
+        },
+        "required": [
+          "scope",
+          "context"
+        ],
+        "additionalProperties": false
       }
     },
     "responses": {
@@ -26278,6 +27351,22 @@
       {
         "method": "HEAD",
         "path": "/api/organizations/{org_id}/tasks/{task_row_id}/artifacts/{artifact_key}/content"
+      },
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/wallet"
+      },
+      {
+        "method": "GET",
+        "path": "/api/platform/organizations/{org_id}/wallet"
+      },
+      {
+        "method": "POST",
+        "path": "/api/platform/organizations/{org_id}/wallet/credits"
+      },
+      {
+        "method": "POST",
+        "path": "/api/platform/organizations/{org_id}/wallet/credits/{credit_id}/reverse"
       }
     ],
     "positive_resource_selector_routes": [
@@ -26936,5 +28025,70 @@
     "serialization": "complete in memory before final authorization recheck",
     "error_content_disposition": "absent",
     "already_published_downloads": "may be retained by the client; no recall guarantee"
+  },
+  "x-organization-wallet-contract": {
+    "routes": [
+      {
+        "method": "GET",
+        "path": "/api/organizations/{org_id}/wallet",
+        "operationId": "organization_wallet_balance",
+        "permission": "owner/admin"
+      },
+      {
+        "method": "GET",
+        "path": "/api/platform/organizations/{org_id}/wallet",
+        "operationId": "platform_organization_wallet_balance",
+        "permission": "root"
+      },
+      {
+        "method": "POST",
+        "path": "/api/platform/organizations/{org_id}/wallet/credits",
+        "operationId": "organization_wallet_credit",
+        "permission": "root"
+      },
+      {
+        "method": "POST",
+        "path": "/api/platform/organizations/{org_id}/wallet/credits/{credit_id}/reverse",
+        "operationId": "organization_wallet_reverse",
+        "permission": "root"
+      }
+    ],
+    "tables": [
+      "organization_wallets",
+      "organization_wallet_entries"
+    ],
+    "scopes": [
+      "platform.organization.wallet_credit",
+      "platform.organization.wallet_reverse"
+    ],
+    "account_creation": "first successful credit transaction only",
+    "business_idempotency": [
+      "organization_id",
+      "request_id",
+      "kind",
+      "amount for credit only",
+      "credit_id for reverse only",
+      "reference",
+      "reason"
+    ],
+    "proof_replay": "reject; every retry requires a new proof",
+    "preview": "explicit full rollback before any wallet/domain write, including idempotent hits",
+    "governance_revision": "checked but not advanced by wallet writes; excluded from business identity",
+    "reversal": "exact original credit amount, once, sufficient available balance, immutable original entry",
+    "disabled": {
+      "credit": false,
+      "reverse": true,
+      "owner_admin_read": true
+    },
+    "dissolved": {
+      "write": false,
+      "owner_admin_read": false,
+      "platform_root_read": true
+    },
+    "dissolve": "reject nonzero balance or any reserved quota; retain zero-balance ledger",
+    "consumption_enabled": false,
+    "personal_funds_fallback": false,
+    "maximum_quota": "9007199254740991",
+    "read_publication": "final current session and role recheck after preparing snapshot"
   }
 }
