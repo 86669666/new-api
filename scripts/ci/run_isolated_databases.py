@@ -703,6 +703,7 @@ ORGANIZATION_READ_SUITES = {
     'organization-task-export': (frozenset(('TestOrganizationTaskExport',)), 'g13-organization-task-export'),
     'organization-task-list-revocation': (frozenset(('TestOrganizationTaskListRevocation',)), 'g14-organization-task-list-revocation'),
     'organization-task-funding-isolation': (frozenset(('TestOrganizationTaskFundingIsolation',)), 'g15-organization-task-funding-isolation'),
+    'organization-capabilities': (frozenset(('TestOrganizationCapabilityProjection', 'TestOrganizationAccessHTTP')), 'g16-organization-capabilities'),
 }
 ORGANIZATION_METADATA_SHA = {
     'mysql': 'e9be5a831164f8c536fa0b5eb1355b9eb41ee779508861b2789cf3dd47861bdb',
@@ -863,6 +864,10 @@ def validate_organization_identity_events(events, suite='organization-identity')
     roots = {name.split('/', 1)[0] for name in passed if name is not None}
     if roots != required or None not in passed:
         raise ValueError('both exact HTTP roots and router package must pass')
+    if suite == 'organization-capabilities' and passed != required | {None,
+            'TestOrganizationCapabilityProjection/capability_projection',
+            'TestOrganizationAccessHTTP/five_operations_roles_and_wire_precision'}:
+        raise ValueError('both exact capability projection subtests must pass without unrelated tests')
     return {'roots': sorted(required), 'passed_tests_and_subtests': len(passed) - 1,
             'package': package, 'skip': 0, 'fail': 0}
 
@@ -932,8 +937,11 @@ def run_organization_identity(args, docker):
                 env['NEWAPI_S2_' + dialect.upper() + '_PORT'] = str(port)
                 env['NEWAPI_S2_MAIN_DSN'] = (f'root@tcp(127.0.0.1:{port})/newapi_ci_contracts?parseTime=true' if dialect == 'mysql'
                                               else f'postgres://postgres@127.0.0.1:{port}/newapi_ci_contracts?sslmode=disable')
+            selection = '^(' + '|'.join(sorted(required_roots)) + ')$'
+            if suite == 'organization-capabilities':
+                selection += '/^(capability_projection|five_operations_roles_and_wire_precision)$'
             command = [str(args.go), '-C', str(root), 'test', '-json', '-count=1', '-timeout=240s',
-                       '-run=^(' + '|'.join(sorted(required_roots)) + ')$', './router']
+                       '-run=' + selection, './router']
             output = run(command, env=env, timeout=270, safe_failure_output=True,
                          guard=functools.partial(check_relays, relays), final_guard=functools.partial(check_relays, relays, fresh=True))
             from database_gate import redact_output
@@ -998,7 +1006,7 @@ def main(argv=None):
     parser.add_argument('--docker-config', type=Path, required=True)
     parser.add_argument('--image-evidence', type=Path, required=True)
     parser.add_argument('--relay-evidence', type=Path, required=True)
-    parser.add_argument('--suite', choices=('database-contract', 'organization-identity', 'organization-task-read', 'organization-invitation-presentation', 'organization-task-batch', 'organization-task-export', 'organization-task-list-revocation', 'organization-task-funding-isolation'), default='database-contract')
+    parser.add_argument('--suite', choices=('database-contract', 'organization-identity', 'organization-task-read', 'organization-invitation-presentation', 'organization-task-batch', 'organization-task-export', 'organization-task-list-revocation', 'organization-task-funding-isolation', 'organization-capabilities'), default='database-contract')
     parser.add_argument('--image-metadata', type=Path)
     parser.add_argument('--preserve-volumes', type=Path)
     parser.add_argument('--go', type=Path)

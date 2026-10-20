@@ -493,6 +493,25 @@ def main():
         results['specs'][name] = {'oas': '3.0.1', 'paths': len(document['paths']), 'operations': len(ids), 'valid': True}
 
     api, relay = documents['api'], documents['relay']
+    access = api['components']['schemas']['OrganizationAccess']['properties']['capabilities']
+    context_access = api['components']['schemas']['RequestAccessContext']['properties']['organization']['properties']['capabilities']
+    assert access == context_access, 'Organization capability projections differ between detail and context'
+    assert access['type'] == 'object' and access['additionalProperties'] is False
+    fields = {'organization_read', 'members_read', 'events_read', 'resource_access',
+              'organization_token_issue', 'organization_spend', 'organization_mutation'}
+    assert set(access['required']) == set(access['properties']) == fields
+    properties = access['properties']
+    for name in ('organization_read', 'members_read', 'events_read'):
+        assert properties[name] == {'type': 'boolean'}
+    for name, expected in [('resource_access', {'type': 'boolean', 'enum': [True]}),
+                           ('organization_mutation', {'type': 'boolean'})]:
+        assert {key: value for key, value in properties[name].items() if key != 'description'} == expected
+        assert properties[name]['description']
+    for name in ('organization_token_issue', 'organization_spend'):
+        assert properties[name] == {'type': 'boolean', 'enum': [False]}
+    assert 'All four unimplemented capabilities are false' not in access['description']
+    results['organization_capabilities'] = {'governance_roles': ['owner', 'admin'], 'task_read_channel': True,
+                                          'token_issuance': False, 'spending': False, 'advisory_only': True, 'live_http': False}
     results['organization_task_reads'] = check_organization_task_reads(api)
     # Bind documented PAT scope/session choices to the checked-in route policy.
     rules = re.findall(r'"([A-Z]+) ([^\"]+)":\s+(accessToken[^,\n]+)', (source_root / 'middleware/access_token_routes.go').read_text())

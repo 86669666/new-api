@@ -9261,5 +9261,164 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "organization capability owner",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationAccess",
+    "value": {
+      "org_id": "9007199254740993",
+      "name": "Capability fixture",
+      "revision": "1",
+      "my_role": "owner",
+      "my_member_revision": "1",
+      "capabilities": {
+        "organization_read": true,
+        "members_read": true,
+        "events_read": true,
+        "resource_access": true,
+        "organization_token_issue": false,
+        "organization_spend": false,
+        "organization_mutation": true
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization capability member",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationAccess",
+    "value": {
+      "org_id": "9007199254740993",
+      "name": "Capability fixture",
+      "revision": "1",
+      "my_role": "member",
+      "my_member_revision": "1",
+      "capabilities": {
+        "organization_read": true,
+        "members_read": true,
+        "events_read": false,
+        "resource_access": true,
+        "organization_token_issue": false,
+        "organization_spend": false,
+        "organization_mutation": false
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization capability context",
+    "document": "api",
+    "schema": "#/components/schemas/RequestAccessContext",
+    "value": {
+      "actor_user_id": "7",
+      "org_id": "9007199254740993",
+      "scope_kind": "organization",
+      "organization": {
+        "org_id": "9007199254740993",
+        "name": "Capability fixture",
+        "revision": "1",
+        "my_role": "member",
+        "my_member_revision": "1",
+        "capabilities": {
+          "organization_read": true,
+          "members_read": true,
+          "events_read": false,
+          "resource_access": true,
+          "organization_token_issue": false,
+          "organization_spend": false,
+          "organization_mutation": false
+        }
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization capability rejects obsolete resource false",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationAccess",
+    "value": {
+      "org_id": "9007199254740993",
+      "name": "Capability fixture",
+      "revision": "1",
+      "my_role": "owner",
+      "my_member_revision": "1",
+      "capabilities": {
+        "organization_read": true,
+        "members_read": true,
+        "events_read": true,
+        "resource_access": false,
+        "organization_token_issue": false,
+        "organization_spend": false,
+        "organization_mutation": true
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization capability rejects token issuance",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationAccess",
+    "value": {
+      "org_id": "9007199254740993",
+      "name": "Capability fixture",
+      "revision": "1",
+      "my_role": "owner",
+      "my_member_revision": "1",
+      "capabilities": {
+        "organization_read": true,
+        "members_read": true,
+        "events_read": true,
+        "resource_access": true,
+        "organization_token_issue": true,
+        "organization_spend": false,
+        "organization_mutation": true
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization capability rejects spending",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationAccess",
+    "value": {
+      "org_id": "9007199254740993",
+      "name": "Capability fixture",
+      "revision": "1",
+      "my_role": "owner",
+      "my_member_revision": "1",
+      "capabilities": {
+        "organization_read": true,
+        "members_read": true,
+        "events_read": true,
+        "resource_access": true,
+        "organization_token_issue": false,
+        "organization_spend": true,
+        "organization_mutation": true
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "organization capability rejects nonboolean governance",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationAccess",
+    "value": {
+      "org_id": "9007199254740993",
+      "name": "Capability fixture",
+      "revision": "1",
+      "my_role": "owner",
+      "my_member_revision": "1",
+      "capabilities": {
+        "organization_read": true,
+        "members_read": true,
+        "events_read": true,
+        "resource_access": true,
+        "organization_token_issue": false,
+        "organization_spend": false,
+        "organization_mutation": "true"
+      }
+    },
+    "valid": false
   }
 ]

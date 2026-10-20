@@ -201,7 +201,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -497,7 +497,9 @@ func TestOrganizationAccessHTTP(t *testing.T) {
 		assert.Len(t, d, 6)
 		caps := d["capabilities"].(map[string]any)
 		assert.Len(t, caps, 7)
-		for _, key := range []string{"resource_access", "organization_token_issue", "organization_spend", "organization_mutation"} {
+		assert.Equal(t, true, caps["resource_access"])
+		assert.Equal(t, true, caps["organization_mutation"])
+		for _, key := range []string{"organization_token_issue", "organization_spend"} {
 			assert.Equal(t, false, caps[key])
 		}
 		for _, actor := range []string{"owner", "admin", "member"} {
@@ -714,6 +716,87 @@ func TestOrganizationAccessHTTP(t *testing.T) {
 		model.LOG_DB = old
 		assert.Equal(t, 404, s)
 		assert.Contains(t, f.logs.snapshot(), common.LogText("audit log write failed (request_id=%s): log database unavailable", failureHeaders.Get(common.RequestIdKey)))
+	})
+}
+
+func TestOrganizationCapabilityProjection(t *testing.T) {
+	t.Run("capability_projection", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		a := strconv.FormatInt(f.orgA, 10)
+		paths := []string{"/api/organizations", "/api/organization-context?org_id=" + a, "/api/organizations/" + a}
+		governance := map[string]bool{"owner": true, "admin": true, "member": false}
+		projection := func(actor, role string) {
+			t.Helper()
+			for index, path := range paths {
+				status, headers, body := f.request(t, http.MethodGet, path, actor, "", nil)
+				require.Equal(t, http.StatusOK, status, "actor=%s path=%s", actor, path)
+				assert.Equal(t, "private, no-store", headers.Get("Cache-Control"))
+				data := body["data"].(map[string]any)
+				var view map[string]any
+				switch index {
+				case 0:
+					for _, value := range data["items"].([]any) {
+						item := value.(map[string]any)
+						if item["org_id"] == a {
+							view = item
+						}
+					}
+				case 1:
+					assert.Equal(t, "organization", data["scope_kind"])
+					view = data["organization"].(map[string]any)
+				case 2:
+					view = data
+				}
+				require.NotNil(t, view, "actor=%s path=%s", actor, path)
+				assert.Equal(t, role, view["my_role"])
+				assert.Equal(t, map[string]any{
+					"organization_read": true, "members_read": true, "events_read": governance[role],
+					"resource_access": true, "organization_mutation": governance[role],
+					"organization_token_issue": false, "organization_spend": false,
+				}, view["capabilities"], "actor=%s path=%s", actor, path)
+			}
+		}
+		unavailable := func(actor string) {
+			t.Helper()
+			for index, path := range paths {
+				status, headers, body := f.request(t, http.MethodGet, path, actor, "", nil)
+				if index != 0 {
+					organizationError(t, status, headers, body, http.StatusNotFound, "ORG_NOT_FOUND")
+					continue
+				}
+				require.Equal(t, http.StatusOK, status)
+				assert.Equal(t, "private, no-store", headers.Get("Cache-Control"))
+				for _, value := range body["data"].(map[string]any)["items"].([]any) {
+					assert.NotEqual(t, a, value.(map[string]any)["org_id"])
+				}
+			}
+		}
+		for _, actor := range []string{"owner", "admin", "member"} {
+			projection(actor, actor)
+		}
+		unavailable("root")
+		require.NoError(t, f.db.Create(&model.OrganizationMember{OrganizationID: f.orgA, UserID: f.users["root"].Id, Role: model.OrganizationRoleMember, Revision: 1, JoinedAt: 1}).Error)
+		projection("root", "member")
+		require.NoError(t, f.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, f.users["admin"].Id).Update("role", model.OrganizationRoleMember).Error)
+		projection("admin", "member")
+		require.NoError(t, f.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, f.users["member"].Id).Update("removed_at", int64(1)).Error)
+		unavailable("member")
+		for _, column := range []string{"self_disabled_at", "platform_disabled_at", "dissolved_at"} {
+			require.NoError(t, f.db.Model(&model.Organization{}).Where("id = ?", f.orgA).Update(column, int64(1)).Error)
+			unavailable("owner")
+			require.NoError(t, f.db.Model(&model.Organization{}).Where("id = ?", f.orgA).Update(column, int64(0)).Error)
+		}
+		status, _, body := f.request(t, http.MethodGet, "/api/organization-context?org_id=0", "owner", "", nil)
+		require.Equal(t, http.StatusOK, status)
+		data := body["data"].(map[string]any)
+		assert.Equal(t, "personal", data["scope_kind"])
+		assert.Nil(t, data["organization"])
+		assert.NotContains(t, data, "capabilities")
+		require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["root"]).Update("status", model.UserSessionStatusRevoked).Error)
+		for _, path := range paths {
+			status, headers, body := f.request(t, http.MethodGet, path, "root", "", nil)
+			organizationError(t, status, headers, body, http.StatusUnauthorized, "AUTH_SESSION_REVOKED")
+		}
 	})
 }
 

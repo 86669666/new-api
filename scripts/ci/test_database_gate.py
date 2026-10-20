@@ -376,6 +376,22 @@ class OrganizationIdentityContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.validate_organization_identity_events(events, 'organization-task-list-revocation')
 
+    def test_organization_capabilities_suite_is_closed(self):
+        suite = 'organization-capabilities'
+        package = 'github.com/QuantumNous/new-api/router'
+        names = ['TestOrganizationCapabilityProjection', 'TestOrganizationCapabilityProjection/capability_projection',
+                 'TestOrganizationAccessHTTP', 'TestOrganizationAccessHTTP/five_operations_roles_and_wire_precision']
+        events = [{'Action': 'pass', 'Package': package, 'Test': name} for name in names]
+        events.append({'Action': 'pass', 'Package': package})
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['roots'], sorted((names[0], names[2])))
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite][1], 'g16-organization-capabilities')
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:], events[:3] + events[4:],
+                          events + [{'Action': 'skip'}], events + [{'Action': 'fail'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': 'TestOrganizationAccessHTTP/other'}],
+                          [dict(event, Package='github.com/QuantumNous/new-api/service') for event in events]):
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+
     def test_live_image_recomputes_bytes_instead_of_trusting_receipt_flags(self):
         import hashlib
         config = {'os': 'linux', 'architecture': 'arm64', 'rootfs': {'type': 'layers', 'diff_ids': ['sha256:layer']},

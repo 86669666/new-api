@@ -66,7 +66,13 @@ type OrganizationAccessPage[T any] struct {
 }
 
 func organizationAccessView(v model.OrganizationView) OrganizationAccess {
-	return OrganizationAccess{OrgID: strconv.FormatInt(v.ID, 10), Name: v.Name, Revision: strconv.FormatInt(v.Revision, 10), MyRole: v.MyRole, MyMemberRevision: strconv.FormatInt(v.MyMemberRevision, 10), Capabilities: OrganizationCapabilities{OrganizationRead: true, MembersRead: true, EventsRead: v.MyRole == model.OrganizationRoleOwner || v.MyRole == model.OrganizationRoleAdmin}}
+	governance := v.MyRole == model.OrganizationRoleOwner || v.MyRole == model.OrganizationRoleAdmin
+	// ReadOrganizationAccess supplies only active membership views. These flags
+	// describe existing governance eligibility and task reads, never a grant.
+	return OrganizationAccess{OrgID: strconv.FormatInt(v.ID, 10), Name: v.Name, Revision: strconv.FormatInt(v.Revision, 10), MyRole: v.MyRole, MyMemberRevision: strconv.FormatInt(v.MyMemberRevision, 10), Capabilities: OrganizationCapabilities{
+		OrganizationRead: true, MembersRead: true, EventsRead: governance,
+		ResourceAccess: true, OrganizationMutation: governance,
+	}}
 }
 
 // OrganizationAccessResponse constructs the complete allowlisted wire shape.

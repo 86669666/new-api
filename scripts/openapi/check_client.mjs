@@ -225,7 +225,7 @@ const inheritedStubbedRequests = calls.length;
 api.OpenAPI.HEADERS = undefined;
 api.OpenAPI.WITH_CREDENTIALS = false;
 const orgId = '9007199254740993';
-const organization = { org_id: orgId, name: 'Fixture organization', revision: '1', my_role: 'owner', my_member_revision: '1', capabilities: { organization_read: true, members_read: true, events_read: true, resource_access: false, organization_token_issue: false, organization_spend: false, organization_mutation: false } };
+const organization = { org_id: orgId, name: 'Fixture organization', revision: '1', my_role: 'owner', my_member_revision: '1', capabilities: { organization_read: true, members_read: true, events_read: true, resource_access: true, organization_token_issue: false, organization_spend: false, organization_mutation: true } };
 const organizationCalls = [
   ['listAccessibleOrganizations', { orgId: '0', afterId: '0', limit: 20 }, '/api/organizations?org_id=0&after_id=0&limit=20', { items: [organization], limit: 20, next_after_id: null }],
   ['getOrganizationRequestContext', { xOrganizationId: orgId }, '/api/organization-context', { actor_user_id: '7', org_id: orgId, scope_kind: 'organization', organization }],
