@@ -55,6 +55,8 @@ import { Route as AuthenticatedUsageLogsSectionRouteImport } from './routes/_aut
 import { Route as AuthenticatedUsageLogsAuditRouteImport } from './routes/_authenticated/usage-logs/audit'
 import { Route as AuthenticatedUsersIndexRouteImport } from './routes/_authenticated/users/index'
 import { Route as AuthenticatedWalletIndexRouteImport } from './routes/_authenticated/wallet/index'
+import { Route as OauthProviderConsentRouteImport } from './routes/oauth/provider/consent'
+import { Route as OauthProviderLoginRouteImport } from './routes/oauth/provider/login'
 import { Route as PricingModelIdIndexRouteImport } from './routes/pricing/$modelId/index'
 import { Route as AuthenticatedSystemSettingsAuthIndexRouteImport } from './routes/_authenticated/system-settings/auth/index'
 import { Route as AuthenticatedSystemSettingsAuthSectionRouteImport } from './routes/_authenticated/system-settings/auth/$section'
@@ -320,6 +322,16 @@ const AuthenticatedWalletIndexRoute =
     path: '/wallet/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
+const OauthProviderConsentRoute = OauthProviderConsentRouteImport.update({
+  id: '/oauth/provider/consent',
+  path: '/oauth/provider/consent',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const OauthProviderLoginRoute = OauthProviderLoginRouteImport.update({
+  id: '/oauth/provider/login',
+  path: '/oauth/provider/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PricingModelIdIndexRoute = PricingModelIdIndexRouteImport.update({
   id: '/pricing/$modelId/',
   path: '/pricing/$modelId/',
@@ -452,6 +464,8 @@ export interface FileRoutesByFullPath {
   '/models/$section': typeof AuthenticatedModelsSectionRoute
   '/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/oauth/provider/consent': typeof OauthProviderConsentRoute
+  '/oauth/provider/login': typeof OauthProviderLoginRoute
   '/channels/': typeof AuthenticatedChannelsIndexRoute
   '/dashboard/': typeof AuthenticatedDashboardIndexRoute
   '/keys/': typeof AuthenticatedKeysIndexRoute
@@ -514,6 +528,8 @@ export interface FileRoutesByTo {
   '/models/$section': typeof AuthenticatedModelsSectionRoute
   '/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/oauth/provider/consent': typeof OauthProviderConsentRoute
+  '/oauth/provider/login': typeof OauthProviderLoginRoute
   '/channels': typeof AuthenticatedChannelsIndexRoute
   '/dashboard': typeof AuthenticatedDashboardIndexRoute
   '/keys': typeof AuthenticatedKeysIndexRoute
@@ -580,6 +596,8 @@ export interface FileRoutesById {
   '/_authenticated/models/$section': typeof AuthenticatedModelsSectionRoute
   '/_authenticated/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/_authenticated/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/oauth/provider/consent': typeof OauthProviderConsentRoute
+  '/oauth/provider/login': typeof OauthProviderLoginRoute
   '/_authenticated/channels/': typeof AuthenticatedChannelsIndexRoute
   '/_authenticated/dashboard/': typeof AuthenticatedDashboardIndexRoute
   '/_authenticated/keys/': typeof AuthenticatedKeysIndexRoute
@@ -645,6 +663,8 @@ export interface FileRouteTypes {
     | '/models/$section'
     | '/usage-logs/$section'
     | '/usage-logs/audit'
+    | '/oauth/provider/consent'
+    | '/oauth/provider/login'
     | '/channels/'
     | '/dashboard/'
     | '/keys/'
@@ -707,6 +727,8 @@ export interface FileRouteTypes {
     | '/models/$section'
     | '/usage-logs/$section'
     | '/usage-logs/audit'
+    | '/oauth/provider/consent'
+    | '/oauth/provider/login'
     | '/channels'
     | '/dashboard'
     | '/keys'
@@ -772,6 +794,8 @@ export interface FileRouteTypes {
     | '/_authenticated/models/$section'
     | '/_authenticated/usage-logs/$section'
     | '/_authenticated/usage-logs/audit'
+    | '/oauth/provider/consent'
+    | '/oauth/provider/login'
     | '/_authenticated/channels/'
     | '/_authenticated/dashboard/'
     | '/_authenticated/keys/'
@@ -822,6 +846,8 @@ export interface RootRouteChildren {
   PricingIndexRoute: typeof PricingIndexRoute
   RankingsIndexRoute: typeof RankingsIndexRoute
   SetupIndexRoute: typeof SetupIndexRoute
+  OauthProviderConsentRoute: typeof OauthProviderConsentRoute
+  OauthProviderLoginRoute: typeof OauthProviderLoginRoute
   PricingModelIdIndexRoute: typeof PricingModelIdIndexRoute
 }
 
@@ -1149,6 +1175,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedWalletIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/oauth/provider/consent': {
+      id: '/oauth/provider/consent'
+      path: '/oauth/provider/consent'
+      fullPath: '/oauth/provider/consent'
+      preLoaderRoute: typeof OauthProviderConsentRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/oauth/provider/login': {
+      id: '/oauth/provider/login'
+      path: '/oauth/provider/login'
+      fullPath: '/oauth/provider/login'
+      preLoaderRoute: typeof OauthProviderLoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/pricing/$modelId/': {
       id: '/pricing/$modelId/'
       path: '/pricing/$modelId'
@@ -1431,6 +1471,8 @@ const rootRouteChildren: RootRouteChildren = {
   PricingIndexRoute: PricingIndexRoute,
   RankingsIndexRoute: RankingsIndexRoute,
   SetupIndexRoute: SetupIndexRoute,
+  OauthProviderConsentRoute: OauthProviderConsentRoute,
+  OauthProviderLoginRoute: OauthProviderLoginRoute,
   PricingModelIdIndexRoute: PricingModelIdIndexRoute,
 }
 export const routeTree = rootRouteImport

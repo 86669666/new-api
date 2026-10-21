@@ -1,0 +1,132 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { Link } from '@tanstack/react-router'
+import { useTranslation } from 'react-i18next'
+
+import { ErrorState } from '@/components/error-state'
+import { LoadingState } from '@/components/loading-state'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Label } from '@/components/ui/label'
+import { AuthLayout } from '@/features/auth/auth-layout'
+
+import { useProviderAuthorization } from './hooks/use-provider-authorization'
+import type { AuthorizationEntry } from './lib/authorization'
+
+export function ProviderAuthorizationPage(props: {
+  entry: AuthorizationEntry
+}) {
+  const { t } = useTranslation()
+  const authorization = useProviderAuthorization(props.entry)
+  const state = authorization.state
+  if (state.kind === 'loading' || state.kind === 'submitting') {
+    return <LoadingState message={t('Preparing authorization...')} />
+  }
+  if (state.kind === 'anonymous') {
+    return (
+      <AuthLayout>
+        <ErrorState
+          title={t('Sign in to continue authorization')}
+          description={t(
+            'After signing in, start authorization again from your client.'
+          )}
+          action={
+            <Button role='link' render={<Link to='/sign-in' />}>
+              {t('Sign in')}
+            </Button>
+          }
+        />
+      </AuthLayout>
+    )
+  }
+  if (state.kind === 'terminal') {
+    return (
+      <AuthLayout>
+        <ErrorState
+          title={t('Authorization could not be completed.')}
+          description={t(
+            'Start authorization again from your client. Do not retry this request.'
+          )}
+        />
+      </AuthLayout>
+    )
+  }
+  return (
+    <AuthLayout>
+      <main className='space-y-6' aria-label={t('Authorize client')}>
+        <h1 className='text-2xl font-semibold'>{t('Authorize client')}</h1>
+        <dl className='space-y-2 break-words'>
+          <dt className='text-muted-foreground'>{t('Client')}</dt>
+          <dd>{state.preview.client_name || state.preview.client_id}</dd>
+          <dt className='text-muted-foreground'>{t('Client ID')}</dt>
+          <dd>{state.preview.client_id}</dd>
+          <dt className='text-muted-foreground'>{t('Account')}</dt>
+          <dd>{state.preview.username}</dd>
+          <dt className='text-muted-foreground'>{t('Audience')}</dt>
+          <dd>{state.preview.audience}</dd>
+        </dl>
+        <p>{t('Only approve a client you recognize.')}</p>
+        {props.entry.phase === 'consent' && (
+          <fieldset className='space-y-3'>
+            <legend className='mb-2 font-medium'>
+              {t('Requested access')}
+            </legend>
+            <div className='flex items-center gap-2'>
+              <Checkbox id='provider-profile' checked disabled />
+              <Label htmlFor='provider-profile'>
+                {t('Profile (required)')}
+              </Label>
+            </div>
+            {state.preview.allowed_scopes.includes('email') && (
+              <div className='flex items-center gap-2'>
+                <Checkbox
+                  id='provider-email'
+                  checked={authorization.email}
+                  onCheckedChange={(checked) =>
+                    authorization.setEmail(checked === true)
+                  }
+                />
+                <Label htmlFor='provider-email'>
+                  {t('Email address (optional)')}
+                </Label>
+              </div>
+            )}
+          </fieldset>
+        )}
+        <div className='flex flex-wrap gap-3'>
+          <Button
+            onClick={() => {
+              void authorization.decide(true)
+            }}
+          >
+            {props.entry.phase === 'login' ? t('Continue') : t('Approve')}
+          </Button>
+          <Button
+            variant='outline'
+            onClick={() => {
+              void authorization.decide(false)
+            }}
+          >
+            {t('Deny')}
+          </Button>
+        </div>
+      </main>
+    </AuthLayout>
+  )
+}

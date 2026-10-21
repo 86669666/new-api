@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -9,6 +10,30 @@ import (
 )
 
 const RouteTagKey = "route_tag"
+
+// OAuthProviderPagePath recognizes only the two reserved authorization pages
+// and their descendants, including one additional escaped/slash variant.
+// It never changes the request used by routing or authentication.
+func OAuthProviderPagePath(path string) bool {
+	for attempt := range 2 {
+		if strings.HasPrefix(path, "/") {
+			collapsed := "/" + strings.Join(strings.FieldsFunc(path, func(r rune) bool { return r == '/' }), "/")
+			for _, page := range []string{"/oauth/provider/login", "/oauth/provider/consent"} {
+				if collapsed == page || strings.HasPrefix(collapsed, page+"/") {
+					return true
+				}
+			}
+		}
+		if attempt == 0 {
+			decoded, err := url.PathUnescape(path)
+			if err != nil || decoded == path {
+				break
+			}
+			path = decoded
+		}
+	}
+	return false
+}
 
 func RouteTag(tag string) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -35,6 +60,9 @@ func SetUpLogger(server *gin.Engine) {
 		// OAuth callbacks carry one-time codes and state in the query string.
 		// Redact the log value only; the handler still needs the original query.
 		resourcePath, _, _ := strings.Cut(path, "?")
+		if OAuthProviderPagePath(param.Request.URL.Path) {
+			path = "/oauth/provider/[authorization]"
+		}
 		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || OAuthRevocationPath(resourcePath) || strings.TrimSuffix(resourcePath, "/") == "/api/v1/oauth/userinfo" || strings.TrimRight(resourcePath, "/") == "/api/events" {
 			path, _, _ = strings.Cut(path, "?")
 		}

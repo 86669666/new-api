@@ -952,6 +952,79 @@ func TestClientEventsReceiverHTTP(t *testing.T) {
 	assert.Equal(t, beforeAccounting, accounting(), "telemetry never mutates accounting/access totals")
 }
 
+// Success with the real stock embed is verified by the root-module browser
+// overlay; embed.FS cannot be fabricated from a router-package MapFS fixture.
+func TestOAuthProviderPagePrivacyHTTP(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	originalMaster := common.IsMasterNode
+	t.Cleanup(func() { common.IsMasterNode = originalMaster })
+	const canary = "provider-page-capability-canary"
+	const injected = "<script>owned-analytics-canary</script>"
+	variants := []string{
+		"/oauth/provider/login/", "/oauth/provider/consent/", "//oauth//provider/login",
+		"/oauth/provider/login//child", "/%6fauth/provider/login", "/%256fauth/provider/login",
+		"/oauth/provider%2flogin", "/oauth/provider/consent/" + canary,
+	}
+	for _, topology := range []struct {
+		name, frontend string
+		master         bool
+	}{
+		{"embedded", "", true},
+		{"master_ignores_frontend", "https://frontend.invalid/prefix", true},
+		{"split_rejects_locally", "https://frontend.invalid/prefix", false},
+	} {
+		t.Run(topology.name, func(t *testing.T) {
+			common.IsMasterNode = topology.master
+			t.Setenv("FRONTEND_BASE_URL", topology.frontend)
+			e := gin.New()
+			middleware.SetUpLogger(e)
+			SetRouter(e, WebAssets{IndexPage: []byte(injected)})
+			request := func(method, path string) *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				e.ServeHTTP(w, httptest.NewRequest(method, path+"?login_challenge="+canary, nil))
+				assert.Equal(t, "private, no-store", w.Header().Get("Cache-Control"))
+				assert.Equal(t, "no-referrer", w.Header().Get("Referrer-Policy"))
+				assert.Equal(t, "frame-ancestors 'none'", w.Header().Get("Content-Security-Policy"))
+				assert.Equal(t, "DENY", w.Header().Get("X-Frame-Options"))
+				assert.Empty(t, w.Header().Get("Location"))
+				assert.Empty(t, w.Header().Values("Set-Cookie"))
+				assert.NotContains(t, w.Body.String(), canary)
+				assert.NotContains(t, w.Body.String(), injected)
+				return w
+			}
+			for _, path := range []string{"/oauth/provider/login", "/oauth/provider/consent"} {
+				for _, method := range []string{http.MethodGet, http.MethodHead} {
+					w := request(method, path)
+					expected := http.StatusServiceUnavailable // no BuildFS: never use injected IndexPage
+					if topology.frontend != "" && !topology.master {
+						expected = http.StatusNotFound
+					}
+					assert.Equal(t, expected, w.Code)
+				}
+				assert.Contains(t, []int{400, 404}, request(http.MethodPost, path).Code)
+			}
+			for _, path := range variants {
+				assert.Contains(t, []int{400, 404}, request(http.MethodGet, path).Code)
+			}
+			// Callback and generic SPA behavior keep the original injected page or
+			// split redirect; this namespace does not alter global redirect policy.
+			for _, path := range []string{"/oauth/github", "/ordinary-page"} {
+				w := httptest.NewRecorder()
+				e.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+				if topology.frontend != "" && !topology.master {
+					assert.Equal(t, http.StatusMovedPermanently, w.Code)
+					assert.Equal(t, topology.frontend+path, w.Header().Get("Location"))
+				} else {
+					assert.Equal(t, http.StatusOK, w.Code)
+					assert.Equal(t, injected, w.Body.String())
+				}
+			}
+		})
+	}
+	assert.NotContains(t, f.logs.snapshot(), canary)
+	assert.Contains(t, f.logs.snapshot(), "/oauth/provider/[authorization]")
+}
+
 func TestOAuthTokenRevocationHTTP(t *testing.T) {
 	oldAPI, oldCritical, oldRedis, oldMaster := common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable, common.RedisEnabled, common.IsMasterNode
 	oldWriter, oldMode := gin.DefaultWriter, gin.Mode()
