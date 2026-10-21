@@ -33,6 +33,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { CHERRY_V2_TEMPLATE } from '@/features/chat/lib/chat-links'
 
 import { SettingsForm } from '../components/settings-form-layout'
 import { SettingsPageFormActions } from '../components/settings-page-context'
@@ -129,6 +130,12 @@ export function ChatSettingsSection({
 
   return (
     <SettingsSection title={t('Chat Presets')}>
+      <p className='text-muted-foreground text-sm'>
+        {t(
+          'To enable Cherry Studio v2, add or edit a preset using this template, then save. Existing v1 presets are unchanged.'
+        )}{' '}
+        <code className='break-all'>{CHERRY_V2_TEMPLATE}</code>
+      </p>
       <Form {...form}>
         {/* eslint-disable-next-line react-hooks/refs */}
         <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>

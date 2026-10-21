@@ -41,10 +41,14 @@ import {
   SidebarMenuSubItem,
   useSidebar,
 } from '@/components/ui/sidebar'
-import { fetchActiveChatKey } from '@/features/chat/hooks/use-active-chat-key'
+import {
+  fetchActiveChatKey,
+  useCherryStudioV2Import,
+} from '@/features/chat/hooks/use-active-chat-key'
 import { useChatPresets } from '@/features/chat/hooks/use-chat-presets'
 import {
   chatLinkRequiresApiKey,
+  isCherryV2Attempt,
   resolveChatUrl,
   type ChatPreset,
 } from '@/features/chat/lib/chat-links'
@@ -161,6 +165,9 @@ function DropdownPresetItem({
 export function ChatPresetsItem({ item }: { item: NavChatPresets }) {
   const { t } = useTranslation()
   const { chatPresets, serverAddress } = useChatPresets()
+  const { openV2, isOpening } = useCherryStudioV2Import(
+    chatPresets.map((preset) => `${preset.id}:${preset.url}`).join('\n')
+  )
   const { state, isMobile, setOpenMobile } = useSidebar()
   const href = useLocation({ select: (location) => location.href })
   const [loadingPresetId, setLoadingPresetId] = useState<string | null>(null)
@@ -174,6 +181,10 @@ export function ChatPresetsItem({ item }: { item: NavChatPresets }) {
   const handleOpenExternal = useCallback(
     async (preset: ChatPreset) => {
       if (preset.type === 'web') return
+      if (isCherryV2Attempt(preset.url)) {
+        await openV2(preset.url)
+        return
+      }
 
       const needsKey = chatLinkRequiresApiKey(preset.url)
       let activeKey: string | undefined
@@ -219,7 +230,7 @@ export function ChatPresetsItem({ item }: { item: NavChatPresets }) {
       window.open(url, '_blank', 'noopener')
       setOpenMobile(false)
     },
-    [serverAddress, setOpenMobile, t]
+    [openV2, serverAddress, setOpenMobile, t]
   )
 
   const normalizedHref = normalizeHref(href)
@@ -246,7 +257,7 @@ export function ChatPresetsItem({ item }: { item: NavChatPresets }) {
               <DropdownPresetItem
                 key={preset.id}
                 preset={preset}
-                loading={loadingPresetId === preset.id}
+                loading={isOpening || loadingPresetId === preset.id}
                 onOpen={handleOpenExternal}
               />
             ))}
@@ -278,7 +289,7 @@ export function ChatPresetsItem({ item }: { item: NavChatPresets }) {
               key={preset.id}
               preset={preset}
               active={normalizedHref === `/chat/${preset.id}`}
-              loading={loadingPresetId === preset.id}
+              loading={isOpening || loadingPresetId === preset.id}
               onOpen={handleOpenExternal}
               onNavigate={() => setOpenMobile(false)}
               preload={isMobile ? false : undefined}

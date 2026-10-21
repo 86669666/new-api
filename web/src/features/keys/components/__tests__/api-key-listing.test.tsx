@@ -43,8 +43,13 @@ import { I18nextProvider } from 'react-i18next'
 import { Toaster, toast } from 'sonner'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
+import {
+  CHERRY_V2_TEMPLATE,
+  CHERRY_V2_ORIGIN_WARNING,
+} from '@/features/chat/lib/chat-links'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
@@ -149,6 +154,7 @@ afterEach(() => {
   useSystemConfigStore
     .getState()
     .setConfig({ currency: { ...DEFAULT_CURRENCY_CONFIG } })
+  useAuthStore.getState().auth.reset()
 })
 
 it('shows desktop remaining and used amounts side by side without labels, with the currency only in the header', () => {
@@ -303,9 +309,24 @@ function KeysPage() {
   )
 }
 
-async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
+async function renderKeysPage(
+  status = 1,
+  overrides: Partial<ApiKey> = {},
+  chats: Array<Record<string, string>> = [],
+  serverAddress = 'https://gateway.example'
+) {
   let currentKey = { ...key, status, ...overrides }
+  const site = {
+    instance_id: '12345678-1234-4234-8234-123456789abc',
+    system_name: 'Fixture',
+    server_address: serverAddress,
+    chats,
+  }
   vi.mocked(api.get).mockImplementation(async (url) => {
+    if (url === '/api/status') return { data: { success: true, data: site } }
+    if (url === `/api/token/${currentKey.id}`) {
+      return { data: { success: true, data: currentKey } }
+    }
     if (url.startsWith('/api/token/')) {
       return {
         data: { success: true, data: { items: [currentKey], total: 1 } },
@@ -324,7 +345,7 @@ async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
-  client.setQueryData(['status'], {})
+  client.setQueryData(['status'], chats.length ? site : {})
   clients.push(client)
   const root = createRootRoute()
   const auth = createRoute({ getParentRoute: () => root, id: '_authenticated' })
@@ -346,7 +367,7 @@ async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
     </I18nextProvider>
   )
   await screen.findByText(currentKey.name)
-  return { post, put }
+  return { post, put, client, get: vi.mocked(api.get) }
 }
 
 it('combines creation and last use while keeping expiry, models and IP restrictions separate', async () => {
@@ -524,4 +545,123 @@ it('keeps mobile quota readable and opens complete model and IP restrictions by 
   details = await screen.findByRole('dialog')
   expect(within(details).getByText('192.0.2.1')).toBeVisible()
   expect(within(details).getByText('2001:db8::1')).toBeVisible()
+})
+
+function loginForCherryImport() {
+  useAuthStore.getState().auth.setBundle({
+    access_token: 'synthetic-dashboard',
+    token_type: 'Bearer',
+    access_expires_at: 9999999999,
+    user: { id: 1, username: 'fixture', role: 1 },
+    session: {
+      sid: 'fixture-session',
+      current: true,
+      login_method: 'password',
+      ip: '',
+      user_agent: '',
+      created_at: 1,
+      last_active_at: 1,
+      expires_at: 9999999999,
+    },
+  })
+}
+
+it('exports only the explicitly selected row key and shows the empty-address administrator warning', async () => {
+  loginForCherryImport()
+  const user = userEvent.setup()
+  const { post } = await renderKeysPage(
+    1,
+    { id: 9, name: 'selected-row' },
+    [{ Cherry: CHERRY_V2_TEMPLATE }],
+    ''
+  )
+  const open = vi.spyOn(window, 'open').mockReturnValue(null)
+  const warning = vi.spyOn(toast, 'warning')
+  expect(post).not.toHaveBeenCalled()
+  await user.click(screen.getByRole('button', { name: 'Open menu' }))
+  await user.click(screen.getByRole('menuitem', { name: 'Chat' }))
+  await user.keyboard('{ArrowRight}')
+  const cherry = await screen.findByRole('menuitem', { name: 'Cherry' })
+  await waitFor(() => expect(cherry).toHaveFocus())
+  await user.keyboard('{Enter}')
+  await waitFor(() => expect(open).toHaveBeenCalledTimes(1))
+  expect(post).toHaveBeenCalledExactlyOnceWith(
+    '/api/token/9/key',
+    undefined,
+    expect.objectContaining({ skipAuthRefresh: true, skipErrorHandler: true })
+  )
+  const payload = JSON.parse(
+    Buffer.from(
+      new URL(String(open.mock.calls[0][0])).searchParams.get('data') ?? '',
+      'base64url'
+    ).toString('utf8')
+  )
+  expect(payload.apiKey).toBe('sk-fake-key-for-test-only')
+  expect(payload.baseUrl).toBe(window.location.origin)
+  expect(warning).toHaveBeenCalledWith(CHERRY_V2_ORIGIN_WARNING)
+  expect(document.body.textContent).not.toContain('fake-key-for-test-only')
+  expect(JSON.stringify(localStorage)).not.toContain('fake-key-for-test-only')
+})
+
+it('does not reveal or open an obsolete selected row after replacement during status preparation', async () => {
+  loginForCherryImport()
+  const user = userEvent.setup()
+  const { post, get, client } = await renderKeysPage(
+    1,
+    { id: 9, name: 'selected-row' },
+    [{ Cherry: CHERRY_V2_TEMPLATE }]
+  )
+  const open = vi.spyOn(window, 'open').mockReturnValue(null)
+  let release!: (value: {
+    data: { success: boolean; data: Record<string, unknown> }
+  }) => void
+  const gate = new Promise<{
+    data: { success: boolean; data: Record<string, unknown> }
+  }>((resolve) => {
+    release = resolve
+  })
+  const original = get.getMockImplementation()
+  if (!original) {
+    throw new Error('Expected API mock implementation')
+  }
+  get.mockImplementation(async (...args) =>
+    args[0] === '/api/status' ? gate : original(...args)
+  )
+  await user.click(screen.getByRole('button', { name: 'Open menu' }))
+  await user.click(screen.getByRole('menuitem', { name: 'Chat' }))
+  await user.keyboard('{ArrowRight}')
+  const cherry = await screen.findByRole('menuitem', { name: 'Cherry' })
+  await waitFor(() => expect(cherry).toHaveFocus())
+  await user.keyboard('{Enter}')
+  const existing = client.getQueriesData<{ items: ApiKey[]; total: number }>({
+    queryKey: ['keys'],
+  })
+  expect(existing).toHaveLength(1)
+  expect(existing[0]?.[1]?.items.map((item) => item.id)).toEqual([9])
+  act(() => {
+    const updated = client.setQueriesData(
+      { queryKey: ['keys'] },
+      {
+        items: [{ ...key, id: 8, name: 'replacement-row' }],
+        total: 1,
+      }
+    )
+    expect(updated).toHaveLength(1)
+  })
+  await screen.findByText('replacement-row')
+  await act(async () => {
+    release({
+      data: {
+        success: true,
+        data: {
+          instance_id: '12345678-1234-4234-8234-123456789abc',
+          system_name: 'Fixture',
+          server_address: 'https://gateway.example',
+        },
+      },
+    })
+    await gate
+  })
+  expect(post).not.toHaveBeenCalled()
+  expect(open).not.toHaveBeenCalled()
 })

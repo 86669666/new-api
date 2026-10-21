@@ -45,6 +45,140 @@ export type ActiveApiKey = {
   status: number
 }
 
+export const CHERRY_V2_TEMPLATE =
+  'cherrystudio://providers/api-keys?v=2&data={cherryConfigV2}'
+export const CHERRY_V2_ERROR =
+  'Unable to prepare Cherry Studio v2 import. Check the site configuration and selected API key.'
+export const CHERRY_V2_ORIGIN_WARNING =
+  'Server address is not configured. Using this page’s origin; ask the administrator to configure the API address.'
+
+export function isCherryV2Attempt(template: string): boolean {
+  // Recognize encoded/nested attempts for classification too. Only the exact
+  // unencoded canonical template is accepted by the explicit export path.
+  let decoded = template
+  for (let depth = 0; depth < 3; depth++) {
+    if (/cherryconfigv2/i.test(decoded)) return true
+    decoded = decoded.replaceAll(/%([0-9a-f]{2})/gi, (_, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16))
+    )
+  }
+  return false
+}
+
+export function validateCherryV2Template(template: string): void {
+  if (template !== CHERRY_V2_TEMPLATE) throw new Error(CHERRY_V2_ERROR)
+}
+
+export type CherryV2Site = {
+  instance_id: unknown
+  system_name: unknown
+  server_address: unknown
+}
+
+export function cherryV2BaseUrl(
+  configured: unknown,
+  origin: string
+): { baseUrl: string; usedOrigin: boolean } {
+  if (configured != null && typeof configured !== 'string') {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  const usedOrigin = configured == null || configured === ''
+  const raw = usedOrigin ? origin : (configured as string)
+  if (/[\s\\?#]|\p{Cc}/u.test(raw)) {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  // Check before URL normalizes away dot segments or escaped separators.
+  const match = /^https?:\/\/([^/]+)(\/.*)?$/i.exec(raw)
+  if (!match || match[1].includes('@') || match[1].endsWith(':')) {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  let path: string
+  try {
+    path = decodeURIComponent(match[2] ?? '')
+  } catch {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  if (
+    /%|[\\?#]|\p{Cc}/u.test(path) ||
+    /%2f|%5c/i.test(match[2] ?? '') ||
+    path.includes('//') ||
+    path.split('/').some((segment) => segment === '.' || segment === '..')
+  ) {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  if (
+    !url.hostname ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.host.endsWith(':') ||
+    url.port === '0'
+  ) {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '')
+  return { baseUrl: url.toString().replace(/\/+$/, ''), usedOrigin }
+}
+
+export function validateCherryV2Site(
+  site: CherryV2Site,
+  origin: string
+): { baseUrl: string; usedOrigin: boolean } {
+  if (
+    typeof site.instance_id !== 'string' ||
+    !/^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+      site.instance_id
+    ) ||
+    site.instance_id.length !== 36 ||
+    typeof site.system_name !== 'string' ||
+    !site.system_name.trim()
+  ) {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  return cherryV2BaseUrl(site.server_address, origin)
+}
+
+export function buildCherryV2Url(
+  site: CherryV2Site,
+  apiKey: string,
+  group: string,
+  origin: string
+): { url: string; usedOrigin: boolean } {
+  const { baseUrl, usedOrigin } = validateCherryV2Site(site, origin)
+  const key = normalizeApiKey(apiKey)
+  if (!key || /\s|\p{Cc}/u.test(key) || !group.trim()) {
+    throw new Error(CHERRY_V2_ERROR)
+  }
+  const payload = JSON.stringify({
+    v: 2,
+    site_id: site.instance_id,
+    type: 'new-api',
+    name: site.system_name,
+    baseUrl,
+    apiKey: key,
+    group,
+    recommended_models: [],
+    default_model: '',
+  })
+  const bytes = new TextEncoder().encode(payload)
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')
+  const encoded = btoa(binary)
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replace(/=+$/, '')
+  return {
+    url: `cherrystudio://providers/api-keys?v=2&data=${encoded}`,
+    usedOrigin,
+  }
+}
+
 const HTTP_REGEX = /^https?:\/\//i
 
 function toBase64(value: string) {
@@ -75,6 +209,7 @@ function toBase64(value: string) {
 }
 
 export function detectChatLinkType(url: string): ChatLinkType {
+  if (isCherryV2Attempt(url)) return 'custom-protocol'
   if (HTTP_REGEX.test(url)) {
     return 'web'
   }
@@ -86,6 +221,7 @@ export function detectChatLinkType(url: string): ChatLinkType {
 
 export function chatLinkRequiresApiKey(url: string): boolean {
   return (
+    isCherryV2Attempt(url) ||
     url.includes('{key}') ||
     url.includes('{cherryConfig}') ||
     url.includes('{aionuiConfig}') ||
@@ -155,6 +291,8 @@ export function resolveChatUrl({
   apiKey,
   serverAddress,
 }: ResolveChatUrlParams): string {
+  // V2 is explicit-action only; never use this legacy/automatic resolver.
+  if (isCherryV2Attempt(template)) return ''
   let url = template
   const safeServerAddress = serverAddress || ''
 

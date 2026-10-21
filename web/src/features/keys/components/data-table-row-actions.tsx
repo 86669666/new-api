@@ -47,8 +47,13 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { useCherryStudioV2Import } from '@/features/chat/hooks/use-active-chat-key'
 import { useChatPresets } from '@/features/chat/hooks/use-chat-presets'
-import { resolveChatUrl, type ChatPreset } from '@/features/chat/lib/chat-links'
+import {
+  isCherryV2Attempt,
+  resolveChatUrl,
+  type ChatPreset,
+} from '@/features/chat/lib/chat-links'
 import { sendToFluent } from '@/features/chat/lib/send-to-fluent'
 import { encodeChannelConnectionInfo } from '@/lib/channel-connection-info'
 import { copyToClipboard } from '@/lib/copy-to-clipboard'
@@ -91,6 +96,9 @@ export function DataTableRowActions<TData>({
   } = useApiKeys()
   const isEnabled = apiKey.status === API_KEY_STATUS.ENABLED
   const { chatPresets, serverAddress } = useChatPresets()
+  const { openV2, isOpening } = useCherryStudioV2Import(
+    `${apiKey.id}:${chatPresets.map((preset) => preset.url).join('\n')}`
+  )
   const [isTogglingStatus, setIsTogglingStatus] = useState(false)
   const isRealKeyLoading = Boolean(loadingKeys[apiKey.id])
 
@@ -99,6 +107,10 @@ export function DataTableRowActions<TData>({
 
   const handleOpenChatPreset = useCallback(
     async (preset: ChatPreset) => {
+      if (isCherryV2Attempt(preset.url)) {
+        await openV2(preset.url, apiKey.id)
+        return
+      }
       const realKey = await resolveRealKey(apiKey.id)
       if (!realKey) return
 
@@ -135,7 +147,7 @@ export function DataTableRowActions<TData>({
         window.location.href = resolvedUrl
       }
     },
-    [resolveRealKey, apiKey.id, serverAddress, t]
+    [openV2, resolveRealKey, apiKey.id, serverAddress, t]
   )
 
   const handleToggleStatus = async (
@@ -274,6 +286,7 @@ export function DataTableRowActions<TData>({
               {chatPresets.map((preset) => (
                 <DropdownMenuItem
                   key={preset.id}
+                  disabled={isOpening}
                   onClick={() => handleOpenChatPreset(preset)}
                 >
                   {preset.name}
