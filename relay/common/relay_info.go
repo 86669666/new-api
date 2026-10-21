@@ -717,6 +717,10 @@ func GenRelayInfo(c *gin.Context, relayFormat types.RelayFormat, request dto.Req
 			return GenRelayInfoResponsesCompaction(c, request), nil
 		}
 		return nil, errors.New("request is not a OpenAIResponsesCompactionRequest")
+	case types.RelayFormatDeepSeekToolsSearch:
+		info = genBaseRelayInfo(c, request)
+		info.OriginModelName = constant.DeepSeekSearchModel
+		info.RelayFormat = types.RelayFormatDeepSeekToolsSearch
 	case types.RelayFormatOpenAIAlphaSearch:
 		if request, ok := request.(*dto.AlphaSearchRequest); ok {
 			return GenRelayInfoAlphaSearch(c, request), nil

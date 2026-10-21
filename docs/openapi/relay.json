@@ -68,6 +68,9 @@
     },
     {
       "name": "未实现/Files"
+    },
+    {
+      "name": "Native Search"
     }
   ],
   "paths": {
@@ -4644,6 +4647,156 @@
         ],
         "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
       }
+    },
+    "/v1/tools/search": {
+      "post": {
+        "summary": "Native DeepSeek structured search",
+        "operationId": "searchDeepSeekTools",
+        "tags": [
+          "Native Search"
+        ],
+        "description": "Native DeepSeek Search only; requires an operator-configured eligible channel. The server-owned subject deepseek-search is fixed before token model authorization/channel distribution and remains the billing/log identity. Body model/group and administrator mapping/overrides cannot change that authority. Known outgoing fields remain validated after overrides. Default billing is one request at USD0.00075; count does not multiply it. Administrator expressions/legacy prices, explicit zero and group overrides remain authoritative. Responses are completely buffered and validated with a gateway 16MiB cap (not a provider limit), within a 30-second attempt deadline or an earlier caller/transport deadline. Only original valid nonempty HTTP200 settles. Empty/error refunds ordinary local reservation, subject to the separate existing violation-fee policy. Fully received original408/429/5xx may follow existing bounded retry policy; an ambiguous sent outcome, truncated/invalid200 or downstream delivery failure is never automatically replayed. Local refund is not proof of no provider charge; separate client requests have no provider idempotency guarantee. No tools/fetch, Responses fallback or provider availability is supplied. For legacy per-call prices this new endpoint uses fixed-expression rounding; an initial truncated reservation can be topped up by one quota unit. Non-trusted wallet top-ups reserve available quota atomically; existing trusted-session/subscription policies remain unchanged.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PersonalOrganizationHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PersonalOrganizationQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeepSeekSearchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Complete valid native search response. Empty results refund the ordinary local reservation; nonempty results settle one fixed search request before delivery.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeepSeekSearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid known request field or organization selector. 请求参数错误 Organization boundary: ORG_SELECTOR_INVALID; ORG_SELECTOR_CONFLICT. Boundary rejections occur before authentication and return Cache-Control: private, no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store on organization-boundary rejection; other existing failures retain their own headers."
+              }
+            }
+          },
+          "401": {
+            "description": "Relay credential rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Current token/user/IP/model/group policy or organization boundary rejected. Token/user/IP/model policy rejected before response begins Organization boundary: ORG_RESOURCE_UNSUPPORTED. Boundary rejections occur before authentication and return Cache-Control: private, no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionUnsupportedError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store on organization-boundary rejection; other existing failures retain their own headers."
+              }
+            }
+          },
+          "429": {
+            "description": "Request rate limit or completely received upstream rate rejection.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Incomplete, invalid, oversized, unknown transport result or unsupported successful status; never replayed automatically.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No available eligible channel, or a completely received upstream failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unsupported configured native channel or local internal failure before publication.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access",
+        "x-fixed-model": "deepseek-search",
+        "x-response-max-bytes": 16777216,
+        "x-attempt-timeout-seconds": 30,
+        "x-automatic-replay-unknown-outcome": false
+      }
     }
   },
   "components": {
@@ -7516,6 +7669,114 @@
             "type": "string"
           }
         ]
+      },
+      "DeepSeekSearchRequest": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "\\S",
+            "description": "Search expression, preserved verbatim; 1..128 Unicode characters and at least one non-whitespace character."
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 10
+          },
+          "need_content": {
+            "type": "boolean",
+            "default": false
+          },
+          "ori_question": {
+            "type": "string",
+            "nullable": true,
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "localization": {
+            "type": "string",
+            "default": "",
+            "description": "Empty or a valid IPv4/IPv6 address; checked by the gateway."
+          }
+        },
+        "description": "Known fields are validated; duplicate object keys and trailing JSON are rejected. Unknown extensions are preserved. model/group extensions never select gateway identity, routing group, or pricing."
+      },
+      "DeepSeekSearchResult": {
+        "type": "object",
+        "required": [
+          "title",
+          "url",
+          "snippet",
+          "summary",
+          "content",
+          "rerank_score",
+          "authority",
+          "site_name",
+          "site_icon",
+          "date"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "snippet": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "rerank_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "authority": {
+            "type": "integer",
+            "minimum": -1,
+            "maximum": 4
+          },
+          "site_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "site_icon": {
+            "type": "string",
+            "nullable": true
+          },
+          "date": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$(?![\\s\\S])"
+          }
+        }
+      },
+      "DeepSeekSearchResponse": {
+        "type": "object",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeepSeekSearchResult"
+            }
+          }
+        },
+        "description": "Complete original HTTP200 JSON only. Nullable site/date fields and unknown extensions are preserved. Result URLs are data and are never fetched by the gateway."
       }
     },
     "responses": {

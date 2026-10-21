@@ -72,6 +72,37 @@ def go_function(source, name):
     return re.sub(r'\s+', ' ', match.group())
 
 
+def check_native_search(relay):
+    operation = relay['paths']['/v1/tools/search']['post']
+    assert set(relay['paths']['/v1/tools/search']) == {'post'}
+    assert operation['operationId'] == 'searchDeepSeekTools'
+    assert operation['security'] == [{'BearerAuth': []}]
+    assert operation['x-fixed-model'] == 'deepseek-search'
+    assert operation['x-response-max-bytes'] == 16 * 1024 * 1024
+    assert operation['x-attempt-timeout-seconds'] == 30
+    assert operation['x-automatic-replay-unknown-outcome'] is False
+    schemas = relay['components']['schemas']
+    request = schemas['DeepSeekSearchRequest']
+    assert request['type'] == 'object' and request['required'] == ['query']
+    assert request.get('additionalProperties', True) is True
+    assert set(request['properties']) == {'query', 'count', 'need_content', 'ori_question', 'localization'}
+    assert request['properties']['count'] == {'type': 'integer', 'minimum': 1, 'maximum': 50, 'default': 10}
+    assert request['properties']['need_content'] == {'type': 'boolean', 'default': False}
+    query = request['properties']['query']
+    assert query['type'] == 'string' and query['minLength'] == 1 and query['maxLength'] == 128
+    result = schemas['DeepSeekSearchResult']
+    assert set(result['required']) == set(result['properties']) == {
+        'title', 'url', 'snippet', 'summary', 'content', 'rerank_score', 'authority', 'site_name', 'site_icon', 'date'}
+    for field in ('site_name', 'site_icon', 'date'):
+        assert result['properties'][field]['nullable'] is True
+    assert result['properties']['rerank_score'] == {'type': 'number', 'minimum': 0, 'maximum': 3}
+    assert result['properties']['authority'] == {'type': 'integer', 'minimum': -1, 'maximum': 4}
+    assert operation['responses']['200']['content'] == {'application/json': {'schema': {'$ref': '#/components/schemas/DeepSeekSearchResponse'}}}
+    assert operation['parameters'] == relay['paths']['/v1/chat/completions']['post']['parameters']
+    return {'route': '/v1/tools/search', 'native_only': True, 'fixed_model': 'deepseek-search',
+            'bounded_complete_response': True, 'provider_io': False}
+
+
 def check_oauth_userinfo(api, source_root):
     path = '/api/v1/oauth/userinfo'
     assert set(api['paths'][path]) == {'get'}
@@ -1042,6 +1073,7 @@ def main():
 
     api, relay = documents['api'], documents['relay']
     results['no_available_channel_detail'] = check_no_available_channel_detail(relay)
+    results['native_search'] = check_native_search(relay)
     access = api['components']['schemas']['OrganizationAccess']['properties']['capabilities']
     context_access = api['components']['schemas']['RequestAccessContext']['properties']['organization']['properties']['capabilities']
     assert access == context_access, 'Organization capability projections differ between detail and context'

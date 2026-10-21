@@ -358,7 +358,11 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 	var modelRequest ModelRequest
 	shouldSelectChannel := true
 	var err error
-	if modelName := c.GetString("resolved_task_model"); modelName != "" {
+	// Native Search has no client model/group selector. Bind before any body
+	// model decoding as well as token model authorization and distribution.
+	if c.Request.URL.Path == "/v1/tools/search" {
+		modelRequest.Model = constant.DeepSeekSearchModel
+	} else if modelName := c.GetString("resolved_task_model"); modelName != "" {
 		modelRequest.Model = modelName
 	} else if strings.Contains(c.Request.URL.Path, "/mj/") {
 		relayMode := relayconstant.Path2RelayModeMidjourney(c.Request.URL.Path)

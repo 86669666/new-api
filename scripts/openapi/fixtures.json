@@ -12179,5 +12179,252 @@
       "cause": "private"
     },
     "valid": false
+  },
+  {
+    "name": "native search defaults",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {
+      "query": "site:example.invalid exact phrase"
+    },
+    "valid": true
+  },
+  {
+    "name": "native search optional false null extensions",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {
+      "query": "query",
+      "count": 50,
+      "need_content": false,
+      "ori_question": null,
+      "localization": "",
+      "extension": null,
+      "model": {
+        "ignored": true
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "native search missing query",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {},
+    "valid": false
+  },
+  {
+    "name": "native search whitespace query",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {
+      "query": " \t\n"
+    },
+    "valid": false
+  },
+  {
+    "name": "native search query limit",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {
+      "query": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+    },
+    "valid": false
+  },
+  {
+    "name": "native search count zero",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {
+      "query": "q",
+      "count": 0
+    },
+    "valid": false
+  },
+  {
+    "name": "native search count noninteger",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {
+      "query": "q",
+      "count": 1.5
+    },
+    "valid": false
+  },
+  {
+    "name": "native search content wrong type",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {
+      "query": "q",
+      "need_content": 0
+    },
+    "valid": false
+  },
+  {
+    "name": "native search empty original question",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchRequest",
+    "value": {
+      "query": "q",
+      "ori_question": ""
+    },
+    "valid": false
+  },
+  {
+    "name": "native search nullable result",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchResponse",
+    "value": {
+      "results": [
+        {
+          "title": "Owned result",
+          "url": "https://example.invalid/r",
+          "snippet": "snippet",
+          "summary": "summary",
+          "content": "text",
+          "rerank_score": 2.5,
+          "authority": -1,
+          "site_name": null,
+          "site_icon": null,
+          "date": null,
+          "extension": null
+        }
+      ],
+      "extension": null
+    },
+    "valid": true
+  },
+  {
+    "name": "native search empty",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchResponse",
+    "value": {
+      "results": []
+    },
+    "valid": true
+  },
+  {
+    "name": "native search dated result",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchResponse",
+    "value": {
+      "results": [
+        {
+          "title": "Owned result",
+          "url": "https://example.invalid/r",
+          "snippet": "snippet",
+          "summary": "summary",
+          "content": "text",
+          "rerank_score": 2.5,
+          "authority": -1,
+          "site_name": "Owned",
+          "site_icon": null,
+          "date": "2026-10-22T00:00:00Z",
+          "extension": null
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "native search null results",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchResponse",
+    "value": {
+      "results": null
+    },
+    "valid": false
+  },
+  {
+    "name": "native search missing required",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchResponse",
+    "value": {
+      "results": [
+        {
+          "title": "Owned result",
+          "url": "https://example.invalid/r",
+          "snippet": "snippet",
+          "summary": "summary",
+          "rerank_score": 2.5,
+          "authority": -1,
+          "site_name": null,
+          "site_icon": null,
+          "date": null,
+          "extension": null
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "native search score bounds",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchResponse",
+    "value": {
+      "results": [
+        {
+          "title": "Owned result",
+          "url": "https://example.invalid/r",
+          "snippet": "snippet",
+          "summary": "summary",
+          "content": "text",
+          "rerank_score": 3.1,
+          "authority": -1,
+          "site_name": null,
+          "site_icon": null,
+          "date": null,
+          "extension": null
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "native search authority integer",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchResponse",
+    "value": {
+      "results": [
+        {
+          "title": "Owned result",
+          "url": "https://example.invalid/r",
+          "snippet": "snippet",
+          "summary": "summary",
+          "content": "text",
+          "rerank_score": 2.5,
+          "authority": 1.5,
+          "site_name": null,
+          "site_icon": null,
+          "date": null,
+          "extension": null
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "native search invalid date",
+    "document": "relay",
+    "schema": "#/components/schemas/DeepSeekSearchResponse",
+    "value": {
+      "results": [
+        {
+          "title": "Owned result",
+          "url": "https://example.invalid/r",
+          "snippet": "snippet",
+          "summary": "summary",
+          "content": "text",
+          "rerank_score": 2.5,
+          "authority": -1,
+          "site_name": null,
+          "site_icon": null,
+          "date": "yesterday",
+          "extension": null
+        }
+      ]
+    },
+    "valid": false
   }
 ]

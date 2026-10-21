@@ -67,6 +67,8 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			fimBaseUrl += "/beta"
 		}
 		switch info.RelayMode {
+		case constant.RelayModeToolsSearch:
+			return fmt.Sprintf("%s/v1/tools/search", strings.TrimRight(info.ChannelBaseUrl, "/")), nil
 		case constant.RelayModeCompletions:
 			return fmt.Sprintf("%s/completions", fimBaseUrl), nil
 		case constant.RelayModeResponses:

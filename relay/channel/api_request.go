@@ -322,7 +322,15 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
+	if info.RelayMode == constant.RelayModeToolsSearch {
+		req = req.WithContext(c.Request.Context())
+	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
+	if info.RelayMode == constant.RelayModeToolsSearch {
+		// An operator-supplied idempotency header is not a provider replay
+		// guarantee. Explicit controller retries build a fresh request body.
+		req.GetBody = nil
+	}
 	headers := req.Header
 	err = a.SetupRequestHeader(c, &headers, info)
 	if err != nil {

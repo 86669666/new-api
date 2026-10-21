@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -39,6 +41,8 @@ func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dt
 		request, err = GetAndValidateResponsesRequest(c)
 	case types.RelayFormatOpenAIResponsesCompaction:
 		request, err = GetAndValidateResponsesCompactionRequest(c)
+	case types.RelayFormatDeepSeekToolsSearch:
+		request, err = GetAndValidateDeepSeekSearchRequest(c)
 	case types.RelayFormatOpenAIAlphaSearch:
 		request, err = GetAndValidateAlphaSearchRequest(c)
 
@@ -408,4 +412,56 @@ func GetAndValidateGeminiBatchEmbeddingRequest(c *gin.Context) (*dto.GeminiBatch
 		return nil, err
 	}
 	return request, nil
+}
+
+// ValidateDeepSeekSearchBody also validates the final administrative override.
+// Unknown values remain raw extensions, never routing or pricing authority.
+func ValidateDeepSeekSearchBody(raw []byte) error {
+	fields, err := common.DecodeRawJSONObject(raw)
+	if err != nil {
+		return errors.New("invalid search JSON object")
+	}
+	var query string
+	if common.GetJsonType(fields["query"]) != "string" || common.Unmarshal(fields["query"], &query) != nil || strings.TrimSpace(query) == "" || utf8.RuneCountInString(query) > 128 {
+		return errors.New("query must contain 1 to 128 Unicode characters")
+	}
+	if value, ok := fields["count"]; ok {
+		var count int
+		if common.GetJsonType(value) != "number" || common.Unmarshal(value, &count) != nil || count < 1 || count > 50 {
+			return errors.New("count must be an integer between 1 and 50")
+		}
+	}
+	if value, ok := fields["need_content"]; ok {
+		var enabled bool
+		if common.GetJsonType(value) != "boolean" || common.Unmarshal(value, &enabled) != nil {
+			return errors.New("need_content must be a boolean")
+		}
+	}
+	if value, ok := fields["ori_question"]; ok && common.GetJsonType(value) != "null" {
+		var question string
+		if common.GetJsonType(value) != "string" || common.Unmarshal(value, &question) != nil || utf8.RuneCountInString(question) < 1 || utf8.RuneCountInString(question) > 128 {
+			return errors.New("ori_question must be null or contain 1 to 128 Unicode characters")
+		}
+	}
+	if value, ok := fields["localization"]; ok {
+		var ip string
+		if common.GetJsonType(value) != "string" || common.Unmarshal(value, &ip) != nil || ip != "" && net.ParseIP(ip) == nil {
+			return errors.New("localization must be an IP address or empty")
+		}
+	}
+	return nil
+}
+func GetAndValidateDeepSeekSearchRequest(c *gin.Context) (*dto.DeepSeekToolsRequest, error) {
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := storage.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	if err = ValidateDeepSeekSearchBody(raw); err != nil {
+		return nil, err
+	}
+	return &dto.DeepSeekToolsRequest{Model: "deepseek-search", RawBody: raw}, nil
 }

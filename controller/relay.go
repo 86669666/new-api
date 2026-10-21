@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
@@ -48,6 +51,8 @@ func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIErro
 		err = relay.EmbeddingHelper(c, info)
 	case relayconstant.RelayModeResponses, relayconstant.RelayModeResponsesCompact:
 		err = relay.ResponsesHelper(c, info)
+	case relayconstant.RelayModeToolsSearch:
+		err = relay.DeepSeekToolsHelper(c, info)
 	case relayconstant.RelayModeAlphaSearch:
 		err = relay.AlphaSearchHelper(c, info)
 	default:
@@ -64,6 +69,45 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 		err = relay.GeminiHelper(c, info)
 	}
 	return err
+}
+
+// bindToolsSearchLegacyPrice preserves the frozen per-request USD price while
+// using the fixed-expression engine for zero-token success and group reservation.
+// Its rounded target is not the session's actual (legacy-truncated) reservation.
+func bindToolsSearchLegacyPrice(info *relaycommon.RelayInfo) error {
+	price := info.PriceData.ModelPrice
+	group := info.PriceData.GroupRatioInfo.GroupRatio
+	unit := common.QuotaPerUnit
+	if math.IsNaN(price) || math.IsInf(price, 0) || price < 0 || math.IsNaN(group) || math.IsInf(group, 0) || group < 0 || math.IsNaN(unit) || math.IsInf(unit, 0) || unit <= 0 {
+		return errors.New("invalid fixed search price")
+	}
+	for _, ratio := range info.PriceData.OtherRatios() {
+		if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 {
+			return errors.New("invalid search price ratio")
+		}
+		price *= ratio
+		if math.IsNaN(price) || math.IsInf(price, 0) {
+			return errors.New("invalid effective search price")
+		}
+	}
+	expression := `tier("request", fixed(` + strconv.FormatFloat(price, 'g', -1, 64) + `))`
+	cost, trace, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{})
+	if err != nil {
+		return err
+	}
+	beforeGroup := cost / 1_000_000 * unit
+	target, err := billingexpr.QuotaRoundStrict(beforeGroup * group)
+	if err != nil {
+		return err
+	}
+	info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+		BillingMode: "tiered_expr", ModelName: info.GetBillingModelName(),
+		ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), ExprVersion: billingexpr.ExprVersion(expression),
+		GroupRatio: group, QuotaPerUnit: unit, PreConsumeMultiplier: 1,
+		EstimatedQuotaBeforeGroup: beforeGroup, EstimatedQuotaAfterGroup: target,
+		EstimatedTier: trace.MatchedTier, EstimatedBillingUnit: trace.BillingUnit, EstimatedFixedPrice: trace.FixedPrice,
+	}
+	return nil
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -146,6 +190,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		newAPIError = relay.RefundFailedRequestBilling(c, relayInfo, newAPIError)
 	}()
+	if relayInfo.RelayMode == relayconstant.RelayModeToolsSearch && relayInfo.PriceData.UsePrice && relayInfo.TieredBillingSnapshot == nil {
+		if err := bindToolsSearchLegacyPrice(relayInfo); err != nil {
+			newAPIError = types.NewErrorWithStatusCode(errors.New("invalid search request price"), types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			return
+		}
+	}
 
 	retryParam := &service.RetryParam{
 		Ctx:         c,
@@ -169,7 +219,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		service.AppendUsedChannel(c, channel.Id)
-		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
+		// Preserve the legacy explicit-free-price admission policy. A zero
+		// request price remains free in every group and needs no new session.
+		freeLegacySearch := relayInfo.RelayMode == relayconstant.RelayModeToolsSearch && relayInfo.PriceData.UsePrice && relayInfo.PriceData.FreeModel && relayInfo.Billing == nil && relayInfo.TieredBillingSnapshot != nil && relayInfo.TieredBillingSnapshot.EstimatedQuotaBeforeGroup == 0
+		if freeLegacySearch {
+			relayInfo.TieredBillingSnapshot.GroupRatio = relayInfo.PriceData.GroupRatioInfo.GroupRatio
+		} else if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
 			newAPIError = billingErr
 			break
 		}

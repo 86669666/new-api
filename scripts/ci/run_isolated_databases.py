@@ -705,6 +705,7 @@ ORGANIZATION_READ_SUITES = {
     'organization-task-funding-isolation': (frozenset(('TestOrganizationTaskFundingIsolation',)), 'g15-organization-task-funding-isolation'),
     'organization-capabilities': (frozenset(('TestOrganizationCapabilityProjection', 'TestOrganizationAccessHTTP')), 'g16-organization-capabilities'),
     'organization-wallet': (frozenset(('TestOrganizationWalletLifecycle',)), 'g17-organization-wallet'),
+    'tools-search': (frozenset(('TestToolsSearchRelayHTTP',)), 'g19-tools-search'),
     'client-events-receiver': (frozenset(('TestClientEventsReceiverHTTP',)), 'g19-client-events-receiver'),
     'client-events-receiver-http-only': (frozenset(('TestClientEventsReceiverHTTP',)), 'g19-client-events-receiver'),
     'site-description': (frozenset(('TestSiteDescriptionHTTP',)), 'g18-site-description'),
@@ -887,6 +888,11 @@ def validate_organization_identity_events(events, suite='organization-identity')
     if suite == 'organization-wallet' and passed != required | {None} | {
             'TestOrganizationWalletLifecycle/' + name for name in ORGANIZATION_WALLET_CASES}:
         raise ValueError('every exact wallet regression case must pass without unrelated tests')
+    if suite == 'tools-search' and passed != required | {None} | {
+            'TestToolsSearchRelayHTTP/' + name for name in (
+                'admission_and_fixed_routing', 'structured_response_and_request_settlement',
+                'upstream_failures_and_refunds')}:
+        raise ValueError('every exact native search case must pass without unrelated tests')
     if suite == 'site-description' and passed != required | {None,
             'TestSiteDescriptionHTTP/shared_identity_and_reopen',
             'TestSiteDescriptionHTTP/reserved_option_and_failures',

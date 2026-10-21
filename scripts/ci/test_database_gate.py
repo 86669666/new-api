@@ -585,6 +585,28 @@ class OrganizationIdentityContracts(unittest.TestCase):
             self.assertEqual(result['release_commit'], released.CLIENT_EVENTS_RELEASE)
             self.assertEqual(result['suite'], suite);self.assertEqual(result['phases'], [])
 
+    def test_tools_search_suite_is_closed(self):
+        suite, root, package = 'tools-search', 'TestToolsSearchRelayHTTP', 'github.com/QuantumNous/new-api/router'
+        leaves = ('admission_and_fixed_routing', 'structured_response_and_request_settlement', 'upstream_failures_and_refunds')
+        events = [{'Action': 'pass', 'Package': package, 'Test': name} for name in
+                  [root] + [root + '/' + name for name in leaves]] + [{'Action': 'pass', 'Package': package}]
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite], (frozenset((root,)), 'g19-tools-search'))
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['passed_tests_and_subtests'], 4)
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:],
+                          events + [{'Action': 'skip'}], events + [{'Action': 'fail'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': root + '/unexpected'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': 'TestOrganizationTaskBatchRead'}],
+                          [dict(event, Package='github.com/QuantumNous/new-api/service') for event in events]):
+            with self.subTest(events=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+        with self.assertRaises(ValueError):
+            runner.validate_organization_identity_events(events, 'organization-identity')
+        for field in ('wallet_runtime', 'client_events_runtime'):
+            args = type('Args', (), {'suite': suite, field: Path('/unowned/migration')})()
+            with patch.object(runner, 'preflight') as provisioning, self.assertRaises(ValueError):
+                runner.run_organization_identity(args, [])
+            provisioning.assert_not_called()
+
     def test_model_capability_metadata_suite_is_closed(self):
         suite, root, package = 'model-capability-metadata', 'TestModelCapabilityMetadataHTTP', 'github.com/QuantumNous/new-api/router'
         leaves = ('authorized_projection_and_versions', 'strict_input_and_atomicity',

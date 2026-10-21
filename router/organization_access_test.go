@@ -38,6 +38,9 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/alicebob/miniredis/v2"
@@ -211,7 +214,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver", "g19-tools-search"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -4258,5 +4261,811 @@ func TestOrganizationRemainingContracts(t *testing.T) {
 		status, _, _ = f.request(t, "GET", "/v1/tasks/task-counter-missing/artifacts/video/content?access="+url.QueryEscape(capability)+"&org_id=1", "", "", nil)
 		require.Equal(t, 403, status)
 		assert.Equal(t, before, attempts.Load(), "selected task requests must not attempt task retrieval")
+	})
+}
+
+// The gateway still uses SetRouter, normal token auth, selection and settlement.
+// Only the downstream writer fails; the completed upstream outcome is unchanged.
+type toolsSearchRejectedWriter struct{ *httptest.ResponseRecorder }
+
+func (w *toolsSearchRejectedWriter) Write([]byte) (int, error) {
+	return 0, errors.New("test downstream closed")
+}
+
+// Observe the real outbound request before the ordinary loopback transport.
+// No request body/header is logged or altered by this test-only boundary.
+type toolsSearchRequestBoundary struct {
+	next  http.RoundTripper
+	t     *testing.T
+	calls atomic.Int64
+}
+
+func (b *toolsSearchRequestBoundary) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Path == "/v1/tools/search" {
+		b.calls.Add(1)
+		assert.NotNil(b.t, req.Body)
+		assert.Greater(b.t, req.ContentLength, int64(0))
+		assert.Nil(b.t, req.GetBody, "sent search must not be replayable by net/http")
+	}
+	return b.next.RoundTrip(req)
+}
+
+func TestToolsSearchRelayHTTP(t *testing.T) {
+	require.Equal(t, "g19-tools-search", os.Getenv("NEWAPI_S2_OWNED"))
+	if service.GetHttpClient() == nil {
+		service.InitHttpClient()
+	}
+	f := newOrganizationHTTPFixture(t)
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = map[string]string{}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+	})
+	outbound := service.GetHttpClient()
+	previousTransport := outbound.Transport
+	boundary := &toolsSearchRequestBoundary{next: previousTransport, t: t}
+	outbound.Transport = boundary
+	t.Cleanup(func() { outbound.Transport = previousTransport })
+	require.NoError(t, f.db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	oldCount, oldBatch, oldExport, oldLog, oldUnit := constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled, common.LogConsumeEnabled, common.QuotaPerUnit
+	constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled, common.LogConsumeEnabled, common.QuotaPerUnit = false, false, false, true, 500000
+	oldQuotaSetting := *operation_setting.GetQuotaSetting()
+	*operation_setting.GetQuotaSetting() = operation_setting.QuotaSetting{EnableFreeModelPreConsume: false, TrustQuotaUSD: 0, PreConsumeMultiplier: 1}
+	t.Cleanup(func() {
+		constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled, common.LogConsumeEnabled, common.QuotaPerUnit = oldCount, oldBatch, oldExport, oldLog, oldUnit
+		*operation_setting.GetQuotaSetting() = oldQuotaSetting
+	})
+	oldPolicy := maps.Clone(model.CurrentRequestPolicy().Options)
+	require.NoError(t, model.UpdateRequestPolicyOptions(map[string]string{"RetryTimes": "2", "AutomaticRetryStatusCodes": "408,429,500-599", "AutomaticDisableChannelEnabled": "false", "CheckSensitiveOnPromptEnabled": "false"}))
+	t.Cleanup(func() { require.NoError(t, model.UpdateRequestPolicyOptions(oldPolicy)) })
+	for _, snapshot := range []struct {
+		before string
+		write  func(string) error
+		next   string
+	}{
+		{setting.UserUsableGroups2JSONString(), setting.UpdateUserUsableGroupsByJSONString, `{"default":"Default","free":"Free","paid":"Paid","auto":"Auto"}`},
+		{setting.AutoGroups2JsonString(), setting.UpdateAutoGroupsByJsonString, `["free","paid"]`},
+		{ratio_setting.GroupRatio2JSONString(), ratio_setting.UpdateGroupRatioByJSONString, `{"default":1,"free":0,"paid":2}`},
+		{ratio_setting.GroupGroupRatio2JSONString(), ratio_setting.UpdateGroupGroupRatioByJSONString, `{}`},
+		{ratio_setting.ModelPrice2JSONString(), ratio_setting.UpdateModelPriceByJSONString, `{}`},
+		{ratio_setting.ModelRatio2JSONString(), ratio_setting.UpdateModelRatioByJSONString, `{}`},
+	} {
+		require.NoError(t, snapshot.write(snapshot.next))
+		t.Cleanup(func() { require.NoError(t, snapshot.write(snapshot.before)) })
+	}
+	cfg := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	oldModes, oldExpressions := cfg.BillingMode, cfg.BillingExpr
+	cfg.BillingMode, cfg.BillingExpr = map[string]string{}, map[string]string{}
+	t.Cleanup(func() { cfg.BillingMode, cfg.BillingExpr = oldModes, oldExpressions })
+	var tokens [2]model.Token
+	require.NoError(t, f.db.Where("user_id = ?", f.users["owner"].Id).Take(&tokens[0]).Error)
+	tokens[1] = model.Token{UserId: f.users["foreign"].Id, Key: "toolssearchotherownedkey00000000000000001", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000000}
+	require.NoError(t, f.db.Create(&tokens[1]).Error)
+	for _, token := range tokens {
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", token.UserId).Updates(map[string]any{"quota": 1000000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", token.Id).Update("remain_quota", 1000000).Error)
+	}
+	const good = `{"results":[{"title":"Owned result","url":"https://example.invalid/result","snippet":"snippet","summary":"summary","content":"body","rerank_score":2.5,"authority":-1,"site_name":null,"site_icon":null,"date":null,"extension":{"kept":true}}],"extension":null}`
+	type scenario struct {
+		status      int
+		body        string
+		firstStatus int
+		mode        string
+		entered     chan struct{}
+		release     chan struct{}
+		cancelled   chan struct{}
+		before      func(int, *http.Request)
+		calls       atomic.Int64
+		mu          sync.Mutex
+		requests    []map[string]any
+		paths       []string
+		connections []string
+		protocols   []int
+		idempotency []string
+	}
+	var scenarios sync.Map
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if !assert.NoError(t, err) {
+			return
+		}
+		var body map[string]any
+		if !assert.NoError(t, common.Unmarshal(raw, &body)) {
+			return
+		}
+		query, _ := body["query"].(string)
+		if r.URL.Path == "/v1/alpha/search" {
+			query = "alpha-control"
+		}
+		item, ok := scenarios.Load(query)
+		if !assert.True(t, ok, "unexpected synthetic upstream query") {
+			w.WriteHeader(500)
+			return
+		}
+		sc := item.(*scenario)
+		attempt := int(sc.calls.Add(1))
+		sc.mu.Lock()
+		sc.requests = append(sc.requests, body)
+		sc.paths = append(sc.paths, r.URL.Path)
+		sc.connections = append(sc.connections, r.RemoteAddr)
+		sc.protocols = append(sc.protocols, r.ProtoMajor)
+		sc.idempotency = append(sc.idempotency, r.Header.Get("Idempotency-Key")+r.Header.Get("X-Idempotency-Key"))
+		sc.mu.Unlock()
+		if sc.before != nil {
+			sc.before(attempt, r)
+		}
+		if sc.mode == "transport" {
+			conn, _, hijackErr := w.(http.Hijacker).Hijack()
+			if assert.NoError(t, hijackErr) {
+				conn.Close()
+			}
+			return
+		}
+		if sc.mode == "partial" {
+			w.Header().Set("Content-Length", "1000")
+			io.WriteString(w, `{"results":[`)
+			return
+		}
+		if sc.entered != nil {
+			if sc.mode == "body-cancel" {
+				io.WriteString(w, `{"results":[`)
+				w.(http.Flusher).Flush()
+			}
+			close(sc.entered)
+			select {
+			case <-sc.release:
+			case <-r.Context().Done():
+				if sc.cancelled != nil {
+					close(sc.cancelled)
+				}
+				return
+			}
+		}
+		status := sc.status
+		if status == 0 {
+			status = 200
+		}
+		if attempt == 1 && sc.firstStatus != 0 {
+			status = sc.firstStatus
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(status)
+		bodyText := sc.body
+		if bodyText == "" {
+			bodyText = good
+		}
+		io.WriteString(w, bodyText)
+	}))
+	t.Cleanup(provider.Close)
+	var channels []*model.Channel
+	for _, entry := range []struct {
+		group, models string
+		kind          int
+	}{{"default", "deepseek-search", constant.ChannelTypeDeepSeek}, {"free", "deepseek-search", constant.ChannelTypeDeepSeek}, {"paid", "deepseek-search", constant.ChannelTypeDeepSeek}, {"default", "alpha-control", constant.ChannelTypeNewAPI}} {
+		base := provider.URL
+		priority := int64(0)
+		weight := uint(100)
+		autoBan := 0
+		ch := &model.Channel{Type: entry.kind, Name: "owned-tools-" + entry.group, Key: "owned-upstream-placeholder", Status: common.ChannelStatusEnabled, BaseURL: &base, Models: entry.models, Group: entry.group, Priority: &priority, Weight: &weight, AutoBan: &autoBan}
+		require.NoError(t, ch.Insert())
+		channels = append(channels, ch)
+	}
+	type accounting struct {
+		quota, used, requests, remaining, tokenUsed int
+		channelQuota, logQuota, logs                int64
+	}
+	snapshot := func(t *testing.T, index int) accounting {
+		t.Helper()
+		var user model.User
+		var token model.Token
+		require.NoError(t, f.db.First(&user, tokens[index].UserId).Error)
+		require.NoError(t, f.db.First(&token, tokens[index].Id).Error)
+		var all []model.Channel
+		require.NoError(t, f.db.Find(&all).Error)
+		state := accounting{quota: user.Quota, used: user.UsedQuota, requests: user.RequestCount, remaining: token.RemainQuota, tokenUsed: token.UsedQuota}
+		for _, channel := range all {
+			state.channelQuota += channel.UsedQuota
+		}
+		var logs []model.Log
+		require.NoError(t, model.LOG_DB.Where("user_id = ? AND type = ?", user.Id, model.LogTypeConsume).Find(&logs).Error)
+		state.logs = int64(len(logs))
+		for _, log := range logs {
+			state.logQuota += int64(log.Quota)
+		}
+		return state
+	}
+	expectAccounting := func(t *testing.T, index int, before accounting, cost, successful int, globalCost int) {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			var user model.User
+			var token model.Token
+			return f.db.First(&user, tokens[index].UserId).Error == nil && f.db.First(&token, tokens[index].Id).Error == nil && user.Quota == before.quota-cost && token.RemainQuota == before.remaining-cost
+		}, 5*time.Second, 10*time.Millisecond, "reservation must settle/refund completely")
+		after := snapshot(t, index)
+		assert.Equal(t, before.used+cost, after.used)
+		assert.Equal(t, before.tokenUsed+cost, after.tokenUsed)
+		assert.Equal(t, before.requests+successful, after.requests)
+		assert.Equal(t, before.logs+int64(successful), after.logs)
+		assert.Equal(t, before.logQuota+int64(cost), after.logQuota)
+		assert.Equal(t, before.channelQuota+int64(globalCost), after.channelQuota)
+	}
+	request := func(t *testing.T, index int, path, body string) (int, http.Header, []byte) {
+		t.Helper()
+		req, err := http.NewRequest("POST", f.server.URL+path, strings.NewReader(body))
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer sk-"+tokens[index].Key)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := f.client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		raw, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		return resp.StatusCode, resp.Header, raw
+	}
+	t.Run("admission_and_fixed_routing", func(t *testing.T) {
+		// Source-compatible RED: the baseline route produces404 before this provider.
+		sc := &scenario{}
+		scenarios.Store("route-presence", sc)
+		before := snapshot(t, 0)
+		status, headers, raw := request(t, 0, "/v1/tools/search", `{"query":"route-presence"}`)
+		require.Equal(t, 200, status, "baseline route absence must be observable, body=%s", raw)
+		assert.Contains(t, headers.Get("Content-Type"), "application/json")
+		assert.JSONEq(t, good, string(raw))
+		assert.Equal(t, int64(1), sc.calls.Load())
+		assert.Positive(t, boundary.calls.Load(), "inspect the actual provider request boundary")
+		expectAccounting(t, 0, before, 375, 1, 375)
+		for _, actor := range []string{"", "owner", "invalid-key"} {
+			status, _, _ := f.request(t, "POST", "/v1/tools/search", actor, `{"query":"unauthorized"}`, http.Header{"Content-Type": {"application/json"}})
+			assert.Contains(t, []int{401, 403}, status)
+		}
+		var originalAuth model.Token
+		var originalUser model.User
+		require.NoError(t, f.db.Select("id", "status", "expired_time", "allow_ips", "model_limits_enabled", "model_limits").First(&originalAuth, tokens[0].Id).Error)
+		require.NoError(t, f.db.Select("id", "status").First(&originalUser, tokens[0].UserId).Error)
+		t.Cleanup(func() {
+			require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Updates(map[string]any{
+				"status": originalAuth.Status, "expired_time": originalAuth.ExpiredTime, "allow_ips": originalAuth.AllowIps,
+				"model_limits_enabled": originalAuth.ModelLimitsEnabled, "model_limits": originalAuth.ModelLimits,
+			}).Error)
+			require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", tokens[0].UserId).Update("status", originalUser.Status).Error)
+		})
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "body-spoof"}).Error)
+		status, _, _ = request(t, 0, "/v1/tools/search", `{"query":"denied-model","model":"body-spoof","group":"paid"}`)
+		assert.Equal(t, 403, status)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Update("model_limits", "deepseek-search").Error)
+		mapped, override := `{"deepseek-search":"body-spoof","body-spoof":"another-model"}`, `{"model":"override-spoof","group":"paid","count":1}`
+		require.NoError(t, f.db.Model(channels[0]).Updates(map[string]any{"model_mapping": mapped, "param_override": override}).Error)
+		sc = &scenario{}
+		scenarios.Store("fixed-subject", sc)
+		before = snapshot(t, 0)
+		status, _, raw = request(t, 0, "/v1/tools/search", `{"query":"fixed-subject","model":{"ignored":true},"group":{"ignored":true},"count":50,"need_content":false,"ori_question":null,"localization":"","extension":null}`)
+		require.Equal(t, 200, status, "%s", raw)
+		expectAccounting(t, 0, before, 375, 1, 375)
+		require.Equal(t, int64(1), sc.calls.Load())
+		assert.Equal(t, "/v1/tools/search", sc.paths[0])
+		assert.Equal(t, false, sc.requests[0]["need_content"])
+		assert.Contains(t, sc.requests[0], "extension")
+		assert.Nil(t, sc.requests[0]["ori_question"])
+		var entry model.Log
+		require.NoError(t, model.LOG_DB.Where("user_id = ? AND type = ?", tokens[0].UserId, model.LogTypeConsume).Order("id DESC").First(&entry).Error)
+		assert.Equal(t, "deepseek-search", entry.ModelName)
+		assert.Equal(t, "default", entry.Group)
+		assert.Equal(t, channels[0].Id, entry.ChannelId)
+		require.NoError(t, f.db.Model(channels[0]).Updates(map[string]any{"model_mapping": "", "param_override": ""}).Error)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Update("model_limits_enabled", false).Error)
+		before = snapshot(t, 0)
+		for _, tc := range []struct {
+			name    string
+			status  int
+			expires int64
+			ips     string
+			want    int
+		}{
+			{"disabled", common.TokenStatusDisabled, -1, "", 401},
+			{"expired", common.TokenStatusEnabled, time.Now().Unix() - 1, "", 401},
+			{"ip_policy", common.TokenStatusEnabled, -1, "192.0.2.1", 403},
+		} {
+			require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Updates(map[string]any{
+				"status": tc.status, "expired_time": tc.expires, "allow_ips": tc.ips,
+			}).Error)
+			var current model.Token
+			require.NoError(t, f.db.Select("id", "status", "expired_time", "allow_ips").First(&current, tokens[0].Id).Error)
+			require.Equal(t, tc.status, current.Status, tc.name)
+			require.Equal(t, tc.expires, current.ExpiredTime, tc.name)
+			require.NotNil(t, current.AllowIps, tc.name)
+			require.Equal(t, tc.ips, *current.AllowIps, tc.name)
+			status, _, _ = request(t, 0, "/v1/tools/search", `{"query":"token-denied"}`)
+			assert.Equal(t, tc.want, status, tc.name)
+			if tc.name == "expired" {
+				require.NoError(t, f.db.Select("id", "status").First(&current, tokens[0].Id).Error)
+				assert.Equal(t, common.TokenStatusExpired, current.Status)
+			}
+		}
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Updates(map[string]any{
+			"status": common.TokenStatusEnabled, "expired_time": int64(-1), "allow_ips": "",
+		}).Error)
+		var restored model.Token
+		require.NoError(t, f.db.Select("id", "status", "expired_time", "allow_ips").First(&restored, tokens[0].Id).Error)
+		require.Equal(t, common.TokenStatusEnabled, restored.Status)
+		require.Equal(t, int64(-1), restored.ExpiredTime)
+		require.NotNil(t, restored.AllowIps)
+		require.Empty(t, *restored.AllowIps)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", tokens[0].UserId).Update("status", common.UserStatusDisabled).Error)
+		status, _, _ = request(t, 0, "/v1/tools/search", `{"query":"disabled-user"}`)
+		assert.Equal(t, 403, status)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", tokens[0].UserId).Update("status", common.UserStatusEnabled).Error)
+		require.NoError(t, f.db.Model(&model.Ability{}).Where("channel_id = ?", channels[0].Id).Update("enabled", false).Error)
+		status, _, raw = request(t, 0, "/v1/tools/search", `{"query":"no-channel","model":"body-spoof"}`)
+		assert.Equal(t, 503, status)
+		var failure map[string]any
+		require.NoError(t, common.Unmarshal(raw, &failure))
+		detail := failure["error"].(map[string]any)
+		assert.Equal(t, "no_available_channel", detail["code_detail"])
+		assert.Equal(t, "deepseek-search", detail["model"])
+		assert.Equal(t, "default", detail["group"])
+		require.NoError(t, f.db.Model(&model.Ability{}).Where("channel_id = ?", channels[0].Id).Update("enabled", true).Error)
+		require.NoError(t, f.db.Model(channels[0]).Update("type", constant.ChannelTypeOpenAI).Error)
+		unsupported := &scenario{}
+		scenarios.Store("unsupported-channel", unsupported)
+		status, _, _ = request(t, 0, "/v1/tools/search", `{"query":"unsupported-channel"}`)
+		assert.Equal(t, 500, status)
+		assert.Zero(t, unsupported.calls.Load(), "unsupported native channel must fail before I/O")
+		require.NoError(t, f.db.Model(channels[0]).Update("type", constant.ChannelTypeDeepSeek).Error)
+		expectAccounting(t, 0, before, 0, 0, 0)
+	})
+	t.Run("structured_response_and_request_settlement", func(t *testing.T) {
+		var traceActive atomic.Bool
+		var traceMu sync.Mutex
+		var balances []int
+		callback := "tools_search_legacy_reservation"
+		require.NoError(t, f.db.Callback().Update().After("gorm:commit_or_rollback_transaction").Register(callback, func(tx *gorm.DB) {
+			if !traceActive.Load() || tx.Statement.Table != "users" || tx.Error != nil {
+				return
+			}
+			var user model.User
+			if assert.NoError(t, f.db.First(&user, tokens[0].UserId).Error) {
+				traceMu.Lock()
+				balances = append(balances, user.Quota)
+				traceMu.Unlock()
+			}
+		}))
+		defer func() { require.NoError(t, f.db.Callback().Update().Remove(callback)) }()
+		for _, tc := range []struct {
+			query, body, expr, legacy, group string
+			cost                             int
+		}{
+			{"count-one", `{"query":"count-one","count":1}`, "", "", "", 375},
+			{"count-fifty", `{"query":"count-fifty","count":50,"need_content":false,"ori_question":"source query","localization":"2001:db8::1","future":{"x":1}}`, "", "", "", 375},
+			{"admin-expr", `{"query":"admin-expr"}`, `tier("request", fixed(0.001))`, "", "", 500},
+			{"admin-zero", `{"query":"admin-zero"}`, `tier("request", fixed(0))`, "", "", 0},
+			{"legacy-price", `{"query":"legacy-price"}`, "", `{"deepseek-search":0.002}`, "", 1000},
+			{"legacy-zero", `{"query":"legacy-zero"}`, "", `{"deepseek-search":0}`, "", 0},
+			{"legacy-fraction", `{"query":"legacy-fraction"}`, "", `{"deepseek-search":0.000751}`, "", 376},
+			{"paid-group", `{"query":"paid-group"}`, "", "", "paid", 750},
+		} {
+			cfg.BillingMode, cfg.BillingExpr = map[string]string{}, map[string]string{}
+			if tc.expr != "" {
+				cfg.BillingMode["deepseek-search"] = "tiered_expr"
+				cfg.BillingExpr["deepseek-search"] = tc.expr
+			}
+			prices := tc.legacy
+			if prices == "" {
+				prices = `{}`
+			}
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(prices))
+			require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Update("group", tc.group).Error)
+			sc := &scenario{}
+			scenarios.Store(tc.query, sc)
+			before := snapshot(t, 0)
+			sc.before = func(_ int, _ *http.Request) {
+				var user model.User
+				var token model.Token
+				assert.NoError(t, f.db.First(&user, tokens[0].UserId).Error)
+				assert.NoError(t, f.db.First(&token, tokens[0].Id).Error)
+				assert.Equal(t, before.quota-tc.cost, user.Quota, "reservation before provider, %s", tc.query)
+				assert.Equal(t, before.remaining-tc.cost, token.RemainQuota)
+			}
+			traceActive.Store(tc.query == "legacy-fraction")
+			status, headers, raw := request(t, 0, "/v1/tools/search", tc.body)
+			traceActive.Store(false)
+			if tc.query == "legacy-fraction" {
+				traceMu.Lock()
+				assert.Contains(t, balances, before.quota-375, "initial legacy reservation truncates")
+				assert.Contains(t, balances, before.quota-376, "fixed target reserves the rounded top-up")
+				traceMu.Unlock()
+			}
+			require.Equal(t, 200, status, "query=%s response=%s", tc.query, raw)
+			assert.Contains(t, headers.Get("Content-Type"), "application/json")
+			assert.JSONEq(t, good, string(raw))
+			assert.Equal(t, int64(1), sc.calls.Load())
+			expectAccounting(t, 0, before, tc.cost, 1, tc.cost)
+			var logged model.Log
+			require.NoError(t, model.LOG_DB.Where("user_id = ? AND type = ?", tokens[0].UserId, model.LogTypeConsume).Order("id DESC").First(&logged).Error)
+			assert.Zero(t, logged.PromptTokens)
+			assert.Zero(t, logged.CompletionTokens)
+			assert.Equal(t, tc.cost, logged.Quota)
+		}
+		cfg.BillingMode, cfg.BillingExpr = map[string]string{}, map[string]string{}
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"deepseek-search":0}`))
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Update("group", "").Error)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", tokens[0].UserId).Update("quota", 0).Error)
+		free := &scenario{}
+		scenarios.Store("legacy-free-no-wallet", free)
+		freeBefore := snapshot(t, 0)
+		status, _, _ := request(t, 0, "/v1/tools/search", `{"query":"legacy-free-no-wallet"}`)
+		require.Equal(t, 200, status)
+		assert.Equal(t, int64(1), free.calls.Load())
+		expectAccounting(t, 0, freeBefore, 0, 1, 0)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"deepseek-search":0.000751}`))
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Update("group", "").Error)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", tokens[0].UserId).Update("quota", 375).Error)
+		topUp := &scenario{}
+		scenarios.Store("legacy-top-up-insufficient", topUp)
+		limited := snapshot(t, 0)
+		status, _, _ = request(t, 0, "/v1/tools/search", `{"query":"legacy-top-up-insufficient"}`)
+		assert.Equal(t, 403, status)
+		assert.Zero(t, topUp.calls.Load(), "375 initial funds cannot fund the rounded376 target")
+		expectAccounting(t, 0, limited, 0, 0, 0)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", tokens[0].UserId).Update("quota", 1000000).Error)
+		for _, query := range []string{"legacy-empty-refund", "legacy-error-refund", "legacy-token-top-up-insufficient"} {
+			sc := &scenario{body: `{"results":[]}`}
+			want, calls := 200, int64(1)
+			if query == "legacy-error-refund" {
+				sc.status = 400
+				sc.body = `{"error":"safe synthetic failure"}`
+				want = 400
+			}
+			if query == "legacy-token-top-up-insufficient" {
+				require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Update("remain_quota", 375).Error)
+				want, calls = 403, 0
+			}
+			scenarios.Store(query, sc)
+			before := snapshot(t, 0)
+			status, _, _ := request(t, 0, "/v1/tools/search", `{"query":"`+query+`"}`)
+			assert.Equal(t, want, status)
+			assert.Equal(t, calls, sc.calls.Load())
+			expectAccounting(t, 0, before, 0, 0, 0)
+		}
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Update("remain_quota", 1000000).Error)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+		for _, body := range []string{`{}`, `{"query":"  "}`, `{"query":null}`, `{"query":"x","query":"y"}`, `{"query":"x","count":0}`, `{"query":"x","count":51}`, `{"query":"x","count":1.5}`, `{"query":"x","need_content":0}`, `{"query":"x","ori_question":""}`, `{"query":"x","localization":"not-an-ip"}`, `{"query":"` + strings.Repeat("界", 129) + `"}`} {
+			before := snapshot(t, 0)
+			status, _, _ := request(t, 0, "/v1/tools/search", body)
+			assert.Equal(t, 400, status)
+			expectAccounting(t, 0, before, 0, 0, 0)
+		}
+		invalidOverride := `{"count":0}`
+		require.NoError(t, f.db.Model(channels[0]).Update("param_override", invalidOverride).Error)
+		before := snapshot(t, 0)
+		status, _, _ = request(t, 0, "/v1/tools/search", `{"query":"override-invalid"}`)
+		assert.Equal(t, 400, status)
+		expectAccounting(t, 0, before, 0, 0, 0)
+		require.NoError(t, f.db.Model(channels[0]).Update("param_override", "").Error)
+		sc := &scenario{body: `{"alpha":"unchanged"}`}
+		scenarios.Store("alpha-control", sc)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"alpha-control":0}`))
+		status, _, raw := request(t, 0, "/v1/alpha/search", `{"model":"alpha-control","commands":{"search_query":[{"q":"owned"}]}}`)
+		require.Equal(t, 200, status)
+		assert.JSONEq(t, sc.body, string(raw))
+		assert.Equal(t, []string{"/v1/alpha/search"}, sc.paths)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+	})
+	t.Run("upstream_failures_and_refunds", func(t *testing.T) {
+		for _, tc := range []struct {
+			query, body, mode   string
+			status, want, calls int
+		}{
+			{"empty", `{"results":[],"future":null}`, "", 200, 200, 1},
+			{"missing", `{"message":"provider-cause-canary"}`, "", 200, 502, 1},
+			{"null-results", `{"results":null}`, "", 200, 502, 1},
+			{"duplicate-results", `{"results":[],"results":[]}`, "", 200, 502, 1},
+			{"invalid-score", strings.Replace(good, `2.5`, `3.1`, 1), "", 200, 502, 1},
+			{"invalid-date", strings.Replace(good, `"date":null`, `"date":"yesterday"`, 1), "", 200, 502, 1},
+			{"trailing", good + `{}`, "", 200, 502, 1},
+			{"oversized", `{"results":[],"padding":"` + strings.Repeat("x", 16*1024*1024) + `"}`, "", 200, 502, 1},
+			{"partial", "", "partial", 200, 502, 1},
+			{"transport", "", "transport", 200, 502, 1},
+			{"other-success", good, "", 201, 502, 1},
+			{"bad-request", `{"error":"provider-cause-canary"}`, "", 400, 400, 1},
+		} {
+			sc := &scenario{body: tc.body, mode: tc.mode, status: tc.status}
+			scenarios.Store(tc.query, sc)
+			before := snapshot(t, 0)
+			status, headers, raw := request(t, 0, "/v1/tools/search", `{"query":"`+tc.query+`"}`)
+			require.Equal(t, tc.want, status, "query=%s response=%s", tc.query, raw)
+			assert.Equal(t, int64(tc.calls), sc.calls.Load())
+			if status == 200 {
+				assert.JSONEq(t, tc.body, string(raw))
+				assert.Contains(t, headers.Get("Content-Type"), "application/json")
+			} else {
+				assert.NotContains(t, string(raw), "provider-cause-canary")
+				assert.NotContains(t, string(raw), "padding")
+			}
+			expectAccounting(t, 0, before, 0, 0, 0)
+		}
+		// Dedicated HTTP/1 hosts guarantee each pair uses its one idle
+		// connection. The second POST is fully read before that connection closes.
+		for index, header := range []string{"Idempotency-Key", "X-Idempotency-Key"} {
+			replayProvider := httptest.NewServer(provider.Config.Handler)
+			defer replayProvider.Close()
+			override := `{"` + header + `":"owned-no-provider-idempotency"}`
+			require.NoError(t, f.db.Model(channels[0]).Updates(map[string]any{"base_url": replayProvider.URL, "header_override": override}).Error)
+			warmQuery := fmt.Sprintf("replay-warm-up-%d", index)
+			warm := &scenario{}
+			scenarios.Store(warmQuery, warm)
+			warmBefore := snapshot(t, 0)
+			status, _, raw := request(t, 0, "/v1/tools/search", `{"query":"`+warmQuery+`"}`)
+			require.Equal(t, 200, status, "%s", raw)
+			expectAccounting(t, 0, warmBefore, 375, 1, 375)
+			lostQuery := fmt.Sprintf("reused-connection-lost-response-%d", index)
+			lost := &scenario{mode: "transport"}
+			scenarios.Store(lostQuery, lost)
+			lostBefore := snapshot(t, 0)
+			status, _, _ = request(t, 0, "/v1/tools/search", `{"query":"`+lostQuery+`"}`)
+			assert.Equal(t, 502, status)
+			require.Equal(t, int64(1), lost.calls.Load(), "idempotency headers must not enable hidden transport replay")
+			require.Len(t, warm.connections, 1)
+			require.Len(t, lost.connections, 1)
+			assert.Equal(t, warm.connections[0], lost.connections[0], "failure must use the actual reused connection")
+			assert.Equal(t, []int{1}, lost.protocols)
+			assert.Equal(t, []string{"owned-no-provider-idempotency"}, lost.idempotency)
+			expectAccounting(t, 0, lostBefore, 0, 0, 0)
+			require.NoError(t, f.db.Model(channels[0]).Updates(map[string]any{"base_url": provider.URL, "header_override": ""}).Error)
+		}
+		for _, code := range []int{408, 429, 503} {
+			query := fmt.Sprintf("retry-%d", code)
+			sc := &scenario{firstStatus: code}
+			scenarios.Store(query, sc)
+			before := snapshot(t, 0)
+			status, _, raw := request(t, 0, "/v1/tools/search", `{"query":"`+query+`"}`)
+			require.Equal(t, 200, status, "%s", raw)
+			require.Equal(t, int64(2), sc.calls.Load())
+			assert.Equal(t, sc.requests[0], sc.requests[1], "allowed retry must rebuild the complete original body")
+			expectAccounting(t, 0, before, 375, 1, 375)
+		}
+		freeSelector := map[string]any{"channel_id": channels[1].Id, "model": "deepseek-search", "group": "free"}
+		setFreeEligible := func(enabled bool) {
+			var current model.Ability
+			if !assert.NoError(t, f.db.Where(freeSelector).Take(&current).Error) {
+				return
+			}
+			if current.Enabled != enabled {
+				updated := f.db.Model(&model.Ability{}).Where(freeSelector).Update("enabled", enabled)
+				assert.NoError(t, updated.Error)
+				assert.Equal(t, int64(1), updated.RowsAffected, "only the owned free ability changes")
+			}
+			var actual model.Ability
+			if assert.NoError(t, f.db.Where(freeSelector).Take(&actual).Error) {
+				assert.Equal(t, enabled, actual.Enabled)
+			}
+		}
+		t.Cleanup(func() { setFreeEligible(true) })
+		// Only the selected owned channel supplies these provider-visible markers.
+		for _, channel := range []*model.Channel{channels[1], channels[2]} {
+			previous := channel.HeaderOverride
+			t.Cleanup(func() {
+				require.NoError(t, f.db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("header_override", previous).Error)
+			})
+			markers, err := common.Marshal(map[string]string{"X-Owned-Channel": strconv.Itoa(channel.Id), "X-Owned-Group": channel.Group})
+			require.NoError(t, err)
+			require.NoError(t, f.db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("header_override", string(markers)).Error)
+		}
+		setFreeEligible(true)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Updates(map[string]any{"group": "auto", "auto_groups": `["free","paid"]`, "cross_group_retry": true}).Error)
+		sc := &scenario{firstStatus: 503}
+		// Use exact snapshots, not elapsed time, to prove paid reservation precedes I/O.
+		before := snapshot(t, 0)
+		sc.before = func(attempt int, outgoing *http.Request) {
+			selected := channels[1]
+			if attempt == 2 {
+				selected = channels[2]
+			}
+			assert.Equal(t, selected.Group, outgoing.Header.Get("X-Owned-Group"))
+			assert.Equal(t, strconv.Itoa(selected.Id), outgoing.Header.Get("X-Owned-Channel"))
+			var user model.User
+			var token model.Token
+			assert.NoError(t, f.db.First(&user, tokens[0].UserId).Error)
+			assert.NoError(t, f.db.First(&token, tokens[0].Id).Error)
+			reserved := 0
+			if attempt == 2 {
+				reserved = 750
+			}
+			assert.Equal(t, before.quota-reserved, user.Quota)
+			assert.Equal(t, before.remaining-reserved, token.RemainQuota)
+			if attempt == 1 {
+				setFreeEligible(false)
+			}
+		}
+		scenarios.Store("free-to-paid", sc)
+		status, _, raw := request(t, 0, "/v1/tools/search", `{"query":"free-to-paid"}`)
+		setFreeEligible(true)
+		require.Equal(t, 200, status, "%s", raw)
+		assert.Equal(t, int64(2), sc.calls.Load())
+		expectAccounting(t, 0, before, 750, 1, 750)
+		var paidLog model.Log
+		require.NoError(t, model.LOG_DB.Where("user_id = ? AND type = ?", tokens[0].UserId, model.LogTypeConsume).Order("id DESC").First(&paidLog).Error)
+		assert.Equal(t, "paid", paidLog.Group)
+		assert.Equal(t, channels[2].Id, paidLog.ChannelId)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"deepseek-search":0.001}`))
+		legacy := &scenario{firstStatus: 503}
+		scenarios.Store("legacy-free-to-paid", legacy)
+		legacyBefore := snapshot(t, 0)
+		legacy.before = func(attempt int, outgoing *http.Request) {
+			selected := channels[1]
+			if attempt == 2 {
+				selected = channels[2]
+			}
+			assert.Equal(t, selected.Group, outgoing.Header.Get("X-Owned-Group"))
+			assert.Equal(t, strconv.Itoa(selected.Id), outgoing.Header.Get("X-Owned-Channel"))
+			var user model.User
+			var token model.Token
+			assert.NoError(t, f.db.First(&user, tokens[0].UserId).Error)
+			assert.NoError(t, f.db.First(&token, tokens[0].Id).Error)
+			reserved := 0
+			if attempt == 2 {
+				reserved = 1000
+			}
+			assert.Equal(t, legacyBefore.quota-reserved, user.Quota)
+			assert.Equal(t, legacyBefore.remaining-reserved, token.RemainQuota)
+			if attempt == 1 {
+				setFreeEligible(false)
+			}
+		}
+		status, _, raw = request(t, 0, "/v1/tools/search", `{"query":"legacy-free-to-paid"}`)
+		setFreeEligible(true)
+		require.Equal(t, 200, status, "%s", raw)
+		assert.Equal(t, int64(2), legacy.calls.Load())
+		expectAccounting(t, 0, legacyBefore, 1000, 1, 1000)
+		paidLog = model.Log{}
+		require.NoError(t, model.LOG_DB.Where("user_id = ? AND type = ?", tokens[0].UserId, model.LogTypeConsume).Order("id DESC").First(&paidLog).Error)
+		assert.Equal(t, "paid", paidLog.Group)
+		assert.Equal(t, channels[2].Id, paidLog.ChannelId)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", tokens[0].UserId).Update("quota", 100).Error)
+		sc = &scenario{firstStatus: 503, before: func(attempt int, outgoing *http.Request) {
+			assert.Equal(t, 1, attempt, "insufficient paid reserve must prevent a second call")
+			assert.Equal(t, "free", outgoing.Header.Get("X-Owned-Group"))
+			assert.Equal(t, strconv.Itoa(channels[1].Id), outgoing.Header.Get("X-Owned-Channel"))
+			setFreeEligible(false)
+		}}
+		scenarios.Store("insufficient-retry", sc)
+		before = snapshot(t, 0)
+		status, _, _ = request(t, 0, "/v1/tools/search", `{"query":"insufficient-retry"}`)
+		setFreeEligible(true)
+		assert.Equal(t, 403, status)
+		assert.Equal(t, int64(1), sc.calls.Load())
+		expectAccounting(t, 0, before, 0, 0, 0)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", tokens[0].UserId).Update("quota", 1000000).Error)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens[0].Id).Updates(map[string]any{"group": "", "cross_group_retry": false}).Error)
+		for _, mode := range []string{"header-cancel", "body-cancel", "parent-deadline"} {
+			sc = &scenario{mode: mode, entered: make(chan struct{}), release: make(chan struct{}), cancelled: make(chan struct{})}
+			scenarios.Store(mode, sc)
+			before = snapshot(t, 0)
+			ctx, cancel := context.WithCancel(context.Background())
+			if mode == "parent-deadline" {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+			}
+			req, err := http.NewRequestWithContext(ctx, "POST", f.server.URL+"/v1/tools/search", strings.NewReader(`{"query":"`+mode+`"}`))
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer sk-"+tokens[0].Key)
+			req.Header.Set("Content-Type", "application/json")
+			finished := make(chan error, 1)
+			go func() {
+				resp, err := f.client.Do(req)
+				if resp != nil {
+					resp.Body.Close()
+				}
+				finished <- err
+			}()
+			select {
+			case <-sc.entered:
+			case <-time.After(5 * time.Second):
+				cancel()
+				t.Fatal("upstream barrier not reached")
+			}
+			if mode != "parent-deadline" {
+				cancel()
+			}
+			select {
+			case err := <-finished:
+				assert.Error(t, err)
+			case <-time.After(5 * time.Second):
+				cancel()
+				t.Fatal("caller cancellation not observed")
+			}
+			select {
+			case <-sc.cancelled:
+			case <-time.After(5 * time.Second):
+				cancel()
+				t.Fatal("outgoing context not cancelled")
+			}
+			cancel()
+			assert.Equal(t, int64(1), sc.calls.Load())
+			expectAccounting(t, 0, before, 0, 0, 0)
+		}
+		// Distinct actors interleave one complete success with one lost response.
+		success := &scenario{entered: make(chan struct{}), release: make(chan struct{})}
+		failure := &scenario{entered: make(chan struct{}), release: make(chan struct{}), mode: "body-cancel", cancelled: make(chan struct{})}
+		scenarios.Store("concurrent-success", success)
+		scenarios.Store("concurrent-failure", failure)
+		ownBefore, otherBefore := snapshot(t, 0), snapshot(t, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		type outcome struct {
+			status int
+			err    error
+		}
+		done := make(chan outcome, 2)
+		for index, query := range []string{"concurrent-success", "concurrent-failure"} {
+			go func() {
+				requestCtx := context.Background()
+				if index == 1 {
+					requestCtx = ctx
+				}
+				req, err := http.NewRequestWithContext(requestCtx, "POST", f.server.URL+"/v1/tools/search", strings.NewReader(`{"query":"`+query+`"}`))
+				if err != nil {
+					done <- outcome{err: err}
+					return
+				}
+				req.Header.Set("Authorization", "Bearer sk-"+tokens[index].Key)
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := f.client.Do(req)
+				status := 0
+				if resp != nil {
+					status = resp.StatusCode
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+				done <- outcome{status, err}
+			}()
+		}
+		for _, sc := range []*scenario{success, failure} {
+			select {
+			case <-sc.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("concurrent barrier not reached")
+			}
+		}
+		cancel()
+		close(success.release)
+		for range 2 {
+			select {
+			case result := <-done:
+				if result.err == nil {
+					assert.Equal(t, 200, result.status)
+				} else {
+					assert.ErrorIs(t, result.err, context.Canceled)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("concurrent request did not finish")
+			}
+		}
+		select {
+		case <-failure.cancelled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("failed actor provider not cancelled")
+		}
+		assert.Equal(t, int64(1), success.calls.Load())
+		assert.Equal(t, int64(1), failure.calls.Load())
+		expectAccounting(t, 0, ownBefore, 375, 1, 375)
+		expectAccounting(t, 1, otherBefore, 0, 0, 375)
+		// A client delivery error happens after settlement; it is never a replay/refund.
+		sc = &scenario{}
+		scenarios.Store("downstream-closed", sc)
+		before = snapshot(t, 0)
+		req := httptest.NewRequest("POST", "/v1/tools/search", strings.NewReader(`{"query":"downstream-closed"}`))
+		req.RemoteAddr = "127.0.0.1:12345"
+		req.Header.Set("Authorization", "Bearer sk-"+tokens[0].Key)
+		req.Header.Set("Content-Type", "application/json")
+		writer := &toolsSearchRejectedWriter{httptest.NewRecorder()}
+		f.engine.ServeHTTP(writer, req)
+		assert.Empty(t, writer.Body.Bytes())
+		assert.Equal(t, int64(1), sc.calls.Load())
+		expectAccounting(t, 0, before, 375, 1, 375)
 	})
 }

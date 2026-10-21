@@ -49,6 +49,10 @@ const adaptation = {
   raw_generation_adapted_before_compile: true,
 };
 await writeFile(path.join(output, 'generator-adaptation.json'), JSON.stringify(adaptation, null, 2) + '\n');
+const searchServices = await Promise.all((await readdir(path.join(output, 'generated/relay/services'))).filter(name => name.endsWith('.ts')).map(async name => ({ name: name.slice(0, -3), source: await readFile(path.join(output, 'generated/relay/services', name), 'utf8') })));
+const nativeSearchServices = searchServices.filter(service => service.source.includes('    public static searchDeepSeekTools('));
+assert.equal(nativeSearchServices.length, 1, 'Exactly one native tools/search method is required');
+const nativeSearchService = nativeSearchServices[0].name;
 const apiDocument = JSON.parse(await readFile(path.join(root, 'docs/openapi/api.json'), 'utf8'));
 const allFixtures = JSON.parse(await readFile(path.join(root, 'scripts/openapi/fixtures.json'), 'utf8'));
 const cacheFixtures = allFixtures.filter(fixture => fixture.kind === 'cache_control');
@@ -118,9 +122,17 @@ await writeFile(path.join(output, 'operation-invocation-map.json'), JSON.stringi
 // ordinary text request previously failed here with TS2741.
 const consumer = path.join(output, 'generated/consumer.ts');
 await writeFile(consumer, `import { GeminiService } from './relay';
+import * as nativeSearch from './relay';
 import { Service, OrganizationsService } from './api';
 import type { RequestAccessContext } from './api';
 export function compileContractCalls() {
+  nativeSearch.${nativeSearchService}.searchDeepSeekTools({ requestBody: { query: 'owned', count: 10, need_content: false, ori_question: null, localization: '' } });
+  // @ts-expect-error a native search query is required
+  nativeSearch.${nativeSearchService}.searchDeepSeekTools({ requestBody: { count: 10 } });
+  // @ts-expect-error count must be numeric
+  nativeSearch.${nativeSearchService}.searchDeepSeekTools({ requestBody: { query: 'owned', count: '10' } });
+  // @ts-expect-error explicit content selection remains boolean
+  nativeSearch.${nativeSearchService}.searchDeepSeekTools({ requestBody: { query: 'owned', need_content: 0 } });
   GeminiService.streamGeminiContent({ model: 'fixture', alt: 'sse', requestBody: { contents: [{ role: 'user', parts: [{ text: 'Hello' }] }] } });
   GeminiService.streamGeminiContent({ model: 'fixture', requestBody: { contents: [{ parts: [{ text: 'Hello' }] }], generationConfig: {} } });
   GeminiService.streamGeminiContent({ model: 'fixture', requestBody: { contents: [{ parts: [{ text: 'Draw a cup' }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } } });
@@ -296,6 +308,18 @@ await api.DefaultService.postApiUserAccessTokens({ requestBody: { name: 'Example
 assert.equal(new Headers(calls.at(-1).init.headers).get('Authorization'), 'Bearer fixture-only');
 assert.equal(new Headers(calls.at(-1).init.headers).get('X-Security-Proof'), 'fixture-proof');
 relay.OpenAPI.TOKEN = 'fixture-relay-key';
+const beforeNativeSearchRequests = calls.length;
+const previousNativeSearchResponse = responseBody;
+const nativeSearchBody = { query: 'owned search', count: 50, need_content: false, ori_question: null, localization: '', extension: null };
+responseBody = { results: [{ title: 'Owned', url: 'https://example.invalid/result', snippet: 'snippet', summary: 'summary', content: 'body', rerank_score: 2, authority: -1, site_name: null, site_icon: null, date: null, extension: { kept: true } }], extension: null };
+assert.deepEqual(await relay[nativeSearchService].searchDeepSeekTools({ requestBody: nativeSearchBody }), responseBody);
+assert.equal(calls.at(-1).url, 'https://example.invalid/v1/tools/search');
+assert.equal(calls.at(-1).init.method, 'POST');
+assert.equal(new Headers(calls.at(-1).init.headers).get('Authorization'), 'Bearer fixture-relay-key');
+assert.deepEqual(JSON.parse(calls.at(-1).init.body), nativeSearchBody);
+responseBody = previousNativeSearchResponse;
+const nativeSearchStubbedRequests = calls.length - beforeNativeSearchRequests;
+
 await relay.ImagesService.createImage({ requestBody: { model: 'gpt-image-1', prompt: 'A cup', n: 1 } });
 assert.equal(new Headers(calls.at(-1).init.headers).get('Authorization'), 'Bearer fixture-relay-key');
 assert.equal(calls.at(-1).url, 'https://example.invalid/v1/images/generations');
@@ -715,4 +739,4 @@ for (const [status, code] of [[400, 'INVALID'], [401, 'UNAUTHORIZED'], [403, 'FO
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const clientEventsStubbedRequests = calls.length - beforeClientEventsRequests;
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
