@@ -706,7 +706,12 @@ ORGANIZATION_READ_SUITES = {
     'organization-capabilities': (frozenset(('TestOrganizationCapabilityProjection', 'TestOrganizationAccessHTTP')), 'g16-organization-capabilities'),
     'organization-wallet': (frozenset(('TestOrganizationWalletLifecycle',)), 'g17-organization-wallet'),
     'site-description': (frozenset(('TestSiteDescriptionHTTP',)), 'g18-site-description'),
+    'organization-name-uniqueness': (frozenset(('TestOrganizationNameUniqueness',)), 'g19-organization-name-uniqueness'),
 }
+ORGANIZATION_NAME_CASES = frozenset((
+    'comparison_and_rename', 'disabled_dissolution_and_history', 'authorization_precedence',
+    'transfer_preview_and_proof', 'transfer_final_recheck', 'create_create', 'rename_rename',
+    'transfer_transfer', 'create_transfer', 'different_owners'))
 ORGANIZATION_WALLET_CASES = frozenset((
     'proof_expired', 'root_role_revoked', 'credit_reversal_idempotency_and_retained_history',
     'quota_ceiling_reserved_protection_and_atomic_rollback', 'concurrent_request_identity',
@@ -882,6 +887,9 @@ def validate_organization_identity_events(events, suite='organization-identity')
             'TestSiteDescriptionHTTP/reserved_option_and_failures',
             'TestSiteDescriptionHTTP/anonymous_links_and_navigation'}:
         raise ValueError('every exact site description case must pass without unrelated tests')
+    if suite == 'organization-name-uniqueness' and passed != required | {None} | {
+            'TestOrganizationNameUniqueness/' + name for name in ORGANIZATION_NAME_CASES}:
+        raise ValueError('every exact name uniqueness case must pass without unrelated tests')
     return {'roots': sorted(required), 'passed_tests_and_subtests': len(passed) - 1,
             'package': package, 'skip': 0, 'fail': 0}
 

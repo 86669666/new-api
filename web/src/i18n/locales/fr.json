@@ -4368,6 +4368,7 @@
     "org-...": "org-...",
     "Organization is disabled.": "L’organisation est désactivée.",
     "Organization is unavailable.": "L’organisation est indisponible.",
+    "Organization name is already in use.": "Ce nom d’organisation est déjà utilisé.",
     "Organization operation is forbidden.": "Cette opération sur l’organisation est interdite.",
     "Organization request has expired.": "La demande d’organisation a expiré.",
     "Organization request is already resolved.": "La demande d’organisation a déjà été traitée.",

@@ -4368,6 +4368,7 @@
     "org-...": "org-...",
     "Organization is disabled.": "組織は無効になっています。",
     "Organization is unavailable.": "組織を利用できません。",
+    "Organization name is already in use.": "この組織名は既に使用されています。",
     "Organization operation is forbidden.": "この組織操作は許可されていません。",
     "Organization request has expired.": "組織へのリクエストは期限切れです。",
     "Organization request is already resolved.": "組織へのリクエストは処理済みです。",

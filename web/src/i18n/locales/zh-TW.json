@@ -4368,6 +4368,7 @@
     "org-...": "org-...",
     "Organization is disabled.": "組織已停用。",
     "Organization is unavailable.": "組織無法使用。",
+    "Organization name is already in use.": "組織名稱已被使用。",
     "Organization operation is forbidden.": "無權執行此組織操作。",
     "Organization request has expired.": "組織請求已過期。",
     "Organization request is already resolved.": "組織請求已處理。",

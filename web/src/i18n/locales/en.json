@@ -4368,6 +4368,7 @@
     "org-...": "org-...",
     "Organization is disabled.": "Organization is disabled.",
     "Organization is unavailable.": "Organization is unavailable.",
+    "Organization name is already in use.": "Organization name is already in use.",
     "Organization operation is forbidden.": "Organization operation is forbidden.",
     "Organization request has expired.": "Organization request has expired.",
     "Organization request is already resolved.": "Organization request is already resolved.",

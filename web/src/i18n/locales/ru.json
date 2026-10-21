@@ -4368,6 +4368,7 @@
     "org-...": "орг-...",
     "Organization is disabled.": "Организация отключена.",
     "Organization is unavailable.": "Организация недоступна.",
+    "Organization name is already in use.": "Это название организации уже используется.",
     "Organization operation is forbidden.": "Операция с организацией запрещена.",
     "Organization request has expired.": "Срок действия запроса организации истёк.",
     "Organization request is already resolved.": "Запрос организации уже обработан.",

@@ -51,6 +51,8 @@ func writeOrganizationLifecycleError(c *gin.Context, err error) {
 		status, code, message = 403, "ORG_FORBIDDEN", "Organization operation is forbidden."
 	case errors.Is(err, model.ErrOrganizationConflict):
 		status, code, message = 409, "ORG_STATE_CHANGED", "Organization state changed. Refresh the organization state before retrying."
+	case errors.Is(err, model.ErrOrganizationNameTaken):
+		status, code, message = 409, "ORG_NAME_TAKEN", "Organization name is already in use."
 	case errors.Is(err, model.ErrOrganizationAlreadyMember):
 		status, code, message = 409, "ORG_ALREADY_MEMBER", "This user is already a member of the organization."
 	case errors.Is(err, model.ErrOrganizationInvitationExists):

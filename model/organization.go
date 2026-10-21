@@ -31,6 +31,7 @@ var (
 	ErrOrganizationForbidden        = errors.New("organization operation is forbidden")
 	ErrOrganizationDisabled         = errors.New("organization is disabled")
 	ErrOrganizationConflict         = errors.New("organization state changed")
+	ErrOrganizationNameTaken        = errors.New("organization name is already in use")
 	ErrOrganizationAlreadyMember    = errors.New("user is already an organization member")
 	ErrOrganizationInvitationExists = errors.New("organization invitation already exists")
 	ErrOrganizationSelfInvite       = errors.New("cannot invite yourself to an organization")
@@ -161,6 +162,22 @@ func organizationName(name string) (string, error) {
 		}
 	}
 	return name, nil
+}
+
+// The caller must hold the owner's User row lock before any ordinary consistent
+// read in this transaction. This keeps the complete namespace snapshot current
+// under MySQL REPEATABLE READ as well as the other supported databases.
+func requireOrganizationNameAvailable(tx *gorm.DB, ownerID int, excludeID int64, name string) error {
+	var organizations []Organization
+	if err := tx.Select("id", "name").Where("owner_user_id = ? AND dissolved_at = 0", ownerID).Find(&organizations).Error; err != nil {
+		return err
+	}
+	for _, org := range organizations {
+		if org.ID != excludeID && strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(org.Name)) {
+			return ErrOrganizationNameTaken
+		}
+	}
+	return nil
 }
 
 func organizationNextVersion(v int64) (int64, error) {

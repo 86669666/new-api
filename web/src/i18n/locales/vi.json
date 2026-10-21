@@ -4368,6 +4368,7 @@
     "org-...": "org-...",
     "Organization is disabled.": "Tổ chức đã bị vô hiệu hóa.",
     "Organization is unavailable.": "Tổ chức không khả dụng.",
+    "Organization name is already in use.": "Tên tổ chức này đã được sử dụng.",
     "Organization operation is forbidden.": "Thao tác với tổ chức bị cấm.",
     "Organization request has expired.": "Yêu cầu của tổ chức đã hết hạn.",
     "Organization request is already resolved.": "Yêu cầu của tổ chức đã được xử lý.",

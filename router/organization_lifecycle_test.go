@@ -51,6 +51,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	gormlogger "gorm.io/gorm/logger"
 )
 
@@ -542,6 +543,519 @@ func (c *organizationLifecycleClient) mutate(t *testing.T, actor, method, path, 
 		assert.Equal(t, event.AfterState, receipt["status"])
 	}
 	return receipt
+}
+
+type organizationNameSnapshot struct {
+	Organizations []model.Organization
+	Members       []model.OrganizationMember
+	Invitations   []model.OrganizationInvitation
+	Transfers     []model.OrganizationOwnershipTransfer
+	Events        []model.OrganizationEvent
+}
+
+func organizationNamesSnapshot(t *testing.T, c *organizationLifecycleClient) organizationNameSnapshot {
+	t.Helper()
+	var state organizationNameSnapshot
+	for _, dest := range []any{&state.Organizations, &state.Members, &state.Invitations, &state.Transfers, &state.Events} {
+		require.NoError(t, c.db.Order("id").Find(dest).Error)
+	}
+	return state
+}
+
+func organizationNamedClient(t *testing.T, c *organizationLifecycleClient, actor, name string) *organizationLifecycleClient {
+	t.Helper()
+	receipt := c.mutate(t, actor, "POST", "/api/organizations", "create", map[string]any{"name": name}, nil, false)
+	id, err := strconv.ParseInt(receipt["organization_id"].(string), 10, 64)
+	require.NoError(t, err)
+	fixture := *c.organizationHTTPFixture
+	fixture.orgA = id
+	return &organizationLifecycleClient{organizationHTTPFixture: &fixture, passwords: c.passwords, refresh: c.refresh}
+}
+
+type organizationNameWrite struct {
+	method, path, actor string
+	body                map[string]any
+	proof               string
+}
+
+func organizationNameTransfer(t *testing.T, c *organizationLifecycleClient, from, to string, proof bool) organizationNameWrite {
+	t.Helper()
+	var member model.OrganizationMember
+	require.NoError(t, c.db.Where("organization_id = ? AND user_id = ? AND removed_at = 0", c.orgA, c.users[to].Id).Find(&member).Error)
+	if member.ID == 0 {
+		invitation := c.mutate(t, from, "POST", c.path()+"/invitations", "invite", map[string]any{"revision": c.revision(t), "target_user_id": strconv.Itoa(c.users[to].Id), "role": "member"}, nil, false)
+		c.mutate(t, to, "POST", c.path()+"/invitations/"+invitation["object_id"].(string)+"/accept", "invitation_accept", map[string]any{"revision": c.revision(t), "generation": invitation["generation"]}, nil, false)
+	}
+	transfer := c.mutate(t, from, "POST", c.path()+"/ownership-transfers", "transfer_initiate", map[string]any{"revision": c.revision(t), "target_user_id": strconv.Itoa(c.users[to].Id), "previous_id": "0", "previous_generation": "0", "replace": false}, nil, true)
+	request := organizationNameWrite{method: "POST", path: c.path() + "/ownership-transfers/" + transfer["object_id"].(string) + "/accept", actor: to, body: map[string]any{"revision": c.revision(t), "generation": transfer["generation"]}}
+	if proof {
+		op := c.operation(t, to, "transfer_accept", request.body, map[string]any{"transfer_id": transfer["object_id"]})
+		request.proof = c.proof(t, to, op, "password", "")
+	}
+	return request
+}
+
+// The first request is held immediately before its primary event, after the
+// actual name check and writes, while it still owns the namespace lock. The
+// second must enter a transaction before that first commit. No transaction is
+// asked to commit another writer while holding SQLite's writer reservation.
+func organizationNameRace(t *testing.T, c *organizationLifecycleClient, first, second organizationNameWrite, name string, independent bool) {
+	t.Helper()
+	if c.mainKind == "mysql" {
+		var local, global string
+		err := c.db.Raw("SELECT @@transaction_isolation, @@global.transaction_isolation").Row().Scan(&local, &global)
+		if err != nil {
+			err = c.db.Raw("SELECT @@tx_isolation, @@global.tx_isolation").Row().Scan(&local, &global)
+		}
+		require.NoError(t, err)
+		require.Equal(t, "REPEATABLE-READ", local)
+		require.Equal(t, "REPEATABLE-READ", global)
+		t.Log("name-race transaction isolation: REPEATABLE-READ")
+	}
+	held, attempted, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var winner atomic.Bool
+	var winnerID atomic.Int64
+	var observedSnapshot, sawWinner atomic.Bool
+	var releaseOnce, attemptOnce sync.Once
+	var wg sync.WaitGroup
+	callback := "organization_name_race"
+	require.NoError(t, c.db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table != "organization_events" || !winner.CompareAndSwap(false, true) {
+			return
+		}
+		event, ok := tx.Statement.Dest.(*model.OrganizationEvent)
+		if !ok {
+			tx.AddError(errors.New("expected primary organization event"))
+			return
+		}
+		winnerID.Store(event.OrganizationID)
+		close(held)
+		select {
+		case <-release:
+		case <-tx.Statement.Context.Done():
+			tx.AddError(tx.Statement.Context.Err())
+		}
+	}))
+	observe := func(tx *gorm.DB) {
+		if !winner.Load() || tx.Statement.Table != "users" {
+			return
+		}
+		if _, ok := tx.Statement.ConnPool.(gorm.TxCommitter); !ok {
+			return
+		}
+		_, lockingRead := tx.Statement.Clauses["FOR"]
+		values, _ := tx.Statement.Dest.(map[string]any)
+		reservation, _ := values["auth_version"].(clause.Expr)
+		if lockingRead || reservation.SQL == "auth_version" {
+			attemptOnce.Do(func() { close(attempted) })
+		}
+	}
+	require.NoError(t, c.db.Callback().Query().Before("gorm:query").Register(callback, observe))
+	require.NoError(t, c.db.Callback().Update().Before("gorm:update").Register(callback, observe))
+	require.NoError(t, c.db.Callback().Query().After("gorm:query").Register(callback+"_snapshot", func(tx *gorm.DB) {
+		owned, ok := tx.Statement.Dest.(*[]model.Organization)
+		if !ok || independent || !winner.Load() || tx.Error != nil || !observedSnapshot.CompareAndSwap(false, true) {
+			return
+		}
+		// The losing transaction's first namespace snapshot must already see the
+		// winner, rather than relying on a later fresh execution to reject it.
+		sawWinner.Store(slices.ContainsFunc(*owned, func(org model.Organization) bool {
+			return org.ID == winnerID.Load() && org.Name == name
+		}))
+	}))
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		wg.Wait()
+		_ = c.db.Callback().Create().Remove(callback)
+		_ = c.db.Callback().Query().Remove(callback)
+		_ = c.db.Callback().Query().Remove(callback + "_snapshot")
+		_ = c.db.Callback().Update().Remove(callback)
+	}()
+	type response struct {
+		status int
+		h      http.Header
+		body   map[string]any
+	}
+	firstDone, secondDone := make(chan response, 1), make(chan response, 1)
+	wg.Go(func() {
+		status, h, body := c.json(t, first.method, first.path, first.actor, first.body, first.proof)
+		firstDone <- response{status, h, body}
+	})
+	select {
+	case <-held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first name writer did not reach its uncommitted event")
+	}
+	wg.Go(func() {
+		status, h, body := c.json(t, second.method, second.path, second.actor, second.body, second.proof)
+		secondDone <- response{status, h, body}
+	})
+	select {
+	case <-attempted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second transaction did not attempt its namespace lock before first commit")
+	}
+	var other response
+	if independent && c.mainKind != "sqlite" {
+		select {
+		case other = <-secondDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a different owner was blocked by the first namespace")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	var initial response
+	select {
+	case initial = <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first writer did not finish")
+	}
+	want := 200
+	if first.path == "/api/organizations" {
+		want = 201
+	}
+	require.Equal(t, want, initial.status)
+	assert.Equal(t, true, initial.body["success"])
+	if !independent || c.mainKind == "sqlite" {
+		select {
+		case other = <-secondDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("second writer did not finish")
+		}
+	}
+	if independent {
+		require.Equal(t, 201, other.status)
+		assert.Equal(t, true, other.body["success"])
+	} else {
+		organizationError(t, other.status, other.h, other.body, 409, "ORG_NAME_TAKEN")
+		assert.Equal(t, "Organization name is already in use.", other.body["message"])
+		assert.True(t, observedSnapshot.Load())
+		assert.True(t, sawWinner.Load(), "the transaction begun before the winner committed must read its committed name")
+	}
+}
+
+func TestOrganizationNameUniqueness(t *testing.T) {
+	t.Run("comparison_and_rename", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		for _, pair := range [][2]string{{"Omega", "\u2003oMEGA\u00a0"}, {"Σ", "ς"}, {"K", "K"}} {
+			organizationNamedClient(t, c, "owner", pair[0])
+			before := organizationNamesSnapshot(t, c)
+			status, h, b := c.json(t, "POST", "/api/organizations", "owner", map[string]any{"name": pair[1]}, "")
+			organizationError(t, status, h, b, 409, "ORG_NAME_TAKEN")
+			assert.Equal(t, "Organization name is already in use.", b["message"])
+			assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		}
+		for _, name := range []string{"ß", "ss", "é", "e\u0301", "e", "A", "Ａ"} {
+			organizationNamedClient(t, c, "owner", name)
+		}
+		organizationNamedClient(t, c, "foreign", "OMEGA")
+		organizationNamedClient(t, c, "admin", "admin namespace")
+		before := organizationNamesSnapshot(t, c)
+		status, h, b := c.json(t, "PATCH", c.path()+"/name", "admin", map[string]any{"revision": c.revision(t), "name": "omega"}, "")
+		organizationError(t, status, h, b, 409, "ORG_NAME_TAKEN")
+		assert.Equal(t, before, organizationNamesSnapshot(t, c), "admin must check the actual owner's namespace")
+		c.mutate(t, "admin", "PATCH", c.path()+"/name", "rename", map[string]any{"revision": c.revision(t), "name": "admin namespace"}, nil, false)
+		c.mutate(t, "owner", "PATCH", c.path()+"/name", "rename", map[string]any{"revision": c.revision(t), "name": "ADMIN NAMESPACE"}, nil, false)
+		before = organizationNamesSnapshot(t, c)
+		status, h, b = c.json(t, "PATCH", c.path()+"/name", "owner", map[string]any{"revision": c.revision(t), "name": " ADMIN NAMESPACE "}, "")
+		organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+		assert.NotContains(t, b, "data")
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		callback := "organization_name_read_failure"
+		require.NoError(t, c.db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Table == "organizations" && slices.Equal(tx.Statement.Selects, []string{"id", "name"}) {
+				tx.AddError(errors.New("owned name scan failure"))
+			}
+		}))
+		defer func() { _ = c.db.Callback().Query().Remove(callback) }()
+		status, h, b = c.json(t, "POST", "/api/organizations", "owner", map[string]any{"name": "new name"}, "")
+		organizationError(t, status, h, b, 500, "ORG_INTERNAL_ERROR")
+		require.NoError(t, c.db.Callback().Query().Remove(callback))
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+	})
+	t.Run("disabled_dissolution_and_history", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		reserved := organizationNamedClient(t, c, "owner", "Reserved")
+		reserved.mutate(t, "owner", "POST", reserved.path()+"/self-state", "self_disable", map[string]any{"revision": reserved.revision(t), "disabled": true, "reason": "fixture"}, nil, true)
+		platform := organizationNamedClient(t, c, "owner", "Platform reserved")
+		platform.mutate(t, "root", "POST", fmt.Sprintf("/api/platform/organizations/%d/state", platform.orgA), "platform_disable", map[string]any{"revision": platform.revision(t), "disabled": true, "reason": "fixture"}, nil, true)
+		for _, name := range []string{"reserved", "PLATFORM RESERVED"} {
+			before := organizationNamesSnapshot(t, c)
+			status, h, b := c.json(t, "POST", "/api/organizations", "owner", map[string]any{"name": name}, "")
+			organizationError(t, status, h, b, 409, "ORG_NAME_TAKEN")
+			assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		}
+		reserved.mutate(t, "owner", "POST", reserved.path()+"/dissolve", "dissolve", map[string]any{"revision": reserved.revision(t)}, nil, true)
+		organizationNamedClient(t, c, "owner", "reserved")
+		legacy := organizationNamedClient(t, c, "owner", "Legacy")
+		// These two rows represent pre-existing data, not successful formal API writes.
+		var historical []model.Organization
+		for _, name := range []string{" LEGACY ", "legacy"} {
+			org := model.Organization{Name: name, OwnerUserID: c.users["owner"].Id, CreatedByUserID: c.users["owner"].Id, Revision: 1, OwnershipVersion: 1}
+			require.NoError(t, c.db.Create(&org).Error)
+			require.NoError(t, c.db.Create(&model.OrganizationMember{OrganizationID: org.ID, UserID: org.OwnerUserID, Role: "member", Revision: 1, JoinedAt: 1}).Error)
+			historical = append(historical, org)
+		}
+		before := organizationNamesSnapshot(t, c)
+		status, _, _ := c.json(t, "GET", legacy.path()+"/self-state", "owner", nil, "")
+		require.Equal(t, 200, status)
+		assert.Equal(t, before, organizationNamesSnapshot(t, c), "reading must not rewrite historical duplicates")
+		for _, tc := range []struct{ name, code string }{{"Legacy", "ORG_STATE_CHANGED"}, {"LEGACY", "ORG_NAME_TAKEN"}} {
+			status, h, b := c.json(t, "PATCH", legacy.path()+"/name", "owner", map[string]any{"revision": legacy.revision(t), "name": tc.name}, "")
+			organizationError(t, status, h, b, 409, tc.code)
+			assert.NotContains(t, b, "data")
+			assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		}
+		status, h, b := c.json(t, "POST", "/api/organizations", "owner", map[string]any{"name": "legacy"}, "")
+		organizationError(t, status, h, b, 409, "ORG_NAME_TAKEN")
+		fixture := *c.organizationHTTPFixture
+		fixture.orgA = historical[1].ID
+		corrected := &organizationLifecycleClient{organizationHTTPFixture: &fixture, passwords: c.passwords, refresh: c.refresh}
+		corrected.mutate(t, "owner", "PATCH", corrected.path()+"/name", "rename", map[string]any{"revision": corrected.revision(t), "name": "Corrected"}, nil, false)
+		request := organizationNameTransfer(t, legacy, "owner", "member", true)
+		status, _, b = c.json(t, request.method, request.path, request.actor, request.body, request.proof)
+		require.Equal(t, 200, status)
+		assert.Equal(t, true, b["success"], "source duplicates must not block a free destination namespace")
+		var retained model.Organization
+		require.NoError(t, c.db.First(&retained, historical[0].ID).Error)
+		assert.Equal(t, historical[0], retained)
+	})
+	t.Run("authorization_precedence", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		organizationNamedClient(t, c, "owner", "Unavailable name")
+		before := organizationNamesSnapshot(t, c)
+		for _, tc := range []struct {
+			actor, revision, code string
+			status                int
+		}{{"member", c.revision(t), "ORG_FORBIDDEN", 403}, {"foreign", c.revision(t), "ORG_NOT_FOUND", 404}, {"root", c.revision(t), "ORG_NOT_FOUND", 404}, {"owner", "1", "ORG_STATE_CHANGED", 409}} {
+			status, h, b := c.json(t, "PATCH", c.path()+"/name", tc.actor, map[string]any{"revision": tc.revision, "name": "UNAVAILABLE NAME"}, "")
+			organizationError(t, status, h, b, tc.status, tc.code)
+			assert.NotContains(t, b, "data")
+		}
+		suffix, err := common.GenerateRandomCharsKey(43)
+		require.NoError(t, err)
+		pat := model.AccessTokenPrefix + suffix
+		row := &model.UserAccessToken{Name: "name fixture", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat), ExpiresAt: time.Now().Unix() + 3600}
+		require.NoError(t, row.SetScopes([]string{"*"}))
+		require.NoError(t, model.CreateUserAccessToken(c.users["owner"].Id, row, service.AccessTokenMaxPerUser))
+		legacy, err := common.GenerateRandomCharsKey(32)
+		require.NoError(t, err)
+		require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["owner"].Id).Update("access_token", legacy).Error)
+		for _, credential := range []string{pat, legacy} {
+			status, h, b := c.json(t, "POST", "/api/organizations", credential, map[string]any{"name": "UNAVAILABLE NAME"}, "")
+			organizationError(t, status, h, b, 403, "AUTH_SESSION_REQUIRED")
+		}
+		for _, tc := range []struct {
+			actor, field string
+			value        any
+		}{{"owner", "status", model.UserSessionStatusRevoked}, {"empty", "expires_at", time.Now().Unix() - 1}} {
+			require.NoError(t, c.db.Model(&model.UserSession{}).Where("sid = ?", c.sids[tc.actor]).Update(tc.field, tc.value).Error)
+			status, h, b := c.json(t, "POST", "/api/organizations", tc.actor, map[string]any{"name": "UNAVAILABLE NAME"}, "")
+			organizationError(t, status, h, b, 401, "AUTH_SESSION_REVOKED")
+		}
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+	})
+	t.Run("transfer_preview_and_proof", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		source := organizationNamedClient(t, c, "owner", "Transfer name")
+		request := organizationNameTransfer(t, source, "owner", "member", false)
+		destination := organizationNamedClient(t, c, "member", "transfer NAME")
+		var transfer model.OrganizationOwnershipTransfer
+		require.NoError(t, c.db.Where("organization_id = ?", source.orgA).First(&transfer).Error)
+		targets := map[string]any{"transfer_id": strconv.FormatInt(transfer.ID, 10)}
+		command := maps.Clone(request.body)
+		command["organization_id"], command["transfer_id"] = strconv.FormatInt(source.orgA, 10), targets["transfer_id"]
+		before := organizationNamesSnapshot(t, c)
+		status, h, b := c.json(t, "POST", source.path()+"/authorization-context", "member", map[string]any{"action": "transfer_accept", "command": command}, "")
+		organizationError(t, status, h, b, 409, "ORG_NAME_TAKEN")
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		destination.mutate(t, "member", "PATCH", destination.path()+"/name", "rename", map[string]any{"revision": destination.revision(t), "name": "Free destination"}, nil, false)
+		before = organizationNamesSnapshot(t, c)
+		for _, tc := range []struct{ proof, code string }{{"", "SECURITY_PROOF_REQUIRED"}, {"invalid-fixture-proof", "SECURITY_PROOF_INVALID"}} {
+			status, h, b = c.json(t, request.method, request.path, request.actor, request.body, tc.proof)
+			organizationError(t, status, h, b, 403, tc.code)
+			assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		}
+		stale := maps.Clone(request.body)
+		stale["generation"] = "2"
+		status, h, b = c.json(t, request.method, request.path, request.actor, stale, "")
+		organizationError(t, status, h, b, 409, "ORG_STATE_CHANGED")
+		assert.NotContains(t, b, "data")
+		op := source.operation(t, "member", "transfer_accept", request.body, targets)
+		proof := c.proof(t, "member", op, "password", "")
+		var flow model.AuthFlow
+		require.NoError(t, c.db.Where("purpose = ? AND session_id = ?", model.AuthFlowPurposeSecurityProof, c.sids["member"]).First(&flow).Error)
+		require.NoError(t, c.db.Model(&flow).Update("expires_at", time.Now().Add(-time.Second)).Error)
+		status, h, b = c.json(t, request.method, request.path, request.actor, request.body, proof)
+		organizationError(t, status, h, b, 403, "SECURITY_PROOF_EXPIRED")
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		op = source.operation(t, "member", "transfer_accept", request.body, targets)
+		proof = c.proof(t, "member", op, "password", "")
+		status, _, b = c.json(t, request.method, request.path, request.actor, request.body, proof)
+		require.Equal(t, 200, status)
+		assert.Equal(t, true, b["success"])
+		var final model.Organization
+		require.NoError(t, c.db.First(&final, source.orgA).Error)
+		assert.Equal(t, c.users["member"].Id, final.OwnerUserID)
+		assert.EqualValues(t, 2, final.OwnershipVersion)
+	})
+	t.Run("transfer_final_recheck", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		source := organizationNamedClient(t, c, "owner", "Late name")
+		request := organizationNameTransfer(t, source, "owner", "member", true)
+		before := organizationNamesSnapshot(t, c)
+		var flow model.AuthFlow
+		require.NoError(t, c.db.Where("purpose = ? AND session_id = ?", model.AuthFlowPurposeSecurityProof, c.sids["member"]).First(&flow).Error)
+		original, statement := c.db.ConnPool, c.db.Statement.ConnPool
+		createdReceipts := make(chan map[string]any, 1)
+		pool := &organizationSelectorPool{ConnPool: original, afterRollback: func() error {
+			// The actual service preview has rolled back and released all locks.
+			status, _, b := c.json(t, "POST", "/api/organizations", "member", map[string]any{"name": "LATE NAME"}, "")
+			if status != 201 || b["success"] != true {
+				return errors.New("intervening fixture create did not commit")
+			}
+			receipt, ok := b["data"].(map[string]any)
+			if !ok {
+				return errors.New("intervening fixture create did not return a receipt")
+			}
+			createdReceipts <- receipt
+			return nil
+		}}
+		c.db.ConnPool, c.db.Statement.ConnPool = pool, pool
+		defer func() { c.db.ConnPool, c.db.Statement.ConnPool = original, statement }()
+		status, h, b := c.json(t, request.method, request.path, request.actor, request.body, request.proof)
+		organizationError(t, status, h, b, 409, "ORG_NAME_TAKEN")
+		assert.True(t, pool.fired.Load())
+		require.Len(t, createdReceipts, 1)
+		receipt := <-createdReceipts
+		orgIDText, ok := receipt["organization_id"].(string)
+		require.True(t, ok)
+		orgID, err := strconv.ParseInt(orgIDText, 10, 64)
+		require.NoError(t, err)
+		require.Positive(t, orgID)
+		eventIDText, ok := receipt["event_id"].(string)
+		require.True(t, ok)
+		eventID, err := strconv.ParseInt(eventIDText, 10, 64)
+		require.NoError(t, err)
+		require.Positive(t, eventID)
+		assert.Equal(t, map[string]any{"organization_id": orgIDText, "revision": "1", "action": "create", "event_id": eventIDText, "object_kind": "organization", "object_id": orgIDText, "generation": nil, "status": nil}, receipt)
+		after := organizationNamesSnapshot(t, c)
+		assert.Equal(t, before.Transfers, after.Transfers)
+		require.Len(t, after.Organizations, len(before.Organizations)+1)
+		require.Len(t, after.Members, len(before.Members)+1)
+		organizations := make(map[int64]model.Organization, len(after.Organizations))
+		for _, org := range after.Organizations {
+			organizations[org.ID] = org
+		}
+		for _, org := range before.Organizations {
+			require.Contains(t, organizations, org.ID)
+			assert.Equal(t, org, organizations[org.ID])
+			delete(organizations, org.ID)
+		}
+		require.Len(t, organizations, 1)
+		require.Contains(t, organizations, orgID)
+		created := organizations[orgID]
+		assert.Positive(t, created.CreatedAt)
+		assert.Equal(t, model.Organization{ID: orgID, Name: "LATE NAME", CreatedByUserID: c.users["member"].Id, OwnerUserID: c.users["member"].Id, Revision: 1, OwnershipVersion: 1, CreatedAt: created.CreatedAt, UpdatedAt: created.CreatedAt}, created)
+		members := make(map[int64]model.OrganizationMember, len(after.Members))
+		for _, member := range after.Members {
+			members[member.ID] = member
+		}
+		for _, member := range before.Members {
+			require.Contains(t, members, member.ID)
+			assert.Equal(t, member, members[member.ID])
+			delete(members, member.ID)
+		}
+		require.Len(t, members, 1)
+		for _, member := range members {
+			assert.Positive(t, member.ID)
+			assert.Equal(t, model.OrganizationMember{ID: member.ID, OrganizationID: orgID, UserID: c.users["member"].Id, Role: model.OrganizationRoleMember, Revision: 1, JoinedAt: created.CreatedAt, UpdatedAt: created.CreatedAt}, member)
+		}
+		assert.Equal(t, before.Invitations, after.Invitations)
+		require.Len(t, after.Events, len(before.Events)+1, "only the intervening creation event may commit")
+		events := make(map[int64]model.OrganizationEvent, len(after.Events))
+		for _, event := range after.Events {
+			events[event.ID] = event
+		}
+		for _, event := range before.Events {
+			require.Contains(t, events, event.ID)
+			assert.Equal(t, event, events[event.ID])
+			delete(events, event.ID)
+		}
+		require.Len(t, events, 1)
+		require.Contains(t, events, eventID)
+		assert.Equal(t, model.OrganizationEvent{ID: eventID, OrganizationID: orgID, OrganizationRevision: 1, ActorUserID: c.users["member"].Id, Action: "organization.created", SubjectUserID: c.users["member"].Id, ObjectKind: "organization", ObjectID: orgID, AfterState: "active", CreatedAt: created.CreatedAt}, events[eventID])
+		require.NoError(t, c.db.First(&flow, flow.Id).Error)
+		assert.NotNil(t, flow.ConsumedAt, "a final business conflict must not restore the consumed proof")
+	})
+	for _, scenario := range []string{"create_create", "rename_rename", "transfer_transfer", "create_transfer", "different_owners"} {
+		t.Run(scenario, func(t *testing.T) {
+			c := newOrganizationLifecycleClient(t)
+			name := "Concurrent name"
+			first := organizationNameWrite{method: "POST", path: "/api/organizations", actor: "owner", body: map[string]any{"name": name}}
+			second := organizationNameWrite{method: "POST", path: "/api/organizations", actor: "owner", body: map[string]any{"name": " CONCURRENT NAME "}}
+			switch scenario {
+			case "rename_rename":
+				left := organizationNamedClient(t, c, "owner", "Left")
+				right := organizationNamedClient(t, c, "owner", "Right")
+				first = organizationNameWrite{method: "PATCH", path: left.path() + "/name", actor: "owner", body: map[string]any{"revision": left.revision(t), "name": name}}
+				second = organizationNameWrite{method: "PATCH", path: right.path() + "/name", actor: "owner", body: map[string]any{"revision": right.revision(t), "name": "CONCURRENT NAME"}}
+			case "transfer_transfer":
+				for _, alias := range []string{"recipient1", "recipient2"} {
+					c.users[alias], c.passwords[alias] = c.users["member"], c.passwords["member"]
+					c.login(t, alias)
+				}
+				left := organizationNamedClient(t, c, "owner", name)
+				right := organizationNamedClient(t, c, "foreign", "CONCURRENT NAME")
+				first = organizationNameTransfer(t, left, "owner", "recipient1", true)
+				second = organizationNameTransfer(t, right, "foreign", "recipient2", true)
+			case "create_transfer":
+				source := organizationNamedClient(t, c, "owner", name)
+				second = organizationNameTransfer(t, source, "owner", "member", true)
+				first.actor = "member"
+			case "different_owners":
+				second.actor = "foreign"
+			}
+			before := organizationNamesSnapshot(t, c)
+			organizationNameRace(t, c, first, second, name, scenario == "different_owners")
+			after := organizationNamesSnapshot(t, c)
+			commits := 1
+			if scenario == "different_owners" {
+				commits = 2
+			}
+			assert.Len(t, after.Events, len(before.Events)+commits)
+			if first.path == "/api/organizations" {
+				assert.Len(t, after.Organizations, len(before.Organizations)+commits)
+				assert.Len(t, after.Members, len(before.Members)+commits)
+			} else {
+				assert.Len(t, after.Organizations, len(before.Organizations))
+				assert.Len(t, after.Members, len(before.Members))
+			}
+			if scenario == "rename_rename" || scenario == "transfer_transfer" || scenario == "create_transfer" {
+				var unchanged model.Organization
+				for _, old := range before.Organizations {
+					if strings.HasPrefix(second.path, fmt.Sprintf("/api/organizations/%d/", old.ID)) {
+						require.NoError(t, c.db.First(&unchanged, old.ID).Error)
+						assert.Equal(t, old, unchanged, "losing organization must keep its owner/name/revision")
+						for _, member := range before.Members {
+							if member.OrganizationID == old.ID {
+								var final model.OrganizationMember
+								require.NoError(t, c.db.First(&final, member.ID).Error)
+								assert.Equal(t, member, final)
+							}
+						}
+						for _, transfer := range before.Transfers {
+							if transfer.OrganizationID == old.ID {
+								var final model.OrganizationOwnershipTransfer
+								require.NoError(t, c.db.First(&final, transfer.ID).Error)
+								assert.Equal(t, transfer, final)
+							}
+						}
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestOrganizationLifecycleWriteReceipts(t *testing.T) {

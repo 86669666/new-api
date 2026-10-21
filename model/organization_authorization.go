@@ -246,6 +246,8 @@ func withOrganizationWithContext(parent context.Context, identity AuthSessionIde
 				s.users[id] = u
 			}
 		}
+		// Keep all ordinary consistent reads after these owner/participant locks.
+		// The name-availability guard relies on this ordering under MySQL RR.
 		var err error
 		s.session, err = validateOrganizationIdentity(tx, identity, organizationNow().Unix())
 		if err != nil {

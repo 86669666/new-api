@@ -147,12 +147,38 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
          'not': {'anyOf': [{'required': ['from_username']}, {'required': ['target_username']}]}},
     ]
     conflict = schemas['OrganizationLifecycleError409']
+    assert conflict['properties']['code']['enum'] == [
+        'ORG_STATE_CHANGED', 'ORG_NAME_TAKEN', 'ORG_DISABLED', 'ORG_REQUEST_RESOLVED',
+        'ORG_ALREADY_MEMBER', 'ORG_INVITATION_EXISTS', 'ORG_WALLET_REQUEST_CONFLICT',
+        'ORG_WALLET_ALREADY_REVERSED', 'ORG_WALLET_INSUFFICIENT_AVAILABLE',
+        'ORG_WALLET_LIMIT_EXCEEDED', 'ORG_WALLET_NOT_EMPTY',
+    ]
+    assert contract['name_uniqueness'] == {
+        'scope': 'same owner_user_id, dissolved_at = 0',
+        'comparison': 'Go strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(existing))',
+        'unicode': 'simple case folding only; no normalization, full folding, accent or width removal',
+        'disabled_reserves': True, 'dissolved_reserves': False,
+        'writers': ['create', 'rename', 'transfer_accept'],
+        'conflict': {'status': 409, 'code': 'ORG_NAME_TAKEN', 'data': False},
+        'exact_self_rename': 'ORG_STATE_CHANGED',
+        'case_only_rename': 'allowed only when no other same-owner non-dissolved name conflicts',
+        'history': 'existing duplicates remain unchanged; rename to a conflict-free name is allowed',
+        'concurrency': 'formal API transactions serialize on the existing owner User lock; no schema or direct SQL constraint',
+    }
+    for path, method in [('/api/organizations', 'post'), ('/api/organizations/{org_id}/name', 'patch'),
+                         ('/api/organizations/{org_id}/ownership-transfers/{transfer_id}/accept', 'post'),
+                         ('/api/organizations/{org_id}/authorization-context', 'post')]:
+        assert '409 ORG_NAME_TAKEN without data or conflicting organization details' in api['paths'][path][method]['description']
     assert conflict['properties']['data']['properties'] == {'revision': {'$ref': '#/components/schemas/OrganizationLifecycleID'}}
     assert conflict['properties']['data']['required'] == ['revision']
     assert conflict['properties']['data']['additionalProperties'] is False
+    assert 'additionalProperties' not in conflict
     assert conflict['oneOf'] == [
         {'properties': {'code': {'enum': ['ORG_STATE_CHANGED']}}},
-        {'properties': {'code': {'enum': [value for value in conflict['properties']['code']['enum'] if value != 'ORG_STATE_CHANGED']}},
+        {'properties': {'success': {'type': 'boolean', 'enum': [False]}, 'message': {'type': 'string'},
+                        'code': {'enum': ['ORG_NAME_TAKEN']}}, 'additionalProperties': False},
+        {'properties': {'code': {'enum': [value for value in conflict['properties']['code']['enum']
+                                        if value not in ('ORG_STATE_CHANGED', 'ORG_NAME_TAKEN')]}},
          'not': {'required': ['data']}},
     ]
     for path in ['/api/organizations/{org_id}/invitations', '/api/organizations/{org_id}/invitations/{invitation_id}/reissue']:

@@ -9998,5 +9998,42 @@
         "github_oauth": true
       }
     }
+  },
+  {
+    "name": "organization name conflict fixed error",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": true,
+    "value": {
+      "success": false,
+      "message": "Organization name is already in use.",
+      "code": "ORG_NAME_TAKEN"
+    }
+  },
+  {
+    "name": "organization name conflict never includes revision",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": false,
+    "value": {
+      "success": false,
+      "message": "Organization name is already in use.",
+      "code": "ORG_NAME_TAKEN",
+      "data": {
+        "revision": "1"
+      }
+    }
+  },
+  {
+    "name": "organization name conflict never includes conflicting identity",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": false,
+    "value": {
+      "success": false,
+      "message": "Organization name is already in use.",
+      "code": "ORG_NAME_TAKEN",
+      "conflicting_organization_id": "1"
+    }
   }
 ]
