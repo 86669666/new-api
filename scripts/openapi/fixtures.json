@@ -11256,5 +11256,113 @@
       "group": "g1"
     },
     "valid": false
+  },
+  {
+    "name": "personal log range default",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalLogRangeError",
+    "value": {
+      "success": false,
+      "code": "LOG_RANGE_TOO_WIDE",
+      "message": "The time range cannot exceed 365 days",
+      "message_key": "The time range cannot exceed {{days}} days",
+      "message_params": {
+        "days": 365
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "personal log range configured",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalLogRangeError",
+    "value": {
+      "success": false,
+      "code": "LOG_RANGE_TOO_WIDE",
+      "message": "The time range cannot exceed 7 days",
+      "message_key": "The time range cannot exceed {{days}} days",
+      "message_params": {
+        "days": 7
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "personal log range missing code",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "The time range cannot exceed 365 days",
+      "message_key": "The time range cannot exceed {{days}} days",
+      "message_params": {
+        "days": 365
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "personal log range wrong code",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "OTHER_LOG_ERROR",
+      "message": "The time range cannot exceed 365 days",
+      "message_key": "The time range cannot exceed {{days}} days",
+      "message_params": {
+        "days": 365
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "personal log range cannot succeed",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": true,
+      "code": "LOG_RANGE_TOO_WIDE",
+      "message": "The time range cannot exceed 365 days",
+      "message_key": "The time range cannot exceed {{days}} days",
+      "message_params": {
+        "days": 365
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "personal log range cannot include data",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "LOG_RANGE_TOO_WIDE",
+      "message": "The time range cannot exceed 365 days",
+      "message_key": "The time range cannot exceed {{days}} days",
+      "message_params": {
+        "days": 365
+      },
+      "data": {
+        "items": [],
+        "total": 0
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "personal log range days must be numeric",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "LOG_RANGE_TOO_WIDE",
+      "message": "The time range cannot exceed 365 days",
+      "message_key": "The time range cannot exceed {{days}} days",
+      "message_params": {
+        "days": "365"
+      }
+    },
+    "valid": false
   }
 ]

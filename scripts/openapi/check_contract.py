@@ -157,6 +157,45 @@ def check_no_available_channel_detail(relay):
     return {'optional_detail': 'no_available_channel', 'legacy_required_fields': ['message', 'type'], 'scope': 'marked HTTP host OpenAI only'}
 
 
+def check_personal_log_range_error(api):
+    operation = api['paths']['/api/log/self']['get']
+    response = operation['responses']['400']
+    legacy = api['components']['responses']['OrganizationSelectionBadRequest']
+    assert response['headers'] == legacy['headers']
+    content = response['content']['application/json']
+    assert content['schema'] == {'anyOf': [
+        {'$ref': '#/components/schemas/OrganizationSelectionBadRequestError'},
+        {'$ref': '#/components/schemas/PersonalLogRangeError'},
+    ]}
+    for name, example in legacy['content']['application/json']['examples'].items():
+        assert content['examples'][name] == example
+    assert set(content['examples']) == set(legacy['content']['application/json']['examples']) | {
+        'LOG_RANGE_TOO_WIDE_365', 'LOG_RANGE_TOO_WIDE_7',
+    }
+    assert 'before authentication' in response['description']
+    assert 'after personal owner validation and the role check' in response['description']
+    assert 'administrators retain' in response['description']
+    schema = api['components']['schemas']['PersonalLogRangeError']
+    assert {key: value for key, value in schema.items() if key != 'description'} == {
+        'type': 'object', 'additionalProperties': False,
+        'required': ['success', 'code', 'message', 'message_key', 'message_params'],
+        'properties': {
+            'success': {'type': 'boolean', 'enum': [False]},
+            'code': {'type': 'string', 'enum': ['LOG_RANGE_TOO_WIDE']},
+            'message': {'type': 'string'},
+            'message_key': {'type': 'string', 'enum': ['The time range cannot exceed {{days}} days']},
+            'message_params': {'type': 'object', 'additionalProperties': False,
+                               'required': ['days'], 'properties': {'days': {'type': 'integer'}}},
+        },
+    }
+    for path, item in api['paths'].items():
+        if path == '/api/log/self':
+            continue
+        assert all(node.get('$ref') != '#/components/schemas/PersonalLogRangeError' for node in walk(item))
+    return {'scope': '/api/log/self ordinary-user range error only', 'status': 400,
+            'code': 'LOG_RANGE_TOO_WIDE', 'selector_400_preserved': True, 'structured_message_preserved': True}
+
+
 def check_personal_log_pagination(api):
     operation = api['paths']['/api/log/self']['get']
     assert operation['x-personal-log-pagination'] == {
@@ -164,7 +203,7 @@ def check_personal_log_pagination(api):
         'page_selection': 'first p value whenever parsed URL contains the p key, including bare/empty/invalid/zero/negative/overflow; otherwise first page value',
         'page_fallback': 'existing platform-int parsing preserved: empty/syntax-invalid/zero defaults to 1; negative and overflow behavior unchanged',
         'page_size': 'first page_size value; zero/parse failure falls through first ps then first size then configured ItemsPerPage; nonzero negative values retained; upper cap 100',
-        'compatibility': 'no new validation errors or response fields; ownership, filters, sorting, range checks and authentication unchanged',
+        'compatibility': 'pagination parsing introduces no new validation errors or response fields; ownership, filters, sorting, range-limit decisions and authentication unchanged; range-error HTTP status/code documented separately',
     }
     assert operation['security'] == [{'DashboardJWT': []}, {'PersonalAccessToken': []}]
     assert operation['x-pat-scope'] == 'usage:read'
@@ -932,6 +971,7 @@ def main():
     results['token_pricing'] = check_token_pricing(api)
     results['model_capability_metadata'] = check_model_capability_metadata(api)
     results['personal_log_pagination'] = check_personal_log_pagination(api)
+    results['personal_log_range_error'] = check_personal_log_range_error(api)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
     for fixture in fixtures:
         if fixture.get('kind') == 's3_operation':

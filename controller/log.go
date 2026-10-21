@@ -83,7 +83,7 @@ func GetUserLogs(c *gin.Context) {
 	if c.GetInt("role") < common.RoleAdminUser {
 		startTimestamp, err := limitLogTimeRange(filter.StartTimestamp, filter.EndTimestamp)
 		if err != nil {
-			common.ApiError(c, err)
+			common.ApiErrorStatus(c, http.StatusBadRequest, err, gin.H{"code": "LOG_RANGE_TOO_WIDE"})
 			return
 		}
 		filter.StartTimestamp = startTimestamp

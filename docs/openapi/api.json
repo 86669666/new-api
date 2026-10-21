@@ -10245,7 +10245,7 @@
       "get": {
         "summary": "获取个人日志",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限）\nPersonal log pagination accepts page only when the parsed URL has no p key. Presence of p (including bare p, p=, malformed or repeated values) always wins; duplicate p/page values use the first. Empty, syntax-invalid or zero page numbers default to 1; legacy negative and platform-int overflow behavior is unchanged. Page size uses page_size, then ps, then size, then configured ItemsPerPage when the selected size is zero or fails its initial parse. Nonzero negative sizes retain legacy behavior; positive sizes are capped at 100. No new parameter validation errors or response fields are introduced. This alias does not apply to administrator logs, export, statistics or other endpoints.",
+        "description": "🔐 需要登录（User权限）\nPersonal log pagination accepts page only when the parsed URL has no p key. Presence of p (including bare p, p=, malformed or repeated values) always wins; duplicate p/page values use the first. Empty, syntax-invalid or zero page numbers default to 1; legacy negative and platform-int overflow behavior is unchanged. Page size uses page_size, then ps, then size, then configured ItemsPerPage when the selected size is zero or fails its initial parse. Nonzero negative sizes retain legacy behavior; positive sizes are capped at 100. Pagination parsing introduces no new parameter validation errors or response fields. This alias does not apply to administrator logs, export, statistics or other endpoints. Ordinary users below the administrator role are subject to log_setting.max_range_days (default 365). The existing start_timestamp/end_timestamp range calculation uses the earlier of now and a nonzero end; a missing start defaults to that end minus the allowed range. Exactly the allowed span is accepted; a greater span returns HTTP400 LOG_RANGE_TOO_WIDE after personal owner validation and the ordinary-user role check. This failure retains success:false, message, message_key and message_params.days without data. Administrators retain their existing self-log range exemption. Invalid/conflicting organization selectors remain separate HTTP400 failures before authentication; no other timestamp-validation or endpoint error behavior changes.",
         "tags": [
           "日志"
         ],
@@ -10348,7 +10348,69 @@
             }
           },
           "400": {
-            "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+            "description": "ORG_SELECTOR_INVALID/ORG_SELECTOR_CONFLICT reject an invalid or conflicting organization selector before authentication. Separately, LOG_RANGE_TOO_WIDE rejects an ordinary user's overwide personal-log range after personal owner validation and the role check; administrators retain their self-log exemption. The structured Message fields are preserved.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Set on these canonical GET routes before authentication/rate limiting, and on organization-boundary rejections. Not a promise for framework redirects before middleware."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PersonalLogRangeError"
+                    }
+                  ]
+                },
+                "examples": {
+                  "ORG_SELECTOR_INVALID": {
+                    "value": {
+                      "success": false,
+                      "code": "ORG_SELECTOR_INVALID",
+                      "message": "Invalid organization selector.",
+                      "message_key": "Invalid organization selector."
+                    }
+                  },
+                  "ORG_SELECTOR_CONFLICT": {
+                    "value": {
+                      "success": false,
+                      "code": "ORG_SELECTOR_CONFLICT",
+                      "message": "Organization selectors conflict.",
+                      "message_key": "Organization selectors conflict."
+                    }
+                  },
+                  "LOG_RANGE_TOO_WIDE_365": {
+                    "value": {
+                      "success": false,
+                      "code": "LOG_RANGE_TOO_WIDE",
+                      "message": "The time range cannot exceed 365 days",
+                      "message_key": "The time range cannot exceed {{days}} days",
+                      "message_params": {
+                        "days": 365
+                      }
+                    }
+                  },
+                  "LOG_RANGE_TOO_WIDE_7": {
+                    "value": {
+                      "success": false,
+                      "code": "LOG_RANGE_TOO_WIDE",
+                      "message": "The time range cannot exceed 7 days",
+                      "message_key": "The time range cannot exceed {{days}} days",
+                      "message_params": {
+                        "days": 7
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "security": [
@@ -10368,7 +10430,7 @@
           "page_selection": "first p value whenever parsed URL contains the p key, including bare/empty/invalid/zero/negative/overflow; otherwise first page value",
           "page_fallback": "existing platform-int parsing preserved: empty/syntax-invalid/zero defaults to 1; negative and overflow behavior unchanged",
           "page_size": "first page_size value; zero/parse failure falls through first ps then first size then configured ItemsPerPage; nonzero negative values retained; upper cap 100",
-          "compatibility": "no new validation errors or response fields; ownership, filters, sorting, range checks and authentication unchanged"
+          "compatibility": "pagination parsing introduces no new validation errors or response fields; ownership, filters, sorting, range-limit decisions and authentication unchanged; range-error HTTP status/code documented separately"
         }
       }
     },
@@ -27236,6 +27298,53 @@
           "key",
           "value"
         ]
+      },
+      "PersonalLogRangeError": {
+        "type": "object",
+        "description": "Only the ordinary-user GET /api/log/self overwide-range error, after personal owner validation and the role check. Existing Message text and numeric days are preserved.",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key",
+          "message_params"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "LOG_RANGE_TOO_WIDE"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string",
+            "enum": [
+              "The time range cannot exceed {{days}} days"
+            ]
+          },
+          "message_params": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "days"
+            ],
+            "properties": {
+              "days": {
+                "type": "integer"
+              }
+            }
+          }
+        }
       }
     },
     "responses": {
