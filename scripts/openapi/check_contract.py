@@ -126,6 +126,46 @@ def check_conditional_authorization(source_root):
     }
 
 
+def check_token_usage(api):
+    operation = api['paths']['/api/usage/token/']['get']
+    assert operation['security'] == [{'RelayKey': []}]
+    assert operation['x-token-usage-contract'] == {
+        'principal': 'request-local authenticated token and owner-group snapshot; no credential reparse lookup',
+        'group': 'nonempty token group, otherwise authenticated owner group; auto remains auto',
+        'auto_groups': False, 'pricing': False,
+        'quota_privacy': 'user_quota only when AllowUserQuotaQuery', 'cache_control': 'private, no-store',
+    }
+    for status in ['200', '401', '403', '500']:
+        assert operation['responses'][status]['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
+    assert operation['responses']['200']['content']['application/json']['schema'] == {
+        'oneOf': [{'$ref': '#/components/schemas/TokenUsageResult'}, {'$ref': '#/components/schemas/ManagementError'}],
+    }
+    schemas = api['components']['schemas']
+    assert schemas['TokenUsageResult'] == {
+        'type': 'object', 'properties': {
+            'code': {'type': 'boolean', 'enum': [True]}, 'message': {'type': 'string', 'enum': ['ok']},
+            'data': {'$ref': '#/components/schemas/TokenUsageData'},
+        }, 'required': ['code', 'message', 'data'], 'additionalProperties': False,
+    }
+    data = schemas['TokenUsageData']
+    types = {'object': 'string', 'name': 'string', 'group': 'string', 'total_granted': 'integer',
+             'total_used': 'integer', 'total_available': 'integer', 'unlimited_quota': 'boolean',
+             'model_limits': 'object', 'model_limits_enabled': 'boolean', 'expires_at': 'integer'}
+    assert data['type'] == 'object' and data['additionalProperties'] is False
+    assert data['required'] == list(types)
+    assert set(data['properties']) == set(types) | {'user_quota'}
+    for name, kind in types.items():
+        assert data['properties'][name]['type'] == kind
+        assert data['properties'][name].get('nullable', False) is False
+    assert data['properties']['object']['enum'] == ['token_usage']
+    assert data['properties']['model_limits']['additionalProperties'] == {'type': 'boolean'}
+    user_quota = data['properties']['user_quota']
+    assert user_quota['type'] == 'object' and user_quota['additionalProperties'] is False
+    assert user_quota['required'] == ['total_available', 'total_used']
+    assert user_quota['properties'] == {name: {'type': 'integer', 'format': 'int64'} for name in user_quota['required']}
+    return {'group': 'selected/inherited/auto', 'pricing': False, 'auto_groups': False}
+
+
 def check_organization_lifecycle(api, relay, fixtures, design_gate):
     check_organization_wallet(api, relay)
     contract = api['x-organization-lifecycle-contract']
@@ -724,6 +764,7 @@ def main():
             results['fixtures'].append(path + ':' + name)
 
     fixtures = json.loads((Path(__file__).with_name('fixtures.json')).read_text())
+    results['token_usage'] = check_token_usage(api)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
     for fixture in fixtures:
         if fixture.get('kind') == 's3_operation':

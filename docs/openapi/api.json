@@ -9076,7 +9076,7 @@
       "get": {
         "summary": "获取令牌使用情况",
         "deprecated": false,
-        "description": "🔑 需要令牌认证（TokenAuth）",
+        "description": "Read-only sk authentication through TokenAuthReadOnly. Supply exactly one Authorization value: Bearer or bearer, one ASCII space, then a nonempty opaque key with an optional sk- prefix. Raw credentials without the scheme, dash suffixes, comma lists, duplicate headers and extra ASCII whitespace are rejected. Expired and exhausted tokens remain readable; disabled tokens, IP restrictions and disabled owners retain the existing checks. data.group is the exact nonempty token group, or the authenticated owner group when empty; auto stays literal auto. This describes the selected group, not current relay permission or an auto candidate. No auto_groups, pricing support or new capability flag is implied. Existing numeric quota and expires_at semantics are unchanged; user_quota is returned only when the token permits it.",
         "tags": [
           "令牌管理"
         ],
@@ -9090,8 +9090,29 @@
         ],
         "responses": {
           "200": {
-            "description": "成功",
-            "headers": {}
+            "description": "Read-only token usage with the selected group, or the existing HTTP200 quota-query failure envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on usage responses and read-only authentication failures."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/TokenUsageResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
           },
           "401": {
             "description": "Missing/invalid authentication",
@@ -9100,6 +9121,14 @@
                 "schema": {
                   "$ref": "#/components/schemas/ManagementError"
                 }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on usage responses and read-only authentication failures."
               }
             }
           },
@@ -9122,14 +9151,32 @@
             "headers": {
               "Cache-Control": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
                 },
-                "description": "private, no-store on organization-boundary rejection; other existing failures retain their own headers."
+                "description": "private, no-store on usage responses and read-only authentication failures."
               }
             }
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "500": {
+            "description": "Read-only authentication database failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on usage responses and read-only authentication failures."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagementError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -9138,7 +9185,16 @@
           }
         ],
         "operationId": "getApiUsageTokenCollection",
-        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
+        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access",
+        "x-auth-source": "middleware/auth.go:TokenAuthReadOnly; controller/token.go:GetTokenUsage",
+        "x-token-usage-contract": {
+          "principal": "request-local authenticated token and owner-group snapshot; no credential reparse lookup",
+          "group": "nonempty token group, otherwise authenticated owner group; auto remains auto",
+          "auto_groups": false,
+          "pricing": false,
+          "quota_privacy": "user_quota only when AllowUserQuotaQuery",
+          "cache_control": "private, no-store"
+        }
       }
     },
     "/api/redemption/": {
@@ -26438,6 +26494,111 @@
             "$ref": "#/components/schemas/SiteDescription"
           }
         }
+      },
+      "TokenUsageData": {
+        "type": "object",
+        "properties": {
+          "object": {
+            "type": "string",
+            "enum": [
+              "token_usage"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string",
+            "description": "Exact selected token group; an empty token group inherits the already authenticated owner group. Literal auto is not expanded."
+          },
+          "total_granted": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_used": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_available": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unlimited_quota": {
+            "type": "boolean"
+          },
+          "model_limits": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "boolean"
+            }
+          },
+          "model_limits_enabled": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds; -1 never-expiring storage is returned as 0, preserving existing behavior."
+          },
+          "user_quota": {
+            "type": "object",
+            "properties": {
+              "total_available": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "total_used": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "required": [
+              "total_available",
+              "total_used"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when this authenticated token allows user quota queries."
+          }
+        },
+        "required": [
+          "object",
+          "name",
+          "group",
+          "total_granted",
+          "total_used",
+          "total_available",
+          "unlimited_quota",
+          "model_limits",
+          "model_limits_enabled",
+          "expires_at"
+        ],
+        "additionalProperties": false
+      },
+      "TokenUsageResult": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/TokenUsageData"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "data"
+        ],
+        "additionalProperties": false
       }
     },
     "responses": {

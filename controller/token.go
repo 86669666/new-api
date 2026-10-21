@@ -236,8 +236,9 @@ func GetTokenStatus(c *gin.Context) {
 }
 
 func GetTokenUsage(c *gin.Context) {
-	authHeader := c.GetHeader("Authorization")
-	if authHeader == "" {
+	c.Header("Cache-Control", "private, no-store")
+	authHeaders := c.Request.Header.Values("Authorization")
+	if len(authHeaders) == 0 || len(authHeaders) == 1 && authHeaders[0] == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"success": false,
 			"message": "No Authorization header",
@@ -245,20 +246,22 @@ func GetTokenUsage(c *gin.Context) {
 		return
 	}
 
-	parts := strings.Split(authHeader, " ")
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+	if len(authHeaders) != 1 {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"success": false,
 			"message": "Invalid Bearer token",
 		})
 		return
 	}
-	tokenKey := parts[1]
-
-	token, err := model.GetTokenByKey(strings.TrimPrefix(tokenKey, "sk-"), false)
-	if err != nil {
-		common.SysError(common.LogText("failed to get token by key: %s", err.Error()))
-		common.ApiErrorI18n(c, i18n.MsgTokenGetInfoFailed)
+	scheme, credential, separated := strings.Cut(authHeaders[0], " ")
+	key := strings.TrimPrefix(credential, "sk-")
+	if !separated || scheme != "Bearer" && scheme != "bearer" || credential != strings.TrimSpace(credential) || key == "" || strings.ContainsAny(key, "- ,\t\r\n\v\f") {
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "Invalid Bearer token"})
+		return
+	}
+	token, ownerGroup, authenticated := middleware.GetReadOnlyToken(c)
+	if !authenticated {
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "Invalid Bearer token"})
 		return
 	}
 
@@ -266,10 +269,15 @@ func GetTokenUsage(c *gin.Context) {
 	if expiredAt == -1 {
 		expiredAt = 0
 	}
+	group := token.Group
+	if group == "" {
+		group = ownerGroup
+	}
 
 	data := gin.H{
 		"object":               "token_usage",
 		"name":                 token.Name,
+		"group":                group,
 		"total_granted":        token.RemainQuota + token.UsedQuota,
 		"total_used":           token.UsedQuota,
 		"total_available":      token.RemainQuota,

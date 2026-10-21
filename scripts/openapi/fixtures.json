@@ -10035,5 +10035,240 @@
       "code": "ORG_NAME_TAKEN",
       "conflicting_organization_id": "1"
     }
+  },
+  {
+    "name": "token usage named group",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "group": "Named group",
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": 100,
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "token usage inherited group",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "group": "Owner group",
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": 100,
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0,
+        "user_quota": {
+          "total_available": 12345,
+          "total_used": 678
+        }
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "token usage auto group",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "group": "auto",
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": 100,
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "token usage missing group",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": 100,
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token usage null group",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "group": null,
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": 100,
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token usage non-string group",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "group": [
+          "auto"
+        ],
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": 100,
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token usage unrequested auto candidates",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "group": "Named group",
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": 100,
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0,
+        "auto_groups": [
+          "Named group"
+        ]
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token usage private owner name",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "group": "Named group",
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": 100,
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0,
+        "username": "private-owner"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token usage quota remains numeric",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageResult",
+    "value": {
+      "code": true,
+      "message": "ok",
+      "data": {
+        "object": "token_usage",
+        "name": "Example key",
+        "group": "Named group",
+        "total_granted": 130,
+        "total_used": 30,
+        "total_available": "100",
+        "unlimited_quota": false,
+        "model_limits": {
+          "example-model": true
+        },
+        "model_limits_enabled": true,
+        "expires_at": 0
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token usage legacy quota failure",
+    "document": "api",
+    "schema": "#/paths/~1api~1usage~1token~1/get/responses/200/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Failed to get token information"
+    },
+    "valid": true
   }
 ]

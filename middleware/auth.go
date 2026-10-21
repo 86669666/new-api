@@ -28,6 +28,7 @@ const (
 	authIdentityContextKey        = "auth_identity"
 	accessTokenLookupContextKey   = "access_token_lookup"
 	accessTokenIdentityContextKey = "access_token_identity"
+	readOnlyTokenContextKey       = "read_only_token_identity"
 	accessTokenSessionRequiredMsg = "a dashboard login session is required"
 )
 
@@ -517,12 +518,32 @@ func TokenOrUserAuth() func(c *gin.Context) {
 	}
 }
 
+type readOnlyTokenIdentity struct {
+	token      model.Token
+	ownerGroup string
+}
+
+// GetReadOnlyToken returns only the request-local snapshot validated by
+// TokenAuthReadOnly. It does not interpret credentials or query another token.
+func GetReadOnlyToken(c *gin.Context) (model.Token, string, bool) {
+	value, _ := c.Get(readOnlyTokenContextKey)
+	identity, ok := value.(readOnlyTokenIdentity)
+	if !ok || identity.token.Id <= 0 || identity.token.UserId <= 0 || identity.token.Key == "" ||
+		c.GetInt("id") != identity.token.UserId || c.GetInt("token_id") != identity.token.Id || c.GetString("token_key") != identity.token.Key {
+		return model.Token{}, "", false
+	}
+	return identity.token, identity.ownerGroup, true
+}
+
 // TokenAuthReadOnly 宽松版本的令牌认证中间件，用于只读查询接口。
 // 只验证令牌 key 是否存在，不检查过期时间和额度。
 // 即使令牌已过期或已耗尽，也允许访问；已禁用的令牌会被拒绝。
 // 仍然检查令牌 IP 白名单和用户是否被封禁。
 func TokenAuthReadOnly() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		if c.FullPath() == "/api/usage/token/" {
+			c.Header("Cache-Control", "private, no-store")
+		}
 		key := c.Request.Header.Get("Authorization")
 		if key == "" {
 			common.ApiErrorStatus(c, http.StatusUnauthorized, errors.New(common.TranslateMessage(c, i18n.MsgTokenNotProvided)))
@@ -586,6 +607,7 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		c.Set("id", token.UserId)
 		c.Set("token_id", token.Id)
 		c.Set("token_key", token.Key)
+		c.Set(readOnlyTokenContextKey, readOnlyTokenIdentity{token: *token, ownerGroup: userCache.Group})
 		c.Next()
 	}
 }

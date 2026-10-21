@@ -647,15 +647,18 @@ func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 		name          string
 		allow         bool
 		expired       bool
+		exhausted     bool
+		group         string
 		allowIps      string
 		remoteAddr    string
 		wantStatus    int
 		wantUserQuota bool
 	}{
-		{name: "switch off", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK},
+		{name: "switch off", group: "Named group", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK},
 		{name: "switch on without IP whitelist", allow: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
-		{name: "switch on with matching IP whitelist", allow: true, allowIps: "198.51.100.1\n203.0.113.0/24", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
+		{name: "switch on with matching IP whitelist", group: "auto", allow: true, allowIps: "198.51.100.1\n203.0.113.0/24", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
 		{name: "expired key with the switch on", allow: true, expired: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
+		{name: "exhausted key remains readable", exhausted: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK},
 		{name: "switch on from an IP outside the whitelist", allow: true, allowIps: "198.51.100.1", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusForbidden},
 		{name: "switch off from an IP outside the whitelist", allowIps: "198.51.100.1", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusForbidden},
 		{name: "unresolved client IP with a whitelist", allow: true, allowIps: "203.0.113.0/24", remoteAddr: "unresolved", wantStatus: http.StatusForbidden},
@@ -666,12 +669,15 @@ func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 			// Initialize production column quoting for the token key lookup.
 			t.Setenv("LOG_SQL_DSN", "")
 			require.NoError(t, model.InitLogDB())
-			user := &model.User{Username: "quota-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", Quota: 12345, UsedQuota: 678, AuthVersion: 1, AffCode: "quota-owner"}
+			user := &model.User{Username: "quota-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "owner-group", Quota: 12345, UsedQuota: 678, AuthVersion: 1, AffCode: "quota-owner"}
 			require.NoError(t, db.Create(user).Error)
 			token := seedToken(t, db, user.Id, "usage-token", "usagekey1234")
-			updates := map[string]any{"allow_user_quota_query": tc.allow, "allow_ips": tc.allowIps, "used_quota": 30}
+			updates := map[string]any{"allow_user_quota_query": tc.allow, "allow_ips": tc.allowIps, "used_quota": 30, "group": tc.group}
 			if tc.expired {
 				updates["status"], updates["expired_time"] = common.TokenStatusExpired, 1
+			}
+			if tc.exhausted {
+				updates["status"], updates["remain_quota"] = common.TokenStatusExhausted, 0
 			}
 			require.NoError(t, db.Model(token).Updates(updates).Error)
 
@@ -684,6 +690,7 @@ func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 			router.ServeHTTP(recorder, request)
 
 			require.Equal(t, tc.wantStatus, recorder.Code, recorder.Body.String())
+			assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
 			if tc.wantStatus != http.StatusOK {
 				assert.NotContains(t, recorder.Body.String(), "total_available")
 				return
@@ -694,16 +701,208 @@ func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 			}
 			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 			require.True(t, response.Code, recorder.Body.String())
-			fields := []string{"expires_at", "model_limits", "model_limits_enabled", "name", "object", "total_available", "total_granted", "total_used", "unlimited_quota"}
+			fields := []string{"expires_at", "group", "model_limits", "model_limits_enabled", "name", "object", "total_available", "total_granted", "total_used", "unlimited_quota"}
 			if tc.wantUserQuota {
 				fields = append(fields, "user_quota")
 			}
 			assert.Equal(t, fields, slices.Sorted(maps.Keys(response.Data)))
-			assert.JSONEq(t, `100`, string(response.Data["total_available"]))
+			wantGroup := tc.group
+			if wantGroup == "" {
+				wantGroup = user.Group
+			}
+			var group string
+			require.NoError(t, common.Unmarshal(response.Data["group"], &group))
+			assert.Equal(t, wantGroup, group)
+			available, expires := 100, 0
+			if tc.exhausted {
+				available = 0
+			}
+			if tc.expired {
+				expires = 1
+			}
+			assert.JSONEq(t, strconv.Itoa(available), string(response.Data["total_available"]))
+			assert.JSONEq(t, strconv.Itoa(available+30), string(response.Data["total_granted"]))
 			assert.JSONEq(t, `30`, string(response.Data["total_used"]))
+			assert.JSONEq(t, strconv.Itoa(expires), string(response.Data["expires_at"]))
 			if tc.wantUserQuota {
 				assert.JSONEq(t, `{"total_available":12345,"total_used":678}`, string(response.Data["user_quota"]))
 			}
+		})
+	}
+}
+
+func TestGetTokenUsageAuthenticatedSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode string
+		headers    []string
+		status     int
+	}{
+		{name: "lowercase bearer", headers: []string{"bearer sk-snapshotkey"}, status: 200},
+		{name: "existing bearer without sk prefix", headers: []string{"Bearer snapshotkey"}, status: 200},
+		{name: "missing header", status: 401},
+		{name: "raw key", headers: []string{"sk-snapshotkey"}, status: 401},
+		{name: "dash suffix", headers: []string{"Bearer sk-snapshotkey-channel"}, status: 401},
+		{name: "duplicate header", headers: []string{"Bearer sk-snapshotkey", "Bearer sk-otherkey"}, status: 401},
+		{name: "comma list", headers: []string{"Bearer sk-snapshotkey, Bearer sk-otherkey"}, status: 401},
+		{name: "extra space", headers: []string{"Bearer  sk-snapshotkey"}, status: 401},
+		{name: "trailing space", headers: []string{"Bearer sk-snapshotkey "}, status: 401},
+		{name: "leading NBSP on bare credential", headers: []string{"Bearer \u00a0snapshotkey"}, status: 401},
+		{name: "trailing NBSP", headers: []string{"Bearer sk-snapshotkey\u00a0"}, status: 401},
+		{name: "leading EM SPACE on bare credential", headers: []string{"Bearer \u2003snapshotkey"}, status: 401},
+		{name: "trailing EM SPACE", headers: []string{"Bearer sk-snapshotkey\u2003"}, status: 401},
+		{name: "unsupported scheme case", headers: []string{"BEARER sk-snapshotkey"}, status: 401},
+		{name: "disabled token", mode: "disabled", status: 401},
+		{name: "deleted token", mode: "deleted", status: 401},
+		{name: "unknown token", headers: []string{"Bearer sk-unknownkey"}, status: 401},
+		{name: "disabled owner", mode: "banned", status: 403},
+		{name: "database failure", mode: "database_failure", status: 500},
+		{name: "header changed after authentication", mode: "replace_header", status: 200},
+		{name: "owner group snapshot", mode: "replace_owner_group", status: 200},
+		{name: "no lookup after authentication", mode: "no_lookup", status: 200},
+		{name: "quota query failure retains legacy error", mode: "quota_failure", status: 200},
+		{name: "missing typed context", mode: "missing_context", status: 401},
+		{name: "malformed typed context", mode: "malformed_context", status: 401},
+		{name: "mismatched context identity", mode: "mismatched_context", status: 401},
+		{name: "dashboard JWT is not an sk key", mode: "jwt", status: 401},
+		{name: "PAT is not an sk key", mode: "pat", status: 401},
+		{name: "dashboard context cannot replace sk owner", mode: "mixed_valid", status: 200},
+		{name: "dashboard context cannot rescue invalid sk", mode: "mixed_invalid", status: 401},
+		{name: "shared log raw syntax unchanged", mode: "log", headers: []string{"sk-snapshotkey"}, status: 200},
+		{name: "shared log suffix syntax unchanged", mode: "log", headers: []string{"Bearer sk-snapshotkey-channel"}, status: 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupTokenControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(&model.User{}))
+			t.Setenv("LOG_SQL_DSN", "")
+			require.NoError(t, model.InitLogDB())
+			if tc.mode == "log" {
+				require.NoError(t, db.AutoMigrate(&model.Log{}))
+			}
+			owner := &model.User{Username: "private-owner", Password: "placeholder", Group: "Owner group", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AuthVersion: 1, AffCode: "owner"}
+			other := &model.User{Username: "other-private-owner", Password: "placeholder", Group: "Other owner group", Status: common.UserStatusEnabled, Role: common.RoleRootUser, AuthVersion: 1, AffCode: "other"}
+			require.NoError(t, db.Create(owner).Error)
+			require.NoError(t, db.Create(other).Error)
+			token := seedToken(t, db, owner.Id, "Visible token name", "snapshotkey")
+			otherToken := seedToken(t, db, other.Id, "Other token name", "otherkey")
+			require.NoError(t, db.Model(token).Update("group", "Named group").Error)
+			switch tc.mode {
+			case "disabled":
+				require.NoError(t, db.Model(token).Update("status", common.TokenStatusDisabled).Error)
+			case "deleted":
+				require.NoError(t, db.Delete(token).Error)
+			case "banned":
+				require.NoError(t, db.Model(owner).Update("status", common.UserStatusDisabled).Error)
+			case "replace_owner_group":
+				require.NoError(t, db.Model(token).Update("group", "").Error)
+			case "quota_failure":
+				require.NoError(t, db.Model(token).Update("allow_user_quota_query", true).Error)
+			}
+			blockQueries := func(tx *gorm.DB) { tx.AddError(errors.New("fixture database failure")) }
+			if tc.mode == "database_failure" {
+				require.NoError(t, db.Callback().Query().Before("gorm:query").Register("usage-fixture-failure", blockQueries))
+			}
+			t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove("usage-fixture-failure")) })
+			headers := tc.headers
+			if headers == nil && tc.mode != "" {
+				headers = []string{"Bearer sk-snapshotkey"}
+			}
+			var dashboardJWT, pat string
+			if tc.mode == "jwt" || tc.mode == "pat" || strings.HasPrefix(tc.mode, "mixed_") {
+				require.NoError(t, db.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+				previousSecret := common.SessionSecret
+				common.SessionSecret = "usage-only-test-signing-key"
+				t.Cleanup(func() { common.SessionSecret = previousSecret })
+				session := &model.UserSession{SID: "other-dashboard-session", UserID: other.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "placeholder", LoginMethod: "password", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+				require.NoError(t, model.CreateUserSession(session))
+				var err error
+				dashboardJWT, _, err = service.IssueAccessToken(service.AuthIdentity{UserID: other.Id, SessionID: session.SID, UserAuthVersion: 1, SessionVersion: 1})
+				require.NoError(t, err)
+				pat = model.AccessTokenPrefix + strings.Repeat("p", 43)
+				accessToken := &model.UserAccessToken{Name: "fixture PAT", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat)}
+				require.NoError(t, accessToken.SetScopes([]string{"profile:read"}))
+				require.NoError(t, model.CreateUserAccessToken(other.Id, accessToken, service.AccessTokenMaxPerUser))
+				switch tc.mode {
+				case "jwt":
+					headers = []string{"Bearer " + dashboardJWT}
+				case "pat":
+					headers = []string{"Bearer " + pat}
+				case "mixed_invalid":
+					headers = []string{"Bearer sk-unknownkey"}
+				}
+			}
+			router := gin.New()
+			handlers := []gin.HandlerFunc{middleware.TokenAuthReadOnly()}
+			if tc.mode == "missing_context" {
+				handlers = nil
+			}
+			handlers = append(handlers, func(c *gin.Context) {
+				switch tc.mode {
+				case "replace_header":
+					c.Request.Header.Set("Authorization", "Bearer sk-otherkey")
+				case "replace_owner_group":
+					require.NoError(t, db.Model(owner).Update("group", "Changed group").Error)
+				case "no_lookup", "quota_failure":
+					require.NoError(t, db.Callback().Query().Before("gorm:query").Register("usage-fixture-failure", blockQueries))
+				case "missing_context":
+					c.Set("id", owner.Id)
+					c.Set("token_id", token.Id)
+					c.Set("token_key", token.Key)
+				case "malformed_context":
+					c.Set("read_only_token_identity", "not an authenticated snapshot")
+				case "mismatched_context":
+					c.Set("id", other.Id)
+					c.Set("token_id", otherToken.Id)
+				}
+			})
+			path := "/api/usage/token/"
+			if tc.mode == "log" {
+				path = "/api/log/token"
+				handlers = append(handlers, GetLogByKey)
+			} else {
+				handlers = append(handlers, GetTokenUsage)
+			}
+			router.GET(path, handlers...)
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.RemoteAddr = "203.0.113.7:4321"
+			for _, header := range headers {
+				request.Header.Add("Authorization", header)
+			}
+			if strings.HasPrefix(tc.mode, "mixed_") {
+				request.Header.Set("X-Auth-Session", dashboardJWT)
+				request.AddCookie(&http.Cookie{Name: "session", Value: dashboardJWT})
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			require.Equal(t, tc.status, recorder.Code)
+			for _, secret := range []string{token.Key, otherToken.Key, owner.Username, other.Username, dashboardJWT, pat} {
+				if secret != "" {
+					assert.NotContains(t, recorder.Body.String(), secret)
+				}
+			}
+			var response map[string]any
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			if tc.mode == "log" {
+				assert.Equal(t, true, response["success"])
+				assert.Empty(t, recorder.Header().Get("Cache-Control"))
+				return
+			}
+			assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+			if tc.status != http.StatusOK || tc.mode == "quota_failure" {
+				assert.Equal(t, false, response["success"])
+				assert.NotContains(t, response, "data")
+				return
+			}
+			require.Equal(t, true, response["code"])
+			data, ok := response["data"].(map[string]any)
+			require.True(t, ok)
+			wantGroup := "Named group"
+			if tc.mode == "replace_owner_group" {
+				wantGroup = "Owner group"
+			}
+			assert.Equal(t, wantGroup, data["group"])
+			assert.Equal(t, token.Name, data["name"])
+			assert.NotContains(t, data, "user_quota")
+			assert.NotContains(t, data, "auto_groups")
 		})
 	}
 }
