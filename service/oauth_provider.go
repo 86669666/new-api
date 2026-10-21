@@ -27,13 +27,15 @@ var (
 	ErrOAuthProviderRequest       = errors.New("invalid_request")
 	ErrOAuthProviderDenied        = errors.New("access_denied")
 	ErrOAuthProviderReplay        = errors.New("invalid_grant")
+	ErrOAuthRevocationClient      = errors.New("invalid_client")
 	currentOAuthProvider          atomic.Pointer[OAuthProviderBridge]
 )
 
 type OAuthProviderConfig struct {
-	Enabled          bool
-	AdminBaseURL     string
-	AuthorizationURL string
+	Enabled           bool
+	RevocationEnabled bool
+	AdminBaseURL      string
+	AuthorizationURL  string
 }
 
 type OAuthProviderBridge struct {
@@ -41,6 +43,7 @@ type OAuthProviderBridge struct {
 	admin     string
 	authorize string
 	policy    string
+	revoke    string
 }
 
 type OAuthProviderPreview struct {
@@ -109,11 +112,12 @@ type oauthProviderRequest struct {
 
 func InitOAuthProviderBridge() error {
 	enabled := os.Getenv("OAUTH_PROVIDER_BRIDGE_ENABLED")
-	if enabled != "" && enabled != "false" && enabled != "true" {
+	revocation := os.Getenv("OAUTH_PROVIDER_REVOCATION_ENABLED")
+	if enabled != "" && enabled != "false" && enabled != "true" || revocation != "" && revocation != "false" && revocation != "true" {
 		return ErrOAuthProviderConfiguration
 	}
 	bridge, err := NewOAuthProviderBridge(OAuthProviderConfig{
-		Enabled: enabled == "true", AdminBaseURL: os.Getenv("OAUTH_PROVIDER_ADMIN_BASE_URL"),
+		Enabled: enabled == "true", RevocationEnabled: revocation == "true", AdminBaseURL: os.Getenv("OAUTH_PROVIDER_ADMIN_BASE_URL"),
 		AuthorizationURL: os.Getenv("OAUTH_PROVIDER_AUTHORIZATION_URL"),
 	}, CurrentOAuthUserInfoResource())
 	if err != nil {
@@ -126,6 +130,9 @@ func InitOAuthProviderBridge() error {
 func CurrentOAuthProviderBridge() *OAuthProviderBridge { return currentOAuthProvider.Load() }
 
 func NewOAuthProviderBridge(config OAuthProviderConfig, resource *OAuthUserInfoResource) (*OAuthProviderBridge, error) {
+	if config.RevocationEnabled && (!config.Enabled || resource == nil) {
+		return nil, ErrOAuthProviderConfiguration
+	}
 	if !config.Enabled {
 		return nil, nil
 	}
@@ -153,7 +160,53 @@ func NewOAuthProviderBridge(config OAuthProviderConfig, resource *OAuthUserInfoR
 	if err != nil {
 		return nil, ErrOAuthProviderConfiguration
 	}
-	return &OAuthProviderBridge{resource: resource, admin: base, authorize: config.AuthorizationURL, policy: fmt.Sprintf("%x", sha256.Sum256(policy))}, nil
+	bridge := &OAuthProviderBridge{resource: resource, admin: base, authorize: config.AuthorizationURL, policy: fmt.Sprintf("%x", sha256.Sum256(policy))}
+	if config.RevocationEnabled {
+		bridge.revoke = strings.TrimSuffix(config.AuthorizationURL, "/auth") + "/revoke"
+	}
+	return bridge, nil
+}
+
+func (b *OAuthProviderBridge) RevocationEnabled() bool { return b != nil && b.revoke != "" }
+
+// RevokeToken forwards only to the fixed issuer. Its RFC-style 200 is not proof
+// of invalidation: the pinned issuer can mask wrong-client and storage errors.
+func (b *OAuthProviderBridge) RevokeToken(ctx context.Context, token, clientID string) error {
+	if !b.RevocationEnabled() {
+		return ErrOAuthResourceUnavailable
+	}
+	if !slices.Contains(b.resource.clients, clientID) {
+		return ErrOAuthProviderRequest
+	}
+	body := url.Values{"token": {token}, "client_id": {clientID}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.revoke, strings.NewReader(body))
+	if err != nil {
+		return ErrOAuthResourceUnavailable
+	}
+	// Do not replay a sent credential-bearing body on a reused connection.
+	req.GetBody = nil
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	response, err := b.resource.client.Do(req)
+	if err != nil {
+		return ErrOAuthResourceUnavailable
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, 4097))
+	if err != nil || len(data) > 4096 {
+		return ErrOAuthResourceUnavailable
+	}
+	if response.StatusCode == http.StatusOK {
+		return nil
+	}
+	if response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusUnauthorized {
+		fields, err := common.DecodeRawJSONObject(data)
+		var code string
+		if err == nil && common.Unmarshal(fields["error"], &code) == nil && code == "invalid_client" {
+			return ErrOAuthRevocationClient
+		}
+	}
+	return ErrOAuthResourceUnavailable
 }
 
 func (b *OAuthProviderBridge) Preview(ctx context.Context, actor AuthIdentity, phase, challenge string) (*OAuthProviderPreview, error) {

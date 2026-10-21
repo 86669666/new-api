@@ -92,6 +92,58 @@ const dataService = dataServices[0].name;
 const oauthUserInfoServices = services.filter(service => service.source.includes('    public static getOAuthUserInfo('));
 assert.equal(oauthUserInfoServices.length, 1, 'Exactly one generated delegated userinfo method is required');
 const oauthUserInfoService = oauthUserInfoServices[0].name;
+const revocationServices = services.filter(service => service.source.includes('    public static revokeOAuthToken('));
+assert.equal(revocationServices.length, 1, 'Exactly one generated public revocation method is required');
+const revocationService = revocationServices[0].name;
+const revocationOperation = apiDocument.paths['/oauth2/revoke'].post;
+assert.equal(revocationOperation.operationId, 'revokeOAuthToken');
+assert.deepEqual(revocationOperation.requestBody, { required: true, content: {
+  'application/x-www-form-urlencoded': { schema: { $ref: '#/components/schemas/OAuthRevocationRequest' } },
+} });
+// The pinned generator emits FormData for this media type. Adapt only this
+// external harness method; the raw SDK does not implement this wire contract.
+const revocationFile = path.join(output, 'generated/api/services', revocationService + '.ts');
+const rawRevocationService = await readFile(revocationFile, 'utf8');
+assert.equal((rawRevocationService.match(/public static revokeOAuthToken\(/g) ?? []).length, 1);
+const revokeStart = rawRevocationService.indexOf('    public static revokeOAuthToken(');
+const revokeClose = rawRevocationService.indexOf('\n    }\n', revokeStart);
+assert(revokeStart >= 0 && revokeClose > revokeStart);
+const revokeEnd = revokeClose + '\n    }'.length;
+const rawRevokeMethod = rawRevocationService.slice(revokeStart, revokeEnd);
+assert.equal(rawRevokeMethod.includes('\n    public static '), false, 'The boundary must not span another method');
+assert(rawRevokeMethod.includes("url: '/oauth2/revoke'"));
+assert(rawRevokeMethod.includes("mediaType: 'application/x-www-form-urlencoded'"));
+assert.equal(rawRevokeMethod.split('formData: formData,').length, 2);
+const adaptRevokeMethod = method => {
+  assert.equal(method.split('formData: formData,').length, 2, 'Only the exact raw form fragment is adaptable');
+  const headerSelector = "            responseHeader: 'Cache-Control',\n";
+  const returnSignature = '}): CancelablePromise<string> {';
+  assert.equal(method.split(headerSelector).length, 2, 'Exactly one Cache-Control response selector is required');
+  assert.equal(method.split(returnSignature).length, 2, 'Exactly the generated string return signature is required');
+  return method.replace('formData: formData,',
+    'body: new URLSearchParams(Object.entries(formData).filter((entry): entry is [string, string] => entry[1] !== undefined)).toString(),')
+    .replace(headerSelector, '')
+    .replace(returnSignature, '}): CancelablePromise<void> {');
+};
+const adaptedRevokeMethod = adaptRevokeMethod(rawRevokeMethod);
+assert.throws(() => adaptRevokeMethod(adaptedRevokeMethod), 'A second adaptation must reject');
+const adaptedRevocationService = rawRevocationService.slice(0, revokeStart) + adaptedRevokeMethod + rawRevocationService.slice(revokeEnd);
+assert.equal(adaptedRevocationService.slice(0, revokeStart), rawRevocationService.slice(0, revokeStart));
+assert.equal(adaptedRevocationService.slice(revokeStart + adaptedRevokeMethod.length), rawRevocationService.slice(revokeEnd));
+const rawRevocationFile = path.join(output, 'raw-revocation-service.ts.raw');
+await writeFile(rawRevocationFile, rawRevocationService);
+await writeFile(revocationFile, adaptedRevocationService);
+const revocationAdaptation = {
+  operation: 'revokeOAuthToken', scope: 'external generated harness method only; shared core unchanged',
+  raw_path: rawRevocationFile, adapted_path: revocationFile,
+  script_sha256: createHash('sha256').update(await readFile(fileURLToPath(import.meta.url))).digest('hex'),
+  changes: ['Unique method formData option to URLSearchParams string body; only undefined omitted', 'Remove only this method Cache-Control response selector so JSON errors remain bodies', 'Change only this method empty-success return signature from string to void'],
+  outside_method_unchanged: true, second_adaptation_rejected: true,
+  raw_sha256: createHash('sha256').update(rawRevocationService).digest('hex'),
+  adapted_sha256: createHash('sha256').update(adaptedRevocationService).digest('hex'),
+  raw_form_data_incompatible: true, raw_response_header_masks_error_body: true, sdk_native_compatibility_claimed: false,
+};
+await writeFile(path.join(output, 'generator-revocation-adaptation.json'), JSON.stringify(revocationAdaptation, null, 2) + '\n');
 const clientEventsServices = services.filter(service => service.source.includes('    public static receiveClientEvents('));
 assert.equal(clientEventsServices.length, 1, 'Exactly one generated receiver method is required');
 const clientEventsService = clientEventsServices[0].name;
@@ -265,6 +317,17 @@ export async function compileOAuthProvider() {
 }
 `);
 await writeFile(consumer, await readFile(consumer, 'utf8') + `
+export async function compileOAuthRevocation() {
+  const result: void = await client.${revocationService}.revokeOAuthToken({ formData: { token: 'opaque', client_id: 'native-public', token_type_hint: 'unknown' } });
+  // @ts-expect-error a revocation token is required
+  const missing: client.OAuthRevocationRequest = { client_id: 'native-public' };
+  // @ts-expect-error confidential client secrets are outside this public-client contract
+  const secret: client.OAuthRevocationRequest = { token: 'opaque', client_id: 'native-public', client_secret: 'forbidden' };
+  return { result, missing, secret };
+}
+`);
+
+await writeFile(consumer, await readFile(consumer, 'utf8') + `
 export async function compileClientEvents() {
   const result = await client.${clientEventsService}.receiveClientEvents({ requestBody: {
     client_id: '00000000-0000-4000-8000-000000000001', channel: 'cherry-studio',
@@ -285,9 +348,17 @@ const calls = [];
 let responseStatus = 200;
 let responseBody = { success: true, message: '', data: {} };
 let responseCacheControl = 'private, no-store';
+const revocationResponses = [];
 globalThis.fetch = async (url, init) => {
   // This replaces the transport completely; URLs are never resolved or contacted.
   calls.push({ url, init });
+  if (url === api.OpenAPI.BASE + '/oauth2/revoke') {
+    const response = new Response(JSON.stringify(responseBody), { status: responseStatus, headers: responseBody === undefined
+      ? { 'Cache-Control': responseCacheControl }
+      : { 'Content-Type': 'application/json', 'Cache-Control': responseCacheControl } });
+    revocationResponses.push(response);
+    return response;
+  }
   return new Response(JSON.stringify(responseBody), { status: responseStatus, headers: responseBody === undefined ? {} : { 'Content-Type': 'application/json', 'Cache-Control': responseCacheControl } });
 };
 api.OpenAPI.BASE = 'https://example.invalid';
@@ -713,6 +784,47 @@ for (const operation of oauthProviderOperations) {
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const oauthProviderStubbedRequests = calls.length - beforeOAuthProviderRequests;
+const beforeRevocationRequests = calls.length;
+const revokePublicConfig = { TOKEN: api.OpenAPI.TOKEN, HEADERS: api.OpenAPI.HEADERS, USERNAME: api.OpenAPI.USERNAME, PASSWORD: api.OpenAPI.PASSWORD, WITH_CREDENTIALS: api.OpenAPI.WITH_CREDENTIALS, CREDENTIALS: api.OpenAPI.CREDENTIALS };
+Object.assign(api.OpenAPI, { TOKEN: undefined, HEADERS: undefined, USERNAME: undefined, PASSWORD: undefined, WITH_CREDENTIALS: true, CREDENTIALS: 'omit' });
+responseCacheControl = 'private, no-store';
+for (const hint of [undefined, '', 'refresh_token', 'unknown']) {
+  responseStatus = 200;
+  responseBody = undefined;
+  const formData = { token: 'opaque+/&=%token', client_id: 'native-public', ...(hint === undefined ? {} : { token_type_hint: hint }) };
+  const before = calls.length;
+  assert.equal(await api[revocationService].revokeOAuthToken({ formData }), undefined);
+  assert.equal(calls.length, before + 1, 'one successful revocation fetch');
+  const response = revocationResponses.at(-1);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('Cache-Control'), 'private, no-store');
+  const request = calls.at(-1);
+  assert.equal(request.url, api.OpenAPI.BASE + '/oauth2/revoke');
+  assert.equal(request.init.method, 'POST');
+  const headers = new Headers(request.init.headers);
+  assert.equal(headers.get('Content-Type'), 'application/x-www-form-urlencoded');
+  assert.equal(headers.has('Authorization'), false);
+  assert.equal(headers.has('Cookie'), false);
+  assert.equal(typeof request.init.body, 'string');
+  assert.equal(request.init.credentials, 'omit');
+  assert.deepEqual([...new URLSearchParams(request.init.body)], Object.entries(formData));
+  assert.equal(headers.get('Content-Type').includes('multipart'), false);
+}
+for (const [status, code] of [[400, 'invalid_request'], [401, 'invalid_client'], [404, 'not_found'], [503, 'temporarily_unavailable']]) {
+  responseStatus = status;
+  responseBody = { error: code };
+  const before = calls.length;
+  await assert.rejects(api[revocationService].revokeOAuthToken({ formData: { token: 'owned', client_id: 'native-public' } }), error => {
+    assert.equal(error.status, status);
+    assert.deepEqual(error.body, responseBody);
+    return true;
+  });
+  assert.equal(calls.length, before + 1, 'no automatic revoke retry');
+  assert.equal(revocationResponses.at(-1).status, status);
+  assert.equal(revocationResponses.at(-1).headers.get('Cache-Control'), 'private, no-store');
+}
+const revocationStubbedRequests = calls.length - beforeRevocationRequests;
+Object.assign(api.OpenAPI, revokePublicConfig);
 const beforeClientEventsRequests = calls.length;
 api.OpenAPI.TOKEN = 'sk-generated-events-fixture';
 api.OpenAPI.HEADERS = undefined;
@@ -739,4 +851,4 @@ for (const [status, code] of [[400, 'INVALID'], [401, 'UNAUTHORIZED'], [403, 'FO
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const clientEventsStubbedRequests = calls.length - beforeClientEventsRequests;
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));

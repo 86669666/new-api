@@ -200,6 +200,42 @@ def check_oauth_provider(api, source_root):
             'ui_or_live_issuer': False, 'bounded_local_replay_hours': 24, 'required_verified_challenge_minutes': 30}
 
 
+def check_oauth_revocation(api, source_root):
+    operation = api['paths']['/oauth2/revoke']['post']
+    assert set(api['paths']['/oauth2/revoke']) == {'post'}
+    assert operation['operationId'] == 'revokeOAuthToken'
+    assert operation['security'] == [] and operation['x-credential-kind'] == 'public-client-token-possession'
+    assert operation['x-default-off'] is True and operation['x-automatic-retry'] is False
+    assert operation['x-query-policy'] == 'forbidden-including-force-query'
+    assert operation['x-request-max-bytes'] == 8192
+    assert operation['requestBody'] == {'required': True, 'content': {
+        'application/x-www-form-urlencoded': {'schema': {'$ref': '#/components/schemas/OAuthRevocationRequest'}}}}
+    schema = api['components']['schemas']['OAuthRevocationRequest']
+    assert schema['type'] == 'object' and schema['additionalProperties'] is False
+    assert schema['required'] == ['token', 'client_id']
+    assert set(schema['properties']) == {'token', 'client_id', 'token_type_hint'}
+    for name, maximum in [('token', 4096), ('client_id', 256), ('token_type_hint', 256)]:
+        assert schema['properties'][name]['type'] == 'string'
+        assert schema['properties'][name]['maxLength'] == maximum
+    assert 'enum' not in schema['properties']['token_type_hint'], 'RFC7009 unknown hints are ignored'
+    responses = operation['responses']
+    assert set(responses) == {'200', '400', '401', '403', '404', '405', '429', '503'}
+    assert 'content' not in responses['200'] and 'content' not in responses['429']
+    for status in ('200', '400', '401', '404', '405', '429', '503'):
+        assert 'private, no-store' in responses[status]['headers']['Cache-Control']['description']
+        assert 'Location' not in responses[status]['headers'] and 'Set-Cookie' not in responses[status]['headers']
+    for name, code in [('OAuthRevocationInvalidRequest', 'invalid_request'),
+                       ('OAuthRevocationInvalidClient', 'invalid_client'), ('OAuthRevocationNotFound', 'not_found')]:
+        assert api['components']['schemas'][name] == {
+            'type': 'object', 'additionalProperties': False, 'required': ['error'],
+            'properties': {'error': {'type': 'string', 'enum': [code]}}}
+    for phrase in ('does not prove actual invalidation', 'mask wrong-client and internal storage failures',
+                   'status oauth.enabled and client_features.oauth remain false', 'GetBody=nil'):
+        assert phrase in operation['description']
+    return {'route': '/oauth2/revoke', 'default_off': True, 'database_changes': False,
+            'fixed_issuer_ingress': True, 'actual_issuer_invalidation_proved': False}
+
+
 def check_conditional_authorization(source_root):
     # Static drift checks on the selected server predicates, not an authorization
     # simulator. Runtime allow/deny tests must still exercise the actual handlers.
@@ -1153,6 +1189,7 @@ def main():
     results['personal_log_range_error'] = check_personal_log_range_error(api)
     results['oauth_userinfo'] = check_oauth_userinfo(api, source_root)
     results['oauth_provider'] = check_oauth_provider(api, source_root)
+    results['oauth_revocation'] = check_oauth_revocation(api, source_root)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
     for fixture in fixtures:
         if fixture.get('kind') == 's3_operation':

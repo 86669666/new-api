@@ -20879,6 +20879,150 @@
         },
         "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
       }
+    },
+    "/oauth2/revoke": {
+      "post": {
+        "operationId": "revokeOAuthToken",
+        "summary": "Request token revocation from the configured issuer",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Startup-only OAUTH_PROVIDER_REVOCATION_ENABLED=false by default; requires the enabled provider bridge and existing userinfo trust. The reserved endpoint, slash/encoded variants and descendants reject locally even when off or for wrong methods; no frontend redirect or SPA fallthrough and no Location. Other OAuth routes retain their behavior. The exact fixed HTTPS issuer-prefix /oauth2/revoke target is derived from the validated authorization URL; no request Host/Forwarded routing, redirects or caller-header forwarding. This public-client token-possession request accepts no Authorization, client_secret, client assertion or dashboard fallback; client_id is an exact configured allowlisted public identifier, not authentication. The issuer must register that client with public/none and owns token-client association. No local user/token lookup or grant/key/session writes. Body-only unique form fields, strict percent encoding, decoded ASCII limits and an8192-byte encoded body bound; no query including empty ForceQuery, duplicate encoded keys, unknown fields or ambiguous Content-Type. Empty/unknown valid hint is ignored, and only token/client_id is sent. Cookies are never authority or forwarded. One bounded context-aware HTTPS POST with GetBody=nil, no application retry or sent-body transport replay. Trusted issuer200 maps to fixed empty200, but does not prove actual invalidation: the pinned issuer can mask wrong-client and internal storage failures as200. Actual token-family cascade is issuer-defined, not exactly-one-token or subject-wide revocation. Only bounded parsed exact invalid_client from trusted400/401 maps to fixed401; network/TLS/timeout/redirect/non-success or unclassifiable explicit responses map to fixed503, without raw body/description/cause/headers. A503 leaves the outcome unknown; clients must assume the token remains usable. Successful-style200 is not actual Hydra/refresh/client acceptance. Before real activation verify public registration, ownership rejection, access/refresh invalidation and issuer storage-failure behavior. Existing status oauth.enabled and client_features.oauth remain false; no discovery, issuance, refresh lifecycle, UI or key grant is delivered. Use a separate unauthenticated generated-client configuration with TOKEN/Authorization unset.",
+        "security": [],
+        "x-pat-policy": "unsupported",
+        "x-credential-kind": "public-client-token-possession",
+        "x-automatic-retry": false,
+        "x-query-policy": "forbidden-including-force-query",
+        "x-request-max-bytes": 8192,
+        "x-default-off": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthRevocationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Fixed empty success-style issuer response; not proof of token invalidation or client ownership.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before local rejection and both API/critical limiters. No Location or Set-Cookie is emitted."
+              }
+            }
+          },
+          "400": {
+            "description": "Strict local request rejection before issuer I/O. Existing organization-selector boundary errors retain their separate contract.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before local rejection and both API/critical limiters. No Location or Set-Cookie is emitted."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthRevocationInvalidRequest"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Only an exact bounded invalid_client response from the configured issuer.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before local rejection and both API/critical limiters. No Location or Set-Cookie is emitted."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthRevocationInvalidClient"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Reserved path rejected locally while revocation is disabled.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before local rejection and both API/critical limiters. No Location or Set-Cookie is emitted."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthRevocationNotFound"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Reserved path rejects unsupported methods locally without Location.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before local rejection and both API/critical limiters. No Location or Set-Cookie is emitted."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthRevocationInvalidRequest"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing endpoint rate limiter; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before local rejection and both API/critical limiters. No Location or Set-Cookie is emitted."
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed unavailable/unknown issuer outcome; no automatic replay.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before local rejection and both API/critical limiters. No Location or Set-Cookie is emitted."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthResourceUnavailable"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/OrganizationSelectionUnsupported"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -29031,6 +29175,81 @@
           }
         },
         "description": "Fixed existing Message keys and safe status code. No raw key/body/query/DB cause, no count."
+      },
+      "OAuthRevocationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "token",
+          "client_id"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[!-~]+(?![\\s\\S])",
+            "description": "Opaque presented token. Token spelling is not a credential-kind or validity assertion."
+          },
+          "client_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[!-~]+(?![\\s\\S])",
+            "description": "Exact configured allowlisted identifier of an issuer-registered public/none client; not a secret or authenticated identity."
+          },
+          "token_type_hint": {
+            "type": "string",
+            "maxLength": 256,
+            "pattern": "^[!-~]*(?![\\s\\S])",
+            "description": "Advisory only. Empty/unknown valid hints are ignored and omitted from the issuer form."
+          }
+        }
+      },
+      "OAuthRevocationInvalidRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "invalid_request"
+            ]
+          }
+        }
+      },
+      "OAuthRevocationInvalidClient": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "invalid_client"
+            ]
+          }
+        }
+      },
+      "OAuthRevocationNotFound": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "not_found"
+            ]
+          }
+        }
       }
     },
     "responses": {

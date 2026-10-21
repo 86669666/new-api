@@ -952,6 +952,324 @@ func TestClientEventsReceiverHTTP(t *testing.T) {
 	assert.Equal(t, beforeAccounting, accounting(), "telemetry never mutates accounting/access totals")
 }
 
+func TestOAuthTokenRevocationHTTP(t *testing.T) {
+	oldAPI, oldCritical, oldRedis, oldMaster := common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable, common.RedisEnabled, common.IsMasterNode
+	oldWriter, oldMode := gin.DefaultWriter, gin.Mode()
+	common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable, common.RedisEnabled = false, false, false
+	gin.SetMode(gin.TestMode)
+	logs := &organizationLogBuffer{}
+	gin.DefaultWriter = logs
+	t.Cleanup(func() {
+		common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable, common.RedisEnabled, common.IsMasterNode = oldAPI, oldCritical, oldRedis, oldMaster
+		gin.DefaultWriter = oldWriter
+		gin.SetMode(oldMode)
+	})
+	t.Setenv("TRUSTED_PROXIES", "none")
+	t.Setenv("OAUTH_USERINFO_ENABLED", "false")
+	t.Setenv("OAUTH_PROVIDER_BRIDGE_ENABLED", "false")
+	t.Setenv("OAUTH_PROVIDER_REVOCATION_ENABLED", "false")
+	require.NoError(t, service.InitOAuthUserInfoResource())
+	require.NoError(t, service.InitOAuthProviderBridge())
+	dbBefore := model.DB
+	const canary = "revocation-capability-canary"
+	var calls, redirectCalls atomic.Int64
+	redirect := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { redirectCalls.Add(1) }))
+	t.Cleanup(redirect.Close)
+	entered := make(chan struct{})
+	var mu sync.Mutex
+	var received []url.Values
+	var warmAddress string
+	issuer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		assert.Equal(t, "/tenant/oauth2/revoke", r.URL.Path)
+		assert.Empty(t, r.URL.RawQuery)
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "application/x-www-form-urlencoded", r.Header.Get("Content-Type"))
+		for _, name := range []string{"Authorization", "Cookie", "Forwarded", "X-Forwarded-Host", "X-Forwarded-For", "Idempotency-Key", "X-Idempotency-Key", "X-Caller-Canary"} {
+			assert.Empty(t, r.Header.Get(name))
+		}
+		assert.NotEqual(t, "caller.invalid", r.Host)
+		assert.NoError(t, r.ParseForm())
+		assert.Len(t, r.PostForm, 2)
+		assert.Equal(t, "native-public", r.PostForm.Get("client_id"))
+		mu.Lock()
+		received = append(received, r.PostForm)
+		mu.Unlock()
+		w.Header().Set("X-Issuer-Canary", canary)
+		w.Header().Set("Set-Cookie", "issuer="+canary)
+		switch r.PostForm.Get("token") {
+		case "invalid-client":
+			w.WriteHeader(401)
+			_, _ = io.WriteString(w, `{"error":"invalid_client","error_description":"`+canary+`","optional":null}`)
+		case "duplicate-error":
+			w.WriteHeader(401)
+			_, _ = io.WriteString(w, `{"error":"invalid_client","error":"invalid_client"}`)
+		case "unknown-error":
+			w.WriteHeader(400)
+			_, _ = io.WriteString(w, `{"error":"invalid_request","cause":"`+canary+`"}`)
+		case "storage-error":
+			w.WriteHeader(500)
+			_, _ = io.WriteString(w, `{"error":"invalid_client"}`)
+		case "malformed-error":
+			w.WriteHeader(401)
+			_, _ = io.WriteString(w, canary)
+		case "oversized-error":
+			w.WriteHeader(401)
+			_, _ = io.WriteString(w, strings.Repeat("x", 4097))
+		case "redirect":
+			w.Header().Set("Location", redirect.URL+"/"+canary)
+			w.WriteHeader(307)
+		case "wait":
+			close(entered)
+			<-r.Context().Done()
+		case "warm":
+			mu.Lock()
+			warmAddress = r.RemoteAddr
+			mu.Unlock()
+		case "drop":
+			mu.Lock()
+			assert.Equal(t, warmAddress, r.RemoteAddr, "the credential request uses the established HTTP1 connection")
+			mu.Unlock()
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if assert.NoError(t, err) {
+				_ = conn.Close()
+			}
+		case "wrong-client-masked", "storage-error-masked":
+			// The pinned issuer can mask both as200. This is not invalidation evidence.
+			_, _ = io.WriteString(w, `{"cause":"`+canary+`"}`)
+		}
+	}))
+	t.Cleanup(issuer.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(issuer.Certificate())
+	resourceConfig := service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: issuer.URL + "/admin/oauth2/introspect", Issuer: issuer.URL + "/tenant/", Audience: "newapi-userinfo", ClientIDs: []string{"native-public"}}
+	resource, err := service.NewOAuthUserInfoResource(resourceConfig, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	config := service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: issuer.URL, AuthorizationURL: issuer.URL + "/tenant/oauth2/auth"}
+	bridge, err := service.NewOAuthProviderBridge(config, resource)
+	require.NoError(t, err)
+	newRouter := func(bridge *service.OAuthProviderBridge) *gin.Engine {
+		e := gin.New()
+		middleware.SetUpLogger(e)
+		SetOAuthProviderRouter(e, bridge)
+		return e
+	}
+	serve := func(e *gin.Engine, method, path, body string, headers http.Header) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.RemoteAddr = "192.0.2.113:43210"
+		r.Host = "caller.invalid"
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		for name, values := range headers {
+			r.Header[name] = values
+		}
+		w := httptest.NewRecorder()
+		e.ServeHTTP(w, r)
+		assert.Equal(t, "private, no-store", w.Header().Get("Cache-Control"))
+		assert.Empty(t, w.Header().Values("Set-Cookie"))
+		assert.Empty(t, w.Header().Get("Location"))
+		assert.Empty(t, w.Header().Get("X-Issuer-Canary"))
+		assert.NotContains(t, w.Body.String(), canary)
+		return w
+	}
+	body := func(token string) string {
+		return url.Values{"token": {token}, "client_id": {"native-public"}}.Encode()
+	}
+	t.Run("startup_and_reserved_path", func(t *testing.T) {
+		for _, value := range []string{"TRUE", "1", " ", "true"} {
+			t.Setenv("OAUTH_PROVIDER_REVOCATION_ENABLED", value)
+			assert.ErrorIs(t, service.InitOAuthProviderBridge(), service.ErrOAuthProviderConfiguration)
+		}
+		t.Setenv("OAUTH_PROVIDER_REVOCATION_ENABLED", "false")
+		require.NoError(t, service.InitOAuthProviderBridge())
+		_, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{RevocationEnabled: true}, resource)
+		assert.ErrorIs(t, err, service.ErrOAuthProviderConfiguration)
+		_, err = service.NewOAuthProviderBridge(config, nil)
+		assert.ErrorIs(t, err, service.ErrOAuthProviderConfiguration)
+		for _, split := range []bool{false, true} {
+			common.IsMasterNode = false
+			frontend := ""
+			if split {
+				frontend = "https://frontend.invalid"
+			}
+			t.Setenv("FRONTEND_BASE_URL", frontend)
+			e := gin.New()
+			middleware.SetUpLogger(e)
+			SetRouter(e, WebAssets{IndexPage: []byte("owned-SPA-fallback")})
+			for _, path := range []string{"/oauth2/revoke", "/oauth2/revoke/", "/oauth2/revoke//", "/oauth2/revoke/child", "/oauth2/%72evoke", "/oauth2%2frevoke/"} {
+				for _, method := range []string{http.MethodPost, http.MethodGet, "PROPFIND"} {
+					w := serve(e, method, path+"?token="+canary, body("owned-token"), nil)
+					assert.Equal(t, 404, w.Code)
+					assert.JSONEq(t, `{"error":"not_found"}`, w.Body.String())
+				}
+			}
+			// Ordinary NoRoute remains intact; the reserved path is a local exception.
+			w := httptest.NewRecorder()
+			e.ServeHTTP(w, httptest.NewRequest("GET", "/unrelated", nil))
+			if split {
+				assert.Equal(t, 301, w.Code)
+				assert.Equal(t, frontend+"/unrelated", w.Header().Get("Location"))
+			} else {
+				assert.Equal(t, "owned-SPA-fallback", w.Body.String())
+			}
+			w = httptest.NewRecorder()
+			e.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
+			var status struct {
+				Data struct {
+					OAuth struct {
+						Enabled bool `json:"enabled"`
+					} `json:"oauth"`
+					Features struct {
+						OAuth bool `json:"oauth"`
+					} `json:"client_features"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &status))
+			assert.False(t, status.Data.OAuth.Enabled)
+			assert.False(t, status.Data.Features.OAuth)
+		}
+		assert.Zero(t, calls.Load())
+	})
+	e := newRouter(bridge)
+	t.Run("strict_form_and_public_identity", func(t *testing.T) {
+		before := calls.Load()
+		for _, tc := range []struct {
+			name, path, body string
+			headers          http.Header
+		}{
+			{name: "missing token", path: "/oauth2/revoke", body: "client_id=native-public"},
+			{name: "missing client", path: "/oauth2/revoke", body: "token=owned"},
+			{name: "duplicate", path: "/oauth2/revoke", body: "token=owned&token=other&client_id=native-public"},
+			{name: "encoded duplicate", path: "/oauth2/revoke", body: "token=owned&%74oken=other&client_id=native-public"},
+			{name: "unknown", path: "/oauth2/revoke", body: body("owned") + "&subject=1"},
+			{name: "client secret", path: "/oauth2/revoke", body: body("owned") + "&client_secret=secret"},
+			{name: "client assertion", path: "/oauth2/revoke", body: body("owned") + "&client_assertion=secret"},
+			{name: "percent", path: "/oauth2/revoke", body: body("owned") + "%Q0"},
+			{name: "semicolon", path: "/oauth2/revoke", body: body("owned") + ";token=other"},
+			{name: "query", path: "/oauth2/revoke?token=" + canary, body: body("owned")},
+			{name: "force query", path: "/oauth2/revoke?", body: body("owned")},
+			{name: "body cap", path: "/oauth2/revoke", body: strings.Repeat("x", 8193)},
+			{name: "token cap", path: "/oauth2/revoke", body: body(strings.Repeat("x", 4097))},
+			{name: "unicode", path: "/oauth2/revoke", body: body("owned\u00a0")},
+			{name: "whitespace", path: "/oauth2/revoke", body: body(" owned")},
+			{name: "empty", path: "/oauth2/revoke", body: body("")},
+			{name: "client cap", path: "/oauth2/revoke", body: "token=owned&client_id=" + strings.Repeat("x", 257)},
+			{name: "not allowed", path: "/oauth2/revoke", body: "token=owned&client_id=foreign"},
+			{name: "hint cap", path: "/oauth2/revoke", body: body("owned") + "&token_type_hint=" + strings.Repeat("x", 257)},
+			{name: "hint duplicate", path: "/oauth2/revoke", body: body("owned") + "&token_type_hint=a&token_type_hint=b"},
+			{name: "authorization", path: "/oauth2/revoke", body: body("owned"), headers: http.Header{"Authorization": {"Bearer " + canary}}},
+			{name: "mixed authorization", path: "/oauth2/revoke", body: body("owned"), headers: http.Header{"Authorization": {"Bearer owned"}, "authorization": {"other"}}},
+			{name: "missing media", path: "/oauth2/revoke", body: body("owned"), headers: http.Header{"Content-Type": {}}},
+			{name: "JSON", path: "/oauth2/revoke", body: body("owned"), headers: http.Header{"Content-Type": {"application/json"}}},
+			{name: "duplicate media", path: "/oauth2/revoke", body: body("owned"), headers: http.Header{"Content-Type": {"application/x-www-form-urlencoded", "application/x-www-form-urlencoded"}}},
+			{name: "mixed media", path: "/oauth2/revoke", body: body("owned"), headers: http.Header{"content-type": {"application/json"}}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				w := serve(e, "POST", tc.path, tc.body, tc.headers)
+				assert.Equal(t, 400, w.Code)
+				assert.JSONEq(t, `{"error":"invalid_request"}`, w.Body.String())
+			})
+		}
+		assert.Equal(t, before, calls.Load())
+		for _, path := range []string{"/oauth2/revoke/", "/oauth2/revoke//", "/oauth2/revoke/child?token=" + canary, "/oauth2/%72evoke"} {
+			assert.Equal(t, 400, serve(e, "POST", path, body("owned"), nil).Code)
+		}
+		assert.Equal(t, 405, serve(e, "DELETE", "/oauth2/revoke?token="+canary, "", nil).Code)
+		for _, token := range []string{"sk-expired.synthetic", "refresh.synthetic", "oauth:disabled.synthetic", "a+b/=opaque"} {
+			for _, hint := range []string{"", "&token_type_hint=", "&token_type_hint=refresh_token", "&token_type_hint=unknown"} {
+				h := http.Header{"Cookie": {"owned=" + canary}, "Forwarded": {"host=caller.invalid"}, "X-Forwarded-Host": {"caller.invalid"}, "X-Forwarded-For": {"198.51.100.1"}, "Idempotency-Key": {"owned"}, "X-Idempotency-Key": {"owned"}, "X-Caller-Canary": {canary}}
+				w := serve(e, "POST", "/oauth2/revoke", body(token)+hint, h)
+				assert.Equal(t, 200, w.Code)
+				assert.Empty(t, w.Body.String())
+				mu.Lock()
+				assert.Equal(t, token, received[len(received)-1].Get("token"))
+				mu.Unlock()
+			}
+		}
+	})
+	t.Run("issuer_responses_and_transport", func(t *testing.T) {
+		for _, tc := range []struct {
+			token  string
+			status int
+			code   string
+		}{
+			{"wrong-client-masked", 200, ""}, {"storage-error-masked", 200, ""},
+			{"invalid-client", 401, "invalid_client"}, {"duplicate-error", 503, "temporarily_unavailable"},
+			{"unknown-error", 503, "temporarily_unavailable"}, {"storage-error", 503, "temporarily_unavailable"},
+			{"malformed-error", 503, "temporarily_unavailable"}, {"oversized-error", 503, "temporarily_unavailable"}, {"redirect", 503, "temporarily_unavailable"},
+		} {
+			w := serve(e, "POST", "/oauth2/revoke", body(tc.token), nil)
+			assert.Equal(t, tc.status, w.Code)
+			if tc.code == "" {
+				assert.Empty(t, w.Body.String())
+			} else {
+				assert.JSONEq(t, `{"error":"`+tc.code+`"}`, w.Body.String())
+			}
+		}
+		assert.Zero(t, redirectCalls.Load())
+		untrusted, err := service.NewOAuthUserInfoResource(resourceConfig, nil)
+		require.NoError(t, err)
+		defer untrusted.CloseIdleConnections()
+		untrustedBridge, err := service.NewOAuthProviderBridge(config, untrusted)
+		require.NoError(t, err)
+		before := calls.Load()
+		assert.Equal(t, 503, serve(newRouter(untrustedBridge), "POST", "/oauth2/revoke", body(canary), nil).Code)
+		assert.Equal(t, before, calls.Load())
+		require.Equal(t, 200, serve(e, "POST", "/oauth2/revoke", body("warm"), nil).Code)
+		before = calls.Load()
+		assert.Equal(t, 503, serve(e, "POST", "/oauth2/revoke", body("drop"), http.Header{"Idempotency-Key": {"owned"}, "X-Idempotency-Key": {"owned"}}).Code)
+		assert.Equal(t, before+1, calls.Load(), "no sent POST replay on the reused HTTP1 connection")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		r := httptest.NewRequest("POST", "/oauth2/revoke", strings.NewReader(body("wait"))).WithContext(ctx)
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() { e.ServeHTTP(w, r); close(done) }()
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("issuer did not receive the bounded request")
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("cancellation did not end revocation request")
+		}
+		assert.Equal(t, 503, w.Code)
+		assert.JSONEq(t, `{"error":"temporarily_unavailable"}`, w.Body.String())
+	})
+	t.Run("limits_and_privacy", func(t *testing.T) {
+		oldNum, oldDuration := common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration
+		common.GlobalApiRateLimitEnable = true
+		common.GlobalApiRateLimitNum = 1
+		common.GlobalApiRateLimitDuration = 60
+		t.Cleanup(func() {
+			common.GlobalApiRateLimitEnable = false
+			common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = oldNum, oldDuration
+		})
+		limited := newRouter(bridge)
+		for i := range 2 {
+			r := httptest.NewRequest("POST", "/oauth2/revoke", strings.NewReader(body("limited")))
+			r.RemoteAddr = "192.0.2.217:43210"
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+			limited.ServeHTTP(w, r)
+			if i == 0 {
+				assert.Equal(t, 200, w.Code)
+			} else {
+				assert.Equal(t, 429, w.Code)
+				assert.NotEmpty(t, w.Header().Get("Retry-After"))
+			}
+			assert.Equal(t, "private, no-store", w.Header().Get("Cache-Control"))
+			assert.Empty(t, w.Header().Get("Location"))
+		}
+		assert.NotContains(t, logs.String(), canary)
+		assert.Equal(t, dbBefore, model.DB, "the root never initializes a database")
+	})
+}
+
 func TestOAuthProviderBridgeHTTP(t *testing.T) {
 	t.Setenv("OAUTH_USERINFO_ENABLED", "false")
 	t.Setenv("OAUTH_PROVIDER_BRIDGE_ENABLED", "false")

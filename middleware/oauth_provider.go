@@ -4,12 +4,62 @@ import (
 	"errors"
 	"mime"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
+
+// OAuthRevocationPath also recognizes encoded and trailing-slash variants so
+// rejected credential queries never reach the frontend or its access log.
+func OAuthRevocationPath(path string) bool {
+	decoded, err := url.PathUnescape(path)
+	return path == "/oauth2/revoke" || strings.HasPrefix(path, "/oauth2/revoke/") || err == nil && (decoded == "/oauth2/revoke" || strings.HasPrefix(decoded, "/oauth2/revoke/"))
+}
+
+func OAuthRevocationBoundary(c *gin.Context) {
+	if c.Request.URL.RawQuery != "" || c.Request.URL.ForceQuery {
+		WriteOAuthRevocationError(c, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	contentTypes := []string{}
+	for key, values := range c.Request.Header {
+		if strings.EqualFold(key, "Authorization") {
+			WriteOAuthRevocationError(c, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		if strings.EqualFold(key, "Content-Type") {
+			contentTypes = append(contentTypes, values...)
+		}
+	}
+	if len(contentTypes) != 1 {
+		WriteOAuthRevocationError(c, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	mediaType, params, err := mime.ParseMediaType(contentTypes[0])
+	if err != nil || mediaType != "application/x-www-form-urlencoded" || len(params) > 1 || len(params) == 1 && !strings.EqualFold(params["charset"], "utf-8") {
+		WriteOAuthRevocationError(c, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	c.Next()
+}
+
+func WriteOAuthRevocationError(c *gin.Context, status int, code string) {
+	c.Header("Cache-Control", "private, no-store")
+	c.AbortWithStatusJSON(status, gin.H{"error": code})
+}
+
+func WriteOAuthRevocationFailure(c *gin.Context, err error) {
+	if errors.Is(err, service.ErrOAuthProviderRequest) {
+		WriteOAuthRevocationError(c, http.StatusBadRequest, "invalid_request")
+	} else if errors.Is(err, service.ErrOAuthRevocationClient) {
+		WriteOAuthRevocationError(c, http.StatusUnauthorized, "invalid_client")
+	} else {
+		WriteOAuthRevocationError(c, http.StatusServiceUnavailable, "temporarily_unavailable")
+	}
+}
 
 // OAuthProviderBoundary keeps this POST-only ceremony separate from cookie
 // authentication and checks configured origins before any flow or Admin work.
