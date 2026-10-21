@@ -11364,5 +11364,185 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "OAuth userinfo profile without email",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": 1,
+      "username": "fixture",
+      "display_name": "Display",
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "OAuth userinfo profile with email",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": 1,
+      "username": "fixture",
+      "display_name": "Display",
+      "group": "default",
+      "email": "fixture@example.invalid"
+    },
+    "valid": true
+  },
+  {
+    "name": "OAuth userinfo profile email null",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": 1,
+      "username": "fixture",
+      "display_name": "Display",
+      "group": "default",
+      "email": null
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuth userinfo profile quota is private",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": 1,
+      "username": "fixture",
+      "display_name": "Display",
+      "group": "default",
+      "quota": 500000
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuth userinfo profile auth version is private",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": 1,
+      "username": "fixture",
+      "display_name": "Display",
+      "group": "default",
+      "auth_version": 1
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuth userinfo profile needs group",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": 1,
+      "username": "fixture",
+      "display_name": "Display"
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuth userinfo profile ID type",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": "1",
+      "username": "fixture",
+      "display_name": "Display",
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuthInvalidToken fixed",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthInvalidToken",
+    "value": {
+      "error": "invalid_token"
+    },
+    "valid": true
+  },
+  {
+    "name": "OAuthInvalidToken never upstream cause",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthInvalidToken",
+    "value": {
+      "error": "invalid_token",
+      "cause": "credential-canary"
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuthInvalidToken never profile",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthInvalidToken",
+    "value": {
+      "error": "invalid_token",
+      "data": {
+        "id": 1
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuthInsufficientScope fixed",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthInsufficientScope",
+    "value": {
+      "error": "insufficient_scope"
+    },
+    "valid": true
+  },
+  {
+    "name": "OAuthInsufficientScope never upstream cause",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthInsufficientScope",
+    "value": {
+      "error": "insufficient_scope",
+      "cause": "credential-canary"
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuthInsufficientScope never profile",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthInsufficientScope",
+    "value": {
+      "error": "insufficient_scope",
+      "data": {
+        "id": 1
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuthResourceUnavailable fixed",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthResourceUnavailable",
+    "value": {
+      "error": "temporarily_unavailable"
+    },
+    "valid": true
+  },
+  {
+    "name": "OAuthResourceUnavailable never upstream cause",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthResourceUnavailable",
+    "value": {
+      "error": "temporarily_unavailable",
+      "cause": "credential-canary"
+    },
+    "valid": false
+  },
+  {
+    "name": "OAuthResourceUnavailable never profile",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthResourceUnavailable",
+    "value": {
+      "error": "temporarily_unavailable",
+      "data": {
+        "id": 1
+      }
+    },
+    "valid": false
   }
 ]

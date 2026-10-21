@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -516,6 +517,14 @@ func GetUserById(id int, selectAll bool) (*User, error) {
 		err = DB.Omit("password", "access_token").First(&user, "id = ?", id).Error
 	}
 	return &user, err
+}
+
+// GetOAuthUserInfoByID reads only the delegated profile and current binding
+// state. Default soft-delete scope and the caller's context remain in force.
+func GetOAuthUserInfoByID(ctx context.Context, id int) (*User, error) {
+	user := &User{}
+	err := DB.WithContext(ctx).Select("id", "username", "display_name", "email", "group", "status", "auth_version").First(user, "id = ?", id).Error
+	return user, err
 }
 
 // GetSelfUserById reads dashboard profile data and password existence in one

@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -15,6 +16,7 @@ import (
 func SetRouter(router *gin.Engine, assets WebAssets) {
 	router.Use(middleware.OrganizationSelectionBoundary())
 	SetApiRouter(router)
+	SetOAuthResourceRouter(router, service.CurrentOAuthUserInfoResource())
 	SetDashboardRouter(router)
 	SetRelayRouter(router)
 	SetTaskPluginProtocolRouter(router)

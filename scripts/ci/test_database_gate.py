@@ -392,6 +392,24 @@ class OrganizationIdentityContracts(unittest.TestCase):
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                 runner.validate_organization_identity_events(candidate, suite)
 
+    def test_oauth_userinfo_suite_is_closed(self):
+        suite, root, package = 'oauth-userinfo', 'TestOAuthUserInfoHTTP', 'github.com/QuantumNous/new-api/router'
+        leaves = ('default_off_and_type_boundary', 'live_profile_and_scope',
+                  'uncached_final_state', 'upstream_failure_and_isolation')
+        events = [{'Action': 'pass', 'Package': package, 'Test': name} for name in
+                  [root] + [root + '/' + leaf for leaf in leaves]]
+        events.append({'Action': 'pass', 'Package': package})
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite], (frozenset((root,)), 'g19-oauth-userinfo'))
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['passed_tests_and_subtests'], 5)
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:], events + [{'Action': 'skip'}],
+                          events + [{'Action': 'fail'}], events + [{'Action': 'pass', 'Package': package, 'Test': root + '/unexpected'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': 'TestSiteDescriptionHTTP'}],
+                          [dict(event, Package='github.com/QuantumNous/new-api/service') for event in events]):
+            with self.subTest(events=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+        with self.assertRaises(ValueError):
+            runner.validate_organization_identity_events(events, 'organization-identity')
+
     def test_model_capability_metadata_suite_is_closed(self):
         suite, root, package = 'model-capability-metadata', 'TestModelCapabilityMetadataHTTP', 'github.com/QuantumNous/new-api/router'
         leaves = ('authorized_projection_and_versions', 'strict_input_and_atomicity',

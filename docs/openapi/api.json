@@ -19693,6 +19693,145 @@
         },
         "x-organization-wallet-permission": "root"
       }
+    },
+    "/api/v1/oauth/userinfo": {
+      "get": {
+        "operationId": "getOAuthUserInfo",
+        "summary": "Read a delegated personal profile",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server, not a delivered login/consent/issuance flow; status oauth.enabled and client_features.oauth remain false. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: a future trusted consent producer must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Dashboard-session logout is not claimed to revoke independent grants. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent.",
+        "security": [
+          {
+            "OAuthResourceBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PersonalOrganizationHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PersonalOrganizationQuery"
+          }
+        ],
+        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access",
+        "x-required-scopes": [
+          "profile"
+        ],
+        "x-optional-disclosure-scope": {
+          "email": "email"
+        },
+        "responses": {
+          "200": {
+            "description": "Final current delegated profile; no dashboard envelope or sensitive management fields.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authorization and the API limiter."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthUserInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid/inactive credential, identity or current local state.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authorization and the API limiter."
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"invalid_token\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInvalidToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient exact profile scope, or existing organization-selector refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authorization and the API limiter."
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer error=\"insufficient_scope\", scope=\"profile\" only for scope refusal."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthInsufficientScope"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionUnsupportedError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "429": {
+            "description": "Existing global API rate-limit response; private, no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authorization and the API limiter."
+              }
+            }
+          },
+          "503": {
+            "description": "Configured introspection or current local state could not be verified; no fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authorization and the API limiter."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthResourceUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -27345,6 +27484,80 @@
             }
           }
         }
+      },
+      "OAuthUserInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "username",
+          "display_name",
+          "group"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "username": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "description": "Present only when the current access token grants the exact email scope."
+          }
+        }
+      },
+      "OAuthInvalidToken": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "invalid_token"
+            ]
+          }
+        }
+      },
+      "OAuthInsufficientScope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "insufficient_scope"
+            ]
+          }
+        }
+      },
+      "OAuthResourceUnavailable": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "temporarily_unavailable"
+            ]
+          }
+        }
       }
     },
     "responses": {
@@ -28160,6 +28373,11 @@
         "type": "http",
         "scheme": "bearer",
         "description": "Relay API token for read-only usage/log queries; accepts expired/exhausted tokens but rejects disabled tokens, blocked users and disallowed IPs."
+      },
+      "OAuthResourceBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider."
       }
     },
     "parameters": {

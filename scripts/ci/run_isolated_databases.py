@@ -706,6 +706,7 @@ ORGANIZATION_READ_SUITES = {
     'organization-capabilities': (frozenset(('TestOrganizationCapabilityProjection', 'TestOrganizationAccessHTTP')), 'g16-organization-capabilities'),
     'organization-wallet': (frozenset(('TestOrganizationWalletLifecycle',)), 'g17-organization-wallet'),
     'site-description': (frozenset(('TestSiteDescriptionHTTP',)), 'g18-site-description'),
+    'oauth-userinfo': (frozenset(('TestOAuthUserInfoHTTP',)), 'g19-oauth-userinfo'),
     'model-capability-metadata': (frozenset(('TestModelCapabilityMetadataHTTP',)), 'g19-model-capability-metadata'),
     'organization-name-uniqueness': (frozenset(('TestOrganizationNameUniqueness',)), 'g19-organization-name-uniqueness'),
 }
@@ -888,6 +889,10 @@ def validate_organization_identity_events(events, suite='organization-identity')
             'TestSiteDescriptionHTTP/reserved_option_and_failures',
             'TestSiteDescriptionHTTP/anonymous_links_and_navigation'}:
         raise ValueError('every exact site description case must pass without unrelated tests')
+    if suite == 'oauth-userinfo' and passed != required | {None} | {
+            'TestOAuthUserInfoHTTP/' + name for name in (
+                'default_off_and_type_boundary', 'live_profile_and_scope', 'uncached_final_state', 'upstream_failure_and_isolation')}:
+        raise ValueError('every exact OAuth userinfo case must pass without unrelated tests')
     if suite == 'model-capability-metadata' and passed != required | {None} | {
             'TestModelCapabilityMetadataHTTP/' + name for name in (
                 'authorized_projection_and_versions', 'strict_input_and_atomicity', 'reserved_option_identity', 'reload_and_catalog_independence')}:

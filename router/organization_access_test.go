@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -207,7 +208,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -476,6 +477,335 @@ func organizationError(t *testing.T, status int, h http.Header, b map[string]any
 	} else {
 		assert.NotContains(t, slices.Collect(maps.Keys(b)), "data")
 	}
+}
+
+// The resource uses the real router, TLS HTTP introspection and current owned
+// database. The issuer fixture is not a deployed authorization/consent service.
+func TestOAuthUserInfoHTTP(t *testing.T) {
+	t.Setenv("OAUTH_USERINFO_ENABLED", "false")
+	require.NoError(t, service.InitOAuthUserInfoResource())
+	f := newOrganizationHTTPFixture(t)
+	const credential = "fixture-oauth-token-canary"
+	const queryCanary = "fixture-query-token-canary"
+	const upstreamCanary = "fixture-upstream-cause-canary"
+	user := f.users["owner"]
+	require.NoError(t, f.db.Model(user).Updates(map[string]any{"display_name": "Profile display", "email": "profile@example.invalid", "setting": "private-setting-canary"}).Error)
+	var mu sync.Mutex
+	var reply func(int64, string) (int, []byte)
+	var calls atomic.Int64
+	claims := func() map[string]any {
+		return map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": "https://issuer.example/", "aud": []string{"newapi-userinfo"}, "client_id": "cherry-studio", "sub": strconv.Itoa(user.Id), "exp": time.Now().Unix() + 3600, "scope": "profile email", "ext": map[string]any{"newapi_auth_version": "1"}}
+	}
+	encode := func(value any) []byte {
+		data, err := common.Marshal(value)
+		assert.NoError(t, err)
+		return data
+	}
+	issuer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/admin/oauth2/introspect", r.URL.Path)
+		assert.Empty(t, r.URL.RawQuery)
+		assert.Empty(t, r.Header.Get("Authorization"))
+		assert.Empty(t, r.Header.Get("Cookie"))
+		assert.Empty(t, r.Header.Get("X-Caller-Canary"))
+		if !assert.NoError(t, r.ParseForm()) || !assert.Len(t, r.PostForm, 1) || len(r.PostForm["token"]) != 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		n := calls.Add(1)
+		mu.Lock()
+		respond := reply
+		mu.Unlock()
+		if respond == nil {
+			<-r.Context().Done()
+			return
+		}
+		status, data := respond(n, r.PostForm.Get("token"))
+		if status == http.StatusFound {
+			w.Header().Set("Location", "https://untrusted.example/"+upstreamCanary)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(issuer.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(issuer.Certificate())
+	config := service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: issuer.URL + "/admin/oauth2/introspect", Issuer: "https://issuer.example/", Audience: "newapi-userinfo", ClientIDs: []string{"cherry-studio", "other-client"}}
+	resource, err := service.NewOAuthUserInfoResource(config, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	configure := func(alter func(map[string]any, int64)) {
+		calls.Store(0)
+		mu.Lock()
+		reply = func(n int64, token string) (int, []byte) {
+			value := claims()
+			if token != credential && token != "sk-trusted-oauth-shape" {
+				value = map[string]any{"active": false}
+			} else if alter != nil {
+				alter(value, n)
+			}
+			return http.StatusOK, encode(value)
+		}
+		mu.Unlock()
+	}
+	read := func(headers http.Header) (int, http.Header, map[string]any) {
+		return f.request(t, http.MethodGet, "/api/v1/oauth/userinfo", credential, "", headers)
+	}
+	checkError := func(status int, header http.Header, body map[string]any, want int, code string) {
+		t.Helper()
+		assert.Equal(t, want, status)
+		assert.Equal(t, map[string]any{"error": code}, body)
+		assert.Equal(t, "private, no-store", header.Get("Cache-Control"))
+		assert.Empty(t, header.Values("Set-Cookie"))
+		if want == 401 {
+			assert.Equal(t, `Bearer error="invalid_token"`, header.Get("WWW-Authenticate"))
+		}
+		if want == 403 {
+			assert.Equal(t, `Bearer error="insufficient_scope", scope="profile"`, header.Get("WWW-Authenticate"))
+		}
+	}
+	counts := func() []int64 {
+		result := []int64{}
+		for _, table := range []any{&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.Token{}} {
+			var count int64
+			require.NoError(t, f.db.Model(table).Count(&count).Error)
+			result = append(result, count)
+		}
+		return result
+	}
+	patKey := model.AccessTokenPrefix + strings.Repeat("p", 48)
+	pat := &model.UserAccessToken{Name: "OAuth boundary fixture", TokenHash: model.AccessTokenFingerprint(patKey), ExpiresAt: time.Now().Unix() + 3600}
+	require.NoError(t, pat.SetScopes([]string{"profile:read"}))
+	require.NoError(t, model.CreateUserAccessToken(user.Id, pat, 20))
+	f.bearer["pat"] = patKey
+	before := counts()
+
+	t.Run("default_off_and_type_boundary", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/oauth/userinfo", "/api/v1/oauth/userinfo/"} {
+			status, _, _ := f.request(t, http.MethodGet, path+"?access_token="+queryCanary, "", "", nil)
+			assert.Equal(t, http.StatusNotFound, status)
+		}
+		status, _, body := f.request(t, http.MethodGet, "/api/status", "", "", nil)
+		require.Equal(t, 200, status)
+		assert.Equal(t, false, body["data"].(map[string]any)["oauth"].(map[string]any)["enabled"])
+		assert.Equal(t, false, body["data"].(map[string]any)["client_features"].(map[string]any)["oauth"])
+		for _, alter := range []func(*service.OAuthUserInfoConfig){
+			func(c *service.OAuthUserInfoConfig) { c.IntrospectionURL = "http://example.invalid/secret" },
+			func(c *service.OAuthUserInfoConfig) { c.IntrospectionURL += "?secret=" + queryCanary },
+			func(c *service.OAuthUserInfoConfig) { c.IntrospectionURL += "#fragment" },
+			func(c *service.OAuthUserInfoConfig) { c.Issuer = "https://name:secret@example.invalid/" },
+			func(c *service.OAuthUserInfoConfig) { c.Audience = "" },
+			func(c *service.OAuthUserInfoConfig) { c.ClientIDs = []string{} },
+		} {
+			invalid := config
+			alter(&invalid)
+			_, err := service.NewOAuthUserInfoResource(invalid, roots)
+			assert.ErrorIs(t, err, service.ErrOAuthResourceConfiguration)
+			assert.Equal(t, "Invalid OAuth userinfo configuration.", err.Error())
+		}
+		t.Setenv("OAUTH_USERINFO_ENABLED", "invalid-secret-canary")
+		assert.ErrorIs(t, service.InitOAuthUserInfoResource(), service.ErrOAuthResourceConfiguration)
+		assert.Zero(t, calls.Load())
+		// Observe the actual resource chain without substituting authentication.
+		f.engine.Use(func(c *gin.Context) {
+			c.Next()
+			_, authenticated := middleware.GetAuthIdentity(c)
+			assert.False(t, authenticated)
+			_, session := middleware.GetSessionAuthIdentity(c)
+			assert.False(t, session)
+			for _, key := range []string{"id", "role", "session_id", "use_access_token", "access_token_identity"} {
+				_, present := c.Get(key)
+				assert.False(t, present, key)
+			}
+		})
+		SetOAuthResourceRouter(f.engine, resource)
+		configure(nil)
+		for _, actor := range []string{"", "owner", "relay", "pat", "fixture-id-token", "fixture-refresh-token"} {
+			status, h, b := f.request(t, http.MethodGet, "/api/v1/oauth/userinfo", actor, "", http.Header{"Cookie": {"new_api_refresh=fixture-cookie-canary"}})
+			checkError(status, h, b, 401, "invalid_token")
+		}
+		for _, headers := range []http.Header{
+			{"Authorization": {"Bearer " + credential, "Bearer " + credential}},
+			{"Authorization": {"Bearer " + credential + "," + credential}},
+			{"Authorization": {"Bearer  " + credential}},
+			{"Authorization": {"Bearer \u00a0" + credential}},
+			{"Authorization": {"Bearer " + credential + "\u2003"}},
+			{"Authorization": {"Basic " + credential}},
+		} {
+			status, h, b := read(headers)
+			checkError(status, h, b, 401, "invalid_token")
+		}
+		for _, path := range []string{"/api/v1/oauth/userinfo?access_token=" + queryCanary, "/api/v1/oauth/userinfo/?access_token=" + queryCanary} {
+			status, h, b := f.request(t, http.MethodGet, path, credential, "", nil)
+			checkError(status, h, b, 401, "invalid_token")
+			assert.Empty(t, h.Get("Location"))
+		}
+		status, _, _ = f.request(t, http.MethodPost, "/api/v1/oauth/userinfo?access_token="+queryCanary, credential, "", nil)
+		assert.Equal(t, 404, status)
+		for _, path := range []string{"/api/user/self", "/api/organizations/" + strconv.FormatInt(f.orgA, 10), "/api/verify/methods"} {
+			status, _, body := f.request(t, http.MethodGet, path, credential, "", nil)
+			assert.Contains(t, []int{401, 403}, status)
+			assert.NotContains(t, body, "data")
+		}
+		status, _, body = f.request(t, http.MethodGet, "/api/v1/oauth/userinfo?org_id="+strconv.FormatInt(f.orgA, 10), credential, "", nil)
+		assert.Equal(t, 403, status)
+		assert.Equal(t, "ORG_RESOURCE_UNSUPPORTED", body["code"])
+	})
+
+	t.Run("live_profile_and_scope", func(t *testing.T) {
+		for _, email := range []bool{false, true} {
+			configure(func(value map[string]any, _ int64) {
+				if !email {
+					value["scope"] = "profile"
+				}
+			})
+			status, h, b := read(http.Header{"X-Caller-Canary": {"must-not-forward"}})
+			require.Equal(t, 200, status)
+			want := map[string]any{"id": float64(user.Id), "username": user.Username, "display_name": "Profile display", "group": "default"}
+			if email {
+				want["email"] = "profile@example.invalid"
+			}
+			assert.Equal(t, want, b)
+			assert.Equal(t, int64(2), calls.Load())
+			assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+			assert.Empty(t, h.Values("Set-Cookie"))
+		}
+		configure(nil)
+		status, _, _ := f.request(t, http.MethodGet, "/api/v1/oauth/userinfo", "sk-trusted-oauth-shape", "", nil)
+		assert.Equal(t, 200, status, "spelling is not credential kind")
+		for _, tc := range []struct {
+			name, field string
+			value       any
+			want        int
+		}{
+			{"inactive", "active", false, 401}, {"active type", "active", "true", 401},
+			{"refresh", "token_use", "refresh_token", 401}, {"ID token", "token_use", "id_token", 401},
+			{"scheme", "token_type", "MAC", 401}, {"issuer", "iss", "https://foreign.example/", 401},
+			{"audience", "aud", []string{"other"}, 401}, {"audience type", "aud", "newapi-userinfo", 401},
+			{"client", "client_id", "unregistered", 401}, {"subject", "sub", "0", 401},
+			{"subject canonical", "sub", "01", 401}, {"subject type", "sub", user.Id, 401},
+			{"subject overflow", "sub", "9223372036854775808", 401}, {"expiry", "exp", time.Now().Unix() - 1, 401},
+			{"expiry type", "exp", "1900000000", 401}, {"not before", "nbf", time.Now().Unix() + 3600, 401},
+			{"version type", "ext", map[string]any{"newapi_auth_version": 1}, 401},
+			{"version stale", "ext", map[string]any{"newapi_auth_version": "2"}, 401},
+			{"scope exact", "scope", "profile:read", 403}, {"empty scope", "scope", "", 403},
+			{"scope spacing", "scope", "profile  email", 401},
+		} {
+			configure(func(value map[string]any, _ int64) { value[tc.field] = tc.value })
+			status, h, b := read(nil)
+			code := "invalid_token"
+			if tc.want == 403 {
+				code = "insufficient_scope"
+			}
+			checkError(status, h, b, tc.want, code)
+			assert.Equal(t, int64(1), calls.Load(), tc.name)
+		}
+		for _, field := range []string{"active", "token_use", "token_type", "iss", "aud", "client_id", "sub", "exp", "scope", "ext"} {
+			configure(func(value map[string]any, _ int64) { delete(value, field) })
+			status, h, b := read(nil)
+			checkError(status, h, b, 401, "invalid_token")
+		}
+	})
+
+	t.Run("uncached_final_state", func(t *testing.T) {
+		for _, scenario := range []string{"inactive", "subject", "client", "email scope", "disabled", "deleted", "auth version"} {
+			configure(func(value map[string]any, n int64) {
+				if n != 2 {
+					return
+				}
+				switch scenario {
+				case "inactive":
+					value["active"] = false
+				case "subject":
+					value["sub"] = strconv.Itoa(f.users["foreign"].Id)
+				case "client":
+					value["client_id"] = "other-client"
+				case "email scope":
+					value["scope"] = "profile"
+				case "disabled":
+					assert.NoError(t, f.db.Model(&model.User{}).Where("id = ?", user.Id).Update("status", common.UserStatusDisabled).Error)
+				case "deleted":
+					assert.NoError(t, f.db.Delete(&model.User{}, user.Id).Error)
+				case "auth version":
+					assert.NoError(t, f.db.Model(&model.User{}).Where("id = ?", user.Id).Update("auth_version", 2).Error)
+				}
+			})
+			status, h, b := read(nil)
+			checkError(status, h, b, 401, "invalid_token")
+			require.NoError(t, f.db.Unscoped().Model(&model.User{}).Where("id = ?", user.Id).Updates(map[string]any{"deleted_at": nil, "status": common.UserStatusEnabled, "auth_version": 1}).Error)
+		}
+		configure(func(_ map[string]any, n int64) {
+			if n == 2 {
+				assert.NoError(t, f.db.Model(&model.User{}).Where("id = ?", user.Id).Update("display_name", "Current final display").Error)
+			}
+		})
+		status, _, body := read(nil)
+		require.Equal(t, 200, status)
+		assert.Equal(t, "Current final display", body["display_name"])
+		// Hold the final local query until its exact token expiry. This is an
+		// observed query barrier plus claim deadline, not an arbitrary race sleep.
+		var localReads atomic.Int64
+		var expiry atomic.Int64
+		callback := "oauth-expiry-after-local-wait"
+		require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Table == "users" && localReads.Add(1) == 2 {
+				timer := time.NewTimer(time.Until(time.Unix(expiry.Load(), 0)))
+				defer timer.Stop()
+				<-timer.C
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, f.db.Callback().Query().Remove(callback)) })
+		configure(func(value map[string]any, n int64) {
+			if n == 2 {
+				deadline := time.Now().Unix() + 1
+				expiry.Store(deadline)
+				value["exp"] = deadline
+			}
+		})
+		status, h, b := read(nil)
+		checkError(status, h, b, 401, "invalid_token")
+		assert.Equal(t, int64(2), localReads.Load())
+		require.NoError(t, f.db.Callback().Query().Remove(callback))
+	})
+
+	t.Run("upstream_failure_and_isolation", func(t *testing.T) {
+		for _, scenario := range []string{"status", "redirect", "oversize", "malformed", "duplicate", "timeout"} {
+			calls.Store(0)
+			mu.Lock()
+			reply = func(_ int64, _ string) (int, []byte) {
+				switch scenario {
+				case "status":
+					return 500, []byte(upstreamCanary)
+				case "redirect":
+					return 302, nil
+				case "oversize":
+					return 200, encode(map[string]any{"padding": strings.Repeat("x", 65537)})
+				case "malformed":
+					return 200, []byte(`{"cause":"` + upstreamCanary)
+				case "duplicate":
+					return 200, []byte(`{"active":true,"active":false}`)
+				}
+				return 500, nil
+			}
+			if scenario == "timeout" {
+				reply = nil
+			}
+			mu.Unlock()
+			status, h, b := read(nil)
+			checkError(status, h, b, 503, "temporarily_unavailable")
+			assert.Equal(t, int64(1), calls.Load())
+		}
+		untrusted, err := service.NewOAuthUserInfoResource(config, nil)
+		require.NoError(t, err)
+		t.Cleanup(untrusted.CloseIdleConnections)
+		_, err = untrusted.Authorize(context.Background(), credential)
+		assert.ErrorIs(t, err, service.ErrOAuthResourceUnavailable)
+		assert.Equal(t, before, counts(), "userinfo cannot create users/sessions/keys")
+		for _, secret := range []string{credential, queryCanary, upstreamCanary, "fixture-cookie-canary", "private-setting-canary"} {
+			assert.NotContains(t, f.logs.snapshot(), secret)
+		}
+	})
 }
 
 // Explicit administrator facts enrich already visible rows, never their pricing

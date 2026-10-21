@@ -72,6 +72,48 @@ def go_function(source, name):
     return re.sub(r'\s+', ' ', match.group())
 
 
+def check_oauth_userinfo(api, source_root):
+    path = '/api/v1/oauth/userinfo'
+    assert set(api['paths'][path]) == {'get'}
+    operation = api['paths'][path]['get']
+    assert operation['operationId'] == 'getOAuthUserInfo'
+    assert operation['security'] == [{'OAuthResourceBearer': []}]
+    assert operation['x-required-scopes'] == ['profile']
+    assert operation['x-optional-disclosure-scope'] == {'email': 'email'}
+    assert 'requestBody' not in operation
+    assert set(operation['responses']) == {'200', '400', '401', '403', '429', '503'}
+    schemas = api['components']['schemas']
+    assert schemas['OAuthUserInfo'] == {
+        'type': 'object', 'additionalProperties': False,
+        'required': ['id', 'username', 'display_name', 'group'],
+        'properties': {'id': {'type': 'integer', 'minimum': 1},
+                       'username': {'type': 'string'}, 'display_name': {'type': 'string'},
+                       'group': {'type': 'string'},
+                       'email': {'type': 'string', 'description': 'Present only when the current access token grants the exact email scope.'}},
+    }
+    for name, code in [('OAuthInvalidToken', 'invalid_token'), ('OAuthInsufficientScope', 'insufficient_scope'),
+                       ('OAuthResourceUnavailable', 'temporarily_unavailable')]:
+        assert schemas[name] == {'type': 'object', 'additionalProperties': False, 'required': ['error'],
+                                 'properties': {'error': {'type': 'string', 'enum': [code]}}}
+    assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OAuthUserInfo'}
+    assert operation['responses']['401']['headers']['WWW-Authenticate']['schema']['enum'] == ['Bearer error="invalid_token"']
+    assert operation['responses']['403']['content']['application/json']['schema'] == {'oneOf': [
+        {'$ref': '#/components/schemas/OAuthInsufficientScope'},
+        api['components']['responses']['OrganizationSelectionUnsupported']['content']['application/json']['schema'],
+    ]}
+    for status in ('200', '401', '403', '429', '503'):
+        assert 'private, no-store' in operation['responses'][status]['headers']['Cache-Control']['description']
+    assert 'Hydra does not generate this local binding' in operation['description']
+    assert 'status oauth.enabled and client_features.oauth remain false' in operation['description']
+    startup = go_function((source_root / 'main.go').read_text(), 'InitResources')
+    assert startup.index('service.InitOAuthUserInfoResource()') < startup.index('model.InitDB()')
+    routes = (source_root / 'router/oauth_resource_router.go').read_text()
+    assert 'OAuthUserInfoAuth(resource)' in routes and 'GlobalAPIRateLimit()' in routes
+    assert 'UserAuth(' not in routes and 'AccessTokenAudit(' not in routes
+    return {'route': path, 'default_off': True, 'profile_scope': True, 'optional_email': True,
+            'independent_credential': True, 'provider_login_delivered': False, 'live_http': False}
+
+
 def check_conditional_authorization(source_root):
     # Static drift checks on the selected server predicates, not an authorization
     # simulator. Runtime allow/deny tests must still exercise the actual handlers.
@@ -972,6 +1014,7 @@ def main():
     results['model_capability_metadata'] = check_model_capability_metadata(api)
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['personal_log_range_error'] = check_personal_log_range_error(api)
+    results['oauth_userinfo'] = check_oauth_userinfo(api, source_root)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
     for fixture in fixtures:
         if fixture.get('kind') == 's3_operation':
