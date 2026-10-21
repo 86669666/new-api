@@ -16,9 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { resolveAuthentication } from '@/lib/auth-session'
+import {
+  refreshAuthentication,
+  resolveAuthentication,
+} from '@/lib/auth-session'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { requestAuthorization, type AuthorizationPreview } from '../api'
@@ -40,51 +43,100 @@ type AuthorizationState =
 
 export function useProviderAuthorization(entry: AuthorizationEntry) {
   const [ceremony] = useState(() => entry.read())
+  const [deadline] = useState(() => Date.now() + 300_000)
   const [state, setState] = useState<AuthorizationState>({ kind: 'loading' })
   const [email, setEmail] = useState(false)
   const mounted = useRef(false)
   const invalidated = useRef(false)
   const submitted = useRef(false)
+  const waiting = useRef(false)
+  const resuming = useRef(false)
   const identity = useRef<AuthorizationIdentity | null>(null)
   const controller = useRef(new AbortController())
+  const expiry = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const initialization = useRef<Promise<AuthorizationPreview | null> | null>(
     null
+  )
+
+  const stop = useCallback(() => {
+    invalidated.current = true
+    controller.current.abort()
+    clearTimeout(expiry.current)
+    if (ceremony) {
+      entry.discard(ceremony)
+    }
+    if (mounted.current) {
+      setState({ kind: 'terminal' })
+    }
+  }, [ceremony, entry])
+
+  const isLive = useCallback(
+    () =>
+      mounted.current &&
+      !invalidated.current &&
+      ceremony?.active === true &&
+      !controller.current.signal.aborted &&
+      window.location.pathname === `/oauth/provider/${entry.phase}` &&
+      (!waiting.current || Date.now() < deadline),
+    [ceremony, deadline, entry.phase]
+  )
+
+  const readPreview = useCallback(
+    async (captured: AuthorizationIdentity): Promise<AuthorizationPreview> => {
+      if (!isLive() || !ceremony || !authorizationIdentityMatches(captured)) {
+        throw new Error('invalid_ceremony')
+      }
+      const preview = await requestAuthorization(
+        captured,
+        ceremony.phase,
+        controller.current.signal,
+        ceremony.challenge
+      )
+      if (
+        !isLive() ||
+        !authorizationIdentityMatches(captured) ||
+        typeof preview === 'string'
+      ) {
+        throw new Error('invalid_preview')
+      }
+      return preview
+    },
+    [ceremony, isLive]
+  )
+
+  const showPreview = useCallback(
+    (preview: AuthorizationPreview) => {
+      if (!isLive()) {
+        stop()
+        return
+      }
+      setState({ kind: 'ready', preview })
+      clearTimeout(expiry.current)
+      const expires = waiting.current
+        ? Math.min(deadline, preview.expires_at * 1000)
+        : preview.expires_at * 1000
+      expiry.current = setTimeout(stop, Math.max(0, expires - Date.now()))
+    },
+    [deadline, isLive, stop]
   )
 
   useEffect(() => {
     mounted.current = true
     let active = true
-    let expiry: ReturnType<typeof setTimeout> | undefined
-    const stop = () => {
-      invalidated.current = true
-      controller.current.abort()
-      if (ceremony) {
-        entry.discard(ceremony)
-      }
-      if (mounted.current) {
-        setState({ kind: 'terminal' })
-      }
-    }
     const unsubscribe = useAuthStore.subscribe(() => {
       if (identity.current && !authorizationIdentityMatches(identity.current)) {
         stop()
       }
     })
     const initialize = async (): Promise<AuthorizationPreview | null> => {
-      if (
-        !ceremony?.active ||
-        window.location.pathname !== `/oauth/provider/${entry.phase}`
-      ) {
+      if (!isLive()) {
         throw new Error('invalid_ceremony')
       }
       const result = await resolveAuthentication()
-      if (
-        !mounted.current ||
-        invalidated.current ||
-        !ceremony.active ||
-        controller.current.signal.aborted ||
-        window.location.pathname !== `/oauth/provider/${entry.phase}`
-      ) {
+      if (result.kind === 'anonymous') {
+        waiting.current = true
+      }
+      if (!isLive()) {
         throw new Error('invalid_ceremony')
       }
       if (result.kind === 'anonymous') {
@@ -95,16 +147,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
         throw new Error('invalid_identity')
       }
       identity.current = captured
-      const value = await requestAuthorization(
-        captured,
-        ceremony.phase,
-        controller.current.signal,
-        ceremony.challenge
-      )
-      if (typeof value === 'string') {
-        throw new Error('invalid_preview')
-      }
-      return value
+      return readPreview(captured)
     }
     initialization.current ??= initialize()
     void initialization.current
@@ -112,22 +155,16 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
         if (!active || invalidated.current) {
           return
         }
-        if (window.location.pathname !== `/oauth/provider/${entry.phase}`) {
+        if (!isLive()) {
           stop()
           return
         }
         if (!preview) {
-          if (ceremony) {
-            entry.discard(ceremony)
-          }
           setState({ kind: 'anonymous' })
+          expiry.current = setTimeout(stop, Math.max(0, deadline - Date.now()))
           return
         }
-        setState({ kind: 'ready', preview })
-        expiry = setTimeout(
-          stop,
-          Math.max(0, preview.expires_at * 1000 - Date.now())
-        )
+        showPreview(preview)
       })
       .catch(() => {
         if (active) {
@@ -138,16 +175,57 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
       active = false
       mounted.current = false
       unsubscribe()
-      clearTimeout(expiry)
-      // StrictMode's immediate setup/cleanup/setup may reuse the same pending
-      // initialization. An actual unmount invalidates it before later results.
+      clearTimeout(expiry.current)
+      // StrictMode can reuse pending initialization during immediate remount.
       queueMicrotask(() => {
         if (!mounted.current) {
           stop()
         }
       })
     }
-  }, [ceremony, entry])
+  }, [deadline, isLive, readPreview, showPreview, stop])
+
+  async function resume(): Promise<void> {
+    if (state.kind !== 'anonymous' || resuming.current || identity.current) {
+      return
+    }
+    if (!isLive()) {
+      stop()
+      return
+    }
+    resuming.current = true
+    setState({ kind: 'loading' })
+    try {
+      const result = await refreshAuthentication()
+      if (!isLive()) {
+        throw new Error('invalid_ceremony')
+      }
+      if (result.kind === 'anonymous') {
+        setState({ kind: 'anonymous' })
+        return
+      }
+      const captured = currentAuthorizationIdentity()
+      if (
+        result.kind !== 'authenticated' ||
+        !captured ||
+        captured.userId !== result.bundle.user.id ||
+        captured.sid !== result.bundle.session.sid ||
+        captured.token !== result.bundle.access_token
+      ) {
+        throw new Error('invalid_identity')
+      }
+      identity.current = captured
+      const preview = await readPreview(captured)
+      if (!isLive()) {
+        throw new Error('invalid_ceremony')
+      }
+      showPreview(preview)
+    } catch {
+      stop()
+    } finally {
+      resuming.current = false
+    }
+  }
 
   async function decide(approve: boolean): Promise<void> {
     const captured = identity.current
@@ -167,9 +245,9 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
     setState({ kind: 'submitting' })
     try {
       if (
+        !isLive() ||
         !authorizationIdentityMatches(captured) ||
-        preview.expires_at <= Date.now() / 1000 ||
-        window.location.pathname !== `/oauth/provider/${entry.phase}`
+        preview.expires_at <= Date.now() / 1000
       ) {
         throw new Error('invalid_ceremony')
       }
@@ -185,27 +263,20 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
         }
       )
       if (
-        !mounted.current ||
-        invalidated.current ||
-        !current.active ||
+        !isLive() ||
         !authorizationIdentityMatches(captured) ||
-        typeof result !== 'string' ||
-        window.location.pathname !== `/oauth/provider/${entry.phase}`
+        typeof result !== 'string'
       ) {
         throw new Error('invalid_ceremony')
       }
       entry.discard(current)
       invalidated.current = true
+      clearTimeout(expiry.current)
       setState({ kind: 'terminal' })
       providerBrowser.replace(result)
     } catch {
-      entry.discard(current)
-      invalidated.current = true
-      controller.current.abort()
-      if (mounted.current) {
-        setState({ kind: 'terminal' })
-      }
+      stop()
     }
   }
-  return { state, email, setEmail, decide }
+  return { state, email, setEmail, decide, resume, cancel: stop }
 }

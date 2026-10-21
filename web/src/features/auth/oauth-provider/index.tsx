@@ -44,12 +44,34 @@ export function ProviderAuthorizationPage(props: {
         <ErrorState
           title={t('Sign in to continue authorization')}
           description={t(
-            'After signing in, start authorization again from your client.'
+            'Sign in in a new tab, then return here and continue within five minutes.'
           )}
           action={
-            <Button role='link' render={<Link to='/sign-in' />}>
-              {t('Sign in')}
-            </Button>
+            <div className='flex flex-wrap justify-center gap-3'>
+              <Button
+                role='link'
+                render={
+                  <Link
+                    to='/sign-in'
+                    target='_blank'
+                    rel='noopener noreferrer'
+                  />
+                }
+              >
+                {t('Sign in')}
+              </Button>
+              <Button
+                variant='outline'
+                onClick={() => {
+                  void authorization.resume()
+                }}
+              >
+                {t('Continue after signing in')}
+              </Button>
+              <Button variant='ghost' onClick={authorization.cancel}>
+                {t('Cancel')}
+              </Button>
+            </div>
           }
         />
       </AuthLayout>

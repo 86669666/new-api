@@ -33,6 +33,7 @@ import { StrictMode } from 'react'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { Route as ApplicationRoute } from '@/routes/__root'
 import { Route as ConsentRoute } from '@/routes/oauth/provider/consent'
 import { Route as LoginRoute } from '@/routes/oauth/provider/login'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
@@ -44,6 +45,24 @@ import {
   type AuthorizationCeremony,
   type AuthorizationPhase,
 } from '../lib/authorization'
+
+// Keep the real auth refresh runner and axios instances; control only their
+// network adapter, including the private refresh client's HTTP boundary.
+const refreshTransport = vi.hoisted(() => ({
+  requests: [] as InternalAxiosRequestConfig[],
+  handler: undefined as AxiosAdapter | undefined,
+}))
+vi.mock('axios', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('axios')>()
+  actual.default.defaults.adapter = async (config) => {
+    refreshTransport.requests.push(config)
+    if (!refreshTransport.handler) {
+      throw new Error('fixture_transport_not_initialized')
+    }
+    return refreshTransport.handler(config)
+  }
+  return actual
+})
 
 const capability = 'owned-challenge-CANARY'
 const originalAdapter = providerHTTP.defaults.adapter
@@ -102,11 +121,16 @@ function deferred<T>() {
 async function mountPage(
   phase: AuthorizationPhase,
   query = `?${phase}_challenge=${capability}`,
-  strict = false
+  strict = false,
+  applicationRoot = false
 ) {
   const path = `/oauth/provider/${phase}`
   window.history.replaceState(null, '', path + query)
   const actual = phase === 'login' ? LoginRoute : ConsentRoute
+  const ApplicationRoot = ApplicationRoute.options.component
+  if (!ApplicationRoot) {
+    throw new Error('production_root_component_missing')
+  }
   const root = createRootRoute({
     beforeLoad: () => {
       expect(window.location.search).toBe('')
@@ -114,7 +138,7 @@ async function mountPage(
     },
     component: () => (
       <QueryClientProvider client={client}>
-        <Outlet />
+        {applicationRoot ? <ApplicationRoot /> : <Outlet />}
       </QueryClientProvider>
     ),
   })
@@ -129,8 +153,13 @@ async function mountPage(
     path: '/sign-in',
     component: () => <p>Normal sign in</p>,
   })
+  const ordinary = createRoute({
+    getParentRoute: () => root,
+    path: '/ordinary',
+    component: () => <p>Ordinary page</p>,
+  })
   const router = createRouter({
-    routeTree: root.addChildren([page, signin]),
+    routeTree: root.addChildren([page, signin, ordinary]),
     history: createMemoryHistory({ initialEntries: [path + query] }),
     defaultPendingMinMs: 0,
   })
@@ -147,6 +176,16 @@ async function mountPage(
 }
 
 beforeEach(() => {
+  refreshTransport.requests.length = 0
+  refreshTransport.handler = async (config) => {
+    if (config.url === '/api/user/auth/refresh') {
+      return { ...response(config, { success: false }), status: 401 }
+    }
+    if (config.url === '/api/status') {
+      return response(config, { success: true, data: {} })
+    }
+    throw new Error('unexpected_fixture_http_path')
+  }
   requests.length = 0
   client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -174,6 +213,7 @@ afterEach(() => {
   providerHTTP.defaults.adapter = originalAdapter
   window.history.replaceState(null, '', '/')
   vi.useRealTimers()
+  vi.unstubAllGlobals()
 })
 
 describe('explicit dashboard-session provider authorization', () => {
@@ -271,6 +311,8 @@ describe('explicit dashboard-session provider authorization', () => {
     await mountPage('login')
     const signin = await screen.findByRole('link', { name: 'Sign in' })
     expect(signin).toHaveAttribute('href', '/sign-in')
+    expect(signin).toHaveAttribute('target', '_blank')
+    expect(signin).toHaveAttribute('rel', 'noopener noreferrer')
     expect(requests).toHaveLength(0)
     expect(window.location.search).toBe('')
     expect(useAuthStore.getState().auth.pendingLoginVerification).toBeNull()
@@ -491,6 +533,304 @@ describe('explicit dashboard-session provider authorization', () => {
     expect(requests).toHaveLength(2)
     expect(navigate).not.toHaveBeenCalled()
   })
+})
+
+describe('first-login continuation in the original authorization tab', () => {
+  function notify(kind: 'authenticated' | 'signed_out', sid: string) {
+    window.dispatchEvent(
+      new StorageEvent('storage', {
+        key: 'new-api:auth-session:event',
+        newValue: JSON.stringify({
+          kind,
+          sid,
+          source: 'other-owned-tab',
+          nonce: 'owned-event',
+          timestamp: Date.now(),
+        }),
+      })
+    )
+  }
+
+  function observeReload() {
+    const reload = vi.fn()
+    const realWindow = window
+    vi.stubGlobal('BroadcastChannel', undefined)
+    vi.stubGlobal(
+      'window',
+      new Proxy(realWindow, {
+        get(target, property) {
+          if (property === 'location') return { ...target.location, reload }
+          return Reflect.get(target, property, target)
+        },
+      })
+    )
+    return reload
+  }
+
+  it.each(['login', 'consent'] as const)(
+    '%s actual root keeps anonymous input through sign-in notice and resumes only once on explicit click',
+    async (phase) => {
+      const reload = observeReload()
+      useAuthStore.getState().auth.reset('complete')
+      await mountPage(phase, undefined, false, true)
+      const resume = await screen.findByRole('button', {
+        name: 'Continue after signing in',
+      })
+      act(() => notify('authenticated', 'untrusted-event-sid'))
+      expect(reload).not.toHaveBeenCalled()
+      expect(useAuthStore.getState().auth.session).toBeNull()
+      expect(requests).toHaveLength(0)
+      expect(
+        refreshTransport.requests.filter(
+          (request) => request.url === '/api/user/auth/refresh'
+        )
+      ).toHaveLength(0)
+      expect(window.location.search).toBe('')
+      const pending = deferred<AuthBundle>()
+      refreshTransport.handler = async (config) =>
+        response(config, {
+          success: true,
+          data: await pending.promise,
+        })
+      act(() => {
+        resume.click()
+        resume.click()
+      })
+      await waitFor(() =>
+        expect(
+          refreshTransport.requests.filter(
+            (request) => request.url === '/api/user/auth/refresh'
+          )
+        ).toHaveLength(1)
+      )
+      expect(requests).toHaveLength(0)
+      const signedIn = bundle(
+        'fresh-real-session-token',
+        'fresh-real-session-sid'
+      )
+      await act(async () => {
+        pending.resolve(signedIn)
+        await pending.promise
+      })
+      const approve = await screen.findByRole('button', {
+        name: phase === 'login' ? 'Continue' : 'Approve',
+      })
+      expect(screen.getByText('Synthetic account')).toBeVisible()
+      expect(requests).toHaveLength(1)
+      expect(requests[0].headers.get('Authorization')).toBe(
+        'Bearer fresh-real-session-token'
+      )
+      expect(useAuthStore.getState().auth.session?.sid).toBe(
+        'fresh-real-session-sid'
+      )
+      expect(navigate).not.toHaveBeenCalled()
+      await userEvent.click(approve)
+      await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+      expect(requests).toHaveLength(2)
+      expect(requests[1].headers.get('Authorization')).toBe(
+        'Bearer fresh-real-session-token'
+      )
+      for (const storage of [localStorage, sessionStorage]) {
+        for (let index = 0; index < storage.length; index++) {
+          const key = storage.key(index)
+          expect(key ? storage.getItem(key) : '').not.toContain(capability)
+        }
+      }
+    }
+  )
+
+  it('still-anonymous retry cannot extend the five-minute boundary even when timers are throttled', async () => {
+    useAuthStore.getState().auth.reset('complete')
+    let now = Date.now()
+    const entered = now
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    await mountPage('login')
+    await screen.findByRole('button', { name: 'Continue after signing in' })
+    now = entered + 299_999
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Continue after signing in' })
+    )
+    await screen.findByRole('button', { name: 'Continue after signing in' })
+    expect(refreshTransport.requests).toHaveLength(1)
+    now = entered + 300_000
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Continue after signing in' })
+    )
+    await screen.findByText('Authorization could not be completed.')
+    expect(refreshTransport.requests).toHaveLength(1)
+    expect(requests).toHaveLength(0)
+  })
+
+  it.each(['expiry', 'unmount', 'new input'] as const)(
+    'pending real refresh cannot preview after %s invalidation',
+    async (change) => {
+      useAuthStore.getState().auth.reset('complete')
+      const entered = Date.now()
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(entered)
+      const view = await mountPage('login')
+      const resume = await screen.findByRole('button', {
+        name: 'Continue after signing in',
+      })
+      const pending = deferred<AuthBundle>()
+      refreshTransport.handler = async (config) =>
+        response(config, { success: true, data: await pending.promise })
+      await userEvent.click(resume)
+      await waitFor(() => expect(refreshTransport.requests).toHaveLength(1))
+      if (change === 'expiry') {
+        clock.mockReturnValue(entered + 300_000)
+      } else if (change === 'unmount') {
+        view.unmount()
+        await act(async () => {
+          await Promise.resolve()
+        })
+      } else {
+        window.history.replaceState(
+          null,
+          '',
+          '/oauth/provider/login?login_challenge=fresh-input'
+        )
+        const validate = LoginRoute.options.validateSearch
+        if (typeof validate !== 'function') {
+          throw new Error('route_validator_missing')
+        }
+        validate({})
+      }
+      await act(async () => {
+        pending.resolve(bundle())
+        await pending.promise
+      })
+      if (change !== 'unmount') {
+        await screen.findByText('Authorization could not be completed.')
+      }
+      expect(requests).toHaveLength(0)
+      expect(navigate).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each(['transient refresh', 'out-of-sync refresh', 'preview'] as const)(
+    '%s failure is terminal without producer replay or raw cause display',
+    async (failure) => {
+      useAuthStore.getState().auth.reset('complete')
+      await mountPage('consent')
+      const resume = await screen.findByRole('button', {
+        name: 'Continue after signing in',
+      })
+      refreshTransport.handler = async (config) =>
+        failure === 'preview'
+          ? response(config, { success: true, data: bundle() })
+          : {
+              ...response(config, { code: 'RAW-CAUSE-CANARY' }),
+              status: failure === 'transient refresh' ? 503 : 403,
+            }
+      if (failure === 'preview') {
+        providerHTTP.defaults.adapter = async (config) => {
+          requests.push(config)
+          throw new Error('RAW-CAUSE-CANARY')
+        }
+      }
+      await userEvent.click(resume)
+      await screen.findByText('Authorization could not be completed.')
+      expect(requests).toHaveLength(failure === 'preview' ? 1 : 0)
+      expect(refreshTransport.requests).toHaveLength(1)
+      expect(
+        screen.queryByRole('button', { name: 'Continue after signing in' })
+      ).not.toBeInTheDocument()
+      expect(document.body.textContent).not.toContain('RAW-CAUSE-CANARY')
+      expect(navigate).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each(['token', 'sid', 'user'] as const)(
+    'refresh outcome must match the current %s before the first binding',
+    async (change) => {
+      useAuthStore.getState().auth.reset('complete')
+      await mountPage('login')
+      const resume = await screen.findByRole('button', {
+        name: 'Continue after signing in',
+      })
+      refreshTransport.handler = async (config) =>
+        response(config, { success: true, data: bundle('refresh-result') })
+      let replaced = false
+      const unsubscribe = useAuthStore.subscribe((state) => {
+        if (!replaced && state.auth.accessToken === 'refresh-result') {
+          replaced = true
+          useAuthStore
+            .getState()
+            .auth.setBundle(
+              bundle(
+                change === 'token' ? 'replacement' : 'refresh-result',
+                change === 'sid' ? 'replacement' : undefined,
+                change === 'user' ? 23 : undefined
+              )
+            )
+        }
+      })
+      try {
+        await userEvent.click(resume)
+        await screen.findByText('Authorization could not be completed.')
+        expect(replaced).toBe(true)
+        expect(requests).toHaveLength(0)
+        expect(navigate).not.toHaveBeenCalled()
+      } finally {
+        unsubscribe()
+      }
+    }
+  )
+
+  it('cancel discards the anonymous input and removes all continuation actions', async () => {
+    useAuthStore.getState().auth.reset('complete')
+    await mountPage('login')
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+    await screen.findByText('Authorization could not be completed.')
+    expect(
+      screen.queryByRole('link', { name: 'Sign in' })
+    ).not.toBeInTheDocument()
+    expect(refreshTransport.requests).toHaveLength(0)
+    expect(requests).toHaveLength(0)
+  })
+
+  it.each(['/ordinary', '/oauth/provider/login/'])(
+    'actual root preserves anonymous authenticated-notice reload outside the two exact paths: %s',
+    async (path) => {
+      const reload = observeReload()
+      useAuthStore.getState().auth.reset('complete')
+      const view = await mountPage('login', undefined, false, true)
+      await screen.findByRole('button', { name: 'Continue after signing in' })
+      await act(async () => {
+        await view.router.navigate({ href: '/ordinary' })
+      })
+      window.history.replaceState(null, '', path)
+      act(() => notify('authenticated', 'another-session'))
+      expect(reload).toHaveBeenCalledTimes(1)
+      expect(useAuthStore.getState().auth.session).toBeNull()
+      expect(requests).toHaveLength(0)
+    }
+  )
+
+  it.each(['authenticated', 'signed_out'] as const)(
+    'actual root preserves bound provider handling of a %s notice',
+    async (kind) => {
+      const reload = observeReload()
+      await mountPage('login', undefined, false, true)
+      await screen.findByRole('button', { name: 'Continue' })
+      act(() =>
+        notify(
+          kind,
+          kind === 'authenticated' ? 'replacement-sid' : 'synthetic-sid'
+        )
+      )
+      if (kind === 'authenticated') {
+        expect(reload).toHaveBeenCalledTimes(1)
+        await screen.findByText('Authorization could not be completed.')
+      } else {
+        expect(reload).not.toHaveBeenCalled()
+        await screen.findByText('Normal sign in')
+      }
+      expect(useAuthStore.getState().auth.session).toBeNull()
+      expect(requests).toHaveLength(1)
+      expect(navigate).not.toHaveBeenCalled()
+    }
+  )
 })
 
 describe('provider authorization with synchronous browser history', () => {

@@ -77,6 +77,15 @@ function RootComponent() {
 
         if (event.kind === 'authenticated') {
           if (event.sid === currentSID) return
+          if (
+            !currentSID &&
+            (window.location.pathname === '/oauth/provider/login' ||
+              window.location.pathname === '/oauth/provider/consent')
+          ) {
+            // Keep only the anonymous page's in-memory ceremony. The event is
+            // not identity; explicit resume must refresh the real session.
+            return
+          }
           if (currentSID) {
             clearAuthentication(false)
           }
