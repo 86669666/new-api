@@ -428,6 +428,163 @@ class OrganizationIdentityContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.validate_organization_identity_events(events, 'organization-identity')
 
+    def test_client_events_receiver_suite_and_migrations_are_closed(self):
+        suite, root, package = 'client-events-receiver', 'TestClientEventsReceiverHTTP', 'github.com/QuantumNous/new-api/router'
+        leaves = ('current_credentials_and_isolation', 'validation_and_resource_limits',
+                  'durability_and_deduplication', 'cleanup_and_current_authority')
+        events = [{'Action': 'pass', 'Package': package, 'Test': name} for name in
+                  [root] + [root + '/' + leaf for leaf in leaves]] + [{'Action': 'pass', 'Package': package}]
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite], (frozenset((root,)), 'g19-client-events-receiver'))
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['passed_tests_and_subtests'], 5)
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:], events + [{'Action': 'skip'}],
+                          events + [{'Action': 'fail'}], events + [{'Action': 'pass', 'Package': package, 'Test': root + '/unexpected'}],
+                          [dict(event, Package='foreign/package') for event in events]):
+            with self.subTest(http=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+        alias = 'client-events-receiver-http-only'
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[alias], runner.ORGANIZATION_READ_SUITES[suite])
+        self.assertEqual(runner.validate_organization_identity_events(events, alias)['passed_tests_and_subtests'], 5)
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:], events + [{'Action': 'skip'}],
+                          events + [{'Action': 'fail'}], events + [{'Action': 'pass', 'Package': package, 'Test': root + '/unexpected'}],
+                          [dict(event, Package='foreign/package') for event in events]):
+            with self.subTest(http_only=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, alias)
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp).resolve()
+            arguments = dict(suite=alias, wallet_runtime=None, client_events_runtime=None,
+                             image_metadata=directory, preserve_volumes=directory / 'baseline.json',
+                             go=Path('/go'), image_evidence=directory / 'images', relay_evidence=directory / 'relays.json')
+            with patch.object(runner, 'preserved_volume_baseline', return_value={}), \
+                    patch.object(runner, 'preflight', side_effect=RuntimeError('stop before resources')) as preflight, \
+                    patch.object(released, 'run_organization_wallet_migrations') as migrate:
+                for name in ('wallet_runtime', 'client_events_runtime'):
+                    with self.subTest(forbidden_migration_parameter=name), self.assertRaises(ValueError):
+                        runner.run_organization_identity(SimpleNamespace(**dict(arguments, **{name: directory / 'new-runtime'})), [])
+                preflight.assert_not_called();migrate.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, 'stop before resources'):
+                    runner.run_organization_identity(SimpleNamespace(**arguments), [])
+                preflight.assert_called_once();migrate.assert_not_called()
+                preflight.reset_mock()
+                with self.assertRaises(ValueError):
+                    runner.run_organization_identity(SimpleNamespace(**dict(arguments, suite=suite)), [])
+                preflight.assert_not_called();migrate.assert_not_called()
+        manifest = [{'main': engine, 'log': 'same', 'phase': phase} for engine in ('sqlite', 'mysql', 'postgres')
+                    for phase in ('fresh_start', 'fresh_restart', 'release_seed', 'candidate_upgrade_1', 'candidate_upgrade_2')]
+        self.assertEqual(released.required_wallet_manifest(), manifest)
+        records = [dict(record, passed=True, version='real version required at runtime') for record in manifest]
+        self.assertEqual(released.validate_wallet_migration_results(records)['passed_phases'], 15)
+        for candidate in (records[:-1], list(reversed(records)), records + records[:1], [dict(record, passed=False) for record in records]):
+            with self.subTest(phases=candidate), self.assertRaises(ValueError):
+                released.validate_wallet_migration_results(candidate)
+        self.assertEqual(released.CLIENT_EVENTS_RELEASE, '7d8b91268dab69d7150f345c448b5e250163146a')
+        self.assertEqual(released.WALLET_RELEASE, '6cf0d90b5ff27f901697dddd61e0c28aba8efefc')
+        self.assertEqual(released.RELEASE, '633b4c5b190dc1af99a2814391354d86948e7943')
+        self.assertEqual(released.client_events_migration_sources(),
+                         (released.CLIENT_EVENTS_RELEASE, released.CLIENT_EVENTS_RELEASE_FIXTURE, released.CLIENT_EVENTS_CANDIDATE_FIXTURE))
+        count = {'name': 'count', 'type': 'integer', 'default': '0', 'default_known': True,
+                 'nullable': True, 'nullable_known': True, 'pk': False, 'pk_known': True,
+                 'length': 0, 'length_known': False}
+        old = [{'table': 'tasks', 'columns': [{'name': 'id', 'type': 'integer'}], 'indexes': []},
+               {'table': 'quota_data', 'columns': [count] + [dict(count, name=name) for name in
+                    ('cache_read_tokens', 'cache_creation_tokens')], 'indexes': []},
+               {'table': 'audit_logs', 'columns': [{'name': 'id', 'type': 'integer'}], 'indexes': [
+                    {'name': 'idx_audit_time_event', 'columns': ['created_at', 'event_id'], 'unique': False, 'known': True}]}]
+        fresh = copy.deepcopy(old)
+        fresh[1]['columns'] = [copy.deepcopy(count)]
+        fresh[2]['indexes'] = []
+        fresh[0]['columns'].append({'name': 'organization_id', 'type': 'integer'})
+        fresh[0]['indexes'].append({'name': 'idx_tasks_organization_user', 'columns': ['organization_id', 'user_id']})
+        fresh += [{'table': table, 'columns': [{'name': 'id', 'type': 'integer'}], 'indexes': []}
+                  for table in sorted(released.ORGANIZATION_TABLES | released.WALLET_TABLES | {'client_events'})]
+        upgrade = copy.deepcopy(fresh)
+        upgrade[1]['columns'] += copy.deepcopy(old[1]['columns'][1:])
+        upgrade[2]['indexes'] = copy.deepcopy(old[2]['indexes'])
+        original = copy.deepcopy((old, upgrade, fresh))
+        released.verify_wallet_release_schema(old, upgrade, fresh, client_events=True)
+        self.assertEqual((old, upgrade, fresh), original, 'raw catalogs must remain complete and unchanged')
+        with self.assertRaises(ValueError):
+            released.verify_wallet_release_schema(old, upgrade, fresh)
+        for mutation in ('foreign_table', 'changed_old', 'missing_events', 'missing_cache', 'changed_cache',
+                         'missing_index', 'wrong_order', 'wrong_unique', 'extra_column', 'extra_index'):
+            changed = copy.deepcopy(upgrade)
+            if mutation == 'foreign_table': changed.append({'table': 'unapproved', 'columns': [], 'indexes': []})
+            elif mutation == 'changed_old': changed[0]['columns'][0]['type'] = 'text'
+            elif mutation == 'missing_events': changed = [table for table in changed if table['table'] != 'client_events']
+            elif mutation == 'missing_cache': changed[1]['columns'].pop()
+            elif mutation == 'changed_cache': changed[1]['columns'][-1]['default'] = '1'
+            elif mutation == 'missing_index': changed[2]['indexes'] = []
+            elif mutation == 'wrong_order': changed[2]['indexes'][0]['columns'].reverse()
+            elif mutation == 'wrong_unique': changed[2]['indexes'][0]['unique'] = True
+            elif mutation == 'extra_column': changed[1]['columns'].append(dict(count, name='unapproved'))
+            else: changed[2]['indexes'].append({'name': 'unapproved', 'columns': ['event_id'], 'unique': False})
+            with self.subTest(schema=mutation), self.assertRaises(ValueError):
+                released.verify_wallet_release_schema(old, changed, fresh, client_events=True)
+        for mutation in ('wrong_order', 'wrong_unique', 'wrong_type'):
+            changed_old, changed_upgrade = copy.deepcopy((old, upgrade))
+            for schema in (changed_old, changed_upgrade):
+                if mutation == 'wrong_order': schema[2]['indexes'][0]['columns'].reverse()
+                elif mutation == 'wrong_unique': schema[2]['indexes'][0]['unique'] = True
+                else: schema[1]['columns'][-1]['type'] = 'text'
+            with self.subTest(released_source=mutation), self.assertRaises(ValueError):
+                released.verify_wallet_release_schema(changed_old, changed_upgrade, fresh, client_events=True)
+        for table, field, item in ((1, 'columns', old[1]['columns'][-1]), (2, 'indexes', old[2]['indexes'][0])):
+            changed_fresh = copy.deepcopy(fresh);changed_fresh[table][field].append(copy.deepcopy(item))
+            with self.subTest(fresh_retained=field), self.assertRaises(ValueError):
+                released.verify_wallet_release_schema(old, upgrade, changed_fresh, client_events=True)
+        pg_old, pg_upgrade, pg_fresh = copy.deepcopy((old, upgrade, fresh))
+        for schema in (pg_old, pg_upgrade, pg_fresh):
+            for column in schema[1]['columns']:
+                column.update(type='int8', length=64, length_known=True)
+            for index in schema[2]['indexes']:
+                index.update(primary=False, primary_known=True, partial=False, partial_known=True,
+                             predicate='', predicate_known=True, predicate_null=True, constraint=None,
+                             access_method='btree', definition='CREATE INDEX idx_audit_time_event ON public.audit_logs USING btree (created_at, event_id)')
+        released.verify_wallet_release_schema(pg_old, pg_upgrade, pg_fresh, client_events=True)
+        for mutation in ('definition', 'constraint', 'unknown_nullability', 'changed_default'):
+            changed_old, changed_upgrade = copy.deepcopy((pg_old, pg_upgrade))
+            for schema in (changed_old, changed_upgrade):
+                if mutation == 'definition': schema[2]['indexes'][0]['definition'] = 'unreviewed expression'
+                elif mutation == 'constraint': schema[2]['indexes'][0]['constraint'] = {'name': 'unapproved'}
+                elif mutation == 'unknown_nullability': schema[1]['columns'][-1]['nullable_known'] = False
+                else: schema[1]['columns'][-1]['default'] = '1'
+            with self.subTest(retained_catalog=mutation), self.assertRaises(ValueError):
+                released.verify_wallet_release_schema(changed_old, changed_upgrade, pg_fresh, client_events=True)
+        snapshot = {key: [] for key in ('data', 'legacy_data', 'organization', 'wallet', 'schema_main', 'schema_log',
+                                      'physical_main', 'engine_version', 'log_version')}
+        snapshot['receiver_release_data'] = {'quota_data': [{'cache_read_tokens': 17, 'cache_creation_tokens': 29}], 'audit_logs': [{'event_id': 'fixture-audit'}]}
+        snapshot['client_events'] = [{'ID': 7, 'Fingerprint': 'fixed', 'InputTokens': 9007199254740991, 'OutputTokens': 0}]
+        released.verify_wallet_restart(snapshot, copy.deepcopy(snapshot), client_events=True)
+        for key in ('client_events', 'receiver_release_data', 'wallet', 'legacy_data', 'physical_main'):
+            changed = dict(snapshot, **{key: 'changed'})
+            with self.subTest(restart=key), self.assertRaises(ValueError):
+                released.verify_wallet_restart(snapshot, changed, client_events=True)
+
+        # Exercise the actual source/export/build/receipt handoff, stopping before
+        # any store can be adopted; this is a deterministic runner contract only.
+        def export_fixture(source, destination, commit=None, *, fixture_source=None):
+            destination.mkdir()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp).resolve();source = directory / 'source';source.mkdir()
+            runtime, evidence = directory / 'runtime', directory / 'evidence'
+            with patch.object(released, 'execute', return_value=(0, released.CLIENT_EVENTS_RELEASE.encode(), b'')) as execute, \
+                    patch.object(released, 'export_sources', side_effect=export_fixture) as export, \
+                    patch.object(released, 'build_fixture') as build, \
+                    patch.object(released, 'validate_built_fixture') as validate, \
+                    patch.object(released.OwnedStores, 'organization_wallet', side_effect=RuntimeError('stop before stores')):
+                with self.assertRaises(RuntimeError):
+                    released.run_organization_wallet_migrations(source, runtime, evidence, Path('/go'), [], 'owned', {}, [], client_events=True)
+                self.assertEqual(execute.call_args.args[0], ['git', 'rev-parse', released.CLIENT_EVENTS_RELEASE + '^{commit}'])
+                self.assertEqual([call.args[2] for call in export.call_args_list], [released.CLIENT_EVENTS_RELEASE, None])
+                self.assertEqual([call.kwargs['fixture_source'] for call in export.call_args_list],
+                                 [released.CLIENT_EVENTS_RELEASE_FIXTURE, released.CLIENT_EVENTS_CANDIDATE_FIXTURE])
+                self.assertEqual(len(build.call_args_list), 2);self.assertEqual(len(validate.call_args_list), 2)
+                for call in build.call_args_list + validate.call_args_list:
+                    self.assertEqual(call.kwargs['release_commit'], released.CLIENT_EVENTS_RELEASE)
+            result = json.loads((evidence / 'result.json').read_text())
+            self.assertEqual(result['release_commit'], released.CLIENT_EVENTS_RELEASE)
+            self.assertEqual(result['suite'], suite);self.assertEqual(result['phases'], [])
+
     def test_model_capability_metadata_suite_is_closed(self):
         suite, root, package = 'model-capability-metadata', 'TestModelCapabilityMetadataHTTP', 'github.com/QuantumNous/new-api/router'
         leaves = ('authorized_projection_and_versions', 'strict_input_and_atomicity',

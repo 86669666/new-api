@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -39,6 +40,7 @@ import (
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
@@ -209,7 +211,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -480,8 +482,473 @@ func organizationError(t *testing.T, status int, h http.Header, b map[string]any
 	}
 }
 
-// This is a protocol fixture for the default-off backend producer. It is not
-// actual Hydra deployment, code issuance, a human consent UI or Cherry login.
+// This fixture exercises authenticated client telemetry against isolated stores.
+// It is not a real Cherry upload or a deployed telemetry service.
+// The only injected commit ambiguity is an acknowledged real commit followed
+// by a synthetic transport-like error, so retry must converge to count zero.
+type clientEventsUncertainPool struct {
+	gorm.ConnPool
+	fired *atomic.Bool
+}
+
+func (p *clientEventsUncertainPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	var pool gorm.ConnPool
+	var err error
+	if beginner, ok := p.ConnPool.(gorm.ConnPoolBeginner); ok {
+		pool, err = beginner.BeginTx(ctx, opts)
+	} else if beginner, ok := p.ConnPool.(gorm.TxBeginner); ok {
+		pool, err = beginner.BeginTx(ctx, opts)
+	} else {
+		return nil, errors.New("fixture cannot begin transaction")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &clientEventsUncertainTx{ConnPool: pool, fired: p.fired}, nil
+}
+
+type clientEventsUncertainTx struct {
+	gorm.ConnPool
+	fired *atomic.Bool
+}
+
+func (tx *clientEventsUncertainTx) Commit() error {
+	err := tx.ConnPool.(gorm.TxCommitter).Commit()
+	if err == nil && tx.fired.CompareAndSwap(false, true) {
+		return errors.New("fixture commit acknowledgement lost")
+	}
+	return err
+}
+func (tx *clientEventsUncertainTx) Rollback() error { return tx.ConnPool.(gorm.TxCommitter).Rollback() }
+
+func TestClientEventsReceiverHTTP(t *testing.T) {
+	t.Setenv("CLIENT_EVENTS_ENABLED", "false")
+	t.Setenv("CLIENT_EVENTS_RETENTION_DAYS", "30")
+	t.Setenv("CLIENT_EVENTS_RATE_LIMIT", "600")
+	require.NoError(t, service.InitClientEventsConfig())
+	t.Cleanup(func() {
+		t.Setenv("CLIENT_EVENTS_ENABLED", "false")
+		require.NoError(t, service.InitClientEventsConfig())
+	})
+	f := newOrganizationHTTPFixture(t)
+	require.NoError(t, f.db.AutoMigrate(&model.ClientEvent{}, &model.SystemTask{}, &model.SystemTaskLock{}))
+	require.NoError(t, f.engine.SetTrustedProxies(nil))
+	var relay model.Token
+	require.NoError(t, f.db.Where(map[string]any{"key": f.bearer["relay"][3:]}).First(&relay).Error)
+	relay.Key = "EventsFixture" + strings.Repeat("a", 28)
+	require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("key", relay.Key).Error)
+	f.bearer["relay"] = "sk-" + relay.Key
+	tokens := map[string]*model.Token{"relay": &relay}
+	for _, name := range []string{"rotate", "foreign", "limit", "expiry"} {
+		key, err := common.GenerateRandomCharsKey(40)
+		require.NoError(t, err)
+		owner := f.users["owner"].Id
+		if name == "foreign" {
+			owner = f.users["foreign"].Id
+		}
+		token := &model.Token{UserId: owner, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1}
+		require.NoError(t, f.db.Create(token).Error)
+		tokens[name] = token
+		f.bearer["events-"+name] = "sk-" + key
+	}
+	encode := func(v any) string { data, err := common.Marshal(v); require.NoError(t, err); return string(data) }
+	config := func(enabled bool, limit int) {
+		t.Setenv("CLIENT_EVENTS_ENABLED", strconv.FormatBool(enabled))
+		t.Setenv("CLIENT_EVENTS_RATE_LIMIT", strconv.Itoa(limit))
+		require.NoError(t, service.InitClientEventsConfig())
+	}
+	const clientID = "8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11"
+	const privateCanary = "never-store-client-content-canary"
+	stamp := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano)
+	event := func(kind string, data any) map[string]any {
+		return map[string]any{"event_type": kind, "timestamp": stamp, "data": data}
+	}
+	envelope := func(events ...any) map[string]any {
+		return map[string]any{"client_id": clientID, "channel": "cherry-studio", "events": events}
+	}
+	launch := event("app_launch", map[string]any{"version": "1.0.0", "os": "darwin", "messages": privateCanary, "ignored": nil})
+	post := func(body any, actor string) (int, http.Header, map[string]any) {
+		return f.request(t, http.MethodPost, "/api/events", actor, encode(body), http.Header{"Content-Type": {"application/json"}, "X-Client-Id": {clientID}})
+	}
+	failure := func(status int, h http.Header, b map[string]any, want int) {
+		assert.Equal(t, want, status)
+		assert.Equal(t, false, b["success"])
+		assert.Contains(t, b, "code")
+		assert.NotContains(t, b, "count")
+		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		assert.Empty(t, h.Get("Location"))
+		assert.NotContains(t, encode(b), privateCanary)
+	}
+	rowCount := func() int64 {
+		var n int64
+		require.NoError(t, f.db.Model(&model.ClientEvent{}).Count(&n).Error)
+		return n
+	}
+	accounting := func() string {
+		value := map[string]any{}
+		for table, columns := range map[string]string{"tokens": "id,user_id,remain_quota,used_quota,accessed_time", "users": "id,quota,used_quota,request_count"} {
+			var rows []map[string]any
+			require.NoError(t, f.db.Table(table).Select(columns).Order("id").Find(&rows).Error)
+			value[table] = rows
+		}
+		for _, table := range []string{"logs", "quota_data", "organization_wallets", "organization_wallet_entries"} {
+			if f.db.Migrator().HasTable(table) {
+				var count int64
+				require.NoError(t, f.db.Table(table).Count(&count).Error)
+				value[table] = count
+			}
+		}
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(encode(value))))
+	}
+	beforeAccounting := accounting()
+	t.Run("current_credentials_and_isolation", func(t *testing.T) {
+		status, h, b := post(envelope(launch), "relay")
+		failure(status, h, b, 404)
+		config(true, 600)
+		for _, actor := range []string{"", "owner", "sk-unknown", "nap_fixture", "Bearer sk-unknown"} {
+			status, h, b = post(envelope(launch), actor)
+			failure(status, h, b, 401)
+		}
+		for _, statusValue := range []int{common.TokenStatusDisabled, common.TokenStatusExpired, 99} {
+			require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("status", statusValue).Error)
+			status, h, b = post(envelope(launch), "relay")
+			failure(status, h, b, 401)
+		}
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Updates(map[string]any{"status": common.TokenStatusEnabled, "expired_time": time.Now().Unix() - 1}).Error)
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 401)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("expired_time", -1).Error)
+		require.NoError(t, f.db.Delete(&model.Token{}, relay.Id).Error)
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 401)
+		require.NoError(t, f.db.Unscoped().Model(&model.Token{}).Where("id = ?", relay.Id).Update("deleted_at", nil).Error)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("status", common.UserStatusDisabled).Error)
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 403)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("status", common.UserStatusEnabled).Error)
+		require.NoError(t, f.db.Delete(&model.User{}, f.users["owner"].Id).Error)
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 403)
+		require.NoError(t, f.db.Unscoped().Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("deleted_at", nil).Error)
+		variant := strings.ToUpper(relay.Key)
+		var matches int64
+		require.NoError(t, f.db.Model(&model.Token{}).Where(map[string]any{"key": variant}).Count(&matches).Error)
+		t.Logf("case-variant SQL equivalence=%t; HTTP must still reject", matches > 0)
+		status, h, b = post(envelope(launch), "sk-"+variant)
+		failure(status, h, b, 401)
+		for _, authorization := range []string{"bearer " + f.bearer["relay"] + "-suffix", "Bearer  " + f.bearer["relay"], "Bearer " + f.bearer["relay"] + "\u00a0"} {
+			status, h, b = f.request(t, http.MethodPost, "/api/events", "", encode(envelope(launch)), http.Header{"Content-Type": {"application/json"}, "Authorization": {authorization}})
+			failure(status, h, b, 401)
+		}
+		status, h, b = f.request(t, http.MethodPost, "/api/events", "", encode(envelope(launch)), http.Header{"Content-Type": {"application/json"}, "Authorization": {"Bearer " + f.bearer["relay"], "Bearer " + f.bearer["relay"]}})
+		failure(status, h, b, 400)
+		assert.Zero(t, rowCount())
+		allow := "203.0.113.0/24"
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("allow_ips", allow).Error)
+		status, h, b = f.request(t, http.MethodPost, "/api/events", "relay", encode(envelope(launch)), http.Header{"Content-Type": {"application/json"}, "X-Forwarded-For": {"203.0.113.5"}})
+		failure(status, h, b, 403)
+		require.NoError(t, f.engine.SetTrustedProxies([]string{"127.0.0.1"}))
+		status, _, b = f.request(t, http.MethodPost, "/api/events", "relay", encode(envelope(launch)), http.Header{"Content-Type": {"application/json"}, "X-Forwarded-For": {"203.0.113.5"}})
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 1, b["count"])
+		require.NoError(t, f.engine.SetTrustedProxies(nil))
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("allow_ips", "").Error)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("status", common.TokenStatusExhausted).Error)
+		status, _, b = post(envelope(launch), "relay")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 0, b["count"])
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("status", common.TokenStatusEnabled).Error)
+		status, _, b = post(envelope(launch), "events-foreign")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 1, b["count"])
+		assert.EqualValues(t, 2, rowCount())
+	})
+	t.Run("validation_and_resource_limits", func(t *testing.T) {
+		initial := rowCount()
+		for _, raw := range []string{`null`, `[]`, `{"client_id":"` + clientID + `","client_id":"` + clientID + `","channel":"cherry-studio","events":[]}`, encode(map[string]any{"Client_id": clientID, "channel": "cherry-studio", "events": []any{launch}}), encode(envelope()), encode(envelope(nil)), strings.Repeat(" ", 256*1024+1)} {
+			want := 400
+			if len(raw) > 256*1024 {
+				want = 413
+			}
+			status, h, b := f.request(t, http.MethodPost, "/api/events", "relay", raw, http.Header{"Content-Type": {"application/json"}})
+			failure(status, h, b, want)
+		}
+		status, h, b := f.request(t, http.MethodPost, "/api/events", "relay", `{"client_id":"`+clientID+`","channel":"cherry-studio","events":[{"event_type":"app_update","data":{"version":"x","version":"y"}}]}`, http.Header{"Content-Type": {"application/json"}})
+		failure(status, h, b, 400)
+		invalid := []any{event("unknown", map[string]any{"data": nil}), event("app_update", map[string]any{"version": nil}), event("app_launch", map[string]any{"version": "x", "os": "wrong"})}
+		for _, counter := range []any{-1, 1.5, "1", nil, uint64(9007199254740992)} {
+			invalid = append(invalid, event("token_usage", map[string]any{"provider": "new-api", "model": "fixture", "input_tokens": counter, "output_tokens": 1}))
+		}
+		old := event("app_update", map[string]any{"version": "x"})
+		old["timestamp"] = time.Now().Add(-8 * 24 * time.Hour).Format(time.RFC3339Nano)
+		future := event("app_update", map[string]any{"version": "x"})
+		future["timestamp"] = time.Now().Add(2 * time.Hour).Format(time.RFC3339Nano)
+		nullTime := event("app_update", map[string]any{"version": "x"})
+		nullTime["timestamp"] = nil
+		invalid = append(invalid, old, future, nullTime)
+		for _, value := range invalid {
+			status, _, b = post(envelope(value), "relay")
+			require.Equal(t, 200, status)
+			assert.EqualValues(t, 0, b["count"])
+		}
+		raw := `{"client_id":"` + clientID + `","channel":"cherry-studio","events":[{"event_type":"app_update","timestamp":"` + stamp + `","data":{"version":"\ud800"}}]}`
+		status, _, b = f.request(t, http.MethodPost, "/api/events", "relay", raw, http.Header{"Content-Type": {"application/json"}})
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 0, b["count"])
+		for _, lexeme := range []string{"1e3", "1.0", "9223372036854775808"} {
+			raw = `{"client_id":"` + clientID + `","channel":"cherry-studio","events":[{"event_type":"token_usage","data":{"provider":"x","model":"x","input_tokens":` + lexeme + `,"output_tokens":1}}]}`
+			status, _, b = f.request(t, http.MethodPost, "/api/events", "relay", raw, http.Header{"Content-Type": {"application/json"}})
+			require.Equal(t, 200, status)
+			assert.EqualValues(t, 0, b["count"])
+		}
+		assert.Equal(t, initial, rowCount())
+		ten := make([]any, 10)
+		for i := range ten {
+			ten[i] = launch
+		}
+		status, _, b = post(envelope(ten...), "relay")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 0, b["count"])
+		status, h, b = post(envelope(append(ten, launch)...), "relay")
+		failure(status, h, b, 400)
+		oversized := event("app_update", map[string]any{"version": "x", "unknown": strings.Repeat("x", 64*1024)})
+		status, h, b = post(envelope(oversized), "relay")
+		failure(status, h, b, 413)
+		// Unknown nullable subtrees are discarded, not recursively strict-validated.
+		unknown := envelope(event("app_update", map[string]any{"version": "nullable-unknown", "unknown": map[string]any{"x": nil}}))
+		unknown["unknown"] = nil
+		status, _, b = post(unknown, "relay")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 1, b["count"])
+		maxEvent := event("token_usage", map[string]any{"provider": "new-api", "model": "safe-integer", "input_tokens": int64(9007199254740991), "output_tokens": 0})
+		status, _, b = post(envelope(maxEvent), "relay")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 1, b["count"])
+		config(true, 1)
+		status, _, _ = post(envelope(launch), "events-limit")
+		require.Equal(t, 200, status)
+		status, h, b = post(envelope(launch), "events-limit")
+		failure(status, h, b, 429)
+		retry, err := strconv.Atoi(h.Get("Retry-After"))
+		require.NoError(t, err)
+		assert.Positive(t, retry)
+		config(true, 600)
+		oldGlobal, oldNumber, oldDuration := common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration
+		t.Cleanup(func() {
+			common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = oldGlobal, oldNumber, oldDuration
+		})
+		common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = true, 2, 60
+		config(false, 600)
+		common.RedisEnabled = true
+		common.RDB = nil
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 404)
+		config(true, 600)
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 503)
+		common.RedisEnabled = false
+		for range 2 {
+			status, _, _ = post(envelope(launch), "relay")
+			require.Equal(t, 200, status, "one global admission per request")
+		}
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 429)
+		common.GlobalApiRateLimitEnable = false
+		common.RedisEnabled = true
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 503)
+		common.RedisEnabled = false
+		common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = oldGlobal, oldNumber, oldDuration
+	})
+	t.Run("durability_and_deduplication", func(t *testing.T) {
+		usage := event("token_usage", map[string]any{"provider": "new-api", "model": "concurrent", "input_tokens": 123, "output_tokens": 456})
+		before := rowCount()
+		results := make(chan map[string]any, 2)
+		var wg sync.WaitGroup
+		for _, actor := range []string{"relay", "events-rotate"} {
+			wg.Go(func() {
+				status, _, b := post(envelope(usage, usage), actor)
+				assert.Equal(t, 200, status)
+				results <- b
+			})
+		}
+		wg.Wait()
+		close(results)
+		sum := 0.0
+		for b := range results {
+			if value, ok := b["count"].(float64); ok {
+				sum += value
+			}
+		}
+		assert.EqualValues(t, 1, sum)
+		assert.Equal(t, before+1, rowCount())
+		withDefault := event("token_usage", map[string]any{"output_tokens": 456, "input_tokens": 123, "model": "concurrent", "provider": "new-api", "source": "chat", "secret": privateCanary})
+		status, _, b := post(envelope(withDefault), "events-rotate")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 0, b["count"])
+		missing := event("app_update", map[string]any{"version": "no-client-time"})
+		delete(missing, "timestamp")
+		status, _, b = post(envelope(missing), "relay")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 1, b["count"])
+		var writes atomic.Int64
+		callback := "events-second-write-fails"
+		require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Table == "client_events" && writes.Add(1) == 2 {
+				tx.AddError(errors.New("fixture private cause"))
+			}
+		}))
+		before = rowCount()
+		a := event("app_update", map[string]any{"version": "rollback-a"})
+		z := event("app_update", map[string]any{"version": "rollback-z"})
+		status, h, b := post(envelope(a, z), "relay")
+		failure(status, h, b, 503)
+		assert.Equal(t, before, rowCount())
+		require.NoError(t, f.db.Callback().Create().Remove(callback))
+		// A real commit followed by lost acknowledgement is503. Retrying timestamped
+		// rows after restoring the pool returns0 without duplicating the row.
+		var fired atomic.Bool
+		pool, statementPool := f.db.Config.ConnPool, f.db.Statement.ConnPool
+		wrapper := &clientEventsUncertainPool{ConnPool: pool, fired: &fired}
+		f.db.Config.ConnPool, f.db.Statement.ConnPool = wrapper, wrapper
+		status, h, b = post(envelope(a), "relay")
+		f.db.Config.ConnPool, f.db.Statement.ConnPool = pool, statementPool
+		failure(status, h, b, 503)
+		assert.True(t, fired.Load())
+		assert.Equal(t, before+1, rowCount())
+		status, _, b = post(envelope(a), "relay")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 0, b["count"])
+		var rows []model.ClientEvent
+		require.NoError(t, f.db.Order("id").Find(&rows).Error)
+		encoded := encode(rows)
+		assert.NotContains(t, encoded, privateCanary)
+		for _, row := range rows {
+			assert.NotEmpty(t, row.Fingerprint)
+			assert.Positive(t, row.UserID)
+			assert.NotEmpty(t, row.ClientID)
+			assert.NotContains(t, encoded, relay.Key)
+		}
+	})
+	t.Run("cleanup_and_current_authority", func(t *testing.T) {
+		cache := miniredis.RunT(t)
+		oldRDB := common.RDB
+		common.RDB = redis.NewClient(&redis.Options{Addr: cache.Addr()})
+		common.RedisEnabled = true
+		t.Cleanup(func() { require.NoError(t, common.RDB.Close()); common.RDB = oldRDB; common.RedisEnabled = false })
+		_, err := model.GetTokenByKey(relay.Key, false)
+		require.NoError(t, err)
+		_, err = model.GetUserCache(f.users["owner"].Id)
+		require.NoError(t, err)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("status", common.TokenStatusDisabled).Error)
+		status, h, b := post(envelope(launch), "relay")
+		failure(status, h, b, 401)
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", relay.Id).Update("status", common.TokenStatusEnabled).Error)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("status", common.UserStatusDisabled).Error)
+		status, h, b = post(envelope(launch), "relay")
+		failure(status, h, b, 403)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("status", common.UserStatusEnabled).Error)
+		common.RedisEnabled = false
+		// Revoke after the preliminary ordinary read, before the final transaction.
+		entered, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		var gated atomic.Bool
+		callback := "events-before-authority-transaction"
+		require.NoError(t, f.db.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Table == "users" && gated.CompareAndSwap(false, true) {
+				close(entered)
+				<-release
+			}
+		}))
+		done := make(chan int, 1)
+		before := rowCount()
+		go func() { status, _, _ := post(envelope(launch), "events-rotate"); done <- status }()
+		t.Cleanup(func() { once.Do(func() { close(release) }); _ = f.db.Callback().Query().Remove(callback) })
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("authority barrier not reached")
+		}
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens["rotate"].Id).Update("status", common.TokenStatusDisabled).Error)
+		once.Do(func() { close(release) })
+		assert.Equal(t, 401, <-done)
+		assert.Equal(t, before, rowCount())
+		require.NoError(t, f.db.Callback().Query().Remove(callback))
+		// Expiry after an insert wait must roll back the inserted row.
+		deadline := time.Now().Unix() + 1
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", tokens["expiry"].Id).Update("expired_time", deadline).Error)
+		var waited atomic.Bool
+		callback = "events-insert-expiry"
+		require.NoError(t, f.db.Callback().Create().After("gorm:create").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Table == "client_events" {
+				waited.Store(true)
+				timer := time.NewTimer(time.Until(time.Unix(deadline, 0)))
+				defer timer.Stop()
+				<-timer.C
+			}
+		}))
+		expiring := event("app_update", map[string]any{"version": "expired-after-wait"})
+		status, h, b = post(envelope(expiring), "events-expiry")
+		failure(status, h, b, 401)
+		assert.True(t, waited.Load(), "expiry must occur after the actual insert wait")
+		assert.Equal(t, before, rowCount())
+		require.NoError(t, f.db.Callback().Create().Remove(callback))
+		cutoff := time.Now().Add(-30 * 24 * time.Hour).Unix()
+		expired := model.ClientEvent{UserID: relay.UserId, TokenID: relay.Id, ClientID: clientID, Channel: "cherry-studio", EventType: "app_update", EventTimeMS: (cutoff - 1) * 1000, ReceivedAt: cutoff - 1, Fingerprint: strings.Repeat("e", 64), AppVersion: "retention"}
+		boundary := expired
+		boundary.ReceivedAt = cutoff
+		boundary.Fingerprint = strings.Repeat("f", 64)
+		require.NoError(t, f.db.Create(&expired).Error)
+		require.NoError(t, f.db.Create(&boundary).Error)
+		n, err := model.DeleteClientEventBatch(context.Background(), cutoff)
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, n)
+		n, err = model.DeleteClientEventBatch(context.Background(), cutoff)
+		require.NoError(t, err)
+		assert.Zero(t, n)
+		var kept model.ClientEvent
+		require.NoError(t, f.db.First(&kept, boundary.ID).Error)
+		old := event("app_update", map[string]any{"version": "retention"})
+		old["timestamp"] = time.UnixMilli(expired.EventTimeMS).UTC().Format(time.RFC3339Nano)
+		status, _, b = post(envelope(old), "relay")
+		require.Equal(t, 200, status)
+		assert.EqualValues(t, 0, b["count"])
+		config(false, 600)
+		handler := service.ClientEventsCleanupHandler{}
+		assert.True(t, handler.Enabled())
+		for _, cancelled := range []bool{false, true} {
+			task, err := model.CreateSystemTask(handler.Type(), struct{}{}, nil)
+			require.NoError(t, err)
+			task, claimed, err := model.ClaimSystemTask(task.ID, handler.Type(), "events-fixture", time.Now().Add(time.Minute).Unix())
+			require.NoError(t, err)
+			require.True(t, claimed)
+			ctx, cancel := context.WithCancel(context.Background())
+			if cancelled {
+				cancel()
+			}
+			handler.Run(ctx, task, "events-fixture")
+			cancel()
+			var result model.SystemTask
+			require.NoError(t, f.db.Where("task_id = ?", task.TaskID).First(&result).Error)
+			if cancelled {
+				assert.Equal(t, model.SystemTaskStatusFailed, result.Status)
+			} else {
+				assert.Equal(t, model.SystemTaskStatusSucceeded, result.Status)
+			}
+		}
+		for _, path := range []string{"/api/events?key=" + privateCanary, "/api/events/?key=" + privateCanary} {
+			status, h, b = f.request(t, http.MethodPost, path, "relay", "{}", http.Header{"Content-Type": {"application/json"}})
+			failure(status, h, b, 404)
+			status, h, _ = f.request(t, http.MethodGet, path, "relay", "", nil)
+			assert.Equal(t, 404, status)
+			assert.Empty(t, h.Get("Location"))
+		}
+		assert.NotContains(t, f.logs.snapshot(), privateCanary)
+		assert.NotContains(t, f.logs.snapshot(), relay.Key)
+	})
+	assert.Equal(t, beforeAccounting, accounting(), "telemetry never mutates accounting/access totals")
+}
+
 func TestOAuthProviderBridgeHTTP(t *testing.T) {
 	t.Setenv("OAUTH_USERINFO_ENABLED", "false")
 	t.Setenv("OAUTH_PROVIDER_BRIDGE_ENABLED", "false")

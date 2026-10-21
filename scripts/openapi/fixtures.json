@@ -11821,5 +11821,363 @@
       "cause": "private"
     },
     "valid": false
+  },
+  {
+    "name": "client events PR44 envelope",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsInput",
+    "value": {
+      "client_id": "8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11",
+      "channel": "cherry-studio",
+      "events": [
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "client events unknown nullable envelope",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsInput",
+    "value": {
+      "client_id": "8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11",
+      "channel": "cherry-studio",
+      "events": [
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        }
+      ],
+      "unknown": null
+    },
+    "valid": true
+  },
+  {
+    "name": "client events skipped unknown event",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsInput",
+    "value": {
+      "client_id": "8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11",
+      "channel": "cherry-studio",
+      "events": [
+        {
+          "event_type": "future",
+          "data": null
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "client events missing client",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsInput",
+    "value": {
+      "channel": "cherry-studio",
+      "events": [
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "client events empty batch",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsInput",
+    "value": {
+      "client_id": "8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11",
+      "channel": "cherry-studio",
+      "events": []
+    },
+    "valid": false
+  },
+  {
+    "name": "client events too many",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsInput",
+    "value": {
+      "client_id": "8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11",
+      "channel": "cherry-studio",
+      "events": [
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        },
+        {
+          "event_type": "app_launch",
+          "timestamp": "2026-10-21T12:00:00.000Z",
+          "data": {
+            "version": "1.0.0",
+            "os": "darwin",
+            "unknown": null
+          }
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "client events nonobject event",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsInput",
+    "value": {
+      "client_id": "8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11",
+      "channel": "cherry-studio",
+      "events": [
+        null
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "client event usage eligibility",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageData",
+    "value": {
+      "provider": "new-api",
+      "model": "fixture",
+      "input_tokens": 123,
+      "output_tokens": 456,
+      "source": "agent"
+    },
+    "valid": true
+  },
+  {
+    "name": "client event ineligible overflow",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageData",
+    "value": {
+      "provider": "new-api",
+      "model": "fixture",
+      "input_tokens": 9007199254740992,
+      "output_tokens": 456,
+      "source": "agent"
+    },
+    "valid": false
+  },
+  {
+    "name": "client event ineligible negative",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageData",
+    "value": {
+      "provider": "new-api",
+      "model": "fixture",
+      "input_tokens": -1,
+      "output_tokens": 456,
+      "source": "agent"
+    },
+    "valid": false
+  },
+  {
+    "name": "client event ineligible fraction",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageData",
+    "value": {
+      "provider": "new-api",
+      "model": "fixture",
+      "input_tokens": 1.5,
+      "output_tokens": 456,
+      "source": "agent"
+    },
+    "valid": false
+  },
+  {
+    "name": "client event ineligible null",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageData",
+    "value": {
+      "provider": "new-api",
+      "model": "fixture",
+      "input_tokens": null,
+      "output_tokens": 456,
+      "source": "agent"
+    },
+    "valid": false
+  },
+  {
+    "name": "client event ineligible both zero",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageData",
+    "value": {
+      "provider": "new-api",
+      "model": "fixture",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "source": "agent"
+    },
+    "valid": false
+  },
+  {
+    "name": "client events committed count 0",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsResult",
+    "value": {
+      "success": true,
+      "count": 0
+    },
+    "valid": true
+  },
+  {
+    "name": "client events committed count 10",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsResult",
+    "value": {
+      "success": true,
+      "count": 10
+    },
+    "valid": true
+  },
+  {
+    "name": "client events excessive receipt count",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsResult",
+    "value": {
+      "success": true,
+      "count": 11
+    },
+    "valid": false
+  },
+  {
+    "name": "client events no raw receipt payload",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsResult",
+    "value": {
+      "success": true,
+      "count": 1,
+      "events": []
+    },
+    "valid": false
+  },
+  {
+    "name": "client events safe failure",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsError",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_UNAVAILABLE",
+      "message": "Internal Server Error!",
+      "message_key": "Internal Server Error!"
+    },
+    "valid": true
+  },
+  {
+    "name": "client events no raw failure",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsError",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_UNAVAILABLE",
+      "message": "Internal Server Error!",
+      "message_key": "Internal Server Error!",
+      "cause": "private"
+    },
+    "valid": false
   }
 ]

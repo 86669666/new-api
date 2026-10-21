@@ -705,6 +705,8 @@ ORGANIZATION_READ_SUITES = {
     'organization-task-funding-isolation': (frozenset(('TestOrganizationTaskFundingIsolation',)), 'g15-organization-task-funding-isolation'),
     'organization-capabilities': (frozenset(('TestOrganizationCapabilityProjection', 'TestOrganizationAccessHTTP')), 'g16-organization-capabilities'),
     'organization-wallet': (frozenset(('TestOrganizationWalletLifecycle',)), 'g17-organization-wallet'),
+    'client-events-receiver': (frozenset(('TestClientEventsReceiverHTTP',)), 'g19-client-events-receiver'),
+    'client-events-receiver-http-only': (frozenset(('TestClientEventsReceiverHTTP',)), 'g19-client-events-receiver'),
     'site-description': (frozenset(('TestSiteDescriptionHTTP',)), 'g18-site-description'),
     'oauth-userinfo': (frozenset(('TestOAuthUserInfoHTTP',)), 'g19-oauth-userinfo'),
     'oauth-provider-bridge': (frozenset(('TestOAuthProviderBridgeHTTP',)), 'g19-oauth-provider-bridge'),
@@ -890,6 +892,11 @@ def validate_organization_identity_events(events, suite='organization-identity')
             'TestSiteDescriptionHTTP/reserved_option_and_failures',
             'TestSiteDescriptionHTTP/anonymous_links_and_navigation'}:
         raise ValueError('every exact site description case must pass without unrelated tests')
+    if suite in ('client-events-receiver', 'client-events-receiver-http-only') and passed != required | {None} | {
+            'TestClientEventsReceiverHTTP/' + name for name in (
+                'current_credentials_and_isolation', 'validation_and_resource_limits',
+                'durability_and_deduplication', 'cleanup_and_current_authority')}:
+        raise ValueError('every exact client receiver case must pass without unrelated tests')
     if suite == 'oauth-provider-bridge' and passed != required | {None} | {
             'TestOAuthProviderBridgeHTTP/' + name for name in (
                 'real_session_and_explicit_decision', 'challenge_client_pkce_binding',
@@ -916,13 +923,17 @@ def run_organization_identity(args, docker):
         raise ValueError('unsupported organization read suite')
     required_roots, fixture_owner = ORGANIZATION_READ_SUITES[suite]
     wallet_runtime = getattr(args, 'wallet_runtime', None)
-    if suite == 'organization-wallet':
-        root = Path(__file__).resolve().parents[2]
-        if (wallet_runtime is None or not wallet_runtime.is_absolute() or wallet_runtime.resolve() != wallet_runtime
-                or wallet_runtime.exists() or not wallet_runtime.parent.is_dir() or root in wallet_runtime.parents):
-            raise ValueError('wallet suite requires a new explicit --wallet-runtime outside the checkout')
-    elif wallet_runtime is not None:
+    client_events_runtime = getattr(args, 'client_events_runtime', None)
+    root = Path(__file__).resolve().parents[2]
+    migration_runtime = wallet_runtime if suite == 'organization-wallet' else client_events_runtime
+    if suite in ('organization-wallet', 'client-events-receiver'):
+        if (migration_runtime is None or not migration_runtime.is_absolute() or migration_runtime.resolve() != migration_runtime
+                or migration_runtime.exists() or not migration_runtime.parent.is_dir() or root in migration_runtime.parents):
+            raise ValueError('migration suite requires its new explicit runtime outside the checkout')
+    if wallet_runtime is not None and suite != 'organization-wallet':
         raise ValueError('wallet runtime cannot alter another suite')
+    if client_events_runtime is not None and suite != 'client-events-receiver':
+        raise ValueError('client event runtime cannot alter another suite')
     if args.image_metadata is None or args.preserve_volumes is None or args.go is None:
         raise ValueError('organization identity requires explicit metadata, preservation baseline and Go paths')
     if any(value and key.startswith('NEWAPI_S2_') for key, value in os.environ.items()):
@@ -975,10 +986,11 @@ def run_organization_identity(args, docker):
             endpoints[engine] = port
         args.relay_evidence.write_text(json.dumps([relay.receipt for relay in relays], indent=2) + '\n')
         root = Path(__file__).resolve().parents[2]
-        if suite == 'organization-wallet':
+        if suite in ('organization-wallet', 'client-events-receiver'):
             from released_database_gate import run_organization_wallet_migrations
-            migrations = run_organization_wallet_migrations(root, wallet_runtime, args.image_evidence / 'wallet-migration',
-                args.go, docker, args.project, containers, relays)
+            migrations = run_organization_wallet_migrations(root, migration_runtime,
+                args.image_evidence / ('client-events-migration' if suite == 'client-events-receiver' else 'wallet-migration'),
+                args.go, docker, args.project, containers, relays, client_events=suite == 'client-events-receiver')
             print(json.dumps({'suite': suite, 'migration_phases': len(migrations['phases']),
                               'release_commit': migrations['release_commit'], 'migration_passed': migrations['passed']}), flush=True)
         for dialect in ('sqlite', 'mysql', 'postgres'):
@@ -1050,7 +1062,7 @@ def run_organization_identity(args, docker):
                 signal.signal(sig, handler)
     summary = {'suite': suite, 'dialects': results, 'primary_error': primary_error,
                'process_cleanup_error': process_cleanup_error, 'cleanup_error': cleanup_error}
-    if suite == 'organization-wallet':
+    if suite in ('organization-wallet', 'client-events-receiver'):
         summary['migrations'] = migrations
     print(json.dumps(summary), flush=True)
     return int(primary_error is not None or process_cleanup_error is not None or cleanup_error is not None)
@@ -1067,6 +1079,7 @@ def main(argv=None):
     parser.add_argument('--preserve-volumes', type=Path)
     parser.add_argument('--go', type=Path)
     parser.add_argument('--wallet-runtime', type=Path)
+    parser.add_argument('--client-events-runtime', type=Path)
     args = parser.parse_args(argv)
     validate_inherited_environment(os.environ)
     if not re.fullmatch(r'newapi-ci-[a-z0-9-]+', args.project):
@@ -1074,7 +1087,7 @@ def main(argv=None):
     docker = docker_command(args.docker_config, args.context)
     if args.suite in ORGANIZATION_READ_SUITES:
         return run_organization_identity(args, docker)
-    if args.image_metadata is not None or args.preserve_volumes is not None or args.go is not None or args.wallet_runtime is not None:
+    if args.image_metadata is not None or args.preserve_volumes is not None or args.go is not None or args.wallet_runtime is not None or args.client_events_runtime is not None:
         raise ValueError('organization-only inputs cannot alter the default database gate')
     preflight(docker)
     compose = docker + ['compose', '-p', args.project, '-f', str(Path(__file__).with_name('database-compose.yml')),

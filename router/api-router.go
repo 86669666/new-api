@@ -15,6 +15,9 @@ import (
 )
 
 func SetApiRouter(router *gin.Engine) {
+	events := router.Group("/api", middleware.RouteTag("api"), middleware.ClientEventsBoundary())
+	events.POST("/events", controller.ReceiveClientEvents)
+	events.POST("/events/", controller.ReceiveClientEvents)
 	apiRouter := router.Group("/api")
 	apiRouter.Use(middleware.RouteTag("api"))
 	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPathsRegexs([]string{`^/api/organizations/[0-9]+/tasks/[0-9]+/artifacts/[^/]+/content$`})))

@@ -335,6 +335,42 @@ def check_personal_log_pagination(api):
     return {'page_alias_scope': '/api/log/self', 'canonical_presence_wins': True, 'legacy_fallback_preserved': True}
 
 
+def check_client_events(api, source_root):
+    operation = api['paths']['/api/events']['post']
+    schemas = api['components']['schemas']
+    assert operation['operationId'] == 'receiveClientEvents'
+    assert operation['security'] == [{'ClientEventsBearer': []}]
+    assert operation['x-default-enabled'] is False and operation['x-query-policy'] == 'forbidden'
+    assert set(operation['responses']) == {'200', '400', '401', '403', '404', '413', '429', '503'}
+    assert operation['requestBody']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/ClientEventsInput'}
+    assert not any(parameter.get('in') == 'query' for parameter in operation['parameters'])
+    body = schemas['ClientEventsInput']
+    assert body['required'] == ['client_id', 'channel', 'events'] and body.get('additionalProperties', True) is True
+    assert body['properties']['events'] == {'type': 'array', 'minItems': 1, 'maxItems': 10, 'items': {'$ref': '#/components/schemas/ClientEventInput'}}
+    event = schemas['ClientEventInput']
+    assert event['type'] == 'object' and event.get('additionalProperties', True) is True
+    assert set(event['properties']) == {'event_type', 'timestamp', 'data'}
+    assert all(set(value) == {'description'} for value in event['properties'].values()), 'invalid known values are skipped, not envelope errors'
+    assert schemas['ClientEventsResult']['required'] == ['success', 'count']
+    assert schemas['ClientEventsResult']['additionalProperties'] is False
+    assert schemas['ClientEventsResult']['properties'] == {'success': {'type': 'boolean', 'enum': [True]}, 'count': {'type': 'integer', 'minimum': 0, 'maximum': 10}}
+    error = schemas['ClientEventsError']
+    assert error['additionalProperties'] is False and error['required'] == ['success', 'code', 'message', 'message_key']
+    assert set(error['properties']) == {'success', 'code', 'message', 'message_key', 'message_params'}
+    assert error['properties']['code']['enum'] == ['CLIENT_EVENTS_INVALID', 'CLIENT_EVENTS_UNAUTHORIZED', 'CLIENT_EVENTS_FORBIDDEN', 'CLIENT_EVENTS_DISABLED', 'CLIENT_EVENTS_TOO_LARGE', 'CLIENT_EVENTS_RATE_LIMIT', 'CLIENT_EVENTS_UNAVAILABLE']
+    usage = schemas['ClientEventUsageData']
+    for field in ('input_tokens', 'output_tokens'):
+        assert usage['properties'][field] == {'type': 'integer', 'minimum': 0, 'maximum': 9007199254740991}
+    for response in operation['responses'].values():
+        assert 'no-store' in response['headers']['Cache-Control']['description']
+    assert operation['responses']['429']['headers']['Retry-After']['schema'] == {'type': 'integer', 'minimum': 1}
+    router = (source_root / 'router/api-router.go').read_text()
+    assert 'events := router.Group("/api", middleware.RouteTag("api"), middleware.ClientEventsBoundary())' in router
+    assert 'events.POST("/events", controller.ReceiveClientEvents)' in router
+    assert 'events.POST("/events/", controller.ReceiveClientEvents)' in router
+    return {'route': 'POST /api/events', 'default_enabled': False, 'durable_count': True, 'event_limit': 10}
+
+
 def check_model_capability_metadata(api):
     schemas = api['components']['schemas']
     facts = ['context_length', 'max_output_tokens', 'vision', 'reasoning', 'tool_use']
@@ -1079,6 +1115,7 @@ def main():
     fixtures = json.loads((Path(__file__).with_name('fixtures.json')).read_text())
     results['token_usage'] = check_token_usage(api)
     results['token_pricing'] = check_token_pricing(api)
+    results['client_events'] = check_client_events(api, source_root)
     results['model_capability_metadata'] = check_model_capability_metadata(api)
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['personal_log_range_error'] = check_personal_log_range_error(api)

@@ -54,6 +54,45 @@ func DecodeJson(reader io.Reader, v any) error {
 	return kitutil.DecodeJson(reader, v)
 }
 
+// DecodeRawJSONObject preserves exact keys and nullable unknown values. Only
+// the decoded object's keys are checked; callers decide which children to read.
+func DecodeRawJSONObject(data []byte) (map[string]RawMessage, error) {
+	if !utf8.Valid(data) {
+		return nil, errors.New("invalid UTF-8 JSON")
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	token, err := d.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, errors.New("JSON object required")
+	}
+	fields := map[string]RawMessage{}
+	for d.More() {
+		token, err := d.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return nil, errors.New("JSON object key required")
+		}
+		if _, exists := fields[key]; exists {
+			return nil, errors.New("duplicate JSON key")
+		}
+		var value RawMessage
+		if err := d.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields[key] = value
+	}
+	if _, err := d.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return nil, errors.New("trailing JSON data")
+	}
+	return fields, nil
+}
+
 // DecodeJsonWithValidation decodes JSON and applies Gin's configured binding-tag
 // validator, including binding:"required" and any registered custom validators.
 func DecodeJsonWithValidation(reader io.Reader, v any) error {

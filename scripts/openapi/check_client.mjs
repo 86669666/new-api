@@ -88,6 +88,9 @@ const dataService = dataServices[0].name;
 const oauthUserInfoServices = services.filter(service => service.source.includes('    public static getOAuthUserInfo('));
 assert.equal(oauthUserInfoServices.length, 1, 'Exactly one generated delegated userinfo method is required');
 const oauthUserInfoService = oauthUserInfoServices[0].name;
+const clientEventsServices = services.filter(service => service.source.includes('    public static receiveClientEvents('));
+assert.equal(clientEventsServices.length, 1, 'Exactly one generated receiver method is required');
+const clientEventsService = clientEventsServices[0].name;
 const oauthProviderOperations = [
   ['previewOAuthProviderLogin', '/api/oauth/provider/login/preview', true],
   ['decideOAuthProviderLogin', '/api/oauth/provider/login', false],
@@ -247,6 +250,20 @@ export async function compileOAuthProvider() {
   // @ts-expect-error explicit scope selection is an array, never a string
   const scopes: client.OAuthProviderConsentDecision = { challenge: 'fixture', preview_token: token, decision: 'approve', selected_scopes: 'profile' };
   return { expires, login: login.redirect_to, resume: resume.redirect_to };
+}
+`);
+await writeFile(consumer, await readFile(consumer, 'utf8') + `
+export async function compileClientEvents() {
+  const result = await client.${clientEventsService}.receiveClientEvents({ requestBody: {
+    client_id: '00000000-0000-4000-8000-000000000001', channel: 'cherry-studio',
+    events: [{ event_type: 'app_launch', timestamp: '2026-10-21T00:00:00Z', data: { version: '1', os: 'darwin' } }],
+  } });
+  const count: number = result.count;
+  // @ts-expect-error the envelope requires its stable client identity
+  const missingIdentity: client.ClientEventsInput = { channel: 'cherry-studio', events: [] };
+  // @ts-expect-error counters in an eligible typed event are numbers, not strings
+  const wrongCounter: client.ClientEventUsageData = { provider: 'fixture', model: 'fixture', input_tokens: '1', output_tokens: 0 };
+  return count;
 }
 `);
 execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'), '--strict', '--target', 'ES2020', '--module', 'commonjs', '--lib', 'ES2020,DOM', '--rootDir', path.join(output, 'generated'), '--outDir', path.join(output, 'compiled'), path.join(output, 'generated/api/index.ts'), path.join(output, 'generated/relay/index.ts'), consumer], { stdio: 'inherit' });
@@ -672,4 +689,30 @@ for (const operation of oauthProviderOperations) {
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const oauthProviderStubbedRequests = calls.length - beforeOAuthProviderRequests;
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+const beforeClientEventsRequests = calls.length;
+api.OpenAPI.TOKEN = 'sk-generated-events-fixture';
+api.OpenAPI.HEADERS = undefined;
+api.OpenAPI.WITH_CREDENTIALS = false;
+const eventPayload = { client_id: '00000000-0000-4000-8000-000000000001', channel: 'cherry-studio', events: [{ event_type: 'app_launch', timestamp: '2026-10-21T00:00:00Z', data: { version: '1', os: 'darwin' } }] };
+for (const count of [1, 0]) {
+  responseStatus = 200;
+  responseBody = { success: true, count };
+  assert.deepEqual(await api[clientEventsService].receiveClientEvents({ requestBody: eventPayload, xClientId: eventPayload.client_id }), responseBody);
+  const request = calls.at(-1);
+  assert.equal(request.url, api.OpenAPI.BASE + '/api/events');
+  assert.equal(request.init.method, 'POST');
+  assert.deepEqual(JSON.parse(request.init.body), eventPayload);
+  assert.equal(new Headers(request.init.headers).get('Authorization'), 'Bearer sk-generated-events-fixture');
+  assert.equal(new Headers(request.init.headers).get('X-Client-Id'), eventPayload.client_id);
+}
+for (const [status, code] of [[400, 'INVALID'], [401, 'UNAUTHORIZED'], [403, 'FORBIDDEN'], [404, 'DISABLED'], [413, 'TOO_LARGE'], [429, 'RATE_LIMIT'], [503, 'UNAVAILABLE']]) {
+  responseStatus = status;
+  responseBody = { success: false, code: 'CLIENT_EVENTS_' + code, message: 'Fixed error', message_key: 'Fixed error' };
+  const before = calls.length;
+  await assert.rejects(api[clientEventsService].receiveClientEvents({ requestBody: eventPayload }), error => error.status === status && JSON.stringify(error.body) === JSON.stringify(responseBody));
+  assert.equal(calls.length, before + 1, 'transport must not replay an uncertain persisted batch');
+}
+api.OpenAPI.TOKEN = undefined;
+api.OpenAPI.HEADERS = undefined;
+const clientEventsStubbedRequests = calls.length - beforeClientEventsRequests;
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));

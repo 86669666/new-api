@@ -28,6 +28,7 @@ from run_isolated_databases import (terminate_group, guarded_communicate, docker
 
 RELEASE = '633b4c5b190dc1af99a2814391354d86948e7943'
 WALLET_RELEASE = '6cf0d90b5ff27f901697dddd61e0c28aba8efefc'
+CLIENT_EVENTS_RELEASE = '7d8b91268dab69d7150f345c448b5e250163146a'
 WALLET_PHASES = ('fresh_start', 'fresh_restart', 'release_seed', 'candidate_upgrade_1', 'candidate_upgrade_2')
 COMBINATIONS = (('sqlite', 'same'), ('mysql', 'same'), ('postgres', 'same'),
                 ('mysql', 'sqlite'), ('sqlite', 'mysql'), ('sqlite', 'postgres'), ('sqlite', 'clickhouse'))
@@ -766,6 +767,83 @@ WALLET_CANDIDATE_FIXTURE = wallet_fixture(CANDIDATE_FIXTURE, candidate=True)
 
 
 
+CLIENT_EVENTS_STATE_FIXTURE = r'''
+func clientEventsState(t *testing.T, phase string) any {
+ t.Helper()
+ value := &model.ClientEvent{}
+ stmt := &gorm.Statement{DB:model.DB}; require.NoError(t,stmt.Parse(value))
+ columns,err:=model.DB.Migrator().ColumnTypes(value);require.NoError(t,err)
+ names:=[]string{};for _,column:=range columns { names=append(names,column.Name()) };require.ElementsMatch(t,stmt.Schema.DBNames,names)
+ indexes,err:=fixtureIndexes(model.DB,stmt.Table);require.NoError(t,err)
+ actual:=map[string]gorm.Index{};for _,index:=range indexes { primary,known:=index.PrimaryKey();if !known || !primary { actual[index.Name()]=index } }
+ expected:=stmt.Schema.ParseIndexes();require.Len(t,actual,len(expected))
+ for _,index:=range expected {
+  got,ok:=actual[index.Name];require.True(t,ok,"missing client event index %s",index.Name)
+  fields:=[]string{};for _,field:=range index.Fields { fields=append(fields,field.DBName) };require.Equal(t,fields,got.Columns())
+  unique,known:=got.Unique();require.True(t,known);require.Equal(t,index.Class=="UNIQUE",unique)
+ }
+ input,output:=int64(9007199254740991),int64(0)
+ wanted:=model.ClientEvent{UserID:1,TokenID:1,ClientID:"00000000-0000-4000-8000-000000000025",Channel:"cherry-studio",EventType:"token_usage",EventTimeMS:1700000000123,ReceivedAt:1700000001,Fingerprint:"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",AppVersion:"1.0中文",OS:"darwin",Provider:"self-report",Model:"model-exact",Source:"chat",InputTokens:&input,OutputTokens:&output}
+ if phase=="seed" || phase=="upgrade_seed" {
+  var count int64;require.NoError(t,model.DB.Model(value).Count(&count).Error);require.Zero(t,count)
+  require.NoError(t,model.DB.Create(&wanted).Error)
+ }
+ var rows []model.ClientEvent;require.NoError(t,model.DB.Order("id").Find(&rows).Error);require.Len(t,rows,1)
+ wanted.ID=rows[0].ID;require.Positive(t,wanted.ID);require.Equal(t,wanted,rows[0],"every typed scalar and nullable counter must survive startup")
+ duplicate:=rows[0];duplicate.ID=0;require.Error(t,model.DB.Create(&duplicate).Error,"client fingerprint remains unique")
+ var count int64;require.NoError(t,model.DB.Model(value).Count(&count).Error);require.EqualValues(t,1,count)
+ return rows
+}
+'''
+
+CLIENT_EVENTS_CANDIDATE_FIXTURE = WALLET_CANDIDATE_FIXTURE.replace(
+    '\twallet := walletState(t, phase)\n', '\twallet := walletState(t, phase)\n\tclientEvents := clientEventsState(t, phase)\n')
+CLIENT_EVENTS_CANDIDATE_FIXTURE = CLIENT_EVENTS_CANDIDATE_FIXTURE.replace(
+    '"wallet": wallet, ', '"wallet": wallet, "client_events": clientEvents, ') + CLIENT_EVENTS_STATE_FIXTURE
+
+
+CLIENT_EVENTS_RELEASE_DATA_FIXTURE = r'''
+func receiverReleaseData(t *testing.T, phase string, released bool) any {
+ t.Helper()
+ hasRead:=model.DB.Migrator().HasColumn("quota_data","cache_read_tokens")
+ hasCreation:=model.DB.Migrator().HasColumn("quota_data","cache_creation_tokens")
+ require.Equal(t,hasRead,hasCreation,"both released counters must be retained together")
+ var rows []map[string]any
+ require.NoError(t,model.DB.Table("quota_data").Order("id").Find(&rows).Error)
+ if released || phase=="upgrade_seed" || hasRead {
+  require.True(t,hasRead);require.Len(t,rows,1)
+  for key,value:=range map[string]int64{"user_id":1,"token_id":1,"channel_id":1,"created_at":1700000000,"token_used":11,"count":3,"quota":5,"cache_read_tokens":17,"cache_creation_tokens":29} { require.EqualValues(t,value,rows[0][key],"retained released scalar %s",key) }
+  for key,value:=range map[string]string{"username":"fixture-zero","model_name":"receiver-release-cache","use_group":"default","node_name":"inert-fixture"} { require.Equal(t,value,rows[0][key]) }
+ } else {
+  require.Empty(t,rows,"candidate fresh must not manufacture released counters or data")
+  require.False(t,hasRead)
+ }
+ var audits []map[string]any
+ require.NoError(t,model.LOG_DB.Table("audit_logs").Order("id").Find(&audits).Error)
+ require.Len(t,audits,1)
+ return map[string]any{"quota_data":rows,"audit_logs":audits}
+}
+'''
+
+CLIENT_EVENTS_RELEASE_FIXTURE = WALLET_RELEASE_FIXTURE.replace(
+    '\tlegacy := walletLegacyState(t, phase)\n',
+    '\tlegacy := walletLegacyState(t, phase)\n' +
+    '\tif phase=="seed" { require.NoError(t,model.DB.Create(&model.QuotaData{UserID:1,Username:"fixture-zero",ModelName:"receiver-release-cache",CreatedAt:1700000000,UseGroup:"default",TokenID:1,ChannelID:1,NodeName:"inert-fixture",TokenUsed:11,Count:3,Quota:5,CacheReadTokens:17,CacheCreationTokens:29}).Error) }\n' +
+    '\treceiverRelease := receiverReleaseData(t,phase,true)\n')
+CLIENT_EVENTS_RELEASE_FIXTURE = CLIENT_EVENTS_RELEASE_FIXTURE.replace(
+    '"legacy_data": legacy, ', '"legacy_data": legacy, "receiver_release_data": receiverRelease, ') + CLIENT_EVENTS_RELEASE_DATA_FIXTURE
+CLIENT_EVENTS_CANDIDATE_FIXTURE = CLIENT_EVENTS_CANDIDATE_FIXTURE.replace(
+    '\tclientEvents := clientEventsState(t, phase)\n',
+    '\tclientEvents := clientEventsState(t, phase)\n\treceiverRelease := receiverReleaseData(t,phase,false)\n')
+CLIENT_EVENTS_CANDIDATE_FIXTURE = CLIENT_EVENTS_CANDIDATE_FIXTURE.replace(
+    '"client_events": clientEvents, ', '"client_events": clientEvents, "receiver_release_data": receiverRelease, ') + CLIENT_EVENTS_RELEASE_DATA_FIXTURE
+
+
+def client_events_migration_sources():
+    """Receiver alone uses the reviewed rc46 source; old suites retain their pins."""
+    return CLIENT_EVENTS_RELEASE, CLIENT_EVENTS_RELEASE_FIXTURE, CLIENT_EVENTS_CANDIDATE_FIXTURE
+
+
 def execute(command, *, cwd=None, env=None, timeout=300, input_bytes=None, guard=None, final_guard=None):
     if guard is not None:
         guard()
@@ -895,7 +973,7 @@ def validate_built_fixture(runtime, kind, source, *, release_commit=RELEASE, fix
 
 def build_fixture(source, output, evidence, go, *, release_commit=RELEASE):
     env = dict(clean_environment(), GOWORK='off', GOFLAGS='-mod=readonly')
-    if release_commit == WALLET_RELEASE:
+    if release_commit in (WALLET_RELEASE, CLIENT_EVENTS_RELEASE):
         env['GOENV'] = 'off'
     before = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in ('go.mod', 'go.sum')}
     cmd = [str(go), 'test', '-c', '-o', str(output), './a03fixture']
@@ -1377,12 +1455,56 @@ def wallet_logical_schema(schema):
     return sorted(value, key=lambda table: table['table'])
 
 
-def verify_wallet_release_schema(old, current, fresh):
-    """rc45 -> existing organization/task additions -> exactly two wallet tables."""
+def client_events_comparison_catalogs(old, current, fresh):
+    """Validate the exact retained rc46 trio before stripping comparison copies."""
+    before, after, reference = ({table['table']: table for table in schema} for schema in (old, current, fresh))
+    for tables in (before, after, reference):
+        if not {'quota_data', 'audit_logs'} <= tables.keys():
+            raise ValueError('receiver release catalogs omit required tables')
+    count = next((column for column in before['quota_data']['columns'] if column['name'] == 'count'), None)
+    if (count is None or count.get('type') not in ('integer', 'bigint', 'int8')
+            or count.get('default') != '0' or count.get('default_known') is not True
+            or count.get('nullable') is not True or count.get('nullable_known') is not True
+            or count.get('pk') is not False or count.get('pk_known') is not True):
+        raise ValueError('released integer/default/nullability semantics are not the reviewed source')
+    retained_columns = {'cache_read_tokens', 'cache_creation_tokens'}
+    for name in retained_columns:
+        original = [column for column in before['quota_data']['columns'] if column['name'] == name]
+        preserved = [column for column in after['quota_data']['columns'] if column['name'] == name]
+        if original != [dict(count, name=name)] or preserved != original:
+            raise ValueError('released cache column changed or is missing: ' + name)
+        if any(column['name'] == name for column in reference['quota_data']['columns']):
+            raise ValueError('fresh candidate must not manufacture a retained-only cache column')
+    name = 'idx_audit_time_event'
+    expected = {'name': name, 'columns': ['created_at', 'event_id'], 'unique': False, 'known': True}
+    original = [index for index in before['audit_logs']['indexes'] if index['name'] == name]
+    preserved = [index for index in after['audit_logs']['indexes'] if index['name'] == name]
+    if original and 'definition' in original[0]:
+        expected.update(primary=False, primary_known=True, partial=False, partial_known=True,
+                        predicate='', predicate_known=True, predicate_null=True, constraint=None,
+                        access_method='btree', definition='CREATE INDEX idx_audit_time_event ON public.audit_logs USING btree (created_at, event_id)')
+    if original != [expected] or preserved != original:
+        raise ValueError('released ordered nonunique audit index changed or is missing')
+    if any(index['name'] == name for index in reference['audit_logs']['indexes']):
+        raise ValueError('fresh candidate must not manufacture the retained-only audit index')
+    copies = copy.deepcopy((old, current))
+    for schema in copies:
+        for table in schema:
+            if table['table'] == 'quota_data':
+                table['columns'] = [column for column in table['columns'] if column['name'] not in retained_columns]
+            elif table['table'] == 'audit_logs':
+                table['indexes'] = [index for index in table['indexes'] if index['name'] != name]
+    return copies
+
+
+def verify_wallet_release_schema(old, current, fresh, *, client_events=False):
+    """Preserve released objects and compare only the fixed, reviewed additions."""
+    if client_events:
+        old, current = client_events_comparison_catalogs(old, current, fresh)
     before = {table['table']: table for table in wallet_logical_schema(old)}
     after = {table['table']: table for table in wallet_logical_schema(current)}
     reference = {table['table']: table for table in wallet_logical_schema(fresh)}
-    added = ORGANIZATION_TABLES | WALLET_TABLES
+    added = ORGANIZATION_TABLES | WALLET_TABLES | (frozenset(('client_events',)) if client_events else frozenset())
     if before.keys() & added or after.keys() != before.keys() | added or after != reference:
         raise ValueError('wallet upgrade must match fresh schema and the fixed rc45 table additions')
     for table, previous in before.items():
@@ -1397,14 +1519,18 @@ def verify_wallet_release_schema(old, current, fresh):
                     raise ValueError('released column/index/constraint changed: '+table+'.'+name)
 
 
-def verify_wallet_restart(before, after):
-    for key in ('data', 'legacy_data', 'organization', 'wallet', 'schema_main', 'schema_log', 'physical_main', 'engine_version', 'log_version'):
+def verify_wallet_restart(before, after, *, client_events=False):
+    keys = ('data', 'legacy_data', 'organization', 'wallet', 'schema_main', 'schema_log', 'physical_main', 'engine_version', 'log_version')
+    for key in keys + (('client_events', 'receiver_release_data') if client_events else ()):
         if before[key] != after[key]:
             raise ValueError('wallet restart changed persisted data or schema identity: '+key)
 
 
-def run_organization_wallet_migrations(source, runtime, evidence, go, docker, project, containers, relays):
+def run_organization_wallet_migrations(source, runtime, evidence, go, docker, project, containers, relays, *, client_events=False):
     """Five new processes per engine, borrowing the live pair until HTTP finishes."""
+    suite = 'client-events-receiver' if client_events else 'organization-wallet'
+    release_commit, release_fixture, candidate_fixture = (client_events_migration_sources() if client_events else
+        (WALLET_RELEASE, WALLET_RELEASE_FIXTURE, WALLET_CANDIDATE_FIXTURE))
     source, runtime, evidence = Path(source), Path(runtime), Path(evidence)
     if (not runtime.is_absolute() or runtime.resolve() != runtime or runtime.exists()
             or not runtime.parent.is_dir() or runtime == source or source in runtime.parents or evidence.exists()):
@@ -1414,31 +1540,31 @@ def run_organization_wallet_migrations(source, runtime, evidence, go, docker, pr
     manifest, records, stores = required_wallet_manifest(), [], None
     primary, cleanup = None, []
     try:
-        code, commit, _ = execute(['git', 'rev-parse', WALLET_RELEASE + '^{commit}'], cwd=source)
-        if code or commit.decode().strip() != WALLET_RELEASE:
+        code, commit, _ = execute(['git', 'rev-parse', release_commit + '^{commit}'], cwd=source)
+        if code or commit.decode().strip() != release_commit:
             raise ValueError('exact latest-release commit is unavailable locally')
-        for kind, fixture in (('release', WALLET_RELEASE_FIXTURE), ('candidate', WALLET_CANDIDATE_FIXTURE)):
+        for kind, fixture in (('release', release_fixture), ('candidate', candidate_fixture)):
             exported = runtime / (kind + '-source')
-            export_sources(source, exported, WALLET_RELEASE if kind == 'release' else None, fixture_source=fixture)
+            export_sources(source, exported, release_commit if kind == 'release' else None, fixture_source=fixture)
             locks = {str(path.relative_to(exported)): hashlib.sha256(path.read_bytes()).hexdigest()
                      for path in exported.rglob('*') if path.is_file() and path.name in ('go.mod', 'go.sum')}
-            build_fixture(exported, runtime / (kind + '-fixture'), evidence, go, release_commit=WALLET_RELEASE)
+            build_fixture(exported, runtime / (kind + '-fixture'), evidence, go, release_commit=release_commit)
             after = {str(path.relative_to(exported)): hashlib.sha256(path.read_bytes()).hexdigest()
                      for path in exported.rglob('*') if path.is_file() and path.name in ('go.mod', 'go.sum')}
             if locks != after:
                 raise ValueError('wallet fixture build changed a module dependency lock')
-            validate_built_fixture(runtime, kind, source, release_commit=WALLET_RELEASE, fixture_source=fixture)
+            validate_built_fixture(runtime, kind, source, release_commit=release_commit, fixture_source=fixture)
         stores = OwnedStores.organization_wallet(runtime, docker, project, containers, relays)
         run_id = hashlib.sha256(str(runtime).encode()).hexdigest()[:12]
         for engine in ('sqlite', 'mysql', 'postgres'):
-            fresh_db = stores.create(engine, 'newapi_ci_wallet_' + run_id + '_' + engine + '_fresh')
-            upgrade_db = stores.create(engine, 'newapi_ci_wallet_' + run_id + '_' + engine + '_upgrade')
+            fresh_db = stores.create(engine, ('newapi_ci_events_' if client_events else 'newapi_ci_wallet_') + run_id + '_' + engine + '_fresh')
+            upgrade_db = stores.create(engine, ('newapi_ci_events_' if client_events else 'newapi_ci_wallet_') + run_id + '_' + engine + '_upgrade')
             snapshots = {}
             for phase in WALLET_PHASES:
                 released = phase == 'release_seed'
                 kind = 'release' if released else 'candidate'
-                fixture = WALLET_RELEASE_FIXTURE if released else WALLET_CANDIDATE_FIXTURE
-                validate_built_fixture(runtime, kind, source, release_commit=WALLET_RELEASE, fixture_source=fixture)
+                fixture = release_fixture if released else candidate_fixture
+                validate_built_fixture(runtime, kind, source, release_commit=release_commit, fixture_source=fixture)
                 startup_phase = ('seed' if phase in ('fresh_start', 'release_seed') else
                                  'upgrade_seed' if phase == 'candidate_upgrade_1' else 'restart')
                 database = fresh_db if phase.startswith('fresh_') else upgrade_db
@@ -1448,20 +1574,22 @@ def run_organization_wallet_migrations(source, runtime, evidence, go, docker, pr
                     raise ValueError('wallet phase omitted real startup or physical schema identity')
                 snapshots[phase] = snapshot
                 if phase == 'fresh_restart':
-                    verify_wallet_restart(snapshots['fresh_start'], snapshot)
+                    verify_wallet_restart(snapshots['fresh_start'], snapshot, client_events=client_events)
                 elif phase == 'candidate_upgrade_1':
                     old = snapshots['release_seed']
                     if old['data'] != snapshot['data'] or old['legacy_data'] != snapshot['legacy_data']:
                         raise ValueError('released User/Token/Task/TopUp data changed on wallet upgrade')
-                    verify_wallet_release_schema(old['schema_main'], snapshot['schema_main'], snapshots['fresh_start']['schema_main'])
+                    if client_events and old['receiver_release_data'] != snapshot['receiver_release_data']:
+                        raise ValueError('full released quota cache and audit rows changed during receiver upgrade')
+                    verify_wallet_release_schema(old['schema_main'], snapshot['schema_main'], snapshots['fresh_start']['schema_main'], client_events=client_events)
                 elif phase == 'candidate_upgrade_2':
-                    verify_wallet_restart(snapshots['candidate_upgrade_1'], snapshot)
+                    verify_wallet_restart(snapshots['candidate_upgrade_1'], snapshot, client_events=client_events)
                 records.append({'main': engine, 'log': 'same', 'phase': phase, 'passed': True,
                                 'version': snapshot['engine_version']})
                 (evidence / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
         validate_wallet_migration_results(records)
-        for kind, fixture in (('release', WALLET_RELEASE_FIXTURE), ('candidate', WALLET_CANDIDATE_FIXTURE)):
-            validate_built_fixture(runtime, kind, source, release_commit=WALLET_RELEASE, fixture_source=fixture)
+        for kind, fixture in (('release', release_fixture), ('candidate', candidate_fixture)):
+            validate_built_fixture(runtime, kind, source, release_commit=release_commit, fixture_source=fixture)
     except BaseException as error:
         primary = {'type': type(error).__name__, 'error': str(error),
                    'process_cleanup_error': getattr(error, 'process_cleanup_error', None)}
@@ -1488,7 +1616,7 @@ def run_organization_wallet_migrations(source, runtime, evidence, go, docker, pr
                         owned.unlink(missing_ok=True)
                 except BaseException as error:
                     cleanup.append({'engine': engine, 'error_type': type(error).__name__, 'error': str(error)})
-    result = {'suite': 'organization-wallet', 'release_commit': WALLET_RELEASE, 'required': manifest,
+    result = {'suite': suite, 'release_commit': release_commit, 'required': manifest,
               'phases': records, 'primary_error': primary, 'cleanup_errors': cleanup,
               'relay_cleanup_owner': 'run_organization_identity',
               'passed': primary is None and not cleanup and len(records) == len(manifest)}
