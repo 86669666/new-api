@@ -310,6 +310,9 @@ func InitResources() error {
 
 	// Initialize SQL Database
 	err = model.InitDB()
+	if err == nil {
+		err = model.InitSiteInstanceID()
+	}
 	if err != nil {
 		common.FatalLog(common.LogText("failed to initialize database: %s", err.Error()))
 		return err

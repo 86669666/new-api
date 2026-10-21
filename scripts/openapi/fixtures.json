@@ -9680,5 +9680,323 @@
     "schema": "#/components/schemas/OrganizationWalletText",
     "value": "Manual\u0000credit",
     "valid": false
+  },
+  {
+    "name": "site description public additive fields",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": true,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description disabled or invalid links",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": true,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": null,
+          "usage_logs": null,
+          "keys": null,
+          "pricing": null
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description zero identity",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "00000000-0000-0000-0000-000000000000",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description noncanonical identity",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789ABC",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description identity newline",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc\n",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description unsupported token_usage_logs",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": true,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description unsupported oauth",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": true,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description unsupported model_metadata",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": true
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description unsupported authorization server",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": true
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description unsafe link scheme",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "javascript:alert(1)",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
+  },
+  {
+    "name": "site description complete link keys required",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "valid": false,
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true
+      }
+    }
   }
 ]

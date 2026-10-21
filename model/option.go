@@ -1,9 +1,12 @@
 package model
 
 import (
+	"errors"
+	"fmt"
 	"maps"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,8 +18,47 @@ import (
 	"github.com/QuantumNous/new-api/setting/performance_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+const siteInstanceIDKey = "SiteInstanceID"
+
+var siteInstanceID atomic.Value
+
+// InitSiteInstanceID loads the identity shared by this main database. Only the
+// stored winner is published; a corrupt value is never silently replaced.
+func InitSiteInstanceID() error {
+	var option Option
+	err := DB.Where(&Option{Key: siteInstanceIDKey}).First(&option).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		candidate, generationErr := uuid.NewRandom()
+		if generationErr != nil {
+			return fmt.Errorf("generate site instance ID: %w", generationErr)
+		}
+		if err := DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&Option{Key: siteInstanceIDKey, Value: candidate.String()}).Error; err != nil {
+			return fmt.Errorf("persist site instance ID: %w", err)
+		}
+		err = DB.Where(&Option{Key: siteInstanceIDKey}).First(&option).Error
+	}
+	if err != nil {
+		return fmt.Errorf("read site instance ID: %w", err)
+	}
+	id, err := uuid.Parse(option.Value)
+	if option.Key != siteInstanceIDKey || err != nil || id == uuid.Nil || id.String() != option.Value {
+		return errors.New("invalid persisted site instance ID")
+	}
+	siteInstanceID.Store(option.Value)
+	return nil
+}
+
+// SiteInstanceID is public installation identity, not an authentication proof.
+// Startup must initialize it successfully before any HTTP routes are served.
+func SiteInstanceID() string {
+	value, _ := siteInstanceID.Load().(string)
+	return value
+}
 
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey"`
@@ -228,6 +270,9 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == siteInstanceIDKey {
+		return common.NewMessage("Invalid parameters")
+	}
 	if key == legacyAccessTokenRetireAtKey {
 		return errLegacyRetireAtReadOnly
 	}
@@ -250,6 +295,9 @@ func validateOptionValue(key string, value string) error {
 }
 
 func UpdateOption(key string, value string) error {
+	if key == siteInstanceIDKey {
+		return common.NewMessage("Invalid parameters")
+	}
 	if IsRequestPolicyOption(key) {
 		return UpdateRequestPolicyOptions(map[string]string{key: value})
 	}
@@ -268,12 +316,20 @@ func UpdateOption(key string, value string) error {
 		Key: key,
 	}
 	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
+	if err := DB.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+		return err
+	}
+	// Check the stored spelling: MySQL may resolve case/accent/space aliases.
+	if option.Key == siteInstanceIDKey {
+		return common.NewMessage("Invalid parameters")
+	}
 	option.Value = value
 	// Save is a combination function.
 	// If save value does not contain primary key, it will execute Create,
 	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
+	if err := DB.Save(&option).Error; err != nil {
+		return err
+	}
 	// Update OptionMap
 	return updateOptionMap(key, value)
 }
@@ -288,7 +344,24 @@ func UpdateOptionsBulk(values map[string]string) error {
 		return nil
 	}
 	for key := range values {
+		if key == siteInstanceIDKey {
+			return common.NewMessage("Invalid parameters")
+		}
+	}
+	for key := range values {
 		if IsPasskeyDomainOption(key) {
+			// The specialized writer also accepts unrelated keys. Resolve any
+			// collation alias before dispatch, while nothing has been mutated.
+			for requested := range values {
+				var stored Option
+				err := DB.Select("key").Where(&Option{Key: requested}).First(&stored).Error
+				if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+				if stored.Key == siteInstanceIDKey {
+					return common.NewMessage("Invalid parameters")
+				}
+			}
 			_, err := UpdatePasskeyDomainOptions(values, false, "")
 			return err
 		}
@@ -324,6 +397,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
 				return err
 			}
+			if option.Key == siteInstanceIDKey {
+				return common.NewMessage("Invalid parameters")
+			}
 			option.Value = v
 			if err := tx.Save(&option).Error; err != nil {
 				return err
@@ -346,7 +422,7 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
-	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey {
+	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey || key == siteInstanceIDKey {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)
 		common.OptionMapRWMutex.Unlock()

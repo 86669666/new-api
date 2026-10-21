@@ -392,6 +392,23 @@ class OrganizationIdentityContracts(unittest.TestCase):
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                 runner.validate_organization_identity_events(candidate, suite)
 
+    def test_site_description_suite_is_closed(self):
+        suite, root, package = 'site-description', 'TestSiteDescriptionHTTP', 'github.com/QuantumNous/new-api/router'
+        names = [root] + [root + '/' + name for name in
+                         ('shared_identity_and_reopen', 'reserved_option_and_failures', 'anonymous_links_and_navigation')]
+        events = [{'Action': 'pass', 'Package': package, 'Test': name} for name in names]
+        events.append({'Action': 'pass', 'Package': package})
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite], (frozenset((root,)), 'g18-site-description'))
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['passed_tests_and_subtests'], 4)
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:], events + [{'Action': 'skip'}],
+                          events + [{'Action': 'fail'}], events + [{'Action': 'pass', 'Package': package, 'Test': root + '/unexpected'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': 'TestOrganizationWalletLifecycle'}],
+                          [dict(event, Package='github.com/QuantumNous/new-api/service') for event in events]):
+            with self.subTest(events=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+        with self.assertRaises(ValueError):
+            runner.validate_organization_identity_events(events, 'organization-wallet')
+
     def test_organization_wallet_suite_and_migration_manifest_are_closed(self):
         import hashlib
         from types import SimpleNamespace

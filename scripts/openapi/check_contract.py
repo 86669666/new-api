@@ -543,6 +543,46 @@ def check_organization_task_reads(api):
     return {'routes': len(expected), 'batch_routes': 1, 'export_routes': 1, 'list_publication_check': True,
             'anonymous_access': False, 'live_http': False}
 
+def check_site_description(api):
+    operation = api['paths']['/api/status']['get']
+    assert operation['operationId'] == 'getApiStatus' and operation['security'] == []
+    assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/SiteDescriptionResult'}
+    assert operation['x-organization-selection'].startswith('personal-only;')
+    schemas = api['components']['schemas']
+    result = schemas['SiteDescriptionResult']
+    assert result == {'type': 'object', 'additionalProperties': False, 'required': ['success', 'message', 'data'],
+                      'properties': {'success': {'type': 'boolean', 'enum': [True]}, 'message': {'type': 'string', 'enum': ['']},
+                                     'data': {'$ref': '#/components/schemas/SiteDescription'}}}
+    description = schemas['SiteDescription']
+    fields = {'instance_id': 'SiteInstanceID', 'console_links': 'ConsoleLinks',
+              'oauth': 'DesktopOAuthDiscovery', 'client_features': 'ClientFeatureFlags'}
+    assert description['type'] == 'object' and description['additionalProperties'] is True
+    assert set(description['required']) == set(fields)
+    assert description['properties'] == {key: {'$ref': '#/components/schemas/' + value} for key, value in fields.items()}
+    identity = schemas['SiteInstanceID']
+    assert identity['type'] == 'string' and identity['pattern'] == r'^(?!00000000-0000-0000-0000-000000000000)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\s\S])'
+    links = schemas['ConsoleLinks']
+    routes = {'topup': '/wallet', 'usage_logs': '/usage-logs', 'keys': '/keys', 'pricing': '/pricing'}
+    assert links['type'] == 'object' and links['additionalProperties'] is False
+    assert set(links['required']) == set(links['properties']) == set(routes)
+    for key, route in routes.items():
+        link = links['properties'][key]
+        assert {k: v for k, v in link.items() if k != 'description'} == {
+            'type': 'string', 'nullable': True, 'pattern': r'^https?://[^/?#@\s\\]+(?:/[^?#\s\\]*)?$(?![\s\S])'}
+        assert route in link['description']
+    for name, flags in [('DesktopOAuthDiscovery', ['enabled']), ('ClientFeatureFlags', ['token_usage_logs', 'oauth', 'model_metadata'])]:
+        schema = schemas[name]
+        assert {k: v for k, v in schema.items() if k != 'description'} == {
+            'type': 'object', 'additionalProperties': False, 'required': flags,
+            'properties': {key: {'type': 'boolean', 'enum': [False]} for key in flags}}
+        assert schema['description']
+    assert all(path in schemas['ClientFeatureFlags']['description'] for path in
+               ('/api/log/token', '/api/log/self', '/api/data/self', '/api/pricing'))
+    assert 'GitHub/OIDC' in schemas['DesktopOAuthDiscovery']['description']
+    return {'anonymous': True, 'additive_fields': list(fields), 'links': routes,
+            'future_contracts_enabled': False, 'live_http': False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root', type=Path, default=ROOT, help='Explicit business source checkout for combined-candidate checks; defaults to this checkout. No source is copied or modified.')
@@ -607,6 +647,7 @@ def main():
     results['organization_capabilities'] = {'governance_roles': ['owner', 'admin'], 'task_read_channel': True,
                                           'token_issuance': False, 'spending': False, 'advisory_only': True, 'live_http': False}
     results['organization_task_reads'] = check_organization_task_reads(api)
+    results['site_description'] = check_site_description(api)
     # Bind documented PAT scope/session choices to the checked-in route policy.
     rules = re.findall(r'"([A-Z]+) ([^\"]+)":\s+(accessToken[^,\n]+)', (source_root / 'middleware/access_token_routes.go').read_text())
     for method, gin_path, rule in rules:

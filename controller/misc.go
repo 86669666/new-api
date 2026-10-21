@@ -5,6 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -48,6 +53,13 @@ func GetStatus(c *gin.Context) {
 	legalSetting := system_setting.GetLegalSettings()
 
 	data := gin.H{
+		"instance_id": model.SiteInstanceID(),
+		"console_links": publicConsoleLinks(system_setting.ServerAddress,
+			common.OptionMap["SidebarModulesAdmin"], common.OptionMap["HeaderNavModules"]),
+		// These describe the new desktop integration contracts, independently
+		// of existing login providers, legacy token logs and pricing APIs.
+		"oauth":                       gin.H{"enabled": false},
+		"client_features":             gin.H{"token_usage_logs": false, "oauth": false, "model_metadata": false},
 		"version":                     common.Version,
 		"start_time":                  common.StartTime,
 		"email_verification":          common.EmailVerificationEnabled,
@@ -172,6 +184,92 @@ func GetStatus(c *gin.Context) {
 		"data":    data,
 	})
 	return
+}
+
+// publicConsoleLinks discovers site navigation, never current-user permission
+// or payment availability. It only uses operator-configured addresses.
+func publicConsoleLinks(serverAddress, sidebarConfig, headerConfig string) map[string]*string {
+	links := map[string]*string{"topup": nil, "usage_logs": nil, "keys": nil, "pricing": nil}
+	raw := serverAddress
+	if configured := os.Getenv("FRONTEND_BASE_URL"); !common.IsMasterNode && configured != "" {
+		raw = configured
+	}
+	for _, r := range raw {
+		if unicode.IsControl(r) || unicode.IsSpace(r) || r == '\\' {
+			return links
+		}
+	}
+	base, err := url.Parse(raw)
+	if err != nil || base == nil || (base.Scheme != "http" && base.Scheme != "https") ||
+		base.Hostname() == "" || base.User != nil || base.Opaque != "" || base.RawQuery != "" ||
+		base.ForceQuery || base.Fragment != "" || strings.ContainsAny(raw, "?#") || strings.HasSuffix(base.Host, ":") {
+		return links
+	}
+	if port := base.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return links
+		}
+	}
+	escaped := strings.ToLower(base.EscapedPath())
+	if strings.Contains(escaped, "%2f") || strings.Contains(escaped, "%5c") ||
+		strings.ContainsAny(base.Path, "%\\?#") || strings.Contains(base.Path, "//") {
+		return links
+	}
+	for _, r := range base.Path {
+		if unicode.IsControl(r) {
+			return links
+		}
+	}
+	for segment := range strings.SplitSeq(base.Path, "/") {
+		if segment == "." || segment == ".." {
+			return links
+		}
+	}
+	var sidebar map[string]any
+	if err := common.Unmarshal([]byte(sidebarConfig), &sidebar); err != nil {
+		sidebar = nil
+	}
+	for _, page := range []struct {
+		key, path, section, item string
+	}{
+		{"topup", "/wallet", "personal", "topup"},
+		{"usage_logs", "/usage-logs", "console", "log"},
+		{"keys", "/keys", "console", "token"},
+		{"pricing", "/pricing", "", ""},
+	} {
+		enabled := true
+		if page.key == "pricing" {
+			enabled = middleware.HeaderNavModuleEnabled(headerConfig, "pricing")
+		} else if section, ok := sidebar[page.section].(map[string]any); ok {
+			// Match the frontend's default merge, JavaScript truthiness for
+			// section.enabled, and strict item === true. A missing item is true.
+			if value, exists := section["enabled"]; exists {
+				switch value := value.(type) {
+				case nil:
+					enabled = false
+				case bool:
+					enabled = value
+				case float64:
+					enabled = value != 0
+				case string:
+					enabled = value != ""
+				}
+			}
+			if value, exists := section[page.item]; exists {
+				item, boolean := value.(bool)
+				enabled = enabled && boolean && item
+			}
+		}
+		if enabled {
+			link := *base
+			link.Path = strings.TrimRight(base.Path, "/") + page.path
+			link.RawPath = ""
+			value := link.String()
+			links[page.key] = &value
+		}
+	}
+	return links
 }
 
 func GetNotice(c *gin.Context) {

@@ -148,7 +148,7 @@
       "get": {
         "summary": "获取系统状态",
         "deprecated": false,
-        "description": "🔓 无需鉴权",
+        "description": "🔓 无需鉴权\n\nSite discovery adds instance_id, console_links, oauth and client_features without changing existing fields. UUID initialization must succeed before serving; GET performs no writes. Links preserve the configured frontend prefix and never trust request Host or forwarding headers. Feature flags describe the new desktop integration contracts, independently of existing token-log, pricing and login-provider APIs.",
         "tags": [
           "系统"
         ],
@@ -163,7 +163,14 @@
         "responses": {
           "200": {
             "description": "成功",
-            "headers": {}
+            "headers": {},
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteDescriptionResult"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
@@ -26272,6 +26279,145 @@
           "context"
         ],
         "additionalProperties": false
+      },
+      "SiteInstanceID": {
+        "type": "string",
+        "pattern": "^(?!00000000-0000-0000-0000-000000000000)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+        "description": "Canonical nonzero UUID persisted once in the main database and shared across nodes. A database clone retains this installation identifier. It is public identity, not a credential, OAuth issuer, origin or trust grant."
+      },
+      "ConsoleLinks": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "topup",
+          "usage_logs",
+          "keys",
+          "pricing"
+        ],
+        "properties": {
+          "topup": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^https?://[^/?#@\\s\\\\]+(?:/[^?#\\s\\\\]*)?$(?![\\s\\S])",
+            "description": "Absolute http/https URL to existing /wallet; null when disabled or the effective base is unsafe. The address may include a configured prefix and port."
+          },
+          "usage_logs": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^https?://[^/?#@\\s\\\\]+(?:/[^?#\\s\\\\]*)?$(?![\\s\\S])",
+            "description": "Absolute http/https URL to existing /usage-logs; null when disabled or the effective base is unsafe. The address may include a configured prefix and port."
+          },
+          "keys": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^https?://[^/?#@\\s\\\\]+(?:/[^?#\\s\\\\]*)?$(?![\\s\\S])",
+            "description": "Absolute http/https URL to existing /keys; null when disabled or the effective base is unsafe. The address may include a configured prefix and port."
+          },
+          "pricing": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^https?://[^/?#@\\s\\\\]+(?:/[^?#\\s\\\\]*)?$(?![\\s\\S])",
+            "description": "Absolute http/https URL to existing /pricing; null when disabled or the effective base is unsafe. The address may include a configured prefix and port."
+          }
+        },
+        "description": "Operator-configured navigation discovery, not current-user permission or payment availability. Invalid effective frontend URL or an explicitly disabled page yields null. FRONTEND_BASE_URL is effective only on non-master nodes; otherwise ServerAddress is used. No Host/Forwarded fallback. Configured path prefixes are preserved. Sidebar section.enabled plus strict item===true governs wallet/usage logs/keys; pricing uses HeaderNavModules.pricing independently of requireAuth or the console top-nav toggle."
+      },
+      "DesktopOAuthDiscovery": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          }
+        },
+        "description": "The desktop OAuth authorization-server contract (#19) is not implemented. Existing inbound GitHub/OIDC and other login providers are independent and unchanged."
+      },
+      "ClientFeatureFlags": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "token_usage_logs",
+          "oauth",
+          "model_metadata"
+        ],
+        "properties": {
+          "token_usage_logs": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "oauth": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "model_metadata": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          }
+        },
+        "description": "False denotes incomplete new desktop integration contracts #16 (token usage logs), #17 (model metadata) and #19 (OAuth). Existing /api/log/token, /api/log/self, /api/data/self, /api/pricing and login-provider endpoints remain unchanged; their legacy availability is not denied by these flags."
+      },
+      "SiteDescription": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "instance_id",
+          "console_links",
+          "oauth",
+          "client_features"
+        ],
+        "properties": {
+          "instance_id": {
+            "$ref": "#/components/schemas/SiteInstanceID"
+          },
+          "console_links": {
+            "$ref": "#/components/schemas/ConsoleLinks"
+          },
+          "oauth": {
+            "$ref": "#/components/schemas/DesktopOAuthDiscovery"
+          },
+          "client_features": {
+            "$ref": "#/components/schemas/ClientFeatureFlags"
+          }
+        },
+        "description": "Four additive discovery fields within the existing public status data object. All existing status fields keep their wire types and behavior. No credential or user-specific settings are added."
+      },
+      "SiteDescriptionResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/SiteDescription"
+          }
+        }
       }
     },
     "responses": {

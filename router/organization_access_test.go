@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -33,11 +34,13 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	sqlmysql "github.com/go-sql-driver/mysql"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,6 +48,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	gormlogger "gorm.io/gorm/logger"
 )
 
@@ -201,7 +205,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -470,6 +474,342 @@ func organizationError(t *testing.T, status int, h http.Header, b map[string]any
 	} else {
 		assert.NotContains(t, slices.Collect(maps.Keys(b)), "data")
 	}
+}
+
+// One root covers the public HTTP contract and independent processes sharing
+// the owned database. Child mode reconnects only; it never migrates or drops it.
+func TestSiteDescriptionHTTP(t *testing.T) {
+	if mode := os.Getenv("NEWAPI_SITE_DESCRIPTION_NODE"); mode != "" {
+		require.Contains(t, []string{"compete", "reopen", "closed"}, mode)
+		require.Equal(t, "g18-site-description", os.Getenv("NEWAPI_S2_OWNED"))
+		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+		require.Equal(t, "none", os.Getenv("NEWAPI_S2_CACHE_MODE"))
+		kind, dsn := os.Getenv("NEWAPI_S2_MAIN"), os.Getenv("NEWAPI_SITE_DESCRIPTION_DSN")
+		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
+		require.Equal(t, kind, os.Getenv("NEWAPI_S2_LOG"))
+		var dial gorm.Dialector
+		if kind == "sqlite" {
+			require.True(t, filepath.IsAbs(dsn))
+			require.Equal(t, "organization.db", filepath.Base(dsn))
+			info, err := os.Lstat(dsn)
+			require.NoError(t, err)
+			require.True(t, info.Mode().IsRegular())
+			dial = sqlite.Open(dsn + "?_pragma=busy_timeout(5000)")
+		} else {
+			require.NoError(t, organizationFixtureDSN(kind, dsn, os.Getenv("NEWAPI_S2_"+strings.ToUpper(kind)+"_PORT")))
+			if kind == "mysql" {
+				config, err := sqlmysql.ParseDSN(dsn)
+				require.NoError(t, err)
+				require.Regexp(t, `^newapi_s2_[a-z0-9_]+$`, config.DBName)
+				dial = mysql.Open(dsn)
+			} else {
+				config, err := pgx.ParseConfig(dsn)
+				require.NoError(t, err)
+				require.Regexp(t, `^newapi_s2_[a-z0-9_]+$`, config.Database)
+				dial = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+			}
+		}
+		db, err := gorm.Open(dial, &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+		require.NoError(t, err)
+		conn, err := db.DB()
+		require.NoError(t, err)
+		model.DB = db
+		if mode == "closed" {
+			require.NoError(t, conn.Close())
+			require.Error(t, model.InitSiteInstanceID())
+			assert.Empty(t, model.SiteInstanceID(), "a failed fresh process must not publish a replacement")
+			return
+		}
+		t.Cleanup(func() { require.NoError(t, conn.Close()) })
+		if mode == "compete" {
+			ready, release := os.NewFile(3, "ready"), os.NewFile(4, "release")
+			require.NotNil(t, ready)
+			require.NotNil(t, release)
+			t.Cleanup(func() { _ = ready.Close(); _ = release.Close() })
+			fired := false
+			require.NoError(t, db.Callback().Query().After("gorm:query").Register("site_identity_absent_barrier", func(tx *gorm.DB) {
+				if !fired && tx.Statement.Table == "options" && errors.Is(tx.Error, gorm.ErrRecordNotFound) {
+					fired = true
+					_, err := ready.Write([]byte{1})
+					require.NoError(t, err)
+					_, err = io.ReadFull(release, make([]byte, 1))
+					require.NoError(t, err)
+				}
+			}))
+		}
+		require.NoError(t, model.InitSiteInstanceID())
+		fmt.Println("SITE_DESCRIPTION_ID=" + model.SiteInstanceID())
+		return
+	}
+
+	f := newOrganizationHTTPFixture(t)
+	oldAddress, oldGithub := system_setting.ServerAddress, common.GitHubOAuthEnabled
+	common.OptionMapRWMutex.Lock()
+	oldOptions := common.OptionMap
+	common.OptionMap = map[string]string{}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		system_setting.ServerAddress, common.GitHubOAuthEnabled = oldAddress, oldGithub
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = oldOptions
+		common.OptionMapRWMutex.Unlock()
+	})
+	const key = "SiteInstanceID"
+	type node struct {
+		cmd            *exec.Cmd
+		mode           string
+		ready, release *os.File
+		output         bytes.Buffer
+		cancel         context.CancelFunc
+		waited         bool
+	}
+	startNode := func(t *testing.T, mode string) *node {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		n := &node{cancel: cancel, mode: mode}
+		n.cmd = exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSiteDescriptionHTTP$", "-test.timeout=25s")
+		n.cmd.Env = append(os.Environ(), "NEWAPI_SITE_DESCRIPTION_NODE="+mode, "NEWAPI_SITE_DESCRIPTION_DSN="+f.mainDSN)
+		n.cmd.Stdout, n.cmd.Stderr = &n.output, &n.output
+		var readyWriter, releaseReader *os.File
+		if mode == "compete" {
+			var err error
+			n.ready, readyWriter, err = os.Pipe()
+			require.NoError(t, err)
+			releaseReader, n.release, err = os.Pipe()
+			require.NoError(t, err)
+			n.cmd.ExtraFiles = []*os.File{readyWriter, releaseReader}
+		}
+		t.Cleanup(func() {
+			if n.release != nil {
+				_ = n.release.Close()
+			}
+			if n.ready != nil {
+				_ = n.ready.Close()
+			}
+			n.cancel()
+			if n.cmd.Process != nil && !n.waited {
+				_ = n.cmd.Wait()
+			}
+		})
+		err := n.cmd.Start()
+		if readyWriter != nil {
+			_ = readyWriter.Close()
+			_ = releaseReader.Close()
+		}
+		require.NoError(t, err)
+		return n
+	}
+	finishNode := func(t *testing.T, n *node) string {
+		t.Helper()
+		err := n.cmd.Wait()
+		n.waited = true
+		require.NoError(t, err, "independent initializer failed: %s", n.output.String())
+		if n.mode == "closed" {
+			return ""
+		}
+		match := regexp.MustCompile(`(?m)^SITE_DESCRIPTION_ID=([0-9a-f-]{36})$`).FindStringSubmatch(n.output.String())
+		require.Len(t, match, 2)
+		return match[1]
+	}
+
+	t.Run("shared_identity_and_reopen", func(t *testing.T) {
+		require.NoError(t, f.db.Create(&model.Option{Key: "ExistingSiteOption", Value: "preserved"}).Error)
+		nodes := []*node{startNode(t, "compete"), startNode(t, "compete")}
+		for _, n := range nodes {
+			_, err := io.ReadFull(n.ready, make([]byte, 1))
+			require.NoError(t, err, "both processes must finish their absent read before either inserts")
+		}
+		for _, n := range nodes {
+			_, err := n.release.Write([]byte{1})
+			require.NoError(t, err)
+		}
+		first, second := finishNode(t, nodes[0]), finishNode(t, nodes[1])
+		require.Equal(t, first, second)
+		parsed, err := uuid.Parse(first)
+		require.NoError(t, err)
+		require.NotEqual(t, uuid.Nil, parsed)
+		require.Equal(t, first, parsed.String())
+		require.Equal(t, first, finishNode(t, startNode(t, "reopen")))
+		require.NoError(t, model.InitSiteInstanceID())
+		require.NoError(t, model.InitSiteInstanceID())
+		assert.Equal(t, first, model.SiteInstanceID())
+		var rows []model.Option
+		require.NoError(t, f.db.Where(&model.Option{Key: key}).Find(&rows).Error)
+		require.Equal(t, []model.Option{{Key: key, Value: first}}, rows)
+		var existing model.Option
+		require.NoError(t, f.db.Where(&model.Option{Key: "ExistingSiteOption"}).First(&existing).Error)
+		assert.Equal(t, "preserved", existing.Value)
+	})
+
+	t.Run("reserved_option_and_failures", func(t *testing.T) {
+		id := model.SiteInstanceID()
+		require.NotEmpty(t, id)
+		require.NoError(t, f.db.Create(&model.Option{Key: "SiteUnrelatedOption", Value: "unchanged"}).Error)
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap["SiteUnrelatedOption"] = "unchanged"
+		common.OptionMapRWMutex.Unlock()
+		snapshot := func() ([]model.Option, map[string]string) {
+			var rows []model.Option
+			require.NoError(t, f.db.Order(clause.OrderByColumn{Column: clause.Column{Name: "key"}}).Find(&rows).Error)
+			common.OptionMapRWMutex.RLock()
+			defer common.OptionMapRWMutex.RUnlock()
+			return rows, maps.Clone(common.OptionMap)
+		}
+		beforeRows, beforeMap := snapshot()
+		require.Error(t, model.UpdateOption(key, uuid.NewString()))
+		for _, values := range []map[string]string{
+			{key: uuid.NewString(), "SiteUnrelatedOption": "changed"},
+			{key: uuid.NewString(), "passkey.rp_id": "changed.invalid", "SiteUnrelatedOption": "changed"},
+		} {
+			require.Error(t, model.UpdateOptionsBulk(values))
+		}
+		afterRows, afterMap := snapshot()
+		assert.Equal(t, beforeRows, afterRows)
+		assert.Equal(t, beforeMap, afterMap)
+		for _, alias := range []string{"siteinstanceid", "SíteInstanceID", "SiteInstanceID "} {
+			var resolved model.Option
+			err := f.db.Where(&model.Option{Key: alias}).First(&resolved).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				require.NoError(t, model.UpdateOption(alias, "distinct ordinary key"))
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, key, resolved.Key)
+				beforeRows, beforeMap = snapshot()
+				require.Error(t, model.UpdateOption(alias, "overwrite"))
+				require.Error(t, model.UpdateOptionsBulk(map[string]string{alias: "overwrite", "SiteUnrelatedOption": "changed"}))
+				require.Error(t, model.UpdateOptionsBulk(map[string]string{alias: "overwrite", "passkey.rp_id": "changed.invalid", "SiteUnrelatedOption": "changed"}))
+				afterRows, afterMap = snapshot()
+				assert.Equal(t, beforeRows, afterRows, alias)
+				assert.Equal(t, beforeMap, afterMap, alias)
+			}
+			var stored model.Option
+			require.NoError(t, f.db.Where(&model.Option{Key: key}).First(&stored).Error)
+			assert.Equal(t, id, stored.Value, alias)
+		}
+		for _, invalid := range []string{"", "invalid", uuid.Nil.String(), "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", id + " "} {
+			require.NoError(t, f.db.Model(&model.Option{}).Where(&model.Option{Key: key}).Update("value", invalid).Error)
+			require.Error(t, model.InitSiteInstanceID())
+			var stored model.Option
+			require.NoError(t, f.db.Where(&model.Option{Key: key}).First(&stored).Error)
+			assert.Equal(t, invalid, stored.Value, "corrupt identity must not be repaired")
+		}
+		require.NoError(t, f.db.Model(&model.Option{}).Where(&model.Option{Key: key}).Update("value", id).Error)
+		if f.mainKind == "mysql" {
+			// This engine's actual collation, not a Go approximation, resolves this alias.
+			var alias model.Option
+			require.NoError(t, f.db.Where(&model.Option{Key: "siteinstanceid"}).First(&alias).Error)
+			require.Equal(t, key, alias.Key)
+			require.NoError(t, f.db.Where(&model.Option{Key: key}).Delete(&model.Option{}).Error)
+			require.NoError(t, f.db.Create(&model.Option{Key: "siteinstanceid", Value: id}).Error)
+			require.Error(t, model.InitSiteInstanceID(), "unexpected stored spelling must not be claimed")
+			require.NoError(t, f.db.Where(&model.Option{Key: "siteinstanceid"}).Delete(&model.Option{}).Error)
+			require.NoError(t, f.db.Create(&model.Option{Key: key, Value: id}).Error)
+		}
+		finishNode(t, startNode(t, "closed"))
+		require.NoError(t, model.InitSiteInstanceID())
+		assert.Equal(t, id, model.SiteInstanceID())
+	})
+
+	t.Run("anonymous_links_and_navigation", func(t *testing.T) {
+		request := func() map[string]any {
+			req, err := http.NewRequest(http.MethodGet, f.server.URL+"/api/status", nil)
+			require.NoError(t, err)
+			req.Host = "hostile.invalid"
+			req.Header.Set("Forwarded", "host=hostile.invalid;proto=https")
+			req.Header.Set("X-Forwarded-Host", "hostile.invalid")
+			req.Header.Set("X-Forwarded-Proto", "https")
+			resp, err := f.client.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Empty(t, resp.Header.Values("Set-Cookie"))
+			var body map[string]any
+			require.NoError(t, common.DecodeJson(resp.Body, &body))
+			require.Equal(t, true, body["success"])
+			require.Equal(t, "", body["message"])
+			data, ok := body["data"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, model.SiteInstanceID(), data["instance_id"])
+			assert.Equal(t, map[string]any{"enabled": false}, data["oauth"])
+			assert.Equal(t, map[string]any{"token_usage_logs": false, "oauth": false, "model_metadata": false}, data["client_features"])
+			assert.Equal(t, system_setting.ServerAddress, data["server_address"])
+			assert.Equal(t, common.Version, data["version"])
+			assert.Equal(t, common.SystemName, data["system_name"])
+			assert.Equal(t, "default", data["theme"])
+			raw, err := common.Marshal(data)
+			require.NoError(t, err)
+			assert.NotContains(t, string(raw), "private-option-canary")
+			return data
+		}
+		common.GitHubOAuthEnabled = true
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap["SMTPToken"] = "private-option-canary"
+		common.OptionMapRWMutex.Unlock()
+		for _, tc := range []struct {
+			address, frontend, prefix string
+			master, valid             bool
+		}{
+			{"https://console.example", "", "https://console.example", false, true},
+			{"http://127.0.0.1:3000/base/", "", "http://127.0.0.1:3000/base", false, true},
+			{"https://primary.example/root", "https://frontend.example/prefix/", "https://frontend.example/prefix", false, true},
+			{"https://primary.example/root", "https://ignored.example", "https://primary.example/root", true, true},
+			{"https://primary.example", "invalid", "", false, false},
+			{"", "", "", false, false}, {"/relative", "", "", false, false},
+			{"//relative.example", "", "", false, false}, {"ftp://example.com", "", "", false, false},
+			{"https://user:secret@example.com", "", "", false, false},
+			{"https://example.com/?q=1", "", "", false, false}, {"https://example.com/#f", "", "", false, false},
+			{"https://example.com/\n", "", "", false, false}, {"https://example.com/\\x", "", "", false, false},
+			{"https://example.com/a/../b", "", "", false, false}, {"https://example.com/%2e", "", "", false, false},
+			{"https://example.com/a%2fb", "", "", false, false}, {"https://example.com/%252f", "", "", false, false},
+			{"https://example.com//a", "", "", false, false}, {"http://example.com:0", "", "", false, false},
+		} {
+			system_setting.ServerAddress, common.IsMasterNode = tc.address, tc.master
+			t.Setenv("FRONTEND_BASE_URL", tc.frontend)
+			data := request()
+			links := data["console_links"].(map[string]any)
+			require.Len(t, links, 4)
+			for name, route := range map[string]string{"topup": "/wallet", "usage_logs": "/usage-logs", "keys": "/keys", "pricing": "/pricing"} {
+				if tc.valid {
+					assert.Equal(t, tc.prefix+route, links[name], tc.address)
+				} else {
+					assert.Nil(t, links[name], tc.address)
+				}
+			}
+			assert.Equal(t, true, data["github_oauth"], "legacy provider enablement is independent")
+		}
+		system_setting.ServerAddress, common.IsMasterNode = "https://console.example", false
+		t.Setenv("FRONTEND_BASE_URL", "")
+		for _, tc := range []struct {
+			sidebar, header string
+			disabled        []string
+		}{
+			{"", "", nil}, {`{"console":{"log":false}}`, "", []string{"usage_logs"}},
+			{`{"console":{"enabled":false}}`, "", []string{"usage_logs", "keys"}},
+			{`{"personal":{"enabled":false}}`, "", []string{"topup"}},
+			{`{"console":{"log":"true","token":1},"personal":{"topup":null}}`, "", []string{"topup", "usage_logs", "keys"}},
+			{`{"console":{"enabled":"false"}}`, "", nil},
+			{`{"console":{"enabled":0}}`, "", []string{"usage_logs", "keys"}},
+			{`{"console":{"log":false},`, "invalid", nil},
+			{"", `{"console":false}`, nil}, {"", `{"pricing":false}`, []string{"pricing"}},
+			{"", `{"pricing":"0"}`, []string{"pricing"}}, {"", `{"pricing":0}`, []string{"pricing"}},
+			{"", `{"pricing":{"enabled":false,"requireAuth":true}}`, []string{"pricing"}},
+			{"", `{"pricing":{"enabled":true,"requireAuth":true}}`, nil},
+		} {
+			common.OptionMapRWMutex.Lock()
+			common.OptionMap["SidebarModulesAdmin"], common.OptionMap["HeaderNavModules"] = tc.sidebar, tc.header
+			common.OptionMapRWMutex.Unlock()
+			links := request()["console_links"].(map[string]any)
+			for name, route := range map[string]string{"topup": "/wallet", "usage_logs": "/usage-logs", "keys": "/keys", "pricing": "/pricing"} {
+				if slices.Contains(tc.disabled, name) {
+					assert.Nil(t, links[name], tc.sidebar+tc.header)
+				} else {
+					assert.Equal(t, "https://console.example"+route, links[name], tc.sidebar+tc.header)
+				}
+			}
+		}
+		status, headers, body := f.request(t, "GET", "/api/status?org_id=1", "", "", nil)
+		organizationError(t, status, headers, body, 403, "ORG_RESOURCE_UNSUPPORTED")
+	})
 }
 
 func TestOrganizationAccessHTTP(t *testing.T) {

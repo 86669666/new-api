@@ -705,6 +705,7 @@ ORGANIZATION_READ_SUITES = {
     'organization-task-funding-isolation': (frozenset(('TestOrganizationTaskFundingIsolation',)), 'g15-organization-task-funding-isolation'),
     'organization-capabilities': (frozenset(('TestOrganizationCapabilityProjection', 'TestOrganizationAccessHTTP')), 'g16-organization-capabilities'),
     'organization-wallet': (frozenset(('TestOrganizationWalletLifecycle',)), 'g17-organization-wallet'),
+    'site-description': (frozenset(('TestSiteDescriptionHTTP',)), 'g18-site-description'),
 }
 ORGANIZATION_WALLET_CASES = frozenset((
     'proof_expired', 'root_role_revoked', 'credit_reversal_idempotency_and_retained_history',
@@ -876,6 +877,11 @@ def validate_organization_identity_events(events, suite='organization-identity')
     if suite == 'organization-wallet' and passed != required | {None} | {
             'TestOrganizationWalletLifecycle/' + name for name in ORGANIZATION_WALLET_CASES}:
         raise ValueError('every exact wallet regression case must pass without unrelated tests')
+    if suite == 'site-description' and passed != required | {None,
+            'TestSiteDescriptionHTTP/shared_identity_and_reopen',
+            'TestSiteDescriptionHTTP/reserved_option_and_failures',
+            'TestSiteDescriptionHTTP/anonymous_links_and_navigation'}:
+        raise ValueError('every exact site description case must pass without unrelated tests')
     return {'roots': sorted(required), 'passed_tests_and_subtests': len(passed) - 1,
             'package': package, 'skip': 0, 'fail': 0}
 

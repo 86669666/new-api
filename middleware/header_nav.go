@@ -15,14 +15,23 @@ type headerNavAccess struct {
 }
 
 func getHeaderNavAccess(module string) headerNavAccess {
+	common.OptionMapRWMutex.RLock()
+	raw := common.OptionMap["HeaderNavModules"]
+	common.OptionMapRWMutex.RUnlock()
+	return parseHeaderNavConfiguration(raw, module)
+}
+
+// HeaderNavModuleEnabled projects the existing policy from a caller's option
+// snapshot without acquiring another OptionMap read lock.
+func HeaderNavModuleEnabled(raw, module string) bool {
+	return parseHeaderNavConfiguration(raw, module).Enabled
+}
+
+func parseHeaderNavConfiguration(raw, module string) headerNavAccess {
 	fallback := headerNavAccess{
 		Enabled:     true,
 		RequireAuth: false,
 	}
-
-	common.OptionMapRWMutex.RLock()
-	raw := common.OptionMap["HeaderNavModules"]
-	common.OptionMapRWMutex.RUnlock()
 
 	if strings.TrimSpace(raw) == "" {
 		return fallback
