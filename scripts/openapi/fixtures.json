@@ -10270,5 +10270,372 @@
       "message": "Failed to get token information"
     },
     "valid": true
+  },
+  {
+    "name": "token pricing named",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": true
+  },
+  {
+    "name": "token pricing auto",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g2",
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g2": 0.5,
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g2": "Group two",
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [
+        "g2",
+        "g1"
+      ],
+      "pricing_version": "fixture-version",
+      "group": "auto"
+    },
+    "valid": true
+  },
+  {
+    "name": "token pricing revoked empty",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [],
+      "vendors": [],
+      "group_ratio": {},
+      "usable_group": {},
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "revoked"
+    },
+    "valid": true
+  },
+  {
+    "name": "token pricing requires top-level group",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version"
+    },
+    "valid": false
+  },
+  {
+    "name": "token pricing no all sentinel",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "all"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
+  },
+  {
+    "name": "token pricing no empty enable groups",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
+  },
+  {
+    "name": "token pricing no credential field",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1",
+      "credential": "must-not-appear"
+    },
+    "valid": false
+  },
+  {
+    "name": "token pricing group is a string",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": [
+        "g1"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "token pricing data is always an array",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": null,
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
+  },
+  {
+    "name": "public pricing unchanged shape",
+    "document": "api",
+    "schema": "#/components/schemas/PublicPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version"
+    },
+    "valid": true
+  },
+  {
+    "name": "public pricing has no selected group",
+    "document": "api",
+    "schema": "#/components/schemas/PublicPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ]
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
   }
 ]

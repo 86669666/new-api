@@ -2,8 +2,11 @@ package controller
 
 import (
 	"maps"
+	"net/http"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -36,6 +39,16 @@ func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string
 }
 
 func GetPricing(c *gin.Context) {
+	if selected, trusted := middleware.TokenPricingRequest(c); selected {
+		c.Header("Cache-Control", "private, no-store")
+		token, ownerGroup, authenticated := middleware.GetReadOnlyToken(c)
+		if !trusted || !authenticated {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "Invalid Bearer token"})
+			return
+		}
+		writeTokenPricing(c, token, ownerGroup)
+		return
+	}
 	pricing := model.GetPricing()
 	userId, exists := c.Get("id")
 	usableGroup := map[string]string{}
@@ -72,6 +85,67 @@ func GetPricing(c *gin.Context) {
 		"usable_group":       usableGroup,
 		"supported_endpoint": model.GetSupportedEndpointMap(),
 		"auto_groups":        service.GetUserAutoGroup(group),
+		"pricing_version":    "a42d372ccf0b5dd13ecf71203521f9d2",
+	})
+}
+
+func writeTokenPricing(c *gin.Context, token model.Token, ownerGroup string) {
+	group := token.Group
+	if group == "" {
+		group = ownerGroup
+	}
+	permitted := service.GetUserUsableGroups(ownerGroup)
+	candidates := []string{}
+	autoGroups := []string{}
+	if group == "auto" {
+		if _, allowed := permitted["auto"]; allowed {
+			custom, err := token.GetAutoGroups()
+			if err == nil {
+				if len(custom) == 0 {
+					candidates = service.GetUserAutoGroup(ownerGroup)
+				} else {
+					candidates = service.FilterUserTokenAutoGroups(ownerGroup, custom)
+				}
+			}
+		}
+	} else if service.IsUserSelectableGroup(ownerGroup, group) {
+		candidates = append(candidates, group)
+	}
+	candidates = slices.DeleteFunc(candidates, func(candidate string) bool { return candidate == "all" })
+	if group == "auto" {
+		autoGroups = candidates
+	}
+	usableGroups := make(map[string]string, len(candidates))
+	groupRatios := make(map[string]float64, len(candidates))
+	for _, candidate := range candidates {
+		usableGroups[candidate] = permitted[candidate]
+		groupRatios[candidate] = service.GetUserGroupRatio(ownerGroup, candidate)
+	}
+	cached := model.GetPricing()
+	pricing := make([]model.Pricing, 0, len(cached))
+	for _, item := range cached {
+		groups := make([]string, 0, len(candidates))
+		all := slices.Contains(item.EnableGroup, "all")
+		for _, candidate := range candidates {
+			if all || slices.Contains(item.EnableGroup, candidate) {
+				groups = append(groups, candidate)
+			}
+		}
+		if len(groups) == 0 {
+			continue
+		}
+		item.EnableGroup = groups
+		pricing = append(pricing, item)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success":            true,
+		"data":               pricing,
+		"group":              group,
+		"vendors":            model.GetVendors(),
+		"group_ratio":        groupRatios,
+		"usable_group":       usableGroups,
+		"supported_endpoint": model.GetSupportedEndpointMap(),
+		"auto_groups":        autoGroups,
 		"pricing_version":    "a42d372ccf0b5dd13ecf71203521f9d2",
 	})
 }

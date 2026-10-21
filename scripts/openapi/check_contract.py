@@ -126,6 +126,46 @@ def check_conditional_authorization(source_root):
     }
 
 
+def check_token_pricing(api):
+    operation = api['paths']['/api/pricing']['get']
+    assert operation['security'] == [{}, {'DashboardJWT': []}, {'PersonalAccessToken': []}, {'RelayKey': []}]
+    assert operation['x-token-pricing-contract'] == {
+        'availability': 'sk only when pricing is enabled and public; dashboard root exception never applies to sk',
+        'credential': 'one Authorization value: exact Bearer or bearer, ASCII space, lowercase sk- and nonempty key; no whitespace, controls, comma or dash suffix',
+        'principal': 'trusted pricing branch and request-local authenticated token/owner-group snapshot; no credential reparse lookup',
+        'group': 'required top-level selection: token group, otherwise owner group; auto remains auto',
+        'named': 'current selectable permission and ratio required; revoked or unavailable gives empty collections without fallback',
+        'auto': 'permission to select auto required; empty/null/[] inherits global order; nonempty custom filters current permissions before dedup/limit; malformed or revoked yields empty without fallback',
+        'projection': 'fresh maps and copied entries; enable_groups intersects candidates; all expands only to candidates; owner-base overrides; prices and units unchanged',
+        'cache_control': 'private, no-store on every sk response',
+        'legacy': 'anonymous and dashboard response fields and navigation behavior unchanged',
+    }
+    assert operation['responses']['200']['content']['application/json']['schema'] == {
+        'oneOf': [{'$ref': '#/components/schemas/PublicPricingResult'}, {'$ref': '#/components/schemas/TokenPricingResult'}],
+    }
+    for status in ['200', '401', '403', '500']:
+        assert 'private, no-store' in operation['responses'][status]['headers']['Cache-Control']['description']
+    schemas = api['components']['schemas']
+    public, token = schemas['PublicPricingResult'], schemas['TokenPricingResult']
+    fields = ['success', 'data', 'vendors', 'group_ratio', 'usable_group', 'supported_endpoint', 'auto_groups', 'pricing_version']
+    assert public['required'] == fields and set(public['properties']) == set(fields)
+    assert token['required'] == fields + ['group'] and set(token['properties']) == set(fields + ['group'])
+    assert public['additionalProperties'] is False and token['additionalProperties'] is False
+    assert token['properties']['group'] == {'type': 'string'}
+    assert token['properties']['data'] == {'type': 'array', 'items': {'$ref': '#/components/schemas/TokenPricingEntry'}}
+    for field in set(fields) - {'data'}:
+        assert public['properties'][field] == token['properties'][field], field
+    assert schemas['TokenPricingEntry'] == {
+        'allOf': [{'$ref': '#/components/schemas/PricingEntry'}, {'type': 'object', 'properties': {
+            'enable_groups': {'type': 'array', 'minItems': 1, 'uniqueItems': True, 'items': {'type': 'string', 'not': {'enum': ['all']}}},
+        }}], 'description': 'Only selected permitted candidates; the all sentinel is expanded and never returned.',
+    }
+    assert schemas['PricingEntry']['additionalProperties'] is False
+    for name in ['model_ratio', 'model_price', 'completion_ratio']:
+        assert schemas['PricingEntry']['properties'][name] == {'type': 'number', 'format': 'double'}
+    return {'optional_public_sk': True, 'required_token_group': True, 'legacy_shape_preserved': True, 'execution_capability': False}
+
+
 def check_token_usage(api):
     operation = api['paths']['/api/usage/token/']['get']
     assert operation['security'] == [{'RelayKey': []}]
@@ -765,6 +805,7 @@ def main():
 
     fixtures = json.loads((Path(__file__).with_name('fixtures.json')).read_text())
     results['token_usage'] = check_token_usage(api)
+    results['token_pricing'] = check_token_pricing(api)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
     for fixture in fixtures:
         if fixture.get('kind') == 's3_operation':

@@ -17,9 +17,12 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -905,6 +908,398 @@ func TestGetTokenUsageAuthenticatedSnapshot(t *testing.T) {
 			assert.NotContains(t, data, "auto_groups")
 		})
 	}
+}
+
+func TestGetTokenPricingProjection(t *testing.T) {
+	previousDB, previousLog := model.DB, model.LOG_DB
+	previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousRedis, previousSecret := common.RedisEnabled, common.SessionSecret
+	db := setupTokenControllerTestDB(t)
+	t.Cleanup(func() {
+		model.InvalidatePricingCache()
+		model.DB, model.LOG_DB = previousDB, previousLog
+		common.SetDatabaseTypes(previousMainType, previousLogType)
+		common.RedisEnabled, common.SessionSecret = previousRedis, previousSecret
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.AuditLog{}, &model.UserAccessToken{}, &model.Option{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB())
+	common.SessionSecret = "pricing-fixture-session-signing-secret"
+
+	for _, settingSnapshot := range []struct {
+		before  string
+		restore func(string) error
+		next    string
+	}{
+		{setting.UserUsableGroups2JSONString(), setting.UpdateUserUsableGroupsByJSONString, `{"g1":"Group one","g2":"Group two","g3":"Group three","auto":"Auto","no-ratio":"Unavailable ratio"}`},
+		{setting.AutoGroups2JsonString(), setting.UpdateAutoGroupsByJsonString, `["g3","g2","g1","g3","revoked"]`},
+		{strconv.Itoa(setting.GetMaxTokenAutoGroups()), setting.UpdateMaxTokenAutoGroups, "2"},
+		{ratio_setting.GroupRatio2JSONString(), ratio_setting.UpdateGroupRatioByJSONString, `{"g1":2,"g2":3,"g3":4,"owner-a":1.6,"owner-b":2.2,"private-group":9}`},
+		{ratio_setting.GroupGroupRatio2JSONString(), ratio_setting.UpdateGroupGroupRatioByJSONString, `{"owner-a":{"g1":0.25,"g2":0.5,"g3":0.75,"owner-a":1.125},"owner-b":{"g2":1.75},"g1":{"g1":9,"g2":99}}`},
+		{ratio_setting.ModelPrice2JSONString(), ratio_setting.UpdateModelPriceByJSONString, `{"pricing-fixed":0.05}`},
+		{ratio_setting.ModelRatio2JSONString(), ratio_setting.UpdateModelRatioByJSONString, `{"pricing-mixed":2.5,"pricing-only-b":4.5,"pricing-owner":6.5}`},
+		{ratio_setting.CompletionRatio2JSONString(), ratio_setting.UpdateCompletionRatioByJSONString, `{"pricing-mixed":1.75}`},
+		{ratio_setting.CacheRatio2JSONString(), ratio_setting.UpdateCacheRatioByJSONString, `{"pricing-mixed":0.1}`},
+	} {
+		t.Cleanup(func() { require.NoError(t, settingSnapshot.restore(settingSnapshot.before)) })
+		require.NoError(t, settingSnapshot.restore(settingSnapshot.next))
+	}
+	special := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+	originalSpecial := special.ReadAll()
+	special.Clear()
+	t.Cleanup(func() { special.Clear(); special.AddAll(originalSpecial) })
+	common.OptionMapRWMutex.Lock()
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	previousNav, hadNav := common.OptionMap["HeaderNavModules"]
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		defer common.OptionMapRWMutex.Unlock()
+		if hadNav {
+			common.OptionMap["HeaderNavModules"] = previousNav
+		} else {
+			delete(common.OptionMap, "HeaderNavModules")
+		}
+	})
+
+	owner := &model.User{Username: "pricing-private-owner", Password: "unused", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "owner-a", AffCode: "pricinga"}
+	other := &model.User{Username: "pricing-private-root", Password: "unused", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "owner-b", AffCode: "pricingb"}
+	require.NoError(t, db.Create(owner).Error)
+	require.NoError(t, db.Create(other).Error)
+	userSession, err := service.CreateLoginSession(owner.Id, "password", "203.0.113.7", "pricing-fixture")
+	require.NoError(t, err)
+	rootSession, err := service.CreateLoginSession(other.Id, "password", "203.0.113.7", "pricing-fixture")
+	require.NoError(t, err)
+	token := seedToken(t, db, owner.Id, "Pricing token", "pricingkeya")
+	rootToken := seedToken(t, db, other.Id, "Root pricing token", "pricingkeyb")
+	require.NoError(t, db.Model(token).Update("group", "g1").Error)
+	require.NoError(t, db.Model(rootToken).Update("group", "g2").Error)
+	patRaw := model.AccessTokenPrefix + strings.Repeat("p", 43)
+	pat := &model.UserAccessToken{Name: "Pricing PAT", TokenHash: model.AccessTokenFingerprint(patRaw), TokenHint: model.AccessTokenHint(patRaw)}
+	require.NoError(t, pat.SetScopes([]string{"profile:read"}))
+	require.NoError(t, model.CreateUserAccessToken(owner.Id, pat, service.AccessTokenMaxPerUser))
+
+	channel := &model.Channel{Type: constant.ChannelTypeOpenAI, Name: "pricing-fixture", Key: "unused-channel-key", Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(channel).Error)
+	vendor := &model.Vendor{Name: "Fixture vendor"}
+	require.NoError(t, db.Create(vendor).Error)
+	for _, entry := range []struct {
+		name   string
+		groups []string
+	}{
+		{"pricing-fixed", []string{"all"}},
+		{"pricing-mixed", []string{"g1", "g2", "private-group"}},
+		{"pricing-only-b", []string{"g2"}},
+		{"pricing-owner", []string{"owner-a"}},
+	} {
+		require.NoError(t, db.Create(&model.Model{ModelName: entry.name, Description: "Fixture metadata", VendorID: vendor.Id, Status: 1, NameRule: model.NameRuleExact}).Error)
+		for _, group := range entry.groups {
+			require.NoError(t, db.Create(&model.Ability{Group: group, Model: entry.name, ChannelId: channel.Id, Enabled: true}).Error)
+		}
+	}
+	model.InvalidatePricingCache()
+	cacheWire, err := common.Marshal(model.GetPricing())
+	require.NoError(t, err)
+	var cache []model.Pricing
+	require.NoError(t, common.Unmarshal(cacheWire, &cache))
+	require.Len(t, cache, 4)
+	byModel := make(map[string]model.Pricing, len(cache))
+	for _, item := range cache {
+		byModel[item.ModelName] = item
+	}
+	require.Equal(t, 0.05, byModel["pricing-fixed"].ModelPrice)
+	require.Equal(t, 2.5, byModel["pricing-mixed"].ModelRatio)
+	require.Equal(t, 1.75, byModel["pricing-mixed"].CompletionRatio)
+	require.NotNil(t, byModel["pricing-mixed"].CacheRatio)
+
+	perform := func(t *testing.T, policy string, headers []string, cookie bool, afterAuth gin.HandlerFunc) (*httptest.ResponseRecorder, map[string]any, int) {
+		t.Helper()
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap["HeaderNavModules"] = policy
+		common.OptionMapRWMutex.Unlock()
+		handled := 0
+		router := gin.New()
+		router.GET("/api/pricing", middleware.HeaderNavModuleAuth("pricing"), func(c *gin.Context) {
+			handled++
+			if afterAuth != nil {
+				afterAuth(c)
+			}
+			GetPricing(c)
+		})
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/api/pricing", nil)
+		request.RemoteAddr = "203.0.113.7:1234"
+		for _, header := range headers {
+			request.Header.Add("Authorization", header)
+		}
+		if cookie {
+			request.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: rootSession.RefreshToken})
+			request.Header.Set("X-Auth-Session", rootSession.AccessToken)
+		}
+		router.ServeHTTP(recorder, request)
+		var body map[string]any
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+		for _, secret := range []string{token.Key, rootToken.Key, userSession.AccessToken, rootSession.AccessToken, rootSession.RefreshToken, patRaw, owner.Username, other.Username} {
+			assert.NotContains(t, recorder.Body.String(), secret)
+		}
+		return recorder, body, handled
+	}
+	projection := func(t *testing.T, body map[string]any, selected, base string, candidates []string) {
+		t.Helper()
+		assert.Equal(t, selected, body["group"])
+		assert.ElementsMatch(t, []string{"success", "data", "group", "vendors", "group_ratio", "usable_group", "supported_endpoint", "auto_groups", "pricing_version"}, slices.Collect(maps.Keys(body)))
+		for _, field := range []string{"group_ratio", "usable_group"} {
+			collection, ok := body[field].(map[string]any)
+			require.True(t, ok, field)
+			assert.ElementsMatch(t, candidates, slices.Collect(maps.Keys(collection)))
+		}
+		for _, candidate := range candidates {
+			assert.Equal(t, service.GetUserGroupRatio(base, candidate), body["group_ratio"].(map[string]any)[candidate])
+		}
+		groups, ok := body["auto_groups"].([]any)
+		require.True(t, ok)
+		expectedAuto := []string{}
+		if selected == "auto" {
+			expectedAuto = candidates
+		}
+		require.Len(t, groups, len(expectedAuto))
+		for i, group := range expectedAuto {
+			assert.Equal(t, group, groups[i])
+		}
+		wire, err := common.Marshal(body["data"])
+		require.NoError(t, err)
+		var actual []model.Pricing
+		require.NoError(t, common.Unmarshal(wire, &actual))
+		require.NotNil(t, actual)
+		expected := make(map[string]model.Pricing)
+		for _, original := range cache {
+			groups := []string{}
+			for _, candidate := range candidates {
+				if slices.Contains(original.EnableGroup, "all") || slices.Contains(original.EnableGroup, candidate) {
+					groups = append(groups, candidate)
+				}
+			}
+			if len(groups) > 0 {
+				original.EnableGroup = groups
+				expected[original.ModelName] = original
+			}
+		}
+		require.Len(t, actual, len(expected))
+		for _, item := range actual {
+			assert.Equal(t, expected[item.ModelName], item)
+			assert.NotContains(t, item.EnableGroup, "all")
+			assert.NotContains(t, item.EnableGroup, "private-group")
+		}
+		after, err := common.Marshal(model.GetPricing())
+		require.NoError(t, err)
+		assert.JSONEq(t, string(cacheWire), string(after))
+	}
+	const public = `{"pricing":{"enabled":true,"requireAuth":false}}`
+	const login = `{"pricing":{"enabled":true,"requireAuth":true}}`
+	const disabled = `{"pricing":{"enabled":false,"requireAuth":false}}`
+	for _, policy := range []struct {
+		name, raw string
+		statuses  []int
+	}{
+		{"public", public, []int{200, 200, 200, 200, 200}},
+		{"login", login, []int{401, 200, 200, 403, 403}},
+		{"disabled", disabled, []int{403, 403, 200, 403, 403}},
+	} {
+		for i, principal := range []struct{ name, credential string }{
+			{"anonymous", ""}, {"dashboard user", "Bearer " + userSession.AccessToken}, {"dashboard root", "Bearer " + rootSession.AccessToken},
+			{"sk", "Bearer sk-" + token.Key}, {"root sk", "Bearer sk-" + rootToken.Key},
+		} {
+			t.Run(policy.name+"/"+principal.name, func(t *testing.T) {
+				var headers []string
+				if principal.credential != "" {
+					headers = []string{principal.credential}
+				}
+				recorder, body, handled := perform(t, policy.raw, headers, false, nil)
+				require.Equal(t, policy.statuses[i], recorder.Code)
+				if i >= 3 {
+					assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+				}
+				if recorder.Code != 200 {
+					assert.Zero(t, handled)
+					assert.NotContains(t, body, "data")
+					assert.NotContains(t, body, "group")
+					return
+				}
+				assert.Equal(t, 1, handled)
+				if i < 3 {
+					assert.NotContains(t, body, "group")
+				} else if i == 3 {
+					projection(t, body, "g1", "owner-a", []string{"g1"})
+				} else {
+					projection(t, body, "g2", "owner-b", []string{"g2"})
+				}
+			})
+		}
+	}
+	t.Run("mixed cookie and canonical bearer", func(t *testing.T) {
+		for _, policy := range []string{public, login, disabled} {
+			recorder, body, handled := perform(t, policy, []string{"bearer sk-" + token.Key}, true, nil)
+			assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+			if policy == public {
+				require.Equal(t, 200, recorder.Code)
+				assert.Equal(t, 1, handled)
+				projection(t, body, "g1", "owner-a", []string{"g1"})
+			} else {
+				require.Equal(t, 403, recorder.Code)
+				assert.Zero(t, handled)
+				assert.NotContains(t, body, "data")
+			}
+		}
+		recorder, body, handled := perform(t, public, []string{"Bearer sk-unknownkey"}, true, nil)
+		assert.Equal(t, 401, recorder.Code)
+		assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+		assert.Zero(t, handled)
+		assert.NotContains(t, body, "data")
+	})
+	for _, tc := range []struct {
+		name    string
+		headers []string
+	}{
+		{"raw", []string{"sk-" + token.Key}}, {"wrong scheme", []string{"Basic sk-" + token.Key}},
+		{"uppercase prefix", []string{"Bearer SK-" + token.Key}}, {"uppercase scheme", []string{"BEARER sk-" + token.Key}},
+		{"empty", []string{"Bearer sk-"}}, {"suffix", []string{"Bearer sk-" + token.Key + "-channel"}},
+		{"duplicate sk first", []string{"Bearer sk-" + token.Key, "Bearer " + rootSession.AccessToken}},
+		{"duplicate dashboard first", []string{"Bearer " + rootSession.AccessToken, "Bearer sk-" + token.Key}},
+		{"comma mixed", []string{"Bearer " + rootSession.AccessToken + ", Bearer sk-" + token.Key}},
+		{"leading space", []string{" Bearer sk-" + token.Key}}, {"extra separator", []string{"Bearer  sk-" + token.Key}},
+		{"trailing space", []string{"Bearer sk-" + token.Key + " "}}, {"NBSP leading", []string{"Bearer \u00a0sk-" + token.Key}},
+		{"NBSP trailing", []string{"Bearer sk-" + token.Key + "\u00a0"}}, {"EM SPACE leading", []string{"\u2003Bearer sk-" + token.Key}},
+		{"EM SPACE trailing", []string{"Bearer sk-" + token.Key + "\u2003"}}, {"NBSP separator", []string{"Bearer\u00a0sk-" + token.Key}},
+		{"embedded control", []string{"Bearer sk-" + token.Key + "\tother"}},
+	} {
+		t.Run("syntax/"+tc.name, func(t *testing.T) {
+			recorder, body, handled := perform(t, public, tc.headers, true, nil)
+			assert.Equal(t, 401, recorder.Code)
+			assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+			assert.Zero(t, handled)
+			assert.NotContains(t, body, "data")
+			assert.NotContains(t, body, "group")
+		})
+	}
+	for _, tc := range []struct {
+		name         string
+		tokenUpdates map[string]any
+		banned       bool
+		status       int
+	}{
+		{"expired", map[string]any{"status": common.TokenStatusExpired, "expired_time": time.Now().Unix() - 60}, false, 200},
+		{"exhausted", map[string]any{"status": common.TokenStatusExhausted, "remain_quota": 0, "unlimited_quota": false}, false, 200},
+		{"disabled", map[string]any{"status": common.TokenStatusDisabled}, false, 401},
+		{"IP mismatch", map[string]any{"allow_ips": "198.51.100.1"}, false, 403},
+		{"owner disabled", nil, true, 403},
+	} {
+		t.Run("readonly/"+tc.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				require.NoError(t, db.Model(token).Updates(map[string]any{"status": common.TokenStatusEnabled, "expired_time": -1, "remain_quota": 100, "unlimited_quota": true, "allow_ips": ""}).Error)
+				require.NoError(t, db.Model(owner).Update("status", common.UserStatusEnabled).Error)
+			})
+			if tc.tokenUpdates != nil {
+				require.NoError(t, db.Model(token).Updates(tc.tokenUpdates).Error)
+			}
+			if tc.banned {
+				require.NoError(t, db.Model(owner).Update("status", common.UserStatusDisabled).Error)
+			}
+			recorder, body, handled := perform(t, public, []string{"Bearer sk-" + token.Key}, false, nil)
+			require.Equal(t, tc.status, recorder.Code)
+			assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+			if tc.status == 200 {
+				assert.Equal(t, 1, handled)
+				projection(t, body, "g1", "owner-a", []string{"g1"})
+			} else {
+				assert.Zero(t, handled)
+				assert.NotContains(t, body, "data")
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, selected, auto, revoke string
+		candidates                   []string
+	}{
+		{"inherited owner", "", "", "", []string{"owner-a"}},
+		{"auto empty", "auto", "", "", []string{"g3", "g2", "g1"}},
+		{"auto null", "auto", "null", "", []string{"g3", "g2", "g1"}},
+		{"auto empty array", "auto", "[]", "", []string{"g3", "g2", "g1"}},
+		{"custom filters before limit", "auto", `["revoked","g2","g2","g3","g1"]`, "", []string{"g2", "g3"}},
+		{"malformed custom", "auto", `{broken`, "", []string{}},
+		{"revoked custom", "auto", `["revoked"]`, "", []string{}},
+		{"auto permission revoked", "auto", "", "auto", []string{}},
+		{"named permission revoked", "g1", "", "g1", []string{}},
+		{"missing ratio", "no-ratio", "", "", []string{}},
+	} {
+		t.Run("groups/"+tc.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				require.NoError(t, db.Model(token).Updates(map[string]any{"group": "g1", "auto_groups": ""}).Error)
+				special.Clear()
+			})
+			require.NoError(t, db.Model(token).Updates(map[string]any{"group": tc.selected, "auto_groups": tc.auto}).Error)
+			if tc.revoke != "" {
+				special.Set("owner-a", map[string]string{"-:" + tc.revoke: ""})
+			}
+			recorder, body, handled := perform(t, public, []string{"Bearer sk-" + token.Key}, false, nil)
+			require.Equal(t, 200, recorder.Code)
+			assert.Equal(t, 1, handled)
+			selected := tc.selected
+			if selected == "" {
+				selected = "owner-a"
+			}
+			projection(t, body, selected, "owner-a", tc.candidates)
+		})
+	}
+	for _, mode := range []string{"missing snapshot", "malformed snapshot", "mismatched token", "malformed branch marker", "replace header"} {
+		t.Run("snapshot/"+mode, func(t *testing.T) {
+			recorder, body, handled := perform(t, public, []string{"Bearer sk-" + token.Key}, false, func(c *gin.Context) {
+				switch mode {
+				case "missing snapshot":
+					delete(c.Keys, "read_only_token_identity")
+				case "malformed snapshot":
+					c.Set("read_only_token_identity", token)
+				case "mismatched token":
+					c.Set("token_id", rootToken.Id)
+				case "malformed branch marker":
+					c.Set("pricing_token_branch", "untrusted")
+				case "replace header":
+					c.Request.Header.Set("Authorization", "Bearer sk-"+rootToken.Key)
+				}
+			})
+			assert.Equal(t, 1, handled)
+			assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+			if mode == "replace header" {
+				require.Equal(t, 200, recorder.Code)
+				projection(t, body, "g1", "owner-a", []string{"g1"})
+			} else {
+				assert.Equal(t, 401, recorder.Code)
+				assert.NotContains(t, body, "data")
+			}
+		})
+	}
+	t.Run("interleaved cache and dashboard compatibility", func(t *testing.T) {
+		var baselines []string
+		for _, headers := range [][]string{nil, {"Bearer " + userSession.AccessToken}, {"Bearer " + rootSession.AccessToken}, {"Bearer " + patRaw}} {
+			recorder, body, handled := perform(t, public, headers, false, nil)
+			require.Equal(t, 200, recorder.Code)
+			assert.Equal(t, 1, handled)
+			assert.NotContains(t, body, "group")
+			baselines = append(baselines, recorder.Body.String())
+		}
+		for _, selection := range []struct{ key, group, base string }{{token.Key, "g1", "owner-a"}, {rootToken.Key, "g2", "owner-b"}} {
+			recorder, body, _ := perform(t, public, []string{"Bearer sk-" + selection.key}, false, nil)
+			require.Equal(t, 200, recorder.Code)
+			projection(t, body, selection.group, selection.base, []string{selection.group})
+		}
+		for i, headers := range [][]string{nil, {"Bearer " + userSession.AccessToken}, {"Bearer " + rootSession.AccessToken}, {"Bearer " + patRaw}} {
+			recorder, _, _ := perform(t, public, headers, false, nil)
+			require.Equal(t, 200, recorder.Code)
+			assert.JSONEq(t, baselines[i], recorder.Body.String())
+		}
+		assert.JSONEq(t, baselines[1], baselines[3])
+	})
 }
 
 func TestAPITokenAuditDatabaseMatrix(t *testing.T) {

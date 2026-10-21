@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
@@ -12,6 +13,18 @@ import (
 type headerNavAccess struct {
 	Enabled     bool
 	RequireAuth bool
+}
+
+const pricingTokenContextKey = "pricing_token_branch"
+
+type pricingTokenBranch struct{}
+
+// TokenPricingRequest distinguishes an absent marker from a malformed one, so
+// a selected token request can never fall back to the public/dashboard view.
+func TokenPricingRequest(c *gin.Context) (selected, trusted bool) {
+	value, selected := c.Get(pricingTokenContextKey)
+	_, trusted = value.(pricingTokenBranch)
+	return selected, trusted
 }
 
 func getHeaderNavAccess(module string) headerNavAccess {
@@ -113,6 +126,42 @@ func parseHeaderNavBool(value any, fallback bool) bool {
 func HeaderNavModuleAuth(module string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		access := getHeaderNavAccess(module)
+		if module == "pricing" {
+			authorizations := c.Request.Header.Values("Authorization")
+			skIntent := false
+			for _, authorization := range authorizations {
+				for _, part := range strings.FieldsFunc(authorization, func(r rune) bool { return unicode.IsSpace(r) || r == ',' }) {
+					if strings.HasPrefix(strings.ToLower(part), "sk-") {
+						skIntent = true
+						break
+					}
+				}
+			}
+			if skIntent {
+				c.Header("Cache-Control", "private, no-store")
+				if len(authorizations) != 1 {
+					c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "Invalid Bearer token"})
+					c.Abort()
+					return
+				}
+				scheme, credential, separated := strings.Cut(authorizations[0], " ")
+				key, prefixed := strings.CutPrefix(credential, "sk-")
+				if !separated || scheme != "Bearer" && scheme != "bearer" || !prefixed || key == "" ||
+					strings.ContainsAny(key, "-,") || strings.IndexFunc(credential, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+					c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "Invalid Bearer token"})
+					c.Abort()
+					return
+				}
+				if !access.Enabled || access.RequireAuth {
+					c.JSON(http.StatusForbidden, gin.H{"success": false, "message": accessTokenSessionRequiredMsg})
+					c.Abort()
+					return
+				}
+				c.Set(pricingTokenContextKey, pricingTokenBranch{})
+				TokenAuthReadOnly()(c)
+				return
+			}
+		}
 		if !access.Enabled {
 			// Keep root pricing management available without reopening the public model square.
 			if module == "pricing" && c.GetHeader("Authorization") != "" {

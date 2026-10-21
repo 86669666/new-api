@@ -76,6 +76,9 @@ const statusService = statusServices[0].name;
 const usageServices = services.filter(service => service.source.includes('    public static getApiUsageTokenCollection('));
 assert.equal(usageServices.length, 1, 'Exactly one generated read-only usage method is required');
 const usageService = usageServices[0].name;
+const pricingServices = services.filter(service => service.source.includes('    public static getApiPricing('));
+assert.equal(pricingServices.length, 1, 'Exactly one generated pricing method is required');
+const pricingService = pricingServices[0].name;
 const camel = value => value.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
 const invocationMap = lifecycleFixtures.map(fixture => {
   const method = camel(fixture.operationId);
@@ -170,6 +173,20 @@ typedCalls.push(`client.Service.postApiVerify({ requestBody: { scope: 'channel.k
 typedCalls.push(`const personalProof: client.PersonalSecurityProofData = { proof_token: 'fixture', scope: 'channel.key.read', method: 'password', expires_at: 1900000060 };`);
 await writeFile(consumer, await readFile(consumer, 'utf8') + `\nimport * as client from './api';\nexport function compileLifecycleCalls() {\n${typedCalls.join('\n')}\n}\n`);
 await writeFile(consumer, await readFile(consumer, 'utf8') + `\nexport async function compileSiteDescription() {\n  const result = await client.${statusService}.getApiStatus({});\n  const identity: string = result.data.instance_id;\n  const topup: string | null = result.data.console_links.topup;\n  const flags: client.ClientFeatureFlags = result.data.client_features;\n  return { identity, topup, flags };\n}\nexport async function compileTokenUsage() {\n  const result = await client.${usageService}.getApiUsageTokenCollection({});\n  if (result.code !== true) return null;\n  const group: string = result.data.group;\n  const quota: number | undefined = result.data.user_quota?.total_available;\n  // @ts-expect-error group remains a string\n  const invalidGroup: client.TokenUsageData['group'] = ['auto'];\n  return { group, quota };\n}\n`);
+await writeFile(consumer, await readFile(consumer, 'utf8') + `
+export async function compileTokenPricing() {
+  const result = await client.${pricingService}.getApiPricing({});
+  if (!('group' in result)) return null;
+  const group: string = result.group;
+  const ratio: number | undefined = result.group_ratio[group];
+  const prices: number[] = result.data.map(entry => entry.model_price);
+  // @ts-expect-error selected pricing requires its top-level group
+  const missingGroup: client.TokenPricingResult = { success: true, data: [], vendors: [], group_ratio: {}, usable_group: {}, supported_endpoint: {}, auto_groups: [], pricing_version: 'fixture' };
+  // @ts-expect-error selection is a string, not candidate array
+  const invalidGroup: client.TokenPricingResult['group'] = ['auto'];
+  return { group, ratio, prices };
+}
+`);
 execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'), '--strict', '--target', 'ES2020', '--module', 'commonjs', '--lib', 'ES2020,DOM', '--rootDir', path.join(output, 'generated'), '--outDir', path.join(output, 'compiled'), path.join(output, 'generated/api/index.ts'), path.join(output, 'generated/relay/index.ts'), consumer], { stdio: 'inherit' });
 const api = require(path.join(output, 'compiled/api/index.js'));
 const relay = require(path.join(output, 'compiled/relay/index.js'));
@@ -403,6 +420,31 @@ responseStatus = 401;
 responseBody = { success: false, message: 'Invalid Bearer token' };
 await assert.rejects(api[usageService].getApiUsageTokenCollection({}), error => error.status === 401 && error.body.message === 'Invalid Bearer token');
 const usageStubbedRequests = calls.length - beforeUsageRequests;
+const beforePricingRequests = calls.length;
+responseStatus = 200;
+api.OpenAPI.TOKEN = 'sk-generated-pricing-fixture';
+api.OpenAPI.HEADERS = undefined;
+for (const name of ['token pricing named', 'token pricing auto', 'token pricing revoked empty']) {
+  responseBody = allFixtures.find(fixture => fixture.name === name).value;
+  const pricingResult = await api[pricingService].getApiPricing({});
+  assert.deepEqual(pricingResult, responseBody);
+  assert.equal(typeof pricingResult.group, 'string');
+  assert.equal(calls.at(-1).url, api.OpenAPI.BASE + '/api/pricing');
+  assert.equal(calls.at(-1).init.method, 'GET');
+  assert.equal(calls.at(-1).init.body, undefined);
+  assert.equal(new Headers(calls.at(-1).init.headers).get('Authorization'), 'Bearer sk-generated-pricing-fixture');
+  assert.equal(new Headers(calls.at(-1).init.headers).has('X-Security-Proof'), false);
+}
+responseStatus = 403;
+responseBody = { success: false, message: 'a dashboard login session is required' };
+await assert.rejects(api[pricingService].getApiPricing({}), error => error.status === 403 && error.body.message === 'a dashboard login session is required');
+api.OpenAPI.TOKEN = undefined;
+responseStatus = 200;
+responseBody = allFixtures.find(fixture => fixture.name === 'public pricing unchanged shape').value;
+assert.deepEqual(await api[pricingService].getApiPricing({}), responseBody);
+assert.equal(new Headers(calls.at(-1).init.headers).has('Authorization'), false);
+assert.equal('group' in responseBody, false);
+const pricingStubbedRequests = calls.length - beforePricingRequests;
 const beforeStatusRequests = calls.length;
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
@@ -415,4 +457,4 @@ assert.equal(calls.at(-1).init.method, 'GET');
 assert.equal(calls.at(-1).init.body, undefined);
 assert.equal(new Headers(calls.at(-1).init.headers).has('Authorization'), false);
 assert.equal(new Headers(calls.at(-1).init.headers).has('X-Security-Proof'), false);
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 14, typed_consumer_negative_calls: 10, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, site_description_stubbed_requests: calls.length - beforeStatusRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 15, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, site_description_stubbed_requests: calls.length - beforeStatusRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
