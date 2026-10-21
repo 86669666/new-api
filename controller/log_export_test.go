@@ -357,6 +357,64 @@ func TestUserLogRangeErrorStatus(t *testing.T) {
 	}
 }
 
+func TestUserQuotaRangeErrorStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&model.QuotaData{}))
+	setting := operation_setting.GetLogSetting()
+	previousSetting := *setting
+	t.Cleanup(func() { *setting = previousSetting })
+	require.Equal(t, 365, setting.MaxRangeDays, "default limit in a fresh test process")
+	// The fixed past end keeps the exact boundary independent of elapsed time.
+	end := time.Now().Unix() - 3600
+	for _, days := range []int{365, 7} {
+		setting.MaxRangeDays = days
+		span := int64(days) * 24 * 60 * 60
+		for _, tc := range []struct {
+			name   string
+			role   int
+			start  int64
+			status int
+		}{
+			{"exact_boundary", common.RoleCommonUser, end - span, http.StatusOK},
+			{"one_second_too_wide", common.RoleCommonUser, end - span - 1, http.StatusBadRequest},
+			{"missing_start", common.RoleCommonUser, 0, http.StatusOK},
+			{"admin_still_limited", common.RoleAdminUser, end - span - 1, http.StatusBadRequest},
+			{"root_still_limited", common.RoleRootUser, end - span - 1, http.StatusBadRequest},
+		} {
+			t.Run(fmt.Sprintf("days_%d/%s", days, tc.name), func(t *testing.T) {
+				query := url.Values{"end_timestamp": {fmt.Sprint(end)}}
+				if tc.start != 0 {
+					query.Set("start_timestamp", fmt.Sprint(tc.start))
+				}
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodGet, "/api/data/self?"+query.Encode(), nil)
+				ctx.Set("id", 1)
+				ctx.Set("auth_identity", service.AuthIdentity{UserID: 1})
+				ctx.Set("role", tc.role)
+				GetUserQuotaDates(ctx)
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+				code, hasCode := body["code"]
+				t.Logf("role=%d max_days=%d start=%d end=%d HTTP=%d has_code=%t code=%v", tc.role, days, tc.start, end, recorder.Code, hasCode, code)
+				assert.Equal(t, tc.status, recorder.Code)
+				if tc.status == http.StatusBadRequest {
+					assert.Equal(t, map[string]any{
+						"success": false, "code": "LOG_RANGE_TOO_WIDE",
+						"message":        fmt.Sprintf("The time range cannot exceed %d days", days),
+						"message_key":    "The time range cannot exceed {{days}} days",
+						"message_params": map[string]any{"days": float64(days)},
+					}, body)
+					return
+				}
+				assert.Equal(t, map[string]any{"success": true, "message": "", "data": []any{}}, body)
+			})
+		}
+	}
+}
+
 func TestLogExportRules(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, _ := newAuditTestDatabase(t, "sqlite", "")

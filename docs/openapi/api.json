@@ -10673,7 +10673,7 @@
       "get": {
         "summary": "获取个人额度数据",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限）",
+        "description": "🔐 需要登录（User权限） The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. Timestamp parsing/defaults, missing-start fallback, min(now,end), strict greater-than boundary and successful data are unchanged.",
         "tags": [
           "数据统计"
         ],
@@ -10726,7 +10726,69 @@
             }
           },
           "400": {
-            "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+            "description": "Organization selector errors occur before authentication. LOG_RANGE_TOO_WIDE occurs after authentication in GetUserQuotaDates; all authenticated roles, including administrators and root, remain subject to the same range limit. Complete existing message/message_key/message_params are preserved; only status400 and the stable code are added. The Cache-Control promise remains conditional on organization-selector rejection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Set on these canonical GET routes before authentication/rate limiting, and on organization-boundary rejections. Not a promise for framework redirects before middleware."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PersonalLogRangeError"
+                    }
+                  ]
+                },
+                "examples": {
+                  "ORG_SELECTOR_INVALID": {
+                    "value": {
+                      "success": false,
+                      "code": "ORG_SELECTOR_INVALID",
+                      "message": "Invalid organization selector.",
+                      "message_key": "Invalid organization selector."
+                    }
+                  },
+                  "ORG_SELECTOR_CONFLICT": {
+                    "value": {
+                      "success": false,
+                      "code": "ORG_SELECTOR_CONFLICT",
+                      "message": "Organization selectors conflict.",
+                      "message_key": "Organization selectors conflict."
+                    }
+                  },
+                  "LOG_RANGE_TOO_WIDE_365": {
+                    "value": {
+                      "success": false,
+                      "code": "LOG_RANGE_TOO_WIDE",
+                      "message": "The time range cannot exceed 365 days",
+                      "message_key": "The time range cannot exceed {{days}} days",
+                      "message_params": {
+                        "days": 365
+                      }
+                    }
+                  },
+                  "LOG_RANGE_TOO_WIDE_7": {
+                    "value": {
+                      "success": false,
+                      "code": "LOG_RANGE_TOO_WIDE",
+                      "message": "The time range cannot exceed 7 days",
+                      "message_key": "The time range cannot exceed {{days}} days",
+                      "message_params": {
+                        "days": 7
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "security": [
@@ -28204,7 +28266,7 @@
       },
       "PersonalLogRangeError": {
         "type": "object",
-        "description": "Only the ordinary-user GET /api/log/self overwide-range error, after personal owner validation and the role check. Existing Message text and numeric days are preserved.",
+        "description": "The overwide-range error for ordinary-user GET /api/log/self and for GET /api/data/self at all authenticated roles, including administrators and root. Existing Message text and numeric days are preserved.",
         "additionalProperties": false,
         "required": [
           "success",

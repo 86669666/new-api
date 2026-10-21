@@ -285,11 +285,24 @@ def check_personal_log_range_error(api):
                                'required': ['days'], 'properties': {'days': {'type': 'integer'}}},
         },
     }
+    data_operation = api['paths']['/api/data/self']['get']
+    data_response = data_operation['responses']['400']
+    assert data_response['headers'] == legacy['headers']
+    assert data_response['content'] == response['content']
+    assert 'before authentication' in data_response['description']
+    assert 'after authentication in GetUserQuotaDates' in data_response['description']
+    assert 'all authenticated roles, including administrators and root' in data_response['description']
+    assert data_operation['security'] == [{'DashboardJWT': []}, {'PersonalAccessToken': []}]
+    assert data_operation['x-pat-scope'] == 'usage:read'
+    assert data_operation['parameters'] == [
+        {'$ref': '#/components/parameters/PersonalOrganizationHeader'},
+        {'$ref': '#/components/parameters/PersonalOrganizationQuery'},
+    ]
     for path, item in api['paths'].items():
-        if path == '/api/log/self':
+        if path in ('/api/log/self', '/api/data/self'):
             continue
         assert all(node.get('$ref') != '#/components/schemas/PersonalLogRangeError' for node in walk(item))
-    return {'scope': '/api/log/self ordinary-user range error only', 'status': 400,
+    return {'scope': '/api/log/self ordinary-user and /api/data/self all-role range errors only', 'status': 400,
             'code': 'LOG_RANGE_TOO_WIDE', 'selector_400_preserved': True, 'structured_message_preserved': True}
 
 

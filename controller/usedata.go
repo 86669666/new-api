@@ -66,7 +66,7 @@ func GetUserQuotaDates(c *gin.Context) {
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
 	startTimestamp, err := limitLogTimeRange(startTimestamp, endTimestamp)
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusBadRequest, err, gin.H{"code": "LOG_RANGE_TOO_WIDE"})
 		return
 	}
 	dates, err := model.GetQuotaDataByUserId(userId, startTimestamp, endTimestamp)
