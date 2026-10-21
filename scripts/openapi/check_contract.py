@@ -126,6 +126,37 @@ def check_conditional_authorization(source_root):
     }
 
 
+def check_no_available_channel_detail(relay):
+    schema = relay['components']['schemas']['RelayError']
+    assert schema['type'] == 'object' and schema['required'] == ['message', 'type']
+    assert set(schema['properties']) == {'message', 'type', 'param', 'code', 'code_detail', 'group', 'model'}
+    assert schema['properties']['message'] == {'type': 'string'}
+    assert schema['properties']['type'] == {'type': 'string'}
+    assert schema['properties']['param'] == {'nullable': True}
+    assert schema['properties']['code'] == {'nullable': True}
+    assert {key: value for key, value in schema['properties']['code_detail'].items() if key != 'description'} == {
+        'type': 'string', 'enum': ['no_available_channel'],
+    }
+    for field in ['group', 'model']:
+        assert {key: value for key, value in schema['properties'][field].items() if key != 'description'} == {'type': 'string'}
+    assert schema['oneOf'] == [
+        {'not': {'required': ['code_detail']}},
+        {'required': ['code_detail', 'group', 'model', 'code'], 'properties': {
+            'code': {'type': 'string', 'enum': ['model_not_found']},
+            'type': {'type': 'string', 'enum': ['new_api_error']},
+        }},
+    ]
+    assert schema['x-no-available-channel-contract'] == {
+        'scope': 'HTTP Distribute host OpenAI fallback only; native vendor hooks/fallback and WebSocket unchanged',
+        'trigger': 'ChannelSelectError.NoAvailableChannel only; never infer from status, code or message',
+        'code_detail': 'no_available_channel',
+        'legacy': 'HTTP503, model_not_found, new_api_error and localized message/request-id suffix unchanged',
+        'group': 'captured usingGroup; auto stays literal auto, never candidate or last-attempt groups',
+        'model': 'original distributor modelRequest.Model; no upstream mapping or plugin/channel diagnostics',
+    }
+    return {'optional_detail': 'no_available_channel', 'legacy_required_fields': ['message', 'type'], 'scope': 'marked HTTP host OpenAI only'}
+
+
 def check_personal_log_pagination(api):
     operation = api['paths']['/api/log/self']['get']
     assert operation['x-personal-log-pagination'] == {
@@ -762,6 +793,7 @@ def main():
         results['specs'][name] = {'oas': '3.0.1', 'paths': len(document['paths']), 'operations': len(ids), 'valid': True}
 
     api, relay = documents['api'], documents['relay']
+    results['no_available_channel_detail'] = check_no_available_channel_detail(relay)
     access = api['components']['schemas']['OrganizationAccess']['properties']['capabilities']
     context_access = api['components']['schemas']['RequestAccessContext']['properties']['organization']['properties']['capabilities']
     assert access == context_access, 'Organization capability projections differ between detail and context'

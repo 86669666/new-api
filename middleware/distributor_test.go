@@ -10,11 +10,16 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -241,8 +246,8 @@ func TestDistributeHidesTaskPluginDetailsButLogsDiagnostics(t *testing.T) {
 				require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 				requestID := recorder.Header().Get(common.RequestIdKey)
 				require.NotEmpty(t, requestID)
-				assert.JSONEq(t, fmt.Sprintf(`{"error":{"message":%q,"type":"new_api_error","code":"model_not_found"}}`,
-					locale.message+" (request id: "+requestID+")"), recorder.Body.String())
+				assert.JSONEq(t, fmt.Sprintf(`{"error":{"message":%q,"type":"new_api_error","code":"model_not_found","code_detail":"no_available_channel","group":%q,"model":"task-model"}}`,
+					locale.message+" (request id: "+requestID+")", group), recorder.Body.String())
 				assert.NotContains(t, recorder.Body.String(), "disable or override")
 				for _, key := range keys {
 					assert.NotContains(t, recorder.Body.String(), key)
@@ -254,6 +259,124 @@ func TestDistributeHidesTaskPluginDetailsButLogsDiagnostics(t *testing.T) {
 				assert.Contains(t, logs.String(), "reason=no_eligible_channel")
 			})
 		}
+	}
+}
+
+func TestDistributeNoAvailableChannelDetails(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	previousMemory, previousRedis := common.MemoryCacheEnabled, common.RedisEnabled
+	common.MemoryCacheEnabled, common.RedisEnabled = true, false
+	t.Cleanup(func() { common.MemoryCacheEnabled, common.RedisEnabled = previousMemory, previousRedis })
+	previousAuto := setting.AutoGroups2JsonString()
+	previousUsable := setting.UserUsableGroups2JSONString()
+	previousRatios := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, setting.UpdateAutoGroupsByJsonString(previousAuto))
+		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousUsable))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousRatios))
+	})
+	require.NoError(t, setting.UpdateAutoGroupsByJsonString(`["private-auto-candidate-a","private-auto-candidate-b"]`))
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"private-auto-candidate-a":"A","private-auto-candidate-b":"B"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"private-auto-candidate-a":1,"private-auto-candidate-b":1}`))
+
+	for _, tc := range []struct {
+		name, group, language, message string
+		emptyAuto, pinned              bool
+		status                         int
+		enriched                       bool
+	}{
+		{"named English", "detail-group", "en", "No available channel for model detail-model under group detail-group (distributor)", false, false, 503, true},
+		{"named Chinese", "detail-group", "zh-CN", "分组 detail-group 下模型 detail-model 无可用渠道（distributor）", false, false, 503, true},
+		{"auto hides candidates", "auto", "en", "No available channel for model detail-model under group auto (distributor)", false, false, 503, true},
+		{"auto selector failure is not no-channel", "auto", "en", "Failed to get available channel for model detail-model under group auto(auto) (distributor): auto groups is not enabled", true, false, 503, false},
+		{"pinned unavailable unchanged", "detail-group", "en", "Invalid channel ID", false, true, 400, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handled := 0
+			router := gin.New()
+			router.POST("/v1/chat/completions", RequestId(), func(c *gin.Context) {
+				common.SetContextKey(c, constant.ContextKeyUsingGroup, tc.group)
+				common.SetContextKey(c, constant.ContextKeyUserGroup, "detail-owner")
+				c.Set("resolved_task_model", "detail-model")
+				if tc.emptyAuto {
+					common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, []string{})
+				}
+				if tc.pinned {
+					service.GetChannelConstraints(c).AddPin(taskdto.ChannelPin{ChannelId: -1, Source: taskdto.PinSourceToken, Rank: taskdto.PinRankToken})
+				}
+			}, Distribute(), func(c *gin.Context) { handled++; c.Status(http.StatusNoContent) })
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"detail-model","credential":"private-body-canary"}`))
+			request.Header.Set("Accept-Language", tc.language)
+			request.Header.Set("Authorization", "Bearer private-credential-canary")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			require.Equal(t, tc.status, recorder.Code)
+			assert.Zero(t, handled)
+			requestID := recorder.Header().Get(common.RequestIdKey)
+			require.NotEmpty(t, requestID)
+			code := "model_not_found"
+			if tc.pinned {
+				code = ""
+			}
+			errorBody := map[string]any{"message": common.MessageWithRequestId(tc.message, requestID), "type": "new_api_error", "code": code}
+			if tc.enriched {
+				errorBody["code_detail"] = "no_available_channel"
+				errorBody["group"] = tc.group
+				errorBody["model"] = "detail-model"
+			}
+			expected, err := common.Marshal(map[string]any{"error": errorBody})
+			require.NoError(t, err)
+			assert.JSONEq(t, string(expected), recorder.Body.String())
+			for _, canary := range []string{"private-body-canary", "private-credential-canary", "private-auto-candidate-a", "private-auto-candidate-b"} {
+				assert.NotContains(t, recorder.Body.String(), canary)
+			}
+		})
+	}
+	t.Run("old wrapper never infers detail from status or code", func(t *testing.T) {
+		for _, tc := range []struct {
+			status int
+			code   types.ErrorCode
+		}{
+			{503, types.ErrorCodeModelNotFound}, {403, ""}, {400, "request_path"},
+		} {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			c.Set(common.RequestIdKey, "legacy-request")
+			abortWithOpenAiMessage(c, tc.status, "Existing rejection", tc.code)
+			assert.True(t, c.IsAborted())
+			assert.Equal(t, tc.status, recorder.Code)
+			assert.JSONEq(t, fmt.Sprintf(`{"error":{"message":"Existing rejection (request id: legacy-request)","type":"new_api_error","code":%q}}`, string(tc.code)), recorder.Body.String())
+		}
+	})
+	for _, tc := range []struct {
+		name, hook string
+		native     bool
+	}{
+		{"native hook", `export const native = {error: function(ctx, error) { return {code: error.code, message: error.message, httpStatus: error.httpStatus, retryable: error.retryable, requestId: error.requestId, keys: Object.keys(error).sort()}; }};`, true},
+		{"missing hook fallback", "", false},
+		{"throwing hook fallback", `export const native = {error: function() { throw new Error("private-renderer-canary"); }};`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin := compileTaskRoutePlugin(t, genericTaskPluginSource+"\n"+tc.hook)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/vendor/failure", nil)
+			c.Set(common.RequestIdKey, "native-request")
+			c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Plugin: plugin})
+			c.Set(jsplugin.ContextKeyRouteRequest, jsplugin.RouteRequestContext{Path: "/vendor/failure", Method: http.MethodPost, Params: map[string]string{}, Query: map[string][]string{}})
+			abortWithOpenAiMessageDetail(c, 503, "https://user:password@upstream.invalid?token=secret", &noAvailableChannelDetail{group: "private-native-group", model: "private-native-model"}, types.ErrorCodeModelNotFound)
+			assert.True(t, c.IsAborted())
+			assert.Equal(t, 503, recorder.Code)
+			if tc.native {
+				assert.JSONEq(t, `{"code":"server_error","message":"Task request failed","httpStatus":503,"retryable":true,"requestId":"native-request","keys":["code","httpStatus","message","requestId","retryable"]}`, recorder.Body.String())
+			} else {
+				assert.JSONEq(t, `{"code":"server_error","message":"Task request failed (request id: native-request)","data":null}`, recorder.Body.String())
+			}
+			for _, canary := range []string{"upstream.invalid", "secret", "password", "private-renderer-canary", "private-native-group", "private-native-model", "code_detail"} {
+				assert.NotContains(t, recorder.Body.String(), canary)
+			}
+		})
 	}
 }
 

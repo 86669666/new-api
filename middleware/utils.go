@@ -11,7 +11,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type noAvailableChannelDetail struct {
+	group string
+	model string
+}
+
 func abortWithOpenAiMessage(c *gin.Context, statusCode int, message string, code ...types.ErrorCode) {
+	abortWithOpenAiMessageDetail(c, statusCode, message, nil, code...)
+}
+
+func abortWithOpenAiMessageDetail(c *gin.Context, statusCode int, message string, detail *noAvailableChannelDetail, code ...types.ErrorCode) {
 	codeStr := ""
 	if len(code) > 0 {
 		codeStr = string(code[0])
@@ -23,13 +32,17 @@ func abortWithOpenAiMessage(c *gin.Context, statusCode int, message string, code
 		Message:    message,
 		StatusCode: statusCode,
 	}) {
-		c.JSON(statusCode, gin.H{
-			"error": gin.H{
-				"message": common.MessageWithRequestId(message, c.GetString(common.RequestIdKey)),
-				"type":    "new_api_error",
-				"code":    codeStr,
-			},
-		})
+		errorBody := gin.H{
+			"message": common.MessageWithRequestId(message, c.GetString(common.RequestIdKey)),
+			"type":    "new_api_error",
+			"code":    codeStr,
+		}
+		if detail != nil {
+			errorBody["code_detail"] = "no_available_channel"
+			errorBody["group"] = detail.group
+			errorBody["model"] = detail.model
+		}
+		c.JSON(statusCode, gin.H{"error": errorBody})
 	}
 	c.Abort()
 	logger.LogError(c.Request.Context(), common.LogText("user %d | %s", userId, message))

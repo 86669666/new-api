@@ -7109,12 +7109,67 @@
           },
           "code": {
             "nullable": true
+          },
+          "code_detail": {
+            "type": "string",
+            "enum": [
+              "no_available_channel"
+            ],
+            "description": "Optional discriminator for the marked HTTP host OpenAI no-channel outcome only."
+          },
+          "group": {
+            "type": "string",
+            "description": "Captured distributor usingGroup; auto is literal auto, without candidate groups."
+          },
+          "model": {
+            "type": "string",
+            "description": "Original request model used by the distributor, not an upstream mapped model."
           }
         },
         "required": [
           "message",
           "type"
-        ]
+        ],
+        "description": "Host OpenAI errors may include code_detail=no_available_channel with group and model only when HTTP Distribute receives the marked NoAvailableChannel outcome and actually emits this host envelope. The legacy HTTP503/model_not_found/new_api_error and localized message/request-id suffix remain unchanged. These details are optional: other 503/model_not_found failures, native plugin vendor errors/sanitized fallback and WebSocket errors are not enriched by this contract. Auto reports literal auto, never candidate groups.",
+        "oneOf": [
+          {
+            "not": {
+              "required": [
+                "code_detail"
+              ]
+            }
+          },
+          {
+            "required": [
+              "code_detail",
+              "group",
+              "model",
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "model_not_found"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "new_api_error"
+                ]
+              }
+            }
+          }
+        ],
+        "x-no-available-channel-contract": {
+          "scope": "HTTP Distribute host OpenAI fallback only; native vendor hooks/fallback and WebSocket unchanged",
+          "trigger": "ChannelSelectError.NoAvailableChannel only; never infer from status, code or message",
+          "code_detail": "no_available_channel",
+          "legacy": "HTTP503, model_not_found, new_api_error and localized message/request-id suffix unchanged",
+          "group": "captured usingGroup; auto stays literal auto, never candidate or last-attempt groups",
+          "model": "original distributor modelRequest.Model; no upstream mapping or plugin/channel diagnostics"
+        }
       },
       "ImageEditMultipartRequest": {
         "type": "object",

@@ -112,12 +112,14 @@ func Distribute() func(c *gin.Context) {
 					logTaskPluginChannelDecision(c, selectErr.Channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
 				message := selectErr.Message
+				var detail *noAvailableChannelDetail
 				if selectErr.NoAvailableChannel {
 					message = noAvailableChannelMessage(c, usingGroup, modelRequest.Model)
+					detail = &noAvailableChannelDetail{group: usingGroup, model: modelRequest.Model}
 				} else if selectErr.MessageID != "" {
 					message = i18n.T(c, selectErr.MessageID, selectErr.Params)
 				}
-				abortWithOpenAiMessage(c, selectErr.StatusCode, message, selectErr.Code)
+				abortWithOpenAiMessageDetail(c, selectErr.StatusCode, message, detail, selectErr.Code)
 				return
 			}
 		}

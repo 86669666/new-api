@@ -10637,5 +10637,162 @@
       "group": "g1"
     },
     "valid": false
+  },
+  {
+    "name": "legacy no-channel error remains valid",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group fixture-group (distributor) (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "model_not_found"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "legacy general error code remains unconstrained",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "Legacy error",
+        "type": "invalid_request_error",
+        "param": null,
+        "code": 42
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "host no-channel named detail",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group fixture-group (distributor) (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "model_not_found",
+        "code_detail": "no_available_channel",
+        "group": "fixture-group",
+        "model": "fixture-model"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "host no-channel auto detail",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group auto (distributor) (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "model_not_found",
+        "code_detail": "no_available_channel",
+        "group": "auto",
+        "model": "fixture-model"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "no-channel detail discriminator is fixed",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group fixture-group (distributor) (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "model_not_found",
+        "code_detail": "get_channel_failed",
+        "group": "fixture-group",
+        "model": "fixture-model"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "no-channel group is not a candidate list",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group fixture-group (distributor) (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "model_not_found",
+        "code_detail": "no_available_channel",
+        "group": [
+          "private-a",
+          "private-b"
+        ],
+        "model": "fixture-model"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "no-channel model is a string",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group fixture-group (distributor) (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "model_not_found",
+        "code_detail": "no_available_channel",
+        "group": "fixture-group",
+        "model": 42
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "no-channel retains legacy code",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group fixture-group (distributor) (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "get_channel_failed",
+        "code_detail": "no_available_channel",
+        "group": "fixture-group",
+        "model": "fixture-model"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "no-channel retains host type",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group fixture-group (distributor) (request id: fixture-request)",
+        "type": "invalid_request_error",
+        "code": "model_not_found",
+        "code_detail": "no_available_channel",
+        "group": "fixture-group",
+        "model": "fixture-model"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "marked no-channel requires group and model",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "No available channel for model fixture-model under group fixture-group (distributor) (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "model_not_found",
+        "code_detail": "no_available_channel",
+        "model": "fixture-model"
+      }
+    },
+    "valid": false
   }
 ]
