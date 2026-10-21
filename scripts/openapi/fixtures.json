@@ -12600,5 +12600,275 @@
       "error": "temporarily_unavailable"
     },
     "valid": true
+  },
+  {
+    "name": "personal hourly quota series",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "personal hourly quota series empty array",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": []
+    },
+    "valid": true
+  },
+  {
+    "name": "personal hourly quota series nullable compatibility",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": null
+    },
+    "valid": true
+  },
+  {
+    "name": "personal hourly quota series legacy HTTP200 error",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": false,
+      "message": "fixture database error"
+    },
+    "valid": true
+  },
+  {
+    "name": "personal hourly quota series missing data",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": ""
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series wrong quota type",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": "19"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series fractional count",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 1.5,
+          "quota": 19
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series retains legacy extra row field",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19,
+          "legacy_extra": "retained"
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "site description optional collection and quota units",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true,
+        "enable_data_export": false,
+        "quota_per_unit": 500000
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "site description unrelated legacy property stays open",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true,
+        "unrelated_legacy_status": {
+          "value": "retained"
+        }
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "site description collection flag wrong type",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true,
+        "enable_data_export": "false"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "site description quota units wrong type",
+    "document": "api",
+    "schema": "#/components/schemas/SiteDescriptionResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "instance_id": "12345678-1234-4234-8234-123456789abc",
+        "console_links": {
+          "topup": "http://127.0.0.1:3000/prefix/wallet",
+          "usage_logs": "https://console.example/prefix/usage-logs",
+          "keys": "https://console.example/prefix/keys",
+          "pricing": "https://console.example/prefix/pricing"
+        },
+        "oauth": {
+          "enabled": false
+        },
+        "client_features": {
+          "token_usage_logs": false,
+          "oauth": false,
+          "model_metadata": false
+        },
+        "version": "unchanged",
+        "github_oauth": true,
+        "quota_per_unit": "500000"
+      }
+    },
+    "valid": false
   }
 ]

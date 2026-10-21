@@ -10673,7 +10673,7 @@
       "get": {
         "summary": "获取个人额度数据",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限） The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. Timestamp parsing/defaults, missing-start fallback, min(now,end), strict greater-than boundary and successful data are unchanged.",
+        "description": "🔐 需要登录（User权限） Existing personal hourly quota series, grouped by authenticated user, username, model and stored bucket timestamp. Normal collection writes hour-start Unix seconds; filtering is inclusive on these stored bucket timestamps, with no sorting, zero-fill or day aggregation guarantee. DataExportEnabled gates new collection and periodic cache saving, not historical reads. Read current configuration from /api/status data.enable_data_export; this flag does not establish completeness of any historical range or prove zero usage. Quota remains a raw integer; quota_per_unit and existing display settings are separate from a complete currency presentation. The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. The range helper uses min(now,end) only for limit calculation and returns an adjusted start. The original parsed end, including 0 for missing or syntax-invalid input, is still passed to SQL; missing end does not become now. Existing parsing and success/message/data behavior are unchanged. HTTP200 may also contain success:false for a database error; inspect success before using data.",
         "tags": [
           "数据统计"
         ],
@@ -10683,12 +10683,39 @@
           },
           {
             "$ref": "#/components/parameters/PersonalOrganizationQuery"
+          },
+          {
+            "name": "start_timestamp",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Optional raw Unix-second start, inclusive on stored bucket timestamps. Existing strconv.ParseInt base10/int64 behavior is unchanged: missing or syntax-invalid input yields0, triggering the existing range-based start fallback; overflow retains its saturated parse result. No new validation or required parameter.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "end_timestamp",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Optional raw Unix-second end, inclusive on stored bucket timestamps. Missing or syntax-invalid input yields0; the original parsed0 is passed to SQL, not replaced with now. The range helper only limits its calculation using min(now,end). Existing int64 overflow and parsing behavior are unchanged.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "成功",
-            "headers": {}
+            "description": "Existing success/message/data hourly series, or the legacy HTTP200 success:false management error. Empty successful queries return data:[]. Collection being disabled does not hide stored history.",
+            "headers": {},
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalQuotaDataResult"
+                }
+              }
+            }
           },
           "401": {
             "description": "Missing/invalid authentication",
@@ -27989,7 +28016,6 @@
       },
       "SiteDescription": {
         "type": "object",
-        "additionalProperties": true,
         "required": [
           "instance_id",
           "console_links",
@@ -28008,9 +28034,17 @@
           },
           "client_features": {
             "$ref": "#/components/schemas/ClientFeatureFlags"
+          },
+          "enable_data_export": {
+            "type": "boolean",
+            "description": "Current collection configuration. False does not hide existing hourly history or establish completeness or zero usage for any range."
+          },
+          "quota_per_unit": {
+            "type": "number",
+            "description": "Existing raw quota units per configured display unit. Optional for older status responses; this value alone does not specify a complete currency presentation."
           }
         },
-        "description": "Four additive discovery fields within the existing public status data object. All existing status fields keep their wire types and behavior. No credential or user-specific settings are added."
+        "description": "The four required discovery fields remain additive within the existing public status data object. Existing collection configuration and quota-per-unit values are optional typed properties; other existing status fields remain accepted with unchanged wire values. No credential or user-specific settings are added."
       },
       "SiteDescriptionResult": {
         "type": "object",
@@ -29250,6 +29284,106 @@
             ]
           }
         }
+      },
+      "PersonalQuotaDataPoint": {
+        "type": "object",
+        "description": "Existing aggregate row. user_id/username/model_name/created_at and summed count/quota/token_used are populated; id/use_group/token_id/channel_id/node_name are serialized zero/empty placeholders, not additional populated dimensions. Extra legacy fields remain accepted. Normal writer timestamps are rounded to hour start, without a database-enforced multiple or ordering guarantee.",
+        "required": [
+          "user_id",
+          "username",
+          "model_name",
+          "created_at",
+          "count",
+          "quota",
+          "token_used"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "integer"
+          },
+          "username": {
+            "type": "string"
+          },
+          "model_name": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stored Unix-second bucket timestamp; normal collection writes the start of an hour."
+          },
+          "count": {
+            "type": "integer"
+          },
+          "quota": {
+            "type": "integer",
+            "description": "Raw integer quota; no amount or currency conversion is applied."
+          },
+          "token_used": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer",
+            "description": "Existing aggregate placeholder, currently0."
+          },
+          "use_group": {
+            "type": "string",
+            "description": "Existing aggregate placeholder, currently empty."
+          },
+          "token_id": {
+            "type": "integer",
+            "description": "Existing aggregate placeholder, currently0."
+          },
+          "channel_id": {
+            "type": "integer",
+            "description": "Existing aggregate placeholder, currently0."
+          },
+          "node_name": {
+            "type": "string",
+            "description": "Existing aggregate placeholder, currently empty."
+          }
+        }
+      },
+      "PersonalQuotaDataSuccess": {
+        "type": "object",
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "type": "array",
+            "nullable": true,
+            "items": {
+              "$ref": "#/components/schemas/PersonalQuotaDataPoint"
+            },
+            "description": "The current no-row handler emits []; nullable compatibility is retained without normalizing production data."
+          }
+        }
+      },
+      "PersonalQuotaDataResult": {
+        "description": "Discriminate success before reading data: the unchanged handler may return HTTP200 success:false on database errors. No DATA_EXPORT_DISABLED read error is introduced.",
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/PersonalQuotaDataSuccess"
+          },
+          {
+            "$ref": "#/components/schemas/ManagementError"
+          }
+        ]
       }
     },
     "responses": {

@@ -415,6 +415,88 @@ func TestUserQuotaRangeErrorStatus(t *testing.T) {
 	}
 }
 
+func TestUserQuotaDataSeriesContract(t *testing.T) {
+	previousMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(previousMode) })
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&model.QuotaData{}))
+	previousExport := common.DataExportEnabled
+	common.DataExportEnabled = true
+	model.CacheQuotaDataLock.Lock()
+	previousCache := model.CacheQuotaData
+	model.CacheQuotaData = make(map[string]*model.QuotaData)
+	model.CacheQuotaDataLock.Unlock()
+	setting := operation_setting.GetLogSetting()
+	previousSetting := *setting
+	setting.MaxRangeDays = 365
+	t.Cleanup(func() {
+		common.DataExportEnabled = previousExport
+		*setting = previousSetting
+		model.CacheQuotaDataLock.Lock()
+		model.CacheQuotaData = previousCache
+		model.CacheQuotaDataLock.Unlock()
+	})
+
+	bucket := time.Now().Unix() - 7200
+	bucket -= bucket % 3600
+	for _, sample := range []model.QuotaDataLogParams{
+		{UserID: 1, Username: "alice", ModelName: "owned-a", CreatedAt: bucket + 1, Quota: 12, TokenUsed: 3},
+		{UserID: 1, Username: "alice", ModelName: "owned-a", CreatedAt: bucket + 3599, Quota: 7, TokenUsed: 5},
+		{UserID: 1, Username: "alice", ModelName: "owned-b", CreatedAt: bucket + 3601, Quota: 6, TokenUsed: 2},
+		{UserID: 2, Username: "bob", ModelName: "other-owner", CreatedAt: bucket + 17, Quota: 99, TokenUsed: 20},
+	} {
+		model.LogQuotaData(sample)
+	}
+	model.SaveQuotaDataCache()
+	var expected []any
+	require.NoError(t, common.UnmarshalJsonStr(fmt.Sprintf(`[
+		{"id":0,"user_id":1,"username":"alice","model_name":"owned-a","created_at":%d,"use_group":"","token_id":0,"channel_id":0,"node_name":"","token_used":8,"count":2,"quota":19},
+		{"id":0,"user_id":1,"username":"alice","model_name":"owned-b","created_at":%d,"use_group":"","token_id":0,"channel_id":0,"node_name":"","token_used":2,"count":1,"quota":6}
+	]`, bucket, bucket+3600), &expected))
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		start   int64
+		end     string
+		want    []any
+	}{
+		{"hourly_owner_only_inclusive_bounds", true, bucket, fmt.Sprint(bucket + 3600), expected},
+		{"disabled_preserves_history", false, bucket, fmt.Sprint(bucket + 3600), expected},
+		{"disabled_empty_bucket_interval", false, bucket + 1, fmt.Sprint(bucket + 3599), []any{}},
+		{"missing_end_stays_zero_in_SQL", false, bucket, "", []any{}},
+		{"syntax_invalid_end_stays_zero_in_SQL", false, bucket, "invalid", []any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			common.DataExportEnabled = tc.enabled
+			query := url.Values{"start_timestamp": {fmt.Sprint(tc.start)}}
+			if tc.end != "" {
+				query.Set("end_timestamp", tc.end)
+			}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/api/data/self?"+query.Encode(), nil)
+			ctx.Set("id", 1)
+			ctx.Set("auth_identity", service.AuthIdentity{UserID: 1})
+			ctx.Set("role", common.RoleCommonUser)
+			GetUserQuotaDates(ctx)
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+			require.Equal(t, http.StatusOK, recorder.Code)
+			require.Len(t, body, 3)
+			assert.Equal(t, true, body["success"])
+			assert.Equal(t, "", body["message"])
+			rows, ok := body["data"].([]any)
+			require.True(t, ok, "the actual empty success value is an array, not null")
+			assert.ElementsMatch(t, tc.want, rows, "hourly aggregates have no ordering guarantee")
+		})
+	}
+}
+
 func TestLogExportRules(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, _ := newAuditTestDatabase(t, "sqlite", "")

@@ -289,6 +289,28 @@ export function compilePersonalLogPagination() {
 }
 `);
 await writeFile(consumer, await readFile(consumer, 'utf8') + `
+export async function compilePersonalQuotaSeries() {
+  const result = await client.${dataService}.getApiDataSelf({ startTimestamp: '1700000000', endTimestamp: '1700003600' });
+  // The pinned generator widens boolean enums; also narrow by the success data property.
+  if (result.success !== true || !('data' in result)) return null;
+  const rows: client.PersonalQuotaDataPoint[] | null = result.data;
+  const quota: number | undefined = rows?.[0]?.quota;
+  const timestamp: number | undefined = rows?.[0]?.created_at;
+  const status = await client.${statusService}.getApiStatus({});
+  const enabled: boolean | undefined = status.data.enable_data_export;
+  const units: number | undefined = status.data.quota_per_unit;
+  // @ts-expect-error raw timestamp query inputs preserve their string wire representation
+  client.${dataService}.getApiDataSelf({ startTimestamp: 1700000000 });
+  // @ts-expect-error aggregate quota remains numeric, never a string
+  const invalidQuota: client.PersonalQuotaDataPoint['quota'] = '19';
+  // @ts-expect-error collection configuration is a boolean when present
+  const invalidEnabled: client.SiteDescription['enable_data_export'] = 'false';
+  // @ts-expect-error quota units are numeric when present
+  const invalidUnits: client.SiteDescription['quota_per_unit'] = '500000';
+  return { rows, quota, timestamp, enabled, units };
+}
+`);
+await writeFile(consumer, await readFile(consumer, 'utf8') + `
 export async function compileOAuthUserInfo() {
   const profile = await client.${oauthUserInfoService}.getOAuthUserInfo({});
   const id: number = profile.id;
@@ -715,6 +737,70 @@ assert.equal(calls.at(-1).init.body, undefined);
 assert.equal(new Headers(calls.at(-1).init.headers).has('Authorization'), false);
 assert.equal(new Headers(calls.at(-1).init.headers).has('X-Security-Proof'), false);
 const statusStubbedRequests = calls.length - beforeStatusRequests;
+const seriesHarnessState = {
+  token: api.OpenAPI.TOKEN, headers: api.OpenAPI.HEADERS,
+  responseStatus, responseBody, responseCacheControl,
+};
+let personalSeriesStubbedRequests = 0;
+let collectionStatusStubbedRequests = 0;
+try {
+  api.OpenAPI.TOKEN = 'fixture-series-dashboard';
+  api.OpenAPI.HEADERS = undefined;
+  responseStatus = 200;
+  const row = { id: 0, user_id: 1, username: 'fixture', model_name: 'fixture-model', created_at: 1700000000, use_group: '', token_id: 0, channel_id: 0, node_name: '', token_used: 8, count: 2, quota: 19, legacy_extra: 'retained' };
+  const beforeSeriesRequests = calls.length;
+  for (const body of [
+    { success: true, message: '', data: [row] },
+    { success: true, message: '', data: [] },
+    { success: true, message: '', data: null },
+    { success: false, message: 'fixture database error' },
+  ]) {
+    responseBody = body;
+    const before = calls.length;
+    const result = await api[dataService].getApiDataSelf({ startTimestamp: '1700000000', endTimestamp: '1700003600' });
+    assert.equal(calls.length, before + 1);
+    assert.deepEqual(result, body);
+    if (result.success === true) {
+      assert.deepEqual(result.data, body.data, 'empty and nullable compatibility values remain distinct');
+    } else {
+      assert.equal('data' in result, false, 'HTTP200 business errors do not imply a series');
+    }
+    const request = calls.at(-1);
+    const url = new URL(request.url);
+    assert.equal(url.pathname, '/api/data/self');
+    assert.deepEqual([...url.searchParams], [['start_timestamp', '1700000000'], ['end_timestamp', '1700003600']]);
+    assert.equal(request.init.method, 'GET');
+    assert.equal(request.init.body, undefined);
+    assert.equal(new Headers(request.init.headers).get('Authorization'), 'Bearer fixture-series-dashboard');
+    assert.equal(new Headers(request.init.headers).has('X-Security-Proof'), false);
+  }
+  personalSeriesStubbedRequests = calls.length - beforeSeriesRequests;
+  api.OpenAPI.TOKEN = undefined;
+  const beforeCollectionStatusRequests = calls.length;
+  for (const enabled of [false, true]) {
+    responseBody = { ...seriesHarnessState.responseBody, data: { ...seriesHarnessState.responseBody.data, enable_data_export: enabled, quota_per_unit: 500000, unrelated_legacy_status: { value: 'retained' } } };
+    const before = calls.length;
+    const result = await api[statusService].getApiStatus({});
+    assert.equal(calls.length, before + 1);
+    assert.deepEqual(result, responseBody);
+    assert.equal(result.data.enable_data_export, enabled);
+    assert.equal(result.data.quota_per_unit, 500000);
+    assert.deepEqual(result.data.unrelated_legacy_status, { value: 'retained' });
+    const request = calls.at(-1);
+    assert.equal(request.url, api.OpenAPI.BASE + '/api/status');
+    assert.equal(request.init.method, 'GET');
+    assert.equal(request.init.body, undefined);
+    assert.equal(new Headers(request.init.headers).has('Authorization'), false);
+    assert.equal(new Headers(request.init.headers).has('X-Security-Proof'), false);
+  }
+  collectionStatusStubbedRequests = calls.length - beforeCollectionStatusRequests;
+} finally {
+  api.OpenAPI.TOKEN = seriesHarnessState.token;
+  api.OpenAPI.HEADERS = seriesHarnessState.headers;
+  responseStatus = seriesHarnessState.responseStatus;
+  responseBody = seriesHarnessState.responseBody;
+  responseCacheControl = seriesHarnessState.responseCacheControl;
+}
 const beforeOAuthUserInfoRequests = calls.length;
 api.OpenAPI.TOKEN = 'fixture-oauth-resource';
 api.OpenAPI.HEADERS = undefined;
@@ -851,4 +937,4 @@ for (const [status, code] of [[400, 'INVALID'], [401, 'UNAUTHORIZED'], [403, 'FO
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const clientEventsStubbedRequests = calls.length - beforeClientEventsRequests;
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, personal_data_series_stubbed_requests: personalSeriesStubbedRequests, collection_status_stubbed_requests: collectionStatusStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));

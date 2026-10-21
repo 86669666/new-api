@@ -361,7 +361,7 @@ def check_personal_log_range_error(api):
     assert 'all authenticated roles, including administrators and root' in data_response['description']
     assert data_operation['security'] == [{'DashboardJWT': []}, {'PersonalAccessToken': []}]
     assert data_operation['x-pat-scope'] == 'usage:read'
-    assert data_operation['parameters'] == [
+    assert data_operation['parameters'][:2] == [
         {'$ref': '#/components/parameters/PersonalOrganizationHeader'},
         {'$ref': '#/components/parameters/PersonalOrganizationQuery'},
     ]
@@ -371,6 +371,54 @@ def check_personal_log_range_error(api):
         assert all(node.get('$ref') != '#/components/schemas/PersonalLogRangeError' for node in walk(item))
     return {'scope': '/api/log/self ordinary-user and /api/data/self all-role range errors only', 'status': 400,
             'code': 'LOG_RANGE_TOO_WIDE', 'selector_400_preserved': True, 'structured_message_preserved': True}
+
+
+def check_personal_quota_series(api):
+    operation = api['paths']['/api/data/self']['get']
+    parameters = operation['parameters'][2:]
+    assert len(parameters) == 2
+    for parameter, name in zip(parameters, ('start_timestamp', 'end_timestamp')):
+        assert {key: value for key, value in parameter.items() if key != 'description'} == {
+            'name': name, 'in': 'query', 'required': False, 'allowEmptyValue': True,
+            'schema': {'type': 'string'},
+        }
+        assert parameter['description']
+    assert 'original parsed end' in operation['description']
+    assert 'missing end does not become now' in operation['description']
+    assert 'no sorting, zero-fill or day aggregation guarantee' in operation['description']
+    assert operation['responses']['200']['headers'] == {}
+    assert operation['responses']['200']['content']['application/json']['schema'] == {
+        '$ref': '#/components/schemas/PersonalQuotaDataResult'}
+    schemas = api['components']['schemas']
+    result = schemas['PersonalQuotaDataResult']
+    assert {key: value for key, value in result.items() if key != 'description'} == {'anyOf': [
+        {'$ref': '#/components/schemas/PersonalQuotaDataSuccess'},
+        {'$ref': '#/components/schemas/ManagementError'},
+    ]}
+    success = schemas['PersonalQuotaDataSuccess']
+    assert success['type'] == 'object' and 'additionalProperties' not in success
+    assert success['required'] == ['success', 'message', 'data']
+    assert set(success['properties']) == {'success', 'message', 'data'}
+    assert success['properties']['success'] == {'type': 'boolean', 'enum': [True]}
+    assert success['properties']['message'] == {'type': 'string', 'enum': ['']}
+    data = success['properties']['data']
+    assert {key: value for key, value in data.items() if key != 'description'} == {
+        'type': 'array', 'nullable': True, 'items': {'$ref': '#/components/schemas/PersonalQuotaDataPoint'}}
+    point = schemas['PersonalQuotaDataPoint']
+    assert point['type'] == 'object' and 'additionalProperties' not in point
+    assert point['required'] == ['user_id', 'username', 'model_name', 'created_at', 'count', 'quota', 'token_used']
+    numeric = {'user_id', 'count', 'quota', 'token_used', 'id', 'token_id', 'channel_id'}
+    strings = {'username', 'model_name', 'use_group', 'node_name'}
+    assert set(point['properties']) == numeric | strings | {'created_at'}
+    for name, field in point['properties'].items():
+        expected = {'type': 'integer'} if name in numeric else {'type': 'string'}
+        if name == 'created_at':
+            expected = {'type': 'integer', 'format': 'int64'}
+        assert {key: value for key, value in field.items() if key != 'description'} == expected
+    assert 'placeholder' in point['description']
+    return {'scope': 'GET /api/data/self existing hourly series', 'query_parameters': [p['name'] for p in parameters],
+            'legacy_200_error_preserved': True, 'empty_array_and_nullable_compatibility': True,
+            'collection_disabled_keeps_history': True, 'live_http': False}
 
 
 def check_personal_log_pagination(api):
@@ -1037,9 +1085,12 @@ def check_site_description(api):
     description = schemas['SiteDescription']
     fields = {'instance_id': 'SiteInstanceID', 'console_links': 'ConsoleLinks',
               'oauth': 'DesktopOAuthDiscovery', 'client_features': 'ClientFeatureFlags'}
-    assert description['type'] == 'object' and description['additionalProperties'] is True
+    assert description['type'] == 'object' and 'additionalProperties' not in description
     assert set(description['required']) == set(fields)
-    assert description['properties'] == {key: {'$ref': '#/components/schemas/' + value} for key, value in fields.items()}
+    expected_properties = {key: {'$ref': '#/components/schemas/' + value} for key, value in fields.items()}
+    expected_properties.update({'enable_data_export': {'type': 'boolean'}, 'quota_per_unit': {'type': 'number'}})
+    assert {key: {k: v for k, v in value.items() if k != 'description'}
+            for key, value in description['properties'].items()} == expected_properties
     identity = schemas['SiteInstanceID']
     assert identity['type'] == 'string' and identity['pattern'] == r'^(?!00000000-0000-0000-0000-000000000000)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\s\S])'
     links = schemas['ConsoleLinks']
@@ -1187,6 +1238,7 @@ def main():
     results['model_capability_metadata'] = check_model_capability_metadata(api)
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['personal_log_range_error'] = check_personal_log_range_error(api)
+    results['personal_quota_series'] = check_personal_quota_series(api)
     results['oauth_userinfo'] = check_oauth_userinfo(api, source_root)
     results['oauth_provider'] = check_oauth_provider(api, source_root)
     results['oauth_revocation'] = check_oauth_revocation(api, source_root)
