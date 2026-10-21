@@ -78,7 +78,7 @@ func GetUserLogs(c *gin.Context) {
 	if !ok {
 		return
 	}
-	pageInfo := common.GetPageQuery(c)
+	pageInfo := common.GetPageQueryWithPageAlias(c)
 	filter := logFilterFromQuery(c, false)
 	if c.GetInt("role") < common.RoleAdminUser {
 		startTimestamp, err := limitLogTimeRange(filter.StartTimestamp, filter.EndTimestamp)

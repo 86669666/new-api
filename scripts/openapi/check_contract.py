@@ -126,6 +126,35 @@ def check_conditional_authorization(source_root):
     }
 
 
+def check_personal_log_pagination(api):
+    operation = api['paths']['/api/log/self']['get']
+    assert operation['x-personal-log-pagination'] == {
+        'scope': 'GET /api/log/self only; other pagination consumers retain p-only behavior',
+        'page_selection': 'first p value whenever parsed URL contains the p key, including bare/empty/invalid/zero/negative/overflow; otherwise first page value',
+        'page_fallback': 'existing platform-int parsing preserved: empty/syntax-invalid/zero defaults to 1; negative and overflow behavior unchanged',
+        'page_size': 'first page_size value; zero/parse failure falls through first ps then first size then configured ItemsPerPage; nonzero negative values retained; upper cap 100',
+        'compatibility': 'no new validation errors or response fields; ownership, filters, sorting, range checks and authentication unchanged',
+    }
+    assert operation['security'] == [{'DashboardJWT': []}, {'PersonalAccessToken': []}]
+    assert operation['x-pat-scope'] == 'usage:read'
+    parameters = operation['parameters']
+    assert parameters[:2] == [
+        {'$ref': '#/components/parameters/PersonalOrganizationHeader'},
+        {'$ref': '#/components/parameters/PersonalOrganizationQuery'},
+    ]
+    assert [parameter['name'] for parameter in parameters[2:]] == ['p', 'page', 'page_size', 'ps', 'size']
+    for parameter in parameters[2:]:
+        assert {key: value for key, value in parameter.items() if key != 'description'} == {
+            'name': parameter['name'], 'in': 'query', 'required': False,
+            'allowEmptyValue': True, 'schema': {'type': 'string'},
+        }
+        assert parameter['description']
+    assert all('x-personal-log-pagination' not in operation
+               for path, item in api['paths'].items() if path != '/api/log/self'
+               for method, operation in item.items() if method in METHODS)
+    return {'page_alias_scope': '/api/log/self', 'canonical_presence_wins': True, 'legacy_fallback_preserved': True}
+
+
 def check_token_pricing(api):
     operation = api['paths']['/api/pricing']['get']
     assert operation['security'] == [{}, {'DashboardJWT': []}, {'PersonalAccessToken': []}, {'RelayKey': []}]
@@ -806,6 +835,7 @@ def main():
     fixtures = json.loads((Path(__file__).with_name('fixtures.json')).read_text())
     results['token_usage'] = check_token_usage(api)
     results['token_pricing'] = check_token_pricing(api)
+    results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
     for fixture in fixtures:
         if fixture.get('kind') == 's3_operation':

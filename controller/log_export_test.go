@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -149,6 +150,137 @@ func TestLogExportDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, true, all[3]["success"])
 		})
 	}
+}
+
+func TestUserLogPageAlias(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Log{}))
+	now := time.Now().Unix()
+	seedExportLogs(t, db, db, now)
+	require.NoError(t, db.Create(&model.Log{UserId: 1, Username: "alice", CreatedAt: now - 30, Type: model.LogTypeConsume, ModelName: "gpt-b", RequestId: "a-3"}).Error)
+	logSetting := operation_setting.GetLogSetting()
+	previousSetting := *logSetting
+	logSetting.MaxRangeDays = 365
+	t.Cleanup(func() { *logSetting = previousSetting })
+	recent := fmt.Sprintf("start_timestamp=%d&end_timestamp=%d&", now-2*24*3600, now)
+	for _, tc := range []struct {
+		name, query, requestID string
+		page, total            int
+	}{
+		{"alias second", "page=2", "a-2", 2, 3},
+		{"canonical second", "p=2", "a-2", 2, 3},
+		{"canonical first wins", "p=1&page=2", "a-3", 1, 3},
+		{"canonical second wins", "p=2&page=1", "a-2", 2, 3},
+		{"empty canonical wins", "p=&page=2", "a-3", 1, 3},
+		{"bare canonical wins", "p&page=2", "a-3", 1, 3},
+		{"invalid canonical wins", "p=bad&page=2", "a-3", 1, 3},
+		{"zero canonical wins", "p=0&page=2", "a-3", 1, 3},
+		{"repeated empty canonical", "p=&p=2&page=2", "a-3", 1, 3},
+		{"repeated invalid canonical", "p=bad&p=2&page=2", "a-3", 1, 3},
+		{"repeated valid canonical", "p=2&p=1&page=1", "a-2", 2, 3},
+		{"encoded canonical key", "%70=2&page=1", "a-2", 2, 3},
+		{"default page", "", "a-3", 1, 3},
+		{"empty alias", "page=", "a-3", 1, 3},
+		{"invalid alias", "page=bad", "a-3", 1, 3},
+		{"zero alias", "page=0", "a-3", 1, 3},
+		{"repeated alias", "page=2&page=1", "a-2", 2, 3},
+		{"repeated empty alias", "page=&page=2", "a-3", 1, 3},
+		{"owner remains selected", "page=2&user_id=2&username=bob", "a-2", 2, 3},
+		{"filter before pagination", "page=2&model_name=gpt-a", "a-1", 2, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := callLogHandler(t, GetUserLogs, 1, common.RoleCommonUser, recent+tc.query+"&page_size=1")[0]
+			require.Equal(t, true, response["success"])
+			data, ok := response["data"].(map[string]any)
+			require.True(t, ok)
+			assert.EqualValues(t, tc.page, data["page"])
+			assert.EqualValues(t, 1, data["page_size"])
+			assert.EqualValues(t, tc.total, data["total"])
+			items, ok := data["items"].([]any)
+			require.True(t, ok)
+			require.Len(t, items, 1)
+			assert.Equal(t, tc.requestID, items[0].(map[string]any)["request_id"])
+		})
+	}
+	parse := func(t *testing.T, query string, alias bool) *common.PageInfo {
+		t.Helper()
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/log/self?"+query, nil)
+		canonical, alternate := ctx.Query("p"), ctx.Query("page") // Prime Gin's existing query cache.
+		var info *common.PageInfo
+		if alias {
+			info = common.GetPageQueryWithPageAlias(ctx)
+		} else {
+			info = common.GetPageQuery(ctx)
+		}
+		assert.Equal(t, query, ctx.Request.URL.RawQuery)
+		assert.Equal(t, canonical, ctx.Query("p"))
+		assert.Equal(t, alternate, ctx.Query("page"))
+		return info
+	}
+	maxInt := int(^uint(0) >> 1)
+	for _, tc := range []struct {
+		name, raw string
+		expected  int
+	}{
+		{"empty", "", 1}, {"invalid", "bad", 1}, {"zero", "0", 1}, {"negative", "-2", -2},
+		{"positive overflow", "999999999999999999999999999999", maxInt},
+		{"negative overflow", "-999999999999999999999999999999", -maxInt - 1},
+	} {
+		t.Run("legacy parser/"+tc.name, func(t *testing.T) {
+			value := url.QueryEscape(tc.raw)
+			original := parse(t, "p="+value+"&page_size=1", false)
+			assert.Equal(t, tc.expected, original.Page)
+			assert.Equal(t, original, parse(t, "page="+value+"&page_size=1", true))
+			assert.Equal(t, original, parse(t, "p="+value+"&page=2&page_size=1", true))
+		})
+	}
+	for _, tc := range []struct {
+		name, query string
+		expected    int
+	}{
+		{"default", "", common.ItemsPerPage},
+		{"page_size first", "page_size=2&ps=3&size=4", 2},
+		{"zero falls to ps", "page_size=0&ps=3&size=4", 3},
+		{"invalid falls to size", "page_size=bad&ps=0&size=4", 4},
+		{"cap", "page_size=101", 100},
+		{"negative retained", "page_size=-2&ps=3", -2},
+		{"first duplicate retained", "page_size=0&page_size=5&ps=2", 2},
+		{"size fallback", "ps=bad&size=4", 4},
+	} {
+		t.Run("page size/"+tc.name, func(t *testing.T) {
+			original := parse(t, "p=2&"+tc.query, false)
+			assert.Equal(t, tc.expected, original.PageSize)
+			assert.Equal(t, original, parse(t, "page=2&"+tc.query, true))
+			assert.Equal(t, original, parse(t, "p=2&page=1&"+tc.query, true))
+		})
+	}
+	t.Run("admin and default do not opt in", func(t *testing.T) {
+		assert.Equal(t, 1, parse(t, "page=2&page_size=1", false).Page)
+		for _, tc := range []struct {
+			query, requestID string
+			page             int
+		}{{"page=2", "a-3", 1}, {"p=2", "a-2", 2}} {
+			response := callLogHandler(t, GetAllLogs, 3, common.RoleAdminUser, recent+tc.query+"&page_size=1")[0]
+			require.Equal(t, true, response["success"])
+			data := response["data"].(map[string]any)
+			assert.EqualValues(t, tc.page, data["page"])
+			assert.EqualValues(t, 4, data["total"])
+			items := data["items"].([]any)
+			require.Len(t, items, 1)
+			assert.Equal(t, tc.requestID, items[0].(map[string]any)["request_id"])
+		}
+	})
+	t.Run("time range error unchanged", func(t *testing.T) {
+		tooLong := fmt.Sprintf("start_timestamp=%d&end_timestamp=%d&page_size=1&", now-366*24*3600, now)
+		canonical := callLogHandler(t, GetUserLogs, 1, common.RoleCommonUser, tooLong+"p=2")[0]
+		alias := callLogHandler(t, GetUserLogs, 1, common.RoleCommonUser, tooLong+"page=2")[0]
+		assert.Equal(t, canonical, alias)
+		assert.Equal(t, false, alias["success"])
+		assert.Equal(t, "The time range cannot exceed {{days}} days", alias["message_key"])
+	})
 }
 
 func TestLogExportRules(t *testing.T) {

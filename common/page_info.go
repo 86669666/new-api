@@ -39,9 +39,24 @@ func (p *PageInfo) SetItems(items any) {
 }
 
 func GetPageQuery(c *gin.Context) *PageInfo {
+	return getPageQuery(c, c.Query("p"))
+}
+
+// GetPageQueryWithPageAlias opts into page only when the canonical p key is
+// absent. An explicitly empty or invalid p keeps its existing fallback behavior.
+func GetPageQueryWithPageAlias(c *gin.Context) *PageInfo {
+	query := c.Request.URL.Query()
+	rawPage := query.Get("p")
+	if !query.Has("p") {
+		rawPage = query.Get("page")
+	}
+	return getPageQuery(c, rawPage)
+}
+
+func getPageQuery(c *gin.Context, rawPage string) *PageInfo {
 	pageInfo := &PageInfo{}
 	// 手动获取并处理每个参数
-	if page, err := strconv.Atoi(c.Query("p")); err == nil {
+	if page, err := strconv.Atoi(rawPage); err == nil {
 		pageInfo.Page = page
 	}
 	if pageSize, err := strconv.Atoi(c.Query("page_size")); err == nil {
@@ -49,7 +64,7 @@ func GetPageQuery(c *gin.Context) *PageInfo {
 	}
 	if pageInfo.Page < 1 {
 		// 兼容
-		page, _ := strconv.Atoi(c.Query("p"))
+		page, _ := strconv.Atoi(rawPage)
 		if page != 0 {
 			pageInfo.Page = page
 		} else {

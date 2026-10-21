@@ -10245,7 +10245,7 @@
       "get": {
         "summary": "获取个人日志",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限）",
+        "description": "🔐 需要登录（User权限）\nPersonal log pagination accepts page only when the parsed URL has no p key. Presence of p (including bare p, p=, malformed or repeated values) always wins; duplicate p/page values use the first. Empty, syntax-invalid or zero page numbers default to 1; legacy negative and platform-int overflow behavior is unchanged. Page size uses page_size, then ps, then size, then configured ItemsPerPage when the selected size is zero or fails its initial parse. Nonzero negative sizes retain legacy behavior; positive sizes are capped at 100. No new parameter validation errors or response fields are introduced. This alias does not apply to administrator logs, export, statistics or other endpoints.",
         "tags": [
           "日志"
         ],
@@ -10255,6 +10255,56 @@
           },
           {
             "$ref": "#/components/parameters/PersonalOrganizationQuery"
+          },
+          {
+            "name": "p",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Canonical page number as a raw string. The first value wins whenever the parsed p key exists, even empty/bare/invalid/zero; page is then ignored. Existing negative/overflow behavior is preserved.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Fallback page-number alias used only when the parsed p key is absent. First value wins; uses exactly the canonical legacy parser, including empty/invalid/zero fallback and negative/overflow behavior.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Preferred page size, first value. Zero or initial parse failure falls through ps, then size, then configured ItemsPerPage. Nonzero negative values are unchanged; upper cap 100.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ps",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Legacy page-size fallback when page_size resolves to zero. First value; nonzero legacy parsed values win, otherwise try size.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Legacy final page-size fallback when page_size and ps resolve to zero. First value; zero then uses configured ItemsPerPage. Upper cap 100, negative nonzero unchanged.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -10312,7 +10362,14 @@
         "x-auth-source": "middleware/access_token_routes.go; router/channel-router.go",
         "x-pat-scope": "usage:read",
         "operationId": "getApiLogSelf",
-        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
+        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access",
+        "x-personal-log-pagination": {
+          "scope": "GET /api/log/self only; other pagination consumers retain p-only behavior",
+          "page_selection": "first p value whenever parsed URL contains the p key, including bare/empty/invalid/zero/negative/overflow; otherwise first page value",
+          "page_fallback": "existing platform-int parsing preserved: empty/syntax-invalid/zero defaults to 1; negative and overflow behavior unchanged",
+          "page_size": "first page_size value; zero/parse failure falls through first ps then first size then configured ItemsPerPage; nonzero negative values retained; upper cap 100",
+          "compatibility": "no new validation errors or response fields; ownership, filters, sorting, range checks and authentication unchanged"
+        }
       }
     },
     "/api/log/self/search": {
