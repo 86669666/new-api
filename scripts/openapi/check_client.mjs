@@ -183,11 +183,21 @@ export async function compileTokenPricing() {
   const group: string = result.group;
   const ratio: number | undefined = result.group_ratio[group];
   const prices: number[] = result.data.map(entry => entry.model_price);
+  const contextLength: number | undefined = result.data[0]?.context_length;
+  const vision: boolean | undefined = result.data[0]?.vision;
+  const declarant: 'administrator' | undefined = result.data[0]?.metadata_source?.kind;
+  const declaration: client.ModelCapabilityMetadataDeclaration = { reasoning: false, max_output_tokens: 4096 };
+  const option: client.ModelCapabilityMetadataOptionWrite = { key: 'ModelCapabilityMetadata', value: JSON.stringify({ fixture: declaration }) };
+  // @ts-expect-error absence, not null, represents an unknown fact
+  const unknownVision: client.ModelCapabilityMetadataDeclaration = { vision: null };
+  // @ts-expect-error metadata is not supplied as an object through the existing option API
+  const objectOption: client.ModelCapabilityMetadataOptionWrite = { key: 'ModelCapabilityMetadata', value: {} };
+
   // @ts-expect-error selected pricing requires its top-level group
   const missingGroup: client.TokenPricingResult = { success: true, data: [], vendors: [], group_ratio: {}, usable_group: {}, supported_endpoint: {}, auto_groups: [], pricing_version: 'fixture' };
   // @ts-expect-error selection is a string, not candidate array
   const invalidGroup: client.TokenPricingResult['group'] = ['auto'];
-  return { group, ratio, prices };
+  return { group, ratio, prices, contextLength, vision, declarant, option };
 }
 `);
 await writeFile(consumer, await readFile(consumer, 'utf8') + `
@@ -452,6 +462,34 @@ responseBody = allFixtures.find(fixture => fixture.name === 'public pricing unch
 assert.deepEqual(await api[pricingService].getApiPricing({}), responseBody);
 assert.equal(new Headers(calls.at(-1).init.headers).has('Authorization'), false);
 assert.equal('group' in responseBody, false);
+for (const [name, token] of [
+  ['public pricing administrator metadata', undefined],
+  ['token pricing administrator metadata', 'sk-generated-pricing-metadata-fixture'],
+]) {
+  api.OpenAPI.TOKEN = token;
+  api.OpenAPI.HEADERS = undefined;
+  responseBody = allFixtures.find(fixture => fixture.name === name).value;
+  const result = await api[pricingService].getApiPricing({});
+  assert.deepEqual(result, responseBody);
+  const headers = new Headers(calls.at(-1).init.headers);
+  if (token === undefined) {
+    assert.equal(headers.has('Authorization'), false);
+    assert.equal('group' in result, false);
+  } else {
+    assert.equal(headers.get('Authorization'), 'Bearer ' + token);
+    assert.equal(result.group, 'g1');
+  }
+  assert.equal(headers.has('X-Security-Proof'), false);
+  assert.equal(result.data[0].reasoning, false);
+  assert.equal(result.data[0].context_length, 128000);
+  assert.equal(result.data[0].metadata_source.kind, 'administrator');
+  assert.match(result.data[0].metadata_source.version, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(new URL(calls.at(-1).url).pathname, '/api/pricing');
+  assert.equal(calls.at(-1).init.method, 'GET');
+  assert.equal(calls.at(-1).init.body, undefined);
+}
+api.OpenAPI.TOKEN = undefined;
+api.OpenAPI.HEADERS = undefined;
 const pricingStubbedRequests = calls.length - beforePricingRequests;
 // Transport only: controller tests, not this replaced fetch response, decide page precedence.
 const beforeLogPaginationRequests = calls.length;

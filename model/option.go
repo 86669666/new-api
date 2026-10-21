@@ -270,6 +270,10 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == ModelCapabilityMetadataOptionKey {
+		_, err := ParseModelCapabilityMetadata(value)
+		return err
+	}
 	if key == siteInstanceIDKey {
 		return common.NewMessage("Invalid parameters")
 	}
@@ -311,6 +315,23 @@ func UpdateOption(key string, value string) error {
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}
+	if key == ModelCapabilityMetadataOptionKey {
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			option := Option{Key: key}
+			if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+				return err
+			}
+			if err := validateModelCapabilityOptionIdentity(key, option.Key, value); err != nil {
+				return err
+			}
+			option.Value = value
+			return tx.Save(&option).Error
+		})
+		if err != nil {
+			return err
+		}
+		return updateOptionMap(key, value)
+	}
 	// Save to database first
 	option := Option{
 		Key: key,
@@ -322,6 +343,9 @@ func UpdateOption(key string, value string) error {
 	// Check the stored spelling: MySQL may resolve case/accent/space aliases.
 	if option.Key == siteInstanceIDKey {
 		return common.NewMessage("Invalid parameters")
+	}
+	if err := validateModelCapabilityOptionIdentity(key, option.Key, value); err != nil {
+		return err
 	}
 	option.Value = value
 	// Save is a combination function.
@@ -399,6 +423,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 			}
 			if option.Key == siteInstanceIDKey {
 				return common.NewMessage("Invalid parameters")
+			}
+			if err := validateModelCapabilityOptionIdentity(k, option.Key, v); err != nil {
+				return err
 			}
 			option.Value = v
 			if err := tx.Save(&option).Error; err != nil {

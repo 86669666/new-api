@@ -1,15 +1,108 @@
 package model
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 
 	"gorm.io/gorm"
 )
+
+const ModelCapabilityMetadataOptionKey = "ModelCapabilityMetadata"
+
+// ModelCapabilityMetadata contains declarations, not provider-verified limits
+// or request enforcement. Pointer fields distinguish unknown from false.
+type ModelCapabilityMetadata struct {
+	ContextLength   *int64                         `json:"context_length,omitempty"`
+	MaxOutputTokens *int64                         `json:"max_output_tokens,omitempty"`
+	Vision          *bool                          `json:"vision,omitempty"`
+	Reasoning       *bool                          `json:"reasoning,omitempty"`
+	ToolUse         *bool                          `json:"tool_use,omitempty"`
+	Source          *ModelCapabilityMetadataSource `json:"metadata_source,omitempty"`
+}
+
+type ModelCapabilityMetadataSource struct {
+	Kind    string `json:"kind"`
+	Version string `json:"version"`
+}
+
+// ParseModelCapabilityMetadata also validates persisted configuration on read.
+// Only exact model names and wire field spellings are accepted.
+func ParseModelCapabilityMetadata(value string) (map[string]ModelCapabilityMetadata, error) {
+	invalid := common.NewMessage("Invalid parameters")
+	if len(value) > 65536 {
+		return nil, invalid
+	}
+	var entries map[string]common.RawMessage
+	if err := common.UnmarshalStrictObject([]byte(value), &entries); err != nil || len(entries) > 256 {
+		return nil, invalid
+	}
+	result := make(map[string]ModelCapabilityMetadata, len(entries))
+	for name, raw := range entries {
+		if name == "" || len(name) > 255 || name != strings.TrimSpace(name) || strings.ContainsFunc(name, unicode.IsControl) {
+			return nil, invalid
+		}
+		if err := common.ValidateJSONObjectFields(raw, nil, []string{"context_length", "max_output_tokens", "vision", "reasoning", "tool_use"}); err != nil {
+			return nil, invalid
+		}
+		var declaration ModelCapabilityMetadata
+		if err := common.UnmarshalStrictObject(raw, &declaration); err != nil {
+			return nil, invalid
+		}
+		if declaration.ContextLength == nil && declaration.MaxOutputTokens == nil && declaration.Vision == nil && declaration.Reasoning == nil && declaration.ToolUse == nil {
+			return nil, invalid
+		}
+		for _, limit := range []*int64{declaration.ContextLength, declaration.MaxOutputTokens} {
+			if limit != nil && (*limit < 1 || *limit > 9007199254740991) {
+				return nil, invalid
+			}
+		}
+		canonical, err := common.Marshal(struct {
+			Version int    `json:"version"`
+			Model   string `json:"model"`
+			ModelCapabilityMetadata
+		}{Version: 1, Model: name, ModelCapabilityMetadata: declaration})
+		if err != nil {
+			return nil, invalid
+		}
+		digest := sha256.Sum256(canonical)
+		declaration.Source = &ModelCapabilityMetadataSource{Kind: "administrator", Version: fmt.Sprintf("sha256:%x", digest)}
+		result[name] = declaration
+	}
+	return result, nil
+}
+
+// ModelCapabilityMetadataSnapshot decodes one bounded immutable snapshot per
+// response. Invalid loaded data is unknown, never a cached prior assertion.
+func ModelCapabilityMetadataSnapshot() map[string]ModelCapabilityMetadata {
+	common.OptionMapRWMutex.RLock()
+	value := common.OptionMap[ModelCapabilityMetadataOptionKey]
+	common.OptionMapRWMutex.RUnlock()
+	metadata, err := ParseModelCapabilityMetadata(value)
+	if err != nil {
+		return nil
+	}
+	return metadata
+}
+
+// validateModelCapabilityOptionIdentity checks the actual primary-key spelling
+// resolved by the database, including MySQL collation-equivalent aliases.
+func validateModelCapabilityOptionIdentity(requested, stored, value string) error {
+	if requested != ModelCapabilityMetadataOptionKey && stored != ModelCapabilityMetadataOptionKey {
+		return nil
+	}
+	if requested != ModelCapabilityMetadataOptionKey || stored != ModelCapabilityMetadataOptionKey {
+		return common.NewMessage("Invalid parameters")
+	}
+	_, err := ParseModelCapabilityMetadata(value)
+	return err
+}
 
 const (
 	NameRuleExact = iota

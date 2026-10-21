@@ -228,7 +228,18 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 		values["ServerAddress"] = serverAddress
 		keys := slices.Sorted(maps.Keys(values))
 		for _, key := range keys {
-			if err := tx.Save(&Option{Key: key, Value: values[key]}).Error; err != nil {
+			option := Option{Key: key}
+			if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+				return err
+			}
+			if option.Key == siteInstanceIDKey {
+				return common.NewMessage("Invalid parameters")
+			}
+			if err := validateModelCapabilityOptionIdentity(key, option.Key, values[key]); err != nil {
+				return err
+			}
+			option.Value = values[key]
+			if err := tx.Save(&option).Error; err != nil {
 				return err
 			}
 		}

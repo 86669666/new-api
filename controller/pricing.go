@@ -38,6 +38,23 @@ func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string
 	return filtered
 }
 
+type pricingWithCapabilityMetadata struct {
+	model.Pricing
+	model.ModelCapabilityMetadata
+}
+
+func projectPricingCapabilityMetadata(pricing []model.Pricing) []pricingWithCapabilityMetadata {
+	if pricing == nil {
+		return nil
+	}
+	metadata := model.ModelCapabilityMetadataSnapshot()
+	result := make([]pricingWithCapabilityMetadata, len(pricing))
+	for i, item := range pricing {
+		result[i] = pricingWithCapabilityMetadata{Pricing: item, ModelCapabilityMetadata: metadata[item.ModelName]}
+	}
+	return result
+}
+
 func GetPricing(c *gin.Context) {
 	if selected, trusted := middleware.TokenPricingRequest(c); selected {
 		c.Header("Cache-Control", "private, no-store")
@@ -79,7 +96,7 @@ func GetPricing(c *gin.Context) {
 
 	c.JSON(200, gin.H{
 		"success":            true,
-		"data":               pricing,
+		"data":               projectPricingCapabilityMetadata(pricing),
 		"vendors":            model.GetVendors(),
 		"group_ratio":        groupRatio,
 		"usable_group":       usableGroup,
@@ -139,7 +156,7 @@ func writeTokenPricing(c *gin.Context, token model.Token, ownerGroup string) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":            true,
-		"data":               pricing,
+		"data":               projectPricingCapabilityMetadata(pricing),
 		"group":              group,
 		"vendors":            model.GetVendors(),
 		"group_ratio":        groupRatios,

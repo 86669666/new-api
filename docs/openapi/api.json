@@ -460,7 +460,7 @@
       "get": {
         "summary": "获取定价信息",
         "deprecated": false,
-        "description": "Access is deployment-configured by HeaderNavModules: public by default, login required when configured, disabled otherwise (dashboard root management exception). Explicit sk pricing is accepted only while enabled and public, using a single Authorization value with exact Bearer or bearer, one ASCII space and lowercase sk- plus a nonempty key. Whitespace, control characters, comma lists, duplicate headers and channel/dash suffixes are rejected without dashboard fallback. A cookie or root-owned sk cannot bypass the public-only gate. Read-only authentication still accepts expired/exhausted keys but rejects disabled keys, blocked owners and disallowed IPs. Token responses require top-level group and expose only currently permitted selected candidates; unknown/revoked selection returns empty collections without fallback. Empty/null/[] auto configuration inherits the global permitted order; a nonempty custom list filters before the token limit, and malformed/all-revoked custom configuration has no fallback. Model prices, units and original-owner ratio overrides are preserved. This is pricing selection, not model execution capability. Every sk response is private, no-store; anonymous/dashboard fields and navigation semantics are unchanged.",
+        "description": "Access is deployment-configured by HeaderNavModules: public by default, login required when configured, disabled otherwise (dashboard root management exception). Explicit sk pricing is accepted only while enabled and public, using a single Authorization value with exact Bearer or bearer, one ASCII space and lowercase sk- plus a nonempty key. Whitespace, control characters, comma lists, duplicate headers and channel/dash suffixes are rejected without dashboard fallback. A cookie or root-owned sk cannot bypass the public-only gate. Read-only authentication still accepts expired/exhausted keys but rejects disabled keys, blocked owners and disallowed IPs. Token responses require top-level group and expose only currently permitted selected candidates; unknown/revoked selection returns empty collections without fallback. Empty/null/[] auto configuration inherits the global permitted order; a nonempty custom list filters before the token limit, and malformed/all-revoked custom configuration has no fallback. Model prices, units and original-owner ratio overrides are preserved. This is pricing selection, not model execution capability. Every sk response is private, no-store; anonymous/dashboard fields and navigation semantics are unchanged. Optional per-row context_length/max_output_tokens/vision/reasoning/tool_use are administrator declarations, not provider-verified capabilities. Unconfigured or invalid loaded data adds no fields. Existing visibility and prices are unchanged.",
         "tags": [
           "系统"
         ],
@@ -12548,7 +12548,7 @@
       "put": {
         "summary": "更新系统选项",
         "deprecated": false,
-        "description": "👑 需要超级管理员权限（Root）。兼容期内 theme.frontend=default 可幂等写入，其他主题值会被拒绝。",
+        "description": "👑 需要超级管理员权限（Root）。兼容期内 theme.frontend=default 可幂等写入，其他主题值会被拒绝。 ModelCapabilityMetadata is a Root-only full replacement of explicit model facts. value is a serialized ModelCapabilityMetadataMap JSON string, not an object. Invalid input or transaction failure leaves persistence and local published options unchanged. Existing option authorization and audit behavior are unchanged.",
         "tags": [
           "系统设置"
         ],
@@ -12615,7 +12615,40 @@
         "x-auth-source": "middleware/access_token_routes.go; router/channel-router.go",
         "x-pat-scope": "option:write",
         "operationId": "putApiOptionCollection",
-        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
+        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ModelCapabilityMetadataOptionWrite"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "key": {
+                        "type": "string",
+                        "not": {
+                          "enum": [
+                            "ModelCapabilityMetadata"
+                          ]
+                        }
+                      },
+                      "value": {}
+                    },
+                    "required": [
+                      "key",
+                      "value"
+                    ],
+                    "additionalProperties": true
+                  }
+                ]
+              }
+            }
+          }
+        }
       }
     },
     "/api/option/rest_model_ratio": {
@@ -26816,6 +26849,30 @@
               "type": "object",
               "additionalProperties": true
             }
+          },
+          "context_length": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "vision": {
+            "type": "boolean"
+          },
+          "reasoning": {
+            "type": "boolean"
+          },
+          "tool_use": {
+            "type": "boolean"
+          },
+          "metadata_source": {
+            "$ref": "#/components/schemas/ModelCapabilityMetadataSource"
           }
         },
         "required": [
@@ -26829,7 +26886,77 @@
           "supported_endpoint_types"
         ],
         "additionalProperties": false,
-        "description": "Existing pricing fields and units are unchanged; billing metadata is passed through without calculating a new price."
+        "description": "Existing pricing fields and units are unchanged; billing metadata is passed through without calculating a new price. Optional facts are exact-name administrator declarations from ModelCapabilityMetadata; omitted fields are unknown and false is explicit. metadata_source is present only with declared facts. They never change pricing, groups, endpoints, routing or request limits.",
+        "oneOf": [
+          {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "context_length"
+                  ]
+                },
+                {
+                  "required": [
+                    "max_output_tokens"
+                  ]
+                },
+                {
+                  "required": [
+                    "vision"
+                  ]
+                },
+                {
+                  "required": [
+                    "reasoning"
+                  ]
+                },
+                {
+                  "required": [
+                    "tool_use"
+                  ]
+                },
+                {
+                  "required": [
+                    "metadata_source"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "required": [
+              "metadata_source"
+            ],
+            "anyOf": [
+              {
+                "required": [
+                  "context_length"
+                ]
+              },
+              {
+                "required": [
+                  "max_output_tokens"
+                ]
+              },
+              {
+                "required": [
+                  "vision"
+                ]
+              },
+              {
+                "required": [
+                  "reasoning"
+                ]
+              },
+              {
+                "required": [
+                  "tool_use"
+                ]
+              }
+            ]
+          }
+        ]
       },
       "TokenPricingEntry": {
         "allOf": [
@@ -27031,6 +27158,84 @@
         ],
         "additionalProperties": false,
         "description": "group is the authenticated selection. Group maps and enable_groups contain only current candidates; unavailable selections keep group and return empty collections. Vendors and endpoint metadata are unchanged and do not assert execution capability."
+      },
+      "ModelCapabilityMetadataDeclaration": {
+        "type": "object",
+        "properties": {
+          "context_length": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "vision": {
+            "type": "boolean"
+          },
+          "reasoning": {
+            "type": "boolean"
+          },
+          "tool_use": {
+            "type": "boolean"
+          }
+        },
+        "minProperties": 1,
+        "additionalProperties": false,
+        "description": "Administrator-declared diagnostic facts only. Every field is optional; absence means unknown and explicit false is a declared negative. Limits are positive JSON-safe integers, not request or billing enforcement. Null and case-aliased field names are invalid."
+      },
+      "ModelCapabilityMetadataMap": {
+        "type": "object",
+        "maxProperties": 256,
+        "additionalProperties": {
+          "$ref": "#/components/schemas/ModelCapabilityMetadataDeclaration"
+        },
+        "description": "Full replacement keyed by exact final pricing model_name: 1..255 UTF-8 bytes, no surrounding Unicode whitespace or control characters. Runtime strictly rejects duplicate JSON keys, null, invalid UTF-8 and trailing JSON. At most 65536 UTF-8 bytes for the serialized map; {} removes all declarations. No prefix/case/routing/alias normalization."
+      },
+      "ModelCapabilityMetadataSource": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "administrator"
+            ]
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "kind",
+          "version"
+        ],
+        "additionalProperties": false,
+        "description": "Declarant and version-1 canonical per-model content digest. Neither provider verification, signature nor freshness guarantee; no global map fingerprint."
+      },
+      "ModelCapabilityMetadataOptionWrite": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "enum": [
+              "ModelCapabilityMetadata"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "maxLength": 65536,
+            "description": "Serialized ModelCapabilityMetadataMap JSON; byte bound and inner exact-field/duplicate/null validation are enforced by the server. This is a JSON string using the existing option API protocol."
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ]
       }
     },
     "responses": {
@@ -28870,5 +29075,34 @@
     "personal_funds_fallback": false,
     "maximum_quota": "9007199254740991",
     "read_publication": "final current session and role recheck after preparing snapshot"
+  },
+  "x-model-capability-metadata-contract": {
+    "write": "RootAuth existing /api/option/ protocol: key ModelCapabilityMetadata and value serialized JSON string; {} replaces with no declarations",
+    "bounds": {
+      "bytes": 65536,
+      "models": 256,
+      "model_name_bytes": 255,
+      "positive_integer_maximum": 9007199254740991
+    },
+    "facts": [
+      "context_length",
+      "max_output_tokens",
+      "vision",
+      "reasoning",
+      "tool_use"
+    ],
+    "unknown": "omitted, never default false/0; null and empty declarations are rejected",
+    "identity": "exact final Pricing.ModelName; no case/prefix/alias/routing/tag/endpoint inference",
+    "authority": "administrator; no upstream/provider verification or execution guarantee",
+    "version": "sha256 of version-1 canonical struct: version, exact model, present facts in declaration field order; metadata_source excluded",
+    "visibility": "project copies only after existing public/dashboard/sk pricing row filtering; original nil/empty data semantics preserved",
+    "consistency": "one raw OptionMap snapshot decoded per response; successful sequential local writes visible next read; other nodes follow existing option sync; no linearizable multiwriter or global freshness guarantee",
+    "failures": "invalid input and failed transactions publish nothing; missing/invalid loaded raw config emits no metadata",
+    "exclusions": [
+      "v1/models",
+      "automatic catalog ingestion",
+      "price/auth/routing/billing changes",
+      "UI"
+    ]
   }
 }

@@ -392,6 +392,24 @@ class OrganizationIdentityContracts(unittest.TestCase):
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                 runner.validate_organization_identity_events(candidate, suite)
 
+    def test_model_capability_metadata_suite_is_closed(self):
+        suite, root, package = 'model-capability-metadata', 'TestModelCapabilityMetadataHTTP', 'github.com/QuantumNous/new-api/router'
+        leaves = ('authorized_projection_and_versions', 'strict_input_and_atomicity',
+                  'reserved_option_identity', 'reload_and_catalog_independence')
+        names = [root] + [root + '/' + name for name in leaves]
+        events = [{'Action': 'pass', 'Package': package, 'Test': name} for name in names]
+        events.append({'Action': 'pass', 'Package': package})
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite], (frozenset((root,)), 'g19-model-capability-metadata'))
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['passed_tests_and_subtests'], 5)
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:], events + [{'Action': 'skip'}],
+                          events + [{'Action': 'fail'}], events + [{'Action': 'pass', 'Package': package, 'Test': root + '/unexpected'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': 'TestSiteDescriptionHTTP'}],
+                          [dict(event, Package='github.com/QuantumNous/new-api/service') for event in events]):
+            with self.subTest(events=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+        with self.assertRaises(ValueError):
+            runner.validate_organization_identity_events(events, 'organization-identity')
+
     def test_organization_name_uniqueness_suite_is_closed(self):
         suite, root, package = 'organization-name-uniqueness', 'TestOrganizationNameUniqueness', 'github.com/QuantumNous/new-api/router'
         leaves = ('comparison_and_rename', 'disabled_dissolution_and_history', 'authorization_precedence',

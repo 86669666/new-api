@@ -706,6 +706,7 @@ ORGANIZATION_READ_SUITES = {
     'organization-capabilities': (frozenset(('TestOrganizationCapabilityProjection', 'TestOrganizationAccessHTTP')), 'g16-organization-capabilities'),
     'organization-wallet': (frozenset(('TestOrganizationWalletLifecycle',)), 'g17-organization-wallet'),
     'site-description': (frozenset(('TestSiteDescriptionHTTP',)), 'g18-site-description'),
+    'model-capability-metadata': (frozenset(('TestModelCapabilityMetadataHTTP',)), 'g19-model-capability-metadata'),
     'organization-name-uniqueness': (frozenset(('TestOrganizationNameUniqueness',)), 'g19-organization-name-uniqueness'),
 }
 ORGANIZATION_NAME_CASES = frozenset((
@@ -887,6 +888,10 @@ def validate_organization_identity_events(events, suite='organization-identity')
             'TestSiteDescriptionHTTP/reserved_option_and_failures',
             'TestSiteDescriptionHTTP/anonymous_links_and_navigation'}:
         raise ValueError('every exact site description case must pass without unrelated tests')
+    if suite == 'model-capability-metadata' and passed != required | {None} | {
+            'TestModelCapabilityMetadataHTTP/' + name for name in (
+                'authorized_projection_and_versions', 'strict_input_and_atomicity', 'reserved_option_identity', 'reload_and_catalog_independence')}:
+        raise ValueError('every exact model metadata case must pass without unrelated tests')
     if suite == 'organization-name-uniqueness' and passed != required | {None} | {
             'TestOrganizationNameUniqueness/' + name for name in ORGANIZATION_NAME_CASES}:
         raise ValueError('every exact name uniqueness case must pass without unrelated tests')

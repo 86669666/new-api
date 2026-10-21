@@ -186,6 +186,69 @@ def check_personal_log_pagination(api):
     return {'page_alias_scope': '/api/log/self', 'canonical_presence_wins': True, 'legacy_fallback_preserved': True}
 
 
+def check_model_capability_metadata(api):
+    schemas = api['components']['schemas']
+    facts = ['context_length', 'max_output_tokens', 'vision', 'reasoning', 'tool_use']
+    properties = {name: {'type': 'integer', 'format': 'int64', 'minimum': 1, 'maximum': 9007199254740991}
+                  if name in facts[:2] else {'type': 'boolean'} for name in facts}
+    declaration = schemas['ModelCapabilityMetadataDeclaration']
+    assert {key: value for key, value in declaration.items() if key != 'description'} == {
+        'type': 'object', 'properties': properties, 'minProperties': 1, 'additionalProperties': False,
+    }
+    mapping = schemas['ModelCapabilityMetadataMap']
+    assert {key: value for key, value in mapping.items() if key != 'description'} == {
+        'type': 'object', 'maxProperties': 256,
+        'additionalProperties': {'$ref': '#/components/schemas/ModelCapabilityMetadataDeclaration'},
+    }
+    source = schemas['ModelCapabilityMetadataSource']
+    assert {key: value for key, value in source.items() if key != 'description'} == {
+        'type': 'object', 'properties': {
+            'kind': {'type': 'string', 'enum': ['administrator']},
+            'version': {'type': 'string', 'pattern': r'^sha256:[0-9a-f]{64}$(?![\s\S])'},
+        }, 'required': ['kind', 'version'], 'additionalProperties': False,
+    }
+    entry = schemas['PricingEntry']
+    assert entry['required'] == ['model_name', 'quota_type', 'model_ratio', 'model_price', 'owner_by',
+                                 'completion_ratio', 'enable_groups', 'supported_endpoint_types']
+    legacy = {'model_name', 'description', 'icon', 'tags', 'owner_by', 'billing_mode', 'billing_expr',
+              'pricing_version', 'model_ratio', 'model_price', 'completion_ratio', 'cache_ratio',
+              'create_cache_ratio', 'image_ratio', 'audio_ratio', 'audio_completion_ratio', 'vendor_id',
+              'quota_type', 'enable_groups', 'supported_endpoint_types', 'billing_usage_schema',
+              'billing_usage_examples', 'billing_plugin_variants'}
+    assert set(entry['properties']) == legacy | set(facts) | {'metadata_source'}
+    for name, schema in properties.items():
+        assert entry['properties'][name] == schema
+    assert entry['properties']['metadata_source'] == {'$ref': '#/components/schemas/ModelCapabilityMetadataSource'}
+    assert entry['oneOf'] == [
+        {'not': {'anyOf': [{'required': [name]} for name in facts + ['metadata_source']]}},
+        {'required': ['metadata_source'], 'anyOf': [{'required': [name]} for name in facts]},
+    ]
+    operation = api['paths']['/api/option/']['put']
+    branches = operation['requestBody']['content']['application/json']['schema']['oneOf']
+    assert branches == [
+        {'$ref': '#/components/schemas/ModelCapabilityMetadataOptionWrite'},
+        {'type': 'object', 'properties': {
+            'key': {'type': 'string', 'not': {'enum': ['ModelCapabilityMetadata']}}, 'value': {},
+        }, 'required': ['key', 'value'], 'additionalProperties': True},
+    ]
+    write = schemas['ModelCapabilityMetadataOptionWrite']
+    assert write['properties']['key'] == {'type': 'string', 'enum': ['ModelCapabilityMetadata']}
+    assert {key: value for key, value in write['properties']['value'].items() if key != 'description'} == {
+        'type': 'string', 'maxLength': 65536,
+    }
+    assert set(write['properties']) == {'key', 'value'} and write['required'] == ['key', 'value']
+    assert write['type'] == 'object' and write.get('additionalProperties', True) is True
+    assert operation['security'] == [{'DashboardJWT': []}, {'PersonalAccessToken': []}]
+    assert operation['x-pat-scope'] == 'option:write'
+    contract = api['x-model-capability-metadata-contract']
+    assert contract['facts'] == facts and contract['bounds'] == {
+        'bytes': 65536, 'models': 256, 'model_name_bytes': 255, 'positive_integer_maximum': 9007199254740991,
+    }
+    assert contract['exclusions'] == ['v1/models', 'automatic catalog ingestion', 'price/auth/routing/billing changes', 'UI']
+    assert 'no linearizable multiwriter' in contract['consistency']
+    return {'authority': 'administrator', 'unknown_omitted': True, 'scope': '/api/pricing only'}
+
+
 def check_token_pricing(api):
     operation = api['paths']['/api/pricing']['get']
     assert operation['security'] == [{}, {'DashboardJWT': []}, {'PersonalAccessToken': []}, {'RelayKey': []}]
@@ -867,6 +930,7 @@ def main():
     fixtures = json.loads((Path(__file__).with_name('fixtures.json')).read_text())
     results['token_usage'] = check_token_usage(api)
     results['token_pricing'] = check_token_pricing(api)
+    results['model_capability_metadata'] = check_model_capability_metadata(api)
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
     for fixture in fixtures:

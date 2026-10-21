@@ -10794,5 +10794,467 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "administrator model metadata declaration",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "context_length": 128000,
+        "max_output_tokens": 4096,
+        "vision": true,
+        "reasoning": false,
+        "tool_use": true
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "administrator model metadata explicitly false",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "vision": false
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "administrator model metadata removal",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {},
+    "valid": true
+  },
+  {
+    "name": "model metadata rejects empty declaration",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {}
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects case alias",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "Vision": true
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects mixed case collision",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "vision": true,
+        "VISION": false
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects null unknown",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "vision": null
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects zero limit",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "context_length": 0
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects negative limit",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "max_output_tokens": -1
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects fraction limit",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "max_output_tokens": 1.5
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects oversized integer",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "context_length": 9007199254740992
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects string limit",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "context_length": "128000"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata rejects source spoof",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataMap",
+    "value": {
+      "fixture-priced-model": {
+        "vision": true,
+        "metadata_source": {
+          "kind": "provider"
+        }
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "model metadata option uses string value",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataOptionWrite",
+    "value": {
+      "key": "ModelCapabilityMetadata",
+      "value": "{\"fixture-priced-model\": {\"context_length\": 128000, \"max_output_tokens\": 4096, \"vision\": true, \"reasoning\": false, \"tool_use\": true}}"
+    },
+    "valid": true
+  },
+  {
+    "name": "model metadata option rejects object value",
+    "document": "api",
+    "schema": "#/components/schemas/ModelCapabilityMetadataOptionWrite",
+    "value": {
+      "key": "ModelCapabilityMetadata",
+      "value": {
+        "fixture-priced-model": {
+          "context_length": 128000,
+          "max_output_tokens": 4096,
+          "vision": true,
+          "reasoning": false,
+          "tool_use": true
+        }
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token pricing administrator metadata",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ],
+          "context_length": 128000,
+          "max_output_tokens": 4096,
+          "vision": true,
+          "reasoning": false,
+          "tool_use": true,
+          "metadata_source": {
+            "kind": "administrator",
+            "version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": true
+  },
+  {
+    "name": "public pricing administrator metadata",
+    "document": "api",
+    "schema": "#/components/schemas/PublicPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ],
+          "context_length": 128000,
+          "max_output_tokens": 4096,
+          "vision": true,
+          "reasoning": false,
+          "tool_use": true,
+          "metadata_source": {
+            "kind": "administrator",
+            "version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version"
+    },
+    "valid": true
+  },
+  {
+    "name": "pricing metadata facts require provenance",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ],
+          "vision": false
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
+  },
+  {
+    "name": "pricing metadata provenance requires facts",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ],
+          "metadata_source": {
+            "kind": "administrator",
+            "version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
+  },
+  {
+    "name": "pricing metadata zero is not unknown",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ],
+          "context_length": 0,
+          "metadata_source": {
+            "kind": "administrator",
+            "version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
+  },
+  {
+    "name": "pricing metadata null is not unknown",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ],
+          "vision": null,
+          "metadata_source": {
+            "kind": "administrator",
+            "version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
+  },
+  {
+    "name": "pricing metadata provider assertion is not administrator",
+    "document": "api",
+    "schema": "#/components/schemas/TokenPricingResult",
+    "value": {
+      "success": true,
+      "data": [
+        {
+          "model_name": "fixture-priced-model",
+          "quota_type": 1,
+          "model_ratio": 0,
+          "model_price": 0.05,
+          "owner_by": "openai",
+          "completion_ratio": 0,
+          "enable_groups": [
+            "g1"
+          ],
+          "supported_endpoint_types": [
+            "openai"
+          ],
+          "vision": true,
+          "metadata_source": {
+            "kind": "provider",
+            "version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ],
+      "vendors": [],
+      "group_ratio": {
+        "g1": 0.25
+      },
+      "usable_group": {
+        "g1": "Group one"
+      },
+      "supported_endpoint": {},
+      "auto_groups": [],
+      "pricing_version": "fixture-version",
+      "group": "g1"
+    },
+    "valid": false
   }
 ]
