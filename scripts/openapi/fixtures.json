@@ -11544,5 +11544,282 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "provider challenge input",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderPreviewInput",
+    "value": {
+      "challenge": "synthetic-challenge"
+    },
+    "valid": true
+  },
+  {
+    "name": "provider preview rejects null",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderPreviewInput",
+    "value": {
+      "challenge": null
+    },
+    "valid": false
+  },
+  {
+    "name": "provider preview rejects alias",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderPreviewInput",
+    "value": {
+      "Challenge": "synthetic"
+    },
+    "valid": false
+  },
+  {
+    "name": "provider preview rejects subject",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderPreviewInput",
+    "value": {
+      "challenge": "synthetic",
+      "subject": "1"
+    },
+    "valid": false
+  },
+  {
+    "name": "provider preview rejects whitespace",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderPreviewInput",
+    "value": {
+      "challenge": "synthetic\n"
+    },
+    "valid": false
+  },
+  {
+    "name": "provider login continue",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderLoginDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "continue"
+    },
+    "valid": true
+  },
+  {
+    "name": "provider login deny",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderLoginDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "deny"
+    },
+    "valid": true
+  },
+  {
+    "name": "provider login cannot choose identity",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderLoginDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "continue",
+      "auth_version": "1"
+    },
+    "valid": false
+  },
+  {
+    "name": "provider consent profile",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "profile"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "provider consent email optional",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "email",
+        "profile"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "provider consent explicit deny",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "deny",
+      "selected_scopes": []
+    },
+    "valid": true
+  },
+  {
+    "name": "provider consent email only",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "email"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "provider consent outside",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "profile",
+        "tokens:read"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "provider consent duplicate",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "profile",
+        "profile"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "provider consent null",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": null
+    },
+    "valid": false
+  },
+  {
+    "name": "provider consent deny grants",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "deny",
+      "selected_scopes": [
+        "profile"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "provider bound preview",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderPreview",
+    "value": {
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expires_at": 1900000000,
+      "phase": "consent",
+      "client_id": "cherry-studio",
+      "client_name": "Fixture",
+      "username": "fixture",
+      "requested_scopes": [
+        "profile",
+        "email",
+        "tokens:read"
+      ],
+      "allowed_scopes": [
+        "profile",
+        "email"
+      ],
+      "audience": "newapi-userinfo"
+    },
+    "valid": true
+  },
+  {
+    "name": "provider preview omits private identity",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderPreview",
+    "value": {
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expires_at": 1900000000,
+      "phase": "consent",
+      "client_id": "cherry-studio",
+      "client_name": "Fixture",
+      "username": "fixture",
+      "requested_scopes": [
+        "profile",
+        "email",
+        "tokens:read"
+      ],
+      "allowed_scopes": [
+        "profile",
+        "email"
+      ],
+      "audience": "newapi-userinfo",
+      "sid": "private"
+    },
+    "valid": false
+  },
+  {
+    "name": "provider validated resume",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderRedirect",
+    "value": {
+      "redirect_to": "https://issuer.example/oauth2/auth?consent_verifier=synthetic"
+    },
+    "valid": true
+  },
+  {
+    "name": "provider no client protocol resume",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderRedirect",
+    "value": {
+      "redirect_to": "cherrystudio://oauth/callback"
+    },
+    "valid": false
+  },
+  {
+    "name": "provider fixed failure",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderError",
+    "value": {
+      "error": "invalid_grant"
+    },
+    "valid": true
+  },
+  {
+    "name": "provider no raw error cause",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderError",
+    "value": {
+      "error": "temporarily_unavailable",
+      "cause": "private"
+    },
+    "valid": false
   }
 ]

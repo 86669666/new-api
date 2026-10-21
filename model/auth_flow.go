@@ -36,6 +36,11 @@ const (
 	AuthFlowDefaultCleanupRetention  = 24 * time.Hour
 )
 
+const (
+	AuthFlowPurposeOAuthProviderPreview = "oauth_provider_preview"
+	AuthFlowPurposeOAuthProviderAttempt = "oauth_provider_attempt"
+)
+
 var (
 	ErrAuthFlowInvalid  = errors.New("auth flow is invalid")
 	ErrAuthFlowExpired  = errors.New("auth flow has expired")

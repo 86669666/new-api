@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -208,7 +209,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -477,6 +478,578 @@ func organizationError(t *testing.T, status int, h http.Header, b map[string]any
 	} else {
 		assert.NotContains(t, slices.Collect(maps.Keys(b)), "data")
 	}
+}
+
+// This is a protocol fixture for the default-off backend producer. It is not
+// actual Hydra deployment, code issuance, a human consent UI or Cherry login.
+func TestOAuthProviderBridgeHTTP(t *testing.T) {
+	t.Setenv("OAUTH_USERINFO_ENABLED", "false")
+	t.Setenv("OAUTH_PROVIDER_BRIDGE_ENABLED", "false")
+	require.NoError(t, service.InitOAuthUserInfoResource())
+	require.NoError(t, service.InitOAuthProviderBridge())
+	f := newOrganizationHTTPFixture(t)
+	require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}))
+	oldCritical, oldAddress := common.CriticalRateLimitEnable, system_setting.ServerAddress
+	common.CriticalRateLimitEnable, system_setting.ServerAddress = false, "https://console.example"
+	t.Cleanup(func() { common.CriticalRateLimitEnable, system_setting.ServerAddress = oldCritical, oldAddress })
+	const publicAuth = "https://issuer.example/oauth2/auth"
+	const logCanary = "provider-capability-canary"
+	type attempt struct {
+		phase, challenge string
+		body             map[string]any
+	}
+	var mu sync.Mutex
+	requests := map[string]map[string]any{}
+	gone := map[string]bool{}
+	attempts := []attempt{}
+	var getHook func(string)
+	var putHook func(*http.Request, string)
+	var badResume bool
+	var producedSubject, producedVersion, producedClient string
+	encode := func(value any) []byte { data, err := common.Marshal(value); assert.NoError(t, err); return data }
+	clone := func(value map[string]any) map[string]any {
+		var result map[string]any
+		assert.NoError(t, common.Unmarshal(encode(value), &result))
+		return result
+	}
+	issuer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Get("Cookie"))
+		assert.Empty(t, r.Header.Get("Authorization"))
+		assert.Empty(t, r.Header.Get("X-Caller-Canary"))
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/admin/oauth2/introspect" {
+			assert.NoError(t, r.ParseForm())
+			assert.Len(t, r.PostForm, 1)
+			mu.Lock()
+			subject, version, client := producedSubject, producedVersion, producedClient
+			mu.Unlock()
+			value := map[string]any{"active": false}
+			if r.PostForm.Get("token") == "provider-produced-token" && subject != "" && version != "" {
+				value = map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": "https://issuer.example/", "aud": []string{"newapi-userinfo"}, "client_id": client, "sub": subject, "exp": time.Now().Unix() + 3600, "scope": "profile email", "ext": map[string]any{"newapi_auth_version": version}}
+			}
+			_, _ = w.Write(encode(value))
+			return
+		}
+		phase := "login"
+		if strings.Contains(r.URL.Path, "/consent") {
+			phase = "consent"
+		}
+		challenge := r.URL.Query().Get(phase + "_challenge")
+		mu.Lock()
+		value, exists := requests[challenge]
+		expired := gone[challenge]
+		if exists {
+			value = clone(value)
+		}
+		onGet, onPut, invalidResume := getHook, putHook, badResume
+		mu.Unlock()
+		if !exists || expired {
+			w.WriteHeader(410)
+			_, _ = w.Write([]byte(`{"cause":"provider-capability-canary"}`))
+			return
+		}
+		if r.Method == http.MethodGet {
+			if onGet != nil {
+				onGet(challenge)
+			}
+			_, _ = w.Write(encode(value))
+			return
+		}
+		assert.Equal(t, http.MethodPut, r.Method)
+		var body map[string]any
+		if !assert.NoError(t, common.DecodeJson(r.Body, &body)) {
+			w.WriteHeader(400)
+			return
+		}
+		mu.Lock()
+		attempts = append(attempts, attempt{phase, challenge, body})
+		if strings.HasSuffix(r.URL.Path, "/accept") {
+			if phase == "login" {
+				producedSubject, _ = body["subject"].(string)
+			} else {
+				if session, ok := body["session"].(map[string]any); ok {
+					if access, ok := session["access_token"].(map[string]any); ok {
+						producedVersion, _ = access["newapi_auth_version"].(string)
+					}
+				}
+				producedClient, _ = value["client"].(map[string]any)["client_id"].(string)
+			}
+		}
+		mu.Unlock()
+		// Accept alone deliberately does not make the challenge USED: Hydra's
+		// verifier is consumed later. The local claim must stop a second PUT.
+		if onPut != nil {
+			onPut(r, challenge)
+		}
+		u, err := url.Parse(value["request_url"].(string))
+		assert.NoError(t, err)
+		q := u.Query()
+		q.Set(phase+"_verifier", "fixture-verifier-"+logCanary)
+		u.RawQuery = q.Encode()
+		resume := u.String()
+		if invalidResume {
+			resume = "https://foreign.example/" + logCanary
+		}
+		_, _ = w.Write(encode(map[string]any{"redirect_to": resume}))
+	}))
+	t.Cleanup(issuer.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(issuer.Certificate())
+	resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: issuer.URL + "/admin/oauth2/introspect", Issuer: "https://issuer.example/", Audience: "newapi-userinfo", ClientIDs: []string{"cherry-studio"}}, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	config := service.OAuthProviderConfig{Enabled: true, AdminBaseURL: issuer.URL + "/", AuthorizationURL: publicAuth}
+	bridge, err := service.NewOAuthProviderBridge(config, resource)
+	require.NoError(t, err)
+	add := func(phase, challenge, actor string) {
+		pkce := sha256.Sum256([]byte("fixture-pkce-verifier"))
+		query := url.Values{"client_id": {"cherry-studio"}, "response_type": {"code"}, "redirect_uri": {"http://127.0.0.1:35421/oauth/callback"}, "scope": {"profile email tokens:read"}, "state": {"fixture-state-" + challenge}, "code_challenge": {base64.RawURLEncoding.EncodeToString(pkce[:])}, "code_challenge_method": {"S256"}, "audience": {"newapi-userinfo"}}
+		subject := ""
+		if phase == "consent" {
+			subject = strconv.Itoa(f.users[actor].Id)
+		}
+		value := map[string]any{"challenge": challenge, "subject": subject, "skip": false, "request_url": publicAuth + "?" + query.Encode(), "requested_scope": []string{"profile", "email", "tokens:read"}, "requested_access_token_audience": []string{"newapi-userinfo"}, "context": nil,
+			"client": map[string]any{"client_id": "cherry-studio", "client_name": "Fixture client", "token_endpoint_auth_method": "none", "scope": "profile email tokens:read", "audience": []string{"newapi-userinfo"}, "redirect_uris": []string{"http://127.0.0.1:29873/oauth/callback"}, "grant_types": []string{"authorization_code"}, "response_types": []string{"code"}, "skip_consent": false, "logo_uri": nil, "metadata": map[string]any{"optional": nil}}}
+		mu.Lock()
+		requests[challenge] = value
+		mu.Unlock()
+	}
+	post := func(t *testing.T, path, actor string, body any) (int, http.Header, map[string]any) {
+		t.Helper()
+		return f.request(t, http.MethodPost, path, actor, string(encode(body)), http.Header{"Content-Type": {"application/json"}})
+	}
+	preview := func(t *testing.T, phase, challenge, actor string) string {
+		t.Helper()
+		status, h, body := post(t, "/api/oauth/provider/"+phase+"/preview", actor, map[string]any{"challenge": challenge})
+		require.Equal(t, 200, status)
+		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		assert.Empty(t, h.Values("Set-Cookie"))
+		assert.Equal(t, []any{"profile", "email"}, body["allowed_scopes"])
+		token, ok := body["preview_token"].(string)
+		require.True(t, ok)
+		require.Len(t, token, 43)
+		assert.LessOrEqual(t, body["expires_at"].(float64), float64(time.Now().Add(5*time.Minute).Unix()))
+		return token
+	}
+	decision := func(t *testing.T, phase, challenge, token, actor, action string, scopes ...string) (int, http.Header, map[string]any) {
+		t.Helper()
+		body := map[string]any{"challenge": challenge, "preview_token": token, "decision": action}
+		if phase == "consent" {
+			body["selected_scopes"] = append([]string{}, scopes...)
+		}
+		return post(t, "/api/oauth/provider/"+phase, actor, body)
+	}
+	putCount := func() int { mu.Lock(); defer mu.Unlock(); return len(attempts) }
+	assertFailure := func(t *testing.T, status int, h http.Header, body map[string]any) {
+		t.Helper()
+		assert.GreaterOrEqual(t, status, 400)
+		assert.NotContains(t, body, "redirect_to")
+		assert.NotContains(t, body, "preview_token")
+		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		assert.Empty(t, h.Get("Location"))
+		assert.Empty(t, h.Values("Set-Cookie"))
+	}
+	counts := func() []int64 {
+		result := []int64{}
+		for _, table := range []any{&model.User{}, &model.UserSession{}, &model.Token{}, &model.UserAccessToken{}} {
+			var n int64
+			require.NoError(t, f.db.Model(table).Count(&n).Error)
+			result = append(result, n)
+		}
+		return result
+	}
+	patKey := model.AccessTokenPrefix + strings.Repeat("b", 48)
+	pat := &model.UserAccessToken{Name: "Provider boundary fixture", TokenHash: model.AccessTokenFingerprint(patKey), ExpiresAt: time.Now().Unix() + 3600}
+	require.NoError(t, pat.SetScopes([]string{"profile:read"}))
+	require.NoError(t, model.CreateUserAccessToken(f.users["owner"].Id, pat, 20))
+	f.bearer["provider-pat"] = patKey
+	otherSID := "s2-provider-" + common.NewRequestId()
+	require.NoError(t, model.CreateUserSession(&model.UserSession{SID: otherSID, UserID: f.users["owner"].Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("b", 64), LoginMethod: "password", ExpiresAt: time.Now().Unix() + 3600}))
+	f.bearer["owner-other"], _, err = service.IssueAccessToken(service.AuthIdentity{UserID: f.users["owner"].Id, SessionID: otherSID, UserAuthVersion: 1, SessionVersion: 1})
+	require.NoError(t, err)
+	before := counts()
+
+	t.Run("real_session_and_explicit_decision", func(t *testing.T) {
+		add("login", "first-login", "owner")
+		status, h, _ := post(t, "/api/oauth/provider/login/preview?challenge="+logCanary, "owner", map[string]any{"challenge": "first-login"})
+		assert.Equal(t, 404, status)
+		assert.Empty(t, h.Get("Location"))
+		for _, invalid := range []service.OAuthProviderConfig{{Enabled: true, AdminBaseURL: "http://untrusted.example/", AuthorizationURL: publicAuth}, {Enabled: true, AdminBaseURL: issuer.URL + "/?secret=" + logCanary, AuthorizationURL: publicAuth}, {Enabled: true, AdminBaseURL: issuer.URL, AuthorizationURL: "https://foreign.example/oauth2/auth"}} {
+			_, err := service.NewOAuthProviderBridge(invalid, resource)
+			require.ErrorIs(t, err, service.ErrOAuthProviderConfiguration)
+		}
+		SetOAuthResourceRouter(f.engine, resource)
+		SetOAuthProviderRouter(f.engine, bridge)
+		for _, actor := range []string{"", "relay", "provider-pat", "provider-produced-token"} {
+			status, h, b := post(t, "/api/oauth/provider/login/preview", actor, map[string]any{"challenge": "first-login"})
+			assertFailure(t, status, h, b)
+		}
+		for _, headers := range []http.Header{
+			{"Origin": {"https://foreign.example"}}, {"Origin": {"https://console.example", "https://console.example"}},
+			{"Origin": {"https://console.example"}, "Sec-Fetch-Site": {"cross-site"}},
+			{"Sec-Fetch-Site": {"same-origin"}}, {"Authorization": {"Bearer " + f.bearer["owner"], "Bearer " + f.bearer["owner"]}},
+		} {
+			headers.Set("Content-Type", "application/json")
+			status, h, b := f.request(t, http.MethodPost, "/api/oauth/provider/login/preview", "owner", `{"challenge":"first-login"}`, headers)
+			assertFailure(t, status, h, b)
+		}
+		for _, body := range []string{`{"challenge":"first-login","challenge":"first-login"}`, `{"challenge":null}`, `{"challenge":"first-login","subject":"1"}`, `{"Challenge":"first-login"}`} {
+			status, h, b := f.request(t, http.MethodPost, "/api/oauth/provider/login/preview", "owner", body, http.Header{"Content-Type": {"application/json"}})
+			assertFailure(t, status, h, b)
+		}
+		assert.Zero(t, putCount())
+		token := preview(t, "login", "first-login", "owner")
+		assert.Zero(t, putCount(), "preview cannot accept")
+		status, _, b := decision(t, "login", "first-login", token, "owner", "continue")
+		require.Equal(t, 200, status)
+		assert.Len(t, b, 1)
+		assert.Contains(t, b["redirect_to"], publicAuth+"?")
+		assert.Equal(t, 1, putCount())
+		mu.Lock()
+		payload := attempts[0].body
+		mu.Unlock()
+		assert.Equal(t, map[string]any{"subject": strconv.Itoa(f.users["owner"].Id), "remember": false}, payload)
+		for _, path := range []string{"/api/oauth/provider/login", "/api/oauth/provider/login/preview", "/api/oauth/provider/consent", "/api/oauth/provider/consent/preview"} {
+			status, h, _ := f.request(t, http.MethodGet, path+"?challenge="+logCanary, "owner", "", nil)
+			assert.Equal(t, 404, status)
+			assert.Empty(t, h.Get("Location"))
+			status, h, b := post(t, path+"/?challenge="+logCanary, "owner", map[string]any{})
+			assertFailure(t, status, h, b)
+		}
+		status, _, b = f.request(t, http.MethodGet, "/api/status", "", "", nil)
+		require.Equal(t, 200, status)
+		assert.Equal(t, false, b["data"].(map[string]any)["oauth"].(map[string]any)["enabled"])
+	})
+
+	t.Run("challenge_client_pkce_binding", func(t *testing.T) {
+		for i, kind := range []string{"client", "subject", "skip", "skip-consent", "method", "audience", "pkce", "plain", "state", "redirect", "issuer", "prompt", "max-age", "request-uri", "response-mode", "duplicate-client", "missing-security"} {
+			challenge := fmt.Sprintf("invalid-%d", i)
+			add("consent", challenge, "owner")
+			mu.Lock()
+			value := requests[challenge]
+			client := value["client"].(map[string]any)
+			u, err := url.Parse(value["request_url"].(string))
+			require.NoError(t, err)
+			q := u.Query()
+			switch kind {
+			case "client":
+				client["client_id"] = "foreign-client"
+			case "subject":
+				value["subject"] = strconv.Itoa(f.users["foreign"].Id)
+			case "skip":
+				value["skip"] = true
+			case "skip-consent":
+				client["skip_consent"] = true
+			case "method":
+				client["token_endpoint_auth_method"] = "client_secret_basic"
+			case "audience":
+				value["requested_access_token_audience"] = []string{"foreign"}
+			case "pkce":
+				q.Set("code_challenge", "not-32-bytes")
+			case "plain":
+				q.Set("code_challenge_method", "plain")
+			case "state":
+				q.Del("state")
+			case "redirect":
+				q.Set("redirect_uri", "http://127.0.0.2:35421/oauth/callback")
+			case "issuer":
+				u.Host = "foreign.example"
+			case "prompt":
+				q.Set("prompt", "none")
+			case "max-age":
+				q.Set("max_age", "0")
+			case "request-uri":
+				q.Set("request_uri", "urn:fixture")
+			case "response-mode":
+				q.Set("response_mode", "form_post")
+			case "duplicate-client":
+				q.Add("client_id", "cherry-studio")
+			case "missing-security":
+				client["scope"] = nil
+			}
+			u.RawQuery = q.Encode()
+			value["request_url"] = u.String()
+			mu.Unlock()
+			before := putCount()
+			status, h, b := post(t, "/api/oauth/provider/consent/preview", "owner", map[string]any{"challenge": challenge})
+			assertFailure(t, status, h, b)
+			assert.Equal(t, before, putCount(), kind)
+		}
+		add("consent", "bound-consent", "owner")
+		token := preview(t, "consent", "bound-consent", "owner")
+		before := putCount()
+		for _, selected := range [][]string{{"profile", "tokens:read"}, {"email"}, {"profile", "profile"}} {
+			status, h, b := decision(t, "consent", "bound-consent", token, "owner", "approve", selected...)
+			assertFailure(t, status, h, b)
+		}
+		status, h, b := decision(t, "consent", "bound-consent", token, "foreign", "approve", "profile")
+		assertFailure(t, status, h, b)
+		status, h, b = decision(t, "consent", "bound-consent", token, "owner-other", "approve", "profile")
+		assertFailure(t, status, h, b)
+		add("login", "other-phase", "owner")
+		status, h, b = decision(t, "login", "other-phase", token, "owner", "continue")
+		assertFailure(t, status, h, b)
+		for _, field := range []string{"auth_version", "version"} {
+			table, where, value := any(&model.User{}), "id = ?", any(f.users["owner"].Id)
+			if field == "version" {
+				table, where, value = &model.UserSession{}, "sid = ?", f.sids["owner"]
+			}
+			require.NoError(t, f.db.Model(table).Where(where, value).Update(field, 2).Error)
+			status, h, b = decision(t, "consent", "bound-consent", token, "owner", "approve", "profile")
+			assertFailure(t, status, h, b)
+			require.NoError(t, f.db.Model(table).Where(where, value).Update(field, 1).Error)
+		}
+		add("consent", "other-consent", "owner")
+		status, h, b = decision(t, "consent", "other-consent", token, "owner", "approve", "profile")
+		assertFailure(t, status, h, b)
+		mu.Lock()
+		value := requests["bound-consent"]
+		u, err := url.Parse(value["request_url"].(string))
+		require.NoError(t, err)
+		q := u.Query()
+		q.Set("state", "substituted-state")
+		u.RawQuery = q.Encode()
+		value["request_url"] = u.String()
+		mu.Unlock()
+		status, h, b = decision(t, "consent", "bound-consent", token, "owner", "approve", "profile")
+		assertFailure(t, status, h, b)
+		assert.Equal(t, before, putCount())
+	})
+
+	t.Run("claim_production_and_userinfo", func(t *testing.T) {
+		add("consent", "produced-consent", "owner")
+		token := preview(t, "consent", "produced-consent", "owner")
+		status, h, body := decision(t, "consent", "produced-consent", token, "owner", "approve", "profile", "email")
+		require.Equal(t, 200, status)
+		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		assert.Len(t, body, 1)
+		mu.Lock()
+		payload := attempts[len(attempts)-1].body
+		mu.Unlock()
+		assert.Equal(t, map[string]any{"remember": false, "grant_scope": []any{"profile", "email"}, "grant_access_token_audience": []any{"newapi-userinfo"}, "session": map[string]any{"access_token": map[string]any{"newapi_auth_version": "1"}}}, payload)
+		status, _, body = f.request(t, http.MethodGet, "/api/v1/oauth/userinfo", "provider-produced-token", "", nil)
+		require.Equal(t, 200, status)
+		assert.Equal(t, float64(f.users["owner"].Id), body["id"])
+		assert.Equal(t, f.users["owner"].Username, body["username"])
+		assert.Len(t, body, 5)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("auth_version", 2).Error)
+		status, _, body = f.request(t, http.MethodGet, "/api/v1/oauth/userinfo", "provider-produced-token", "", nil)
+		assert.Equal(t, 401, status)
+		assert.NotContains(t, body, "username")
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("auth_version", 1).Error)
+		add("login", "denied-login", "owner")
+		token = preview(t, "login", "denied-login", "owner")
+		status, _, _ = decision(t, "login", "denied-login", token, "owner", "deny")
+		require.Equal(t, 200, status)
+		mu.Lock()
+		denied := attempts[len(attempts)-1].body
+		mu.Unlock()
+		assert.Equal(t, map[string]any{"error": "access_denied"}, denied)
+	})
+
+	t.Run("replay_revocation_and_privacy", func(t *testing.T) {
+		for _, samePreview := range []bool{true, false} {
+			challenge := fmt.Sprintf("concurrent-%t", samePreview)
+			add("login", challenge, "owner")
+			a := preview(t, "login", challenge, "owner")
+			b := a
+			if !samePreview {
+				b = preview(t, "login", challenge, "owner")
+			}
+			before := putCount()
+			results := make(chan int, 2)
+			var wg sync.WaitGroup
+			for _, token := range []string{a, b} {
+				wg.Go(func() { status, _, _ := decision(t, "login", challenge, token, "owner", "continue"); results <- status })
+			}
+			wg.Wait()
+			close(results)
+			successes := 0
+			for status := range results {
+				if status == 200 {
+					successes++
+				} else {
+					assert.GreaterOrEqual(t, status, 400)
+				}
+			}
+			assert.Equal(t, 1, successes)
+			assert.Equal(t, before+1, putCount())
+		}
+		add("login", "unknown-result", "owner")
+		a := preview(t, "login", "unknown-result", "owner")
+		mu.Lock()
+		putHook = func(r *http.Request, challenge string) {
+			if challenge == "unknown-result" {
+				<-r.Context().Done()
+			}
+		}
+		mu.Unlock()
+		before := putCount()
+		status, h, body := decision(t, "login", "unknown-result", a, "owner", "continue")
+		assert.Equal(t, 503, status)
+		assertFailure(t, status, h, body)
+		mu.Lock()
+		putHook = nil
+		mu.Unlock()
+		status, h, body = decision(t, "login", "unknown-result", a, "owner", "continue")
+		assertFailure(t, status, h, body)
+		b := preview(t, "login", "unknown-result", "owner")
+		status, h, body = decision(t, "login", "unknown-result", b, "owner", "continue")
+		assertFailure(t, status, h, body)
+		assert.Equal(t, before+1, putCount())
+		// A real revoke commits while the read-only Admin GET is waiting. The
+		// subsequent local transaction must reject before any external PUT.
+		add("login", "revoked-before-put", "revoked")
+		token := preview(t, "login", "revoked-before-put", "revoked")
+		entered, release := make(chan struct{}), make(chan struct{})
+		var releaseOnce sync.Once
+		mu.Lock()
+		getHook = func(challenge string) {
+			if challenge == "revoked-before-put" {
+				close(entered)
+				<-release
+			}
+		}
+		mu.Unlock()
+		done := make(chan int, 1)
+		before = putCount()
+		go func() {
+			status, _, _ := decision(t, "login", "revoked-before-put", token, "revoked", "continue")
+			done <- status
+		}()
+		t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Admin request barrier not reached")
+		}
+		_, err := model.RevokeUserSession(f.users["revoked"].Id, f.sids["revoked"], "test revoke")
+		require.NoError(t, err)
+		releaseOnce.Do(func() { close(release) })
+		assert.Equal(t, 401, <-done)
+		assert.Equal(t, before, putCount())
+		mu.Lock()
+		getHook = nil
+		mu.Unlock()
+		// Once PUT has started, a later revoke withholds resume publication but
+		// does not pretend to roll back Hydra's already observed acceptance.
+		add("login", "revoked-after-put", "empty")
+		token = preview(t, "login", "revoked-after-put", "empty")
+		entered2, release2 := make(chan struct{}), make(chan struct{})
+		var once2 sync.Once
+		mu.Lock()
+		putHook = func(_ *http.Request, challenge string) {
+			if challenge == "revoked-after-put" {
+				close(entered2)
+				<-release2
+			}
+		}
+		mu.Unlock()
+		doneBody := make(chan map[string]any, 1)
+		go func() {
+			status, _, body := decision(t, "login", "revoked-after-put", token, "empty", "continue")
+			assert.Equal(t, 401, status)
+			doneBody <- body
+		}()
+		t.Cleanup(func() { once2.Do(func() { close(release2) }) })
+		select {
+		case <-entered2:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Admin write barrier not reached")
+		}
+		_, err = model.RevokeUserSession(f.users["empty"].Id, f.sids["empty"], "test late revoke")
+		require.NoError(t, err)
+		once2.Do(func() { close(release2) })
+		assert.NotContains(t, <-doneBody, "redirect_to")
+		mu.Lock()
+		putHook = nil
+		mu.Unlock()
+		// Delay the session query to the persisted deadline. Validation must use
+		// a new clock observation after that database wait, not request entry.
+		add("login", "session-wait-expiry", "admin")
+		token = preview(t, "login", "session-wait-expiry", "admin")
+		var deadline atomic.Int64
+		var waited atomic.Bool
+		callback := "oauth-provider-session-wait"
+		require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Table == "user_sessions" && deadline.Load() > 0 && waited.CompareAndSwap(false, true) {
+				timer := time.NewTimer(time.Until(time.Unix(deadline.Load(), 0)))
+				defer timer.Stop()
+				<-timer.C
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, f.db.Callback().Query().Remove(callback)) })
+		mu.Lock()
+		getHook = func(challenge string) {
+			if challenge == "session-wait-expiry" {
+				expires := time.Now().Unix() + 1
+				assert.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["admin"]).Update("expires_at", expires).Error)
+				deadline.Store(expires)
+			}
+		}
+		mu.Unlock()
+		before = putCount()
+		status, h, body = decision(t, "login", "session-wait-expiry", token, "admin", "continue")
+		assert.Equal(t, 401, status)
+		assertFailure(t, status, h, body)
+		assert.True(t, waited.Load())
+		assert.Equal(t, before, putCount())
+		mu.Lock()
+		getHook = nil
+		mu.Unlock()
+		require.NoError(t, f.db.Callback().Query().Remove(callback))
+		add("login", "unsafe-resume", "owner")
+		token = preview(t, "login", "unsafe-resume", "owner")
+		mu.Lock()
+		badResume = true
+		mu.Unlock()
+		status, h, body = decision(t, "login", "unsafe-resume", token, "owner", "continue")
+		assert.Equal(t, 503, status)
+		assertFailure(t, status, h, body)
+		assert.NotContains(t, string(encode(body)), "foreign.example")
+		mu.Lock()
+		badResume = false
+		mu.Unlock()
+		// Flow expiry is explicit stored state, not a timing race.
+		add("login", "expired-preview", "owner")
+		token = preview(t, "login", "expired-preview", "owner")
+		require.NoError(t, f.db.Model(&model.AuthFlow{}).Where("purpose = ? AND intent = ?", model.AuthFlowPurposeOAuthProviderPreview, "login").Update("expires_at", time.Now().Add(-time.Minute)).Error)
+		before = putCount()
+		status, h, body = decision(t, "login", "expired-preview", token, "owner", "continue")
+		assertFailure(t, status, h, body)
+		assert.Equal(t, before, putCount())
+		// Retention is bounded by existing cleanup. Use explicit persisted
+		// timestamps; a fresh local preview is not remote issuance-time proof.
+		add("login", "retained-attempt", "owner")
+		token = preview(t, "login", "retained-attempt", "owner")
+		var prior []int64
+		require.NoError(t, f.db.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposeOAuthProviderAttempt).Pluck("id", &prior).Error)
+		status, _, _ = decision(t, "login", "retained-attempt", token, "owner", "continue")
+		require.Equal(t, 200, status)
+		var claim model.AuthFlow
+		require.NoError(t, f.db.Where("purpose = ? AND id NOT IN ?", model.AuthFlowPurposeOAuthProviderAttempt, prior).First(&claim).Error)
+		require.NotNil(t, claim.ConsumedAt)
+		anchor := *claim.ConsumedAt
+		require.NoError(t, model.DeleteExpiredAuthFlows(anchor.Add(24*time.Hour-time.Second)))
+		var count int64
+		require.NoError(t, f.db.Model(&model.AuthFlow{}).Where("id = ?", claim.Id).Count(&count).Error)
+		assert.Equal(t, int64(1), count)
+		assert.ErrorIs(t, model.ClaimExternalAuthAssertion(model.AuthFlowPurposeOAuthProviderAttempt, "https://issuer.example/\nlogin\nretained-attempt", time.Now().Add(time.Minute)), model.ErrAuthFlowConsumed)
+		require.NoError(t, model.DeleteExpiredAuthFlows(anchor.Add(24*time.Hour+time.Second)))
+		require.NoError(t, f.db.Model(&model.AuthFlow{}).Where("id = ?", claim.Id).Count(&count).Error)
+		assert.Zero(t, count)
+		mu.Lock()
+		gone["retained-attempt"] = true
+		mu.Unlock()
+		before = putCount()
+		status, h, body = post(t, "/api/oauth/provider/login/preview", "owner", map[string]any{"challenge": "retained-attempt"})
+		assertFailure(t, status, h, body)
+		assert.Equal(t, before, putCount())
+		for _, canary := range []string{logCanary, "provider-produced-token", token, "fixture-verifier-" + logCanary} {
+			assert.NotContains(t, f.logs.snapshot(), canary)
+		}
+	})
+	assert.Equal(t, before, counts(), "no new user/session/key is created by the bridge")
 }
 
 // The resource uses the real router, TLS HTTP introspection and current owned

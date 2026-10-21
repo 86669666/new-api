@@ -19701,7 +19701,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server, not a delivered login/consent/issuance flow; status oauth.enabled and client_features.oauth remain false. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: a future trusted consent producer must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Dashboard-session logout is not claimed to revoke independent grants. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent.",
+        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server, not a delivered login/consent/issuance flow; status oauth.enabled and client_features.oauth remain false. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: the optional trusted producer bridge must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Dashboard-session logout is not claimed to revoke independent grants. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -19826,6 +19826,770 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OAuthResourceUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oauth/provider/login/preview": {
+      "post": {
+        "operationId": "previewOAuthProviderLogin",
+        "summary": "Preview login challenge",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Startup-only OAUTH_PROVIDER_BRIDGE_ENABLED=false by default; absent while disabled. Requires the configured userinfo resource, a matching fixed HTTPS Admin base, exact public authorization endpoint and allowed client/audience policy. Backend protocol producer only: no login/consent UI or deployed authorization server, and status oauth.enabled and client_features.oauth remain false. One current real dashboard Bearer session is required; PAT, legacy, relay, OAuth resource credentials and cookie-only requests cannot decide. POST JSON only, no query parameters, duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Configured Origin/Referer and the existing omitted-origin native policy apply; cross-site Fetch Metadata rejects. Preview creates only an opaque local binding, valid at most five minutes and no later than session expiry. Decision re-fetches and binds the exact challenge, issuer/client policy, request, actor, SID and both current versions. Ordinary public-client authorization_code/code with canonical S256, state and exact registered redirect is supported; only the numeric loopback port may vary. Skip, silent/fresh-auth requirements, PAR/JAR and unsupported interaction/response modes reject. Explicit approval grants selected intersect requested intersect registered intersect server profile/email policy with profile mandatory, exact configured audience and remember=false. Only canonical local subject and current AuthVersion are sent as access-token claims; never SID or ID-token claims. Local preview consumption and a cross-preview challenge claim commit before one Admin PUT; no database locks span HTTP. Failed or unknown external outcomes are not retried: start a new authorization challenge. Existing cleanup gives at least 24 hours of local attempt exclusion, not permanent replay prevention. Before real activation the operator must verify effective Hydra challenge TTL <=30 minutes including old outstanding requests; no live issuer TTL or grant interoperability is established here. Current local identity is checked immediately before PUT and before publishing a validated same-endpoint phase-verifier resume URL. Later revocation may withhold the URL but cannot undo an already accepted external decision. Successful capabilities exist only in no-store JSON; fixed errors never contain upstream causes/capabilities. Wrong methods are absent; POST slash variants reject without Location redirects.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "x-pat-policy": "session-only",
+        "x-automatic-retry": false,
+        "x-query-policy": "forbidden",
+        "x-request-max-bytes": 16384,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthProviderPreviewInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bound preview only; no external decision.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderPreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed input/headers/query or existing pre-auth organization selector refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or changed current real dashboard identity/session.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Origin, session-only, subject, policy, scope selection or existing organization selection refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionUnsupportedError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Expired/consumed preview or already attempted/expired challenge; never automatically retry.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing API or critical rate limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed configuration/transport/protocol/internal failure; no raw cause and no retry.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oauth/provider/login": {
+      "post": {
+        "operationId": "decideOAuthProviderLogin",
+        "summary": "Explicitly decide login challenge",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Startup-only OAUTH_PROVIDER_BRIDGE_ENABLED=false by default; absent while disabled. Requires the configured userinfo resource, a matching fixed HTTPS Admin base, exact public authorization endpoint and allowed client/audience policy. Backend protocol producer only: no login/consent UI or deployed authorization server, and status oauth.enabled and client_features.oauth remain false. One current real dashboard Bearer session is required; PAT, legacy, relay, OAuth resource credentials and cookie-only requests cannot decide. POST JSON only, no query parameters, duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Configured Origin/Referer and the existing omitted-origin native policy apply; cross-site Fetch Metadata rejects. Preview creates only an opaque local binding, valid at most five minutes and no later than session expiry. Decision re-fetches and binds the exact challenge, issuer/client policy, request, actor, SID and both current versions. Ordinary public-client authorization_code/code with canonical S256, state and exact registered redirect is supported; only the numeric loopback port may vary. Skip, silent/fresh-auth requirements, PAR/JAR and unsupported interaction/response modes reject. Explicit approval grants selected intersect requested intersect registered intersect server profile/email policy with profile mandatory, exact configured audience and remember=false. Only canonical local subject and current AuthVersion are sent as access-token claims; never SID or ID-token claims. Local preview consumption and a cross-preview challenge claim commit before one Admin PUT; no database locks span HTTP. Failed or unknown external outcomes are not retried: start a new authorization challenge. Existing cleanup gives at least 24 hours of local attempt exclusion, not permanent replay prevention. Before real activation the operator must verify effective Hydra challenge TTL <=30 minutes including old outstanding requests; no live issuer TTL or grant interoperability is established here. Current local identity is checked immediately before PUT and before publishing a validated same-endpoint phase-verifier resume URL. Later revocation may withhold the URL but cannot undo an already accepted external decision. Successful capabilities exist only in no-store JSON; fixed errors never contain upstream causes/capabilities. Wrong methods are absent; POST slash variants reject without Location redirects.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "x-pat-policy": "session-only",
+        "x-automatic-retry": false,
+        "x-query-policy": "forbidden",
+        "x-request-max-bytes": 16384,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthProviderLoginDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated resume capability after one committed local attempt and external decision.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderRedirect"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed input/headers/query or existing pre-auth organization selector refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or changed current real dashboard identity/session.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Origin, session-only, subject, policy, scope selection or existing organization selection refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionUnsupportedError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Expired/consumed preview or already attempted/expired challenge; never automatically retry.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing API or critical rate limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed configuration/transport/protocol/internal failure; no raw cause and no retry.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oauth/provider/consent/preview": {
+      "post": {
+        "operationId": "previewOAuthProviderConsent",
+        "summary": "Preview consent challenge",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Startup-only OAUTH_PROVIDER_BRIDGE_ENABLED=false by default; absent while disabled. Requires the configured userinfo resource, a matching fixed HTTPS Admin base, exact public authorization endpoint and allowed client/audience policy. Backend protocol producer only: no login/consent UI or deployed authorization server, and status oauth.enabled and client_features.oauth remain false. One current real dashboard Bearer session is required; PAT, legacy, relay, OAuth resource credentials and cookie-only requests cannot decide. POST JSON only, no query parameters, duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Configured Origin/Referer and the existing omitted-origin native policy apply; cross-site Fetch Metadata rejects. Preview creates only an opaque local binding, valid at most five minutes and no later than session expiry. Decision re-fetches and binds the exact challenge, issuer/client policy, request, actor, SID and both current versions. Ordinary public-client authorization_code/code with canonical S256, state and exact registered redirect is supported; only the numeric loopback port may vary. Skip, silent/fresh-auth requirements, PAR/JAR and unsupported interaction/response modes reject. Explicit approval grants selected intersect requested intersect registered intersect server profile/email policy with profile mandatory, exact configured audience and remember=false. Only canonical local subject and current AuthVersion are sent as access-token claims; never SID or ID-token claims. Local preview consumption and a cross-preview challenge claim commit before one Admin PUT; no database locks span HTTP. Failed or unknown external outcomes are not retried: start a new authorization challenge. Existing cleanup gives at least 24 hours of local attempt exclusion, not permanent replay prevention. Before real activation the operator must verify effective Hydra challenge TTL <=30 minutes including old outstanding requests; no live issuer TTL or grant interoperability is established here. Current local identity is checked immediately before PUT and before publishing a validated same-endpoint phase-verifier resume URL. Later revocation may withhold the URL but cannot undo an already accepted external decision. Successful capabilities exist only in no-store JSON; fixed errors never contain upstream causes/capabilities. Wrong methods are absent; POST slash variants reject without Location redirects.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "x-pat-policy": "session-only",
+        "x-automatic-retry": false,
+        "x-query-policy": "forbidden",
+        "x-request-max-bytes": 16384,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthProviderPreviewInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bound preview only; no external decision.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderPreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed input/headers/query or existing pre-auth organization selector refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or changed current real dashboard identity/session.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Origin, session-only, subject, policy, scope selection or existing organization selection refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionUnsupportedError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Expired/consumed preview or already attempted/expired challenge; never automatically retry.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing API or critical rate limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed configuration/transport/protocol/internal failure; no raw cause and no retry.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oauth/provider/consent": {
+      "post": {
+        "operationId": "decideOAuthProviderConsent",
+        "summary": "Explicitly decide consent challenge",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Startup-only OAUTH_PROVIDER_BRIDGE_ENABLED=false by default; absent while disabled. Requires the configured userinfo resource, a matching fixed HTTPS Admin base, exact public authorization endpoint and allowed client/audience policy. Backend protocol producer only: no login/consent UI or deployed authorization server, and status oauth.enabled and client_features.oauth remain false. One current real dashboard Bearer session is required; PAT, legacy, relay, OAuth resource credentials and cookie-only requests cannot decide. POST JSON only, no query parameters, duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Configured Origin/Referer and the existing omitted-origin native policy apply; cross-site Fetch Metadata rejects. Preview creates only an opaque local binding, valid at most five minutes and no later than session expiry. Decision re-fetches and binds the exact challenge, issuer/client policy, request, actor, SID and both current versions. Ordinary public-client authorization_code/code with canonical S256, state and exact registered redirect is supported; only the numeric loopback port may vary. Skip, silent/fresh-auth requirements, PAR/JAR and unsupported interaction/response modes reject. Explicit approval grants selected intersect requested intersect registered intersect server profile/email policy with profile mandatory, exact configured audience and remember=false. Only canonical local subject and current AuthVersion are sent as access-token claims; never SID or ID-token claims. Local preview consumption and a cross-preview challenge claim commit before one Admin PUT; no database locks span HTTP. Failed or unknown external outcomes are not retried: start a new authorization challenge. Existing cleanup gives at least 24 hours of local attempt exclusion, not permanent replay prevention. Before real activation the operator must verify effective Hydra challenge TTL <=30 minutes including old outstanding requests; no live issuer TTL or grant interoperability is established here. Current local identity is checked immediately before PUT and before publishing a validated same-endpoint phase-verifier resume URL. Later revocation may withhold the URL but cannot undo an already accepted external decision. Successful capabilities exist only in no-store JSON; fixed errors never contain upstream causes/capabilities. Wrong methods are absent; POST slash variants reject without Location redirects.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "x-pat-policy": "session-only",
+        "x-automatic-retry": false,
+        "x-query-policy": "forbidden",
+        "x-request-max-bytes": 16384,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthProviderConsentDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validated resume capability after one committed local attempt and external decision.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderRedirect"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed input/headers/query or existing pre-auth organization selector refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or changed current real dashboard identity/session.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Origin, session-only, subject, policy, scope selection or existing organization selection refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionUnsupportedError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Expired/consumed preview or already attempted/expired challenge; never automatically retry.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing API or critical rate limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthProviderError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fixed configuration/transport/protocol/internal failure; no raw cause and no retry.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set before authentication and API/critical limiters."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthProviderError"
                 }
               }
             }
@@ -27554,6 +28318,231 @@
           "error": {
             "type": "string",
             "enum": [
+              "temporarily_unavailable"
+            ]
+          }
+        }
+      },
+      "OAuthProviderPreviewInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "challenge"
+        ],
+        "properties": {
+          "challenge": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+          }
+        }
+      },
+      "OAuthProviderLoginDecision": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "challenge",
+          "preview_token",
+          "decision"
+        ],
+        "properties": {
+          "challenge": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+          },
+          "preview_token": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 43,
+            "pattern": "^[A-Za-z0-9_-]{43}(?![\\s\\S])"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "continue",
+              "deny"
+            ]
+          }
+        }
+      },
+      "OAuthProviderConsentDecision": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "challenge",
+          "preview_token",
+          "decision",
+          "selected_scopes"
+        ],
+        "properties": {
+          "challenge": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+          },
+          "preview_token": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 43,
+            "pattern": "^[A-Za-z0-9_-]{43}(?![\\s\\S])"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "deny"
+            ]
+          },
+          "selected_scopes": {
+            "type": "array",
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "profile",
+                "email"
+              ]
+            }
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "approve"
+                ]
+              },
+              "selected_scopes": {
+                "minItems": 1,
+                "not": {
+                  "maxItems": 1,
+                  "items": {
+                    "enum": [
+                      "email"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "deny"
+                ]
+              },
+              "selected_scopes": {
+                "maxItems": 0
+              }
+            }
+          }
+        ]
+      },
+      "OAuthProviderPreview": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "preview_token",
+          "expires_at",
+          "phase",
+          "client_id",
+          "client_name",
+          "username",
+          "requested_scopes",
+          "allowed_scopes",
+          "audience"
+        ],
+        "properties": {
+          "preview_token": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 43,
+            "pattern": "^[A-Za-z0-9_-]{43}(?![\\s\\S])"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "login",
+              "consent"
+            ]
+          },
+          "client_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "client_name": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "requested_scopes": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowed_scopes": {
+            "type": "array",
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "profile",
+                "email"
+              ]
+            },
+            "minItems": 1
+          },
+          "audience": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "OAuthProviderRedirect": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "redirect_to"
+        ],
+        "properties": {
+          "redirect_to": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://",
+            "description": "One-use capability at the exact configured public authorization endpoint; never follow it server-side or persist/log it."
+          }
+        }
+      },
+      "OAuthProviderError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "invalid_request",
+              "invalid_token",
+              "access_denied",
+              "invalid_grant",
               "temporarily_unavailable"
             ]
           }

@@ -114,6 +114,61 @@ def check_oauth_userinfo(api, source_root):
             'independent_credential': True, 'provider_login_delivered': False, 'live_http': False}
 
 
+def check_oauth_provider(api, source_root):
+    schemas = api['components']['schemas']
+    expected = {
+        '/api/oauth/provider/login/preview': ('previewOAuthProviderLogin', 'OAuthProviderPreviewInput', 'OAuthProviderPreview'),
+        '/api/oauth/provider/login': ('decideOAuthProviderLogin', 'OAuthProviderLoginDecision', 'OAuthProviderRedirect'),
+        '/api/oauth/provider/consent/preview': ('previewOAuthProviderConsent', 'OAuthProviderPreviewInput', 'OAuthProviderPreview'),
+        '/api/oauth/provider/consent': ('decideOAuthProviderConsent', 'OAuthProviderConsentDecision', 'OAuthProviderRedirect'),
+    }
+    for path, (operation_id, request, response) in expected.items():
+        assert set(api['paths'][path]) == {'post'}
+        operation = api['paths'][path]['post']
+        assert operation['operationId'] == operation_id
+        assert operation['security'] == [{'DashboardJWT': []}]
+        assert operation['x-pat-policy'] == 'session-only'
+        assert operation['x-query-policy'] == 'forbidden' and operation['x-request-max-bytes'] == 16384
+        assert operation['x-automatic-retry'] is False
+        assert operation['requestBody'] == {'required': True, 'content': {'application/json': {'schema': {'$ref': '#/components/schemas/' + request}}}}
+        assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/' + response}
+        assert set(operation['responses']) == {'200', '400', '401', '403', '409', '429', '503'}
+        for item in operation['responses'].values():
+            assert 'private, no-store' in item['headers']['Cache-Control']['description']
+        for phrase in ('both current versions', 'at least 24 hours', 'TTL <=30 minutes',
+                       'commit before one Admin PUT', 'status oauth.enabled and client_features.oauth remain false'):
+            assert phrase in operation['description']
+    for name, fields in {
+        'OAuthProviderPreviewInput': ['challenge'],
+        'OAuthProviderLoginDecision': ['challenge', 'preview_token', 'decision'],
+        'OAuthProviderConsentDecision': ['challenge', 'preview_token', 'decision', 'selected_scopes'],
+        'OAuthProviderPreview': ['preview_token', 'expires_at', 'phase', 'client_id', 'client_name', 'username', 'requested_scopes', 'allowed_scopes', 'audience'],
+        'OAuthProviderRedirect': ['redirect_to'], 'OAuthProviderError': ['error'],
+    }.items():
+        schema = schemas[name]
+        assert schema['type'] == 'object' and schema['additionalProperties'] is False
+        assert schema['required'] == fields and set(schema['properties']) == set(fields)
+    assert schemas['OAuthProviderLoginDecision']['properties']['decision']['enum'] == ['continue', 'deny']
+    consent = schemas['OAuthProviderConsentDecision']
+    assert consent['properties']['decision']['enum'] == ['approve', 'deny']
+    assert consent['properties']['selected_scopes'] == {
+        'type': 'array', 'maxItems': 2, 'uniqueItems': True,
+        'items': {'type': 'string', 'enum': ['profile', 'email']}}
+    assert consent['oneOf'] == [
+        {'properties': {'decision': {'enum': ['approve']},
+                        'selected_scopes': {'minItems': 1, 'not': {'maxItems': 1, 'items': {'enum': ['email']}}}}},
+        {'properties': {'decision': {'enum': ['deny']}, 'selected_scopes': {'maxItems': 0}}}]
+    assert schemas['OAuthProviderError']['properties'] == {'error': {'type': 'string', 'enum': [
+        'invalid_request', 'invalid_token', 'access_denied', 'invalid_grant', 'temporarily_unavailable']}}
+    routes = (source_root / 'router/oauth_provider_router.go').read_text()
+    assert 'OAuthProviderBoundary' in routes and 'OAuthProviderSessionOnly' in routes
+    assert 'UserAuth()' in routes and 'CriticalRateLimit()' in routes and 'OAuthResourceNoStore' in routes
+    startup = go_function((source_root / 'main.go').read_text(), 'InitResources')
+    assert startup.index('service.InitOAuthProviderBridge()') < startup.index('model.InitDB()')
+    return {'routes': 4, 'default_off': True, 'real_session_only': True, 'backend_producer_only': True,
+            'ui_or_live_issuer': False, 'bounded_local_replay_hours': 24, 'required_verified_challenge_minutes': 30}
+
+
 def check_conditional_authorization(source_root):
     # Static drift checks on the selected server predicates, not an authorization
     # simulator. Runtime allow/deny tests must still exercise the actual handlers.
@@ -1015,6 +1070,7 @@ def main():
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['personal_log_range_error'] = check_personal_log_range_error(api)
     results['oauth_userinfo'] = check_oauth_userinfo(api, source_root)
+    results['oauth_provider'] = check_oauth_provider(api, source_root)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
     for fixture in fixtures:
         if fixture.get('kind') == 's3_operation':

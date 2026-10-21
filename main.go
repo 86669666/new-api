@@ -303,6 +303,9 @@ func InitResources() error {
 	if err := service.InitOAuthUserInfoResource(); err != nil {
 		return err
 	}
+	if err := service.InitOAuthProviderBridge(); err != nil {
+		return err
+	}
 
 	logger.SetupLogger()
 

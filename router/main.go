@@ -17,6 +17,7 @@ func SetRouter(router *gin.Engine, assets WebAssets) {
 	router.Use(middleware.OrganizationSelectionBoundary())
 	SetApiRouter(router)
 	SetOAuthResourceRouter(router, service.CurrentOAuthUserInfoResource())
+	SetOAuthProviderRouter(router, service.CurrentOAuthProviderBridge())
 	SetDashboardRouter(router)
 	SetRelayRouter(router)
 	SetTaskPluginProtocolRouter(router)

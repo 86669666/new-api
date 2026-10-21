@@ -392,6 +392,24 @@ class OrganizationIdentityContracts(unittest.TestCase):
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                 runner.validate_organization_identity_events(candidate, suite)
 
+    def test_oauth_provider_bridge_suite_is_closed(self):
+        suite, root, package = 'oauth-provider-bridge', 'TestOAuthProviderBridgeHTTP', 'github.com/QuantumNous/new-api/router'
+        leaves = ('real_session_and_explicit_decision', 'challenge_client_pkce_binding',
+                  'claim_production_and_userinfo', 'replay_revocation_and_privacy')
+        events = [{'Action': 'pass', 'Package': package, 'Test': name} for name in
+                  [root] + [root + '/' + leaf for leaf in leaves]]
+        events.append({'Action': 'pass', 'Package': package})
+        self.assertEqual(runner.ORGANIZATION_READ_SUITES[suite], (frozenset((root,)), 'g19-oauth-provider-bridge'))
+        self.assertEqual(runner.validate_organization_identity_events(events, suite)['passed_tests_and_subtests'], 5)
+        for candidate in (events[1:], events[:-1], events[:1] + events[2:], events + [{'Action': 'skip'}],
+                          events + [{'Action': 'fail'}], events + [{'Action': 'pass', 'Package': package, 'Test': root + '/unexpected'}],
+                          events + [{'Action': 'pass', 'Package': package, 'Test': 'TestOAuthUserInfoHTTP'}],
+                          [dict(event, Package='github.com/QuantumNous/new-api/service') for event in events]):
+            with self.subTest(events=candidate), self.assertRaises(ValueError):
+                runner.validate_organization_identity_events(candidate, suite)
+        with self.assertRaises(ValueError):
+            runner.validate_organization_identity_events(events, 'oauth-userinfo')
+
     def test_oauth_userinfo_suite_is_closed(self):
         suite, root, package = 'oauth-userinfo', 'TestOAuthUserInfoHTTP', 'github.com/QuantumNous/new-api/router'
         leaves = ('default_off_and_type_boundary', 'live_profile_and_scope',

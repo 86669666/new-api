@@ -707,6 +707,7 @@ ORGANIZATION_READ_SUITES = {
     'organization-wallet': (frozenset(('TestOrganizationWalletLifecycle',)), 'g17-organization-wallet'),
     'site-description': (frozenset(('TestSiteDescriptionHTTP',)), 'g18-site-description'),
     'oauth-userinfo': (frozenset(('TestOAuthUserInfoHTTP',)), 'g19-oauth-userinfo'),
+    'oauth-provider-bridge': (frozenset(('TestOAuthProviderBridgeHTTP',)), 'g19-oauth-provider-bridge'),
     'model-capability-metadata': (frozenset(('TestModelCapabilityMetadataHTTP',)), 'g19-model-capability-metadata'),
     'organization-name-uniqueness': (frozenset(('TestOrganizationNameUniqueness',)), 'g19-organization-name-uniqueness'),
 }
@@ -889,6 +890,11 @@ def validate_organization_identity_events(events, suite='organization-identity')
             'TestSiteDescriptionHTTP/reserved_option_and_failures',
             'TestSiteDescriptionHTTP/anonymous_links_and_navigation'}:
         raise ValueError('every exact site description case must pass without unrelated tests')
+    if suite == 'oauth-provider-bridge' and passed != required | {None} | {
+            'TestOAuthProviderBridgeHTTP/' + name for name in (
+                'real_session_and_explicit_decision', 'challenge_client_pkce_binding',
+                'claim_production_and_userinfo', 'replay_revocation_and_privacy')}:
+        raise ValueError('every exact OAuth provider bridge case must pass without unrelated tests')
     if suite == 'oauth-userinfo' and passed != required | {None} | {
             'TestOAuthUserInfoHTTP/' + name for name in (
                 'default_off_and_type_boundary', 'live_profile_and_scope', 'uncached_final_state', 'upstream_failure_and_isolation')}:
