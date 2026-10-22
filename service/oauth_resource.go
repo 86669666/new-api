@@ -203,6 +203,15 @@ func (r *OAuthUserInfoResource) IssuedTokenQuota() int {
 	return r.issuedQuota
 }
 
+// AllowsClient accepts a startup allowlist entry or an enabled console client.
+// Deleting a console client does not remove an id that was set in the environment.
+func (r *OAuthUserInfoResource) AllowsClient(id string) bool {
+	if r == nil || id == "" {
+		return false
+	}
+	return slices.Contains(r.clients, id) || model.OAuthClientEnabled(id)
+}
+
 func (r *OAuthUserInfoResource) IssuedTokenExpireDays() int {
 	if r == nil || r.issuedExpireDays < 1 {
 		return 30
@@ -332,7 +341,7 @@ func (r *OAuthUserInfoResource) introspect(ctx context.Context, credential strin
 		common.Unmarshal(fields["token_type"], &tokenType) != nil || tokenType != "Bearer" ||
 		common.Unmarshal(fields["iss"], &issuer) != nil || issuer != r.issuer ||
 		common.Unmarshal(fields["aud"], &audience) != nil || !slices.Contains(audience, r.audience) ||
-		common.Unmarshal(fields["client_id"], &clientID) != nil || !slices.Contains(r.clients, clientID) ||
+		common.Unmarshal(fields["client_id"], &clientID) != nil || !r.AllowsClient(clientID) ||
 		common.Unmarshal(fields["sub"], &subject) != nil ||
 		common.Unmarshal(fields["exp"], &expires) != nil ||
 		common.Unmarshal(fields["scope"], &scope) != nil ||

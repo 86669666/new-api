@@ -39,7 +39,7 @@ Discovery is rebuilt from the configured issuer and `ServerAddress`. It is not H
 
 The replacement origin is `ServerAddress` after it matches the issuer host. The request `Host`, `Forwarded`, and `X-Forwarded-Host` are not copied to Hydra and are not the replacement origin. The proxy sends `X-Forwarded-Host` set to the configured public host only.
 
-Locations whose host is the upstream origin are rewritten to that public origin. `http://127.0.0.1` and `http://[::1]` locations with an explicit port are passed through, as is `cherrystudio://oauth/callback`. Any other host, including an HTTPS application callback that is not the public origin, is rejected. Preserving registered HTTPS callbacks is left to client registration work.
+Locations whose host is the upstream origin are rewritten to that public origin. `http://127.0.0.1` and `http://[::1]` locations with an explicit port are passed through, as is `cherrystudio://oauth/callback`. An enabled console client may also register an exact `https://` callback or an exact custom-scheme callback. The proxy allows that stored URL and does not apply the caller `Host` rejection to it. The port is not rewritten. Any other host is rejected.
 
 Login and consent decisions rewrite a Hydra `redirect_to` or stored `request_url` from the upstream origin to the public authorization URL before the browser sees it. A URL on any other host is rejected.
 
@@ -47,7 +47,7 @@ Login and consent decisions rewrite a Hydra `redirect_to` or stored `request_url
 
 The intended public client uses PKCE S256 and a loopback callback `http://127.0.0.1:{port}/oauth/callback`. The authorize query allowlist is `client_id`, `response_type=code`, `redirect_uri`, `scope`, `state`, `code_challenge`, `code_challenge_method=S256`, and optional `response_mode=query`, `prompt=consent`, and `audience`. `prompt=none` is rejected.
 
-Stock Hydra compares redirect URIs exactly. A random loopback port can be rejected by Hydra before New API's consent check, which already allows any loopback port for a registered loopback path. This proxy does not rewrite that port. Registering the client, including an RFC 8252 port rule if Hydra cannot express one, is separate work.
+Stock Hydra compares redirect URIs exactly. A random loopback port can be rejected by Hydra before New API's consent check, which already allows any loopback port for a registered loopback path. This proxy does not rewrite that port. The console registry below registers `http://127.0.0.1/oauth/callback` for Boxo. That does not make Hydra accept another port. If Hydra cannot express an RFC 8252 port rule, the operator still has to solve that in Hydra. Do not point the callback at a host taken from the request.
 
 ## Operator sequence
 
@@ -57,7 +57,7 @@ Stock Hydra compares redirect URIs exactly. A random loopback port can be reject
 4. Start only the compose file's database and Hydra. Do not publish port 4445. Do not publish port 4444 either; New API reaches `https://hydra:4444` on the compose network.
 5. Set the New API environment from the table below and set console `ServerAddress` to the same public origin. Restart New API. The flags are read at startup.
 6. Fetch `https://auth.example.com/.well-known/openid-configuration` and confirm `issuer` is exactly `URLS_SELF_ISSUER` before creating a public client.
-7. Create the public client through Hydra's admin API on the admin origin. Use `token_endpoint_auth_method=none`, grants `authorization_code` and `refresh_token`, response type `code`, and PKCE. Do not store the admin API credential in this repository.
+7. Create the public client in the console OAuth clients section. That action requires step-up. When the provider bridge is on, the console syncs the client to Hydra's admin API. The client is public (`token_endpoint_auth_method=none`), grants only `authorization_code` and `refresh_token`, and has no secret. The client id is generated (`oc_` plus random hex) and is not built into the desktop app. `OAUTH_USERINFO_CLIENT_IDS` is an extra allowlist and is not removed when a console client is deleted. Confidential clients are refused, because the login bridge only accepts method `none`.
 
 New API environment when the proxy is intentionally on:
 
@@ -78,6 +78,18 @@ OAUTH_PROVIDER_UPSTREAM_URL=https://hydra:4444
 `auth.example.com` and `hydra` are placeholders. Replace the public origin; keep the compose service name only if New API joins that network.
 
 Access tokens are opaque and last one hour in the example. Refresh tokens last 720 hours. Login and consent challenges are capped at 30 minutes by the example. That cap was taken from the Hydra v26.2.0 schema default and the explicit setting; it was not measured on a running Hydra.
+
+## Client registry
+
+The registry is available only while `OAUTH_USERINFO_ENABLED=true`. With that flag off, `/api/oauth/clients` and `/api/oauth/authorizations` return JSON `404` and the tables `oauth_clients` and `oauth_authorizations` are not created. Turning the flag on migrates both tables. They do not change the tokens table.
+
+An administrator lists, creates, edits, and deletes public clients. Create, update, and delete require a step-up proof bound to the name, redirects, and scopes (and the row id for update and delete). The enabled flag is not part of that proof. The proof is still single-use and bound to the administrator and the other fields. The audit record stores the client id and name. Create and update also store the redirects and scopes. It does not store a secret, because none is issued. A disabled client is rejected locally even if Hydra still has the client. Deleting a client removes it from Hydra first (a missing Hydra client is success), then disables relay keys that client created and revokes the local grants.
+
+Redirects must be canonical. `https` URLs are matched exactly. `http` is only `127.0.0.1` or `[::1]`. A registered loopback path matches any incoming port; a different path or a non-loopback host does not. Custom schemes are an exact match and cannot be `javascript`, `data`, `file`, `blob`, `filesystem`, `vbscript`, `about`, or `jar`. The preset `boxo` stores `http://127.0.0.1/oauth/callback`. The preset `cherry_studio` stores `http://127.0.0.1:29873/oauth/callback`. A preset replaces any redirects submitted with it. Scopes are the known catalog, and `profile` is required.
+
+The same user's authorized-apps list shows grants recorded after consent is accepted. Revoking one app uses the dashboard session and does not require another step-up proof. It disables only the relay keys that app created for that user. It does not by itself revoke Hydra login sessions; that linkage is separate.
+
+Inbound custom OAuth provider slugs cannot be `login`, `consent`, `logout`, `admin`, or `provider`. The existing telegram reservation is unchanged.
 
 ## Scopes
 
@@ -108,6 +120,6 @@ Usage follows `/api/log/self`: `p` is the page, and `page` is used only when `p`
 
 - ID token signatures are not verified. The proxy only checks that an `iss` claim matches the configured issuer before forwarding the token. Clients must validate the signature against the published JWKS.
 - A revocation HTTP 200 from Hydra is not proof that the token was invalidated.
-- HTTPS redirect targets other than the public origin are rejected.
-- Hydra may still require an exact loopback port.
+- An HTTPS redirect is rejected unless it is the public origin or an enabled registered client callback.
+- Hydra may still require an exact loopback port. This proxy does not rewrite that port.
 - No real Hydra process is started by the tests or by applying this repository.

@@ -134,6 +134,13 @@ func InitOAuthProviderBridge() error {
 
 func CurrentOAuthProviderBridge() *OAuthProviderBridge { return currentOAuthProvider.Load() }
 
+// UseOAuthProviderBridge replaces the process bridge and returns the previous
+// one. Startup still goes through InitOAuthProviderBridge. Tests point admin
+// calls at a local issuer and restore the previous value.
+func UseOAuthProviderBridge(bridge *OAuthProviderBridge) *OAuthProviderBridge {
+	return currentOAuthProvider.Swap(bridge)
+}
+
 func oauthProviderTriState(value string) bool {
 	return value == "" || value == "false" || value == "true"
 }
@@ -198,7 +205,7 @@ func (b *OAuthProviderBridge) RevokeToken(ctx context.Context, token, clientID s
 	if !b.RevocationEnabled() {
 		return ErrOAuthResourceUnavailable
 	}
-	if !slices.Contains(b.resource.clients, clientID) {
+	if b.resource == nil || !b.resource.AllowsClient(clientID) {
 		return ErrOAuthProviderRequest
 	}
 	body := url.Values{"token": {token}, "client_id": {clientID}}.Encode()
@@ -346,6 +353,17 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 	if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
 		return nil, err
 	}
+	if phase == "consent" && input.Decision == "approve" {
+		granted := make([]string, 0, len(input.SelectedScopes))
+		for _, scope := range oauthProviderKnownScopes {
+			if slices.Contains(input.SelectedScopes, scope) {
+				granted = append(granted, scope)
+			}
+		}
+		if err := model.SaveOAuthAuthorization(actor.UserID, request.clientID, request.clientName, strings.Join(granted, " ")); err != nil {
+			return nil, ErrOAuthResourceUnavailable
+		}
+	}
 	return &OAuthProviderRedirect{RedirectTo: redirect}, nil
 }
 
@@ -376,7 +394,7 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 		return nil, err
 	}
 	client := value.Client
-	if value.Challenge != challenge || value.Subject == nil || value.Skip == nil || *value.Skip || value.RequestURL == nil || value.Scopes == nil || value.Audience == nil || client == nil || client.Method == nil || *client.Method != "none" || client.Scope == nil || client.Audience == nil || client.SkipConsent || !slices.Contains(b.resource.clients, client.ID) || !slices.Contains(client.Grants, "authorization_code") || !slices.Contains(client.Responses, "code") {
+	if value.Challenge != challenge || value.Subject == nil || value.Skip == nil || *value.Skip || value.RequestURL == nil || value.Scopes == nil || value.Audience == nil || client == nil || client.Method == nil || *client.Method != "none" || client.Scope == nil || client.Audience == nil || client.SkipConsent || !b.resource.AllowsClient(client.ID) || !slices.Contains(client.Grants, "authorization_code") || !slices.Contains(client.Responses, "code") {
 		return nil, ErrOAuthProviderDenied
 	}
 	if phase == "consent" && *value.Subject != strconv.Itoa(actor.UserID) || phase == "login" && *value.Subject != "" && *value.Subject != strconv.Itoa(actor.UserID) {
@@ -617,8 +635,8 @@ func validOAuthProviderRedirect(raw, registered string) bool {
 	if u.Scheme == "https" && u.Hostname() != "" {
 		return raw == registered
 	}
-	if u.Scheme == "cherrystudio" {
-		return raw == registered && u.Host == "oauth" && u.Path == "/callback"
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return raw == registered && oauthCustomScheme(u.Scheme) && u.Host != "" && strings.HasPrefix(u.Path, "/")
 	}
 	if u.Scheme != "http" || v.Scheme != "http" || u.Hostname() != v.Hostname() || u.Hostname() != "127.0.0.1" && u.Hostname() != "::1" {
 		return false

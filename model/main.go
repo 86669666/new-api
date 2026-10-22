@@ -400,6 +400,9 @@ func migrateDB() error {
 	if err := MigrateOAuthIssuedTokensIfEnabled(DB); err != nil {
 		return err
 	}
+	if err := MigrateOAuthClientsIfEnabled(DB); err != nil {
+		return err
+	}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 		if err := ensureSubscriptionPlanTableSQLite(); err != nil {
 			return err

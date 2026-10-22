@@ -140,6 +140,33 @@ func DisableOAuthIssuedTokensForUser(userID int) error {
 	return DisableOAuthIssuedTokens(userID, "")
 }
 
+// DisableOAuthIssuedTokensByClient disables every relay key created for one
+// OAuth client, across users. A missing table is a no-op.
+func DisableOAuthIssuedTokensByClient(clientID string) error {
+	if clientID == "" || DB == nil || !DB.Migrator().HasTable(&OAuthIssuedToken{}) {
+		return nil
+	}
+	var rows []OAuthIssuedToken
+	if err := DB.Where("client_id = ?", clientID).Find(&rows).Error; err != nil {
+		return err
+	}
+	for _, row := range rows {
+		var token Token
+		err := DB.Where("id = ? AND user_id = ?", row.TokenID, row.UserID).First(&token).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		token.Status = common.TokenStatusDisabled
+		if err = token.SelectUpdate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func oauthIssuedTokenName(clientID string) string {
 	name := "oauth-" + clientID
 	if len(name) > 40 {
