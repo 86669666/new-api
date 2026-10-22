@@ -165,7 +165,7 @@ func organizationRequest(c *gin.Context, allowProof, paged bool, bodyLimit int64
 	}
 	var ok bool
 	identity, ok = middleware.GetAuthIdentity(c)
-	if !ok || identity.SessionID == "" || strings.HasPrefix(identity.SessionID, "pat:") || strings.HasPrefix(identity.SessionID, "legacy") {
+	if !ok || identity.SessionID == "" || model.NonDashboardSessionID(identity.SessionID) {
 		return identity, nil, page, &organizationHTTPError{403, "AUTH_SESSION_REQUIRED", "A dashboard session is required."}
 	}
 	if !middleware.OrganizationOriginAllowed(c.Request) {

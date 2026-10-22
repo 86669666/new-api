@@ -1485,7 +1485,7 @@ func TestOAuthProviderBridgeHTTP(t *testing.T) {
 		require.Equal(t, 200, status)
 		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
 		assert.Empty(t, h.Values("Set-Cookie"))
-		assert.Equal(t, []any{"profile", "email"}, body["allowed_scopes"])
+		assert.Equal(t, []any{"profile", "email", "tokens:read"}, body["allowed_scopes"])
 		token, ok := body["preview_token"].(string)
 		require.True(t, ok)
 		require.Len(t, token, 43)
@@ -1639,7 +1639,7 @@ func TestOAuthProviderBridgeHTTP(t *testing.T) {
 		add("consent", "bound-consent", "owner")
 		token := preview(t, "consent", "bound-consent", "owner")
 		before := putCount()
-		for _, selected := range [][]string{{"profile", "tokens:read"}, {"email"}, {"profile", "profile"}} {
+		for _, selected := range [][]string{{"profile", "tokens:write"}, {"email"}, {"profile", "profile"}} {
 			status, h, b := decision(t, "consent", "bound-consent", token, "owner", "approve", selected...)
 			assertFailure(t, status, h, b)
 		}
@@ -2105,8 +2105,14 @@ func TestOAuthUserInfoHTTP(t *testing.T) {
 			assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
 			assert.Empty(t, h.Values("Set-Cookie"))
 		}
+		configure(func(value map[string]any, _ int64) {
+			value["scope"] = "profile tokens:read usage:read balance:read"
+		})
+		status, _, b := read(nil)
+		require.Equal(t, 200, status)
+		assert.Equal(t, map[string]any{"id": float64(user.Id), "username": user.Username, "display_name": "Profile display", "group": "default"}, b)
 		configure(nil)
-		status, _, _ := f.request(t, http.MethodGet, "/api/v1/oauth/userinfo", "sk-trusted-oauth-shape", "", nil)
+		status, _, _ = f.request(t, http.MethodGet, "/api/v1/oauth/userinfo", "sk-trusted-oauth-shape", "", nil)
 		assert.Equal(t, 200, status, "spelling is not credential kind")
 		for _, tc := range []struct {
 			name, field string
@@ -2124,6 +2130,7 @@ func TestOAuthUserInfoHTTP(t *testing.T) {
 			{"version type", "ext", map[string]any{"newapi_auth_version": 1}, 401},
 			{"version stale", "ext", map[string]any{"newapi_auth_version": "2"}, 401},
 			{"scope exact", "scope", "profile:read", 403}, {"empty scope", "scope", "", 403},
+			{"openid only", "scope", "openid", 403}, {"balance only", "scope", "balance:read", 403},
 			{"scope spacing", "scope", "profile  email", 401},
 		} {
 			configure(func(value map[string]any, _ int64) { value[tc.field] = tc.value })

@@ -182,13 +182,19 @@ def check_oauth_provider(api, source_root):
     assert schemas['OAuthProviderLoginDecision']['properties']['decision']['enum'] == ['continue', 'deny']
     consent = schemas['OAuthProviderConsentDecision']
     assert consent['properties']['decision']['enum'] == ['approve', 'deny']
+    oauth_scopes = ['openid', 'profile', 'email', 'offline_access', 'balance:read', 'usage:read', 'tokens:read', 'tokens:write']
+    optional_scopes = [scope for scope in oauth_scopes if scope != 'profile']
     assert consent['properties']['selected_scopes'] == {
-        'type': 'array', 'maxItems': 2, 'uniqueItems': True,
-        'items': {'type': 'string', 'enum': ['profile', 'email']}}
+        'type': 'array', 'maxItems': 8, 'uniqueItems': True,
+        'items': {'type': 'string', 'enum': oauth_scopes}}
     assert consent['oneOf'] == [
         {'properties': {'decision': {'enum': ['approve']},
-                        'selected_scopes': {'minItems': 1, 'not': {'maxItems': 1, 'items': {'enum': ['email']}}}}},
+                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': optional_scopes}}}}},
         {'properties': {'decision': {'enum': ['deny']}, 'selected_scopes': {'maxItems': 0}}}]
+    assert schemas['OAuthProviderPreview']['properties']['allowed_scopes'] == {
+        'type': 'array', 'maxItems': 8, 'minItems': 1, 'uniqueItems': True,
+        'items': {'type': 'string', 'enum': oauth_scopes},
+        'not': {'items': {'enum': optional_scopes}}}
     assert schemas['OAuthProviderError']['properties'] == {'error': {'type': 'string', 'enum': [
         'invalid_request', 'invalid_token', 'access_denied', 'invalid_grant', 'temporarily_unavailable']}}
     routes = (source_root / 'router/oauth_provider_router.go').read_text()

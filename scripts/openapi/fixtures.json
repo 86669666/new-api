@@ -11690,10 +11690,29 @@
       "decision": "approve",
       "selected_scopes": [
         "profile",
-        "tokens:read"
+        "api_key:read"
       ]
     },
     "valid": false
+  },
+  {
+    "name": "provider consent delegated scopes",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "profile",
+        "offline_access",
+        "balance:read",
+        "usage:read",
+        "tokens:read",
+        "tokens:write"
+      ]
+    },
+    "valid": true
   },
   {
     "name": "provider consent duplicate",

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -138,7 +139,7 @@ func OAuthProviderBoundary(c *gin.Context) {
 // context fields. The service rechecks persisted state and both versions.
 func OAuthProviderSessionOnly(c *gin.Context) {
 	identity, ok := GetAuthIdentity(c)
-	if !ok || c.GetBool("use_access_token") || identity.UserID <= 0 || identity.SessionID == "" || identity.UserAuthVersion <= 0 || identity.SessionVersion <= 0 || strings.HasPrefix(identity.SessionID, "pat:") || strings.HasPrefix(identity.SessionID, "legacy") {
+	if !ok || c.GetBool("use_access_token") || identity.UserID <= 0 || identity.SessionID == "" || identity.UserAuthVersion <= 0 || identity.SessionVersion <= 0 || model.NonDashboardSessionID(identity.SessionID) {
 		WriteOAuthProviderError(c, service.ErrOAuthInvalidToken)
 		return
 	}

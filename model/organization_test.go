@@ -418,7 +418,7 @@ func testOrganizationAuthorization(t *testing.T, f *organizationFixture) {
 	c = f.command(o.ID)
 	c.TargetUserID = f.identities[1].UserID
 	assert.ErrorIs(t, RemoveOrganizationMember(f.identities[0], c), ErrOrganizationForbidden)
-	for _, sid := range []string{"", "pat:1", "legacy:1", "missing"} {
+	for _, sid := range []string{"", "pat:1", "legacy:1", "oauth:1", "missing"} {
 		identity := f.identities[0]
 		identity.SessionID = sid
 		_, err := CreateOrganization(identity, "bad")

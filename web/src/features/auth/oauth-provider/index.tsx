@@ -26,6 +26,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
 import { AuthLayout } from '@/features/auth/auth-layout'
 
+import { oauthProviderScopes } from './api'
 import { useProviderAuthorization } from './hooks/use-provider-authorization'
 import type { AuthorizationEntry } from './lib/authorization'
 
@@ -34,6 +35,16 @@ export function ProviderAuthorizationPage(props: {
 }) {
   const { t } = useTranslation()
   const authorization = useProviderAuthorization(props.entry)
+  const scopeLabel: Record<(typeof oauthProviderScopes)[number], string> = {
+    openid: t('Sign-in identity'),
+    profile: t('Profile (required)'),
+    email: t('Email address (optional)'),
+    offline_access: t('Refresh access'),
+    'balance:read': t('Read balance'),
+    'usage:read': t('Read usage'),
+    'tokens:read': t('Read API keys'),
+    'tokens:write': t('Create API keys'),
+  }
   const state = authorization.state
   if (state.kind === 'loading' || state.kind === 'submitting') {
     return <LoadingState message={t('Preparing authorization...')} />
@@ -109,26 +120,27 @@ export function ProviderAuthorizationPage(props: {
             <legend className='mb-2 font-medium'>
               {t('Requested access')}
             </legend>
-            <div className='flex items-center gap-2'>
-              <Checkbox id='provider-profile' checked disabled />
-              <Label htmlFor='provider-profile'>
-                {t('Profile (required)')}
-              </Label>
-            </div>
-            {state.preview.allowed_scopes.includes('email') && (
-              <div className='flex items-center gap-2'>
-                <Checkbox
-                  id='provider-email'
-                  checked={authorization.email}
-                  onCheckedChange={(checked) =>
-                    authorization.setEmail(checked === true)
-                  }
-                />
-                <Label htmlFor='provider-email'>
-                  {t('Email address (optional)')}
-                </Label>
-              </div>
-            )}
+            {oauthProviderScopes
+              .filter((scope) => state.preview.allowed_scopes.includes(scope))
+              .map((scope) => (
+                <div key={scope} className='flex items-center gap-2'>
+                  <Checkbox
+                    id={`provider-scope-${scope.replaceAll(':', '-')}`}
+                    checked={
+                      scope === 'profile' || !authorization.omitted.has(scope)
+                    }
+                    disabled={scope === 'profile'}
+                    onCheckedChange={(checked) =>
+                      authorization.setScope(scope, checked === true)
+                    }
+                  />
+                  <Label
+                    htmlFor={`provider-scope-${scope.replaceAll(':', '-')}`}
+                  >
+                    {scopeLabel[scope]}
+                  </Label>
+                </div>
+              ))}
           </fieldset>
         )}
         <div className='flex flex-wrap gap-3'>

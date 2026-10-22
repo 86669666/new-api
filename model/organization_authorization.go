@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -156,7 +155,7 @@ func (s *organizationState) binding(c OrganizationCommand) OrganizationAuthoriza
 
 func validateOrganizationIdentity(tx *gorm.DB, identity AuthSessionIdentity, now int64) (UserSession, error) {
 	var session UserSession
-	if identity.UserID <= 0 || identity.UserAuthVersion <= 0 || identity.SessionVersion <= 0 || identity.SessionID == "" || strings.HasPrefix(identity.SessionID, "pat:") || strings.HasPrefix(identity.SessionID, "legacy") {
+	if identity.UserID <= 0 || identity.UserAuthVersion <= 0 || identity.SessionVersion <= 0 || identity.SessionID == "" || NonDashboardSessionID(identity.SessionID) {
 		return session, ErrOrganizationUnauthenticated
 	}
 	if err := ValidateAuthSessionWithTx(tx, identity); err != nil {

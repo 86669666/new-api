@@ -28860,13 +28860,19 @@
           },
           "selected_scopes": {
             "type": "array",
-            "maxItems": 2,
+            "maxItems": 8,
             "uniqueItems": true,
             "items": {
               "type": "string",
               "enum": [
+                "openid",
                 "profile",
-                "email"
+                "email",
+                "offline_access",
+                "balance:read",
+                "usage:read",
+                "tokens:read",
+                "tokens:write"
               ]
             }
           }
@@ -28882,10 +28888,15 @@
               "selected_scopes": {
                 "minItems": 1,
                 "not": {
-                  "maxItems": 1,
                   "items": {
                     "enum": [
-                      "email"
+                      "openid",
+                      "email",
+                      "offline_access",
+                      "balance:read",
+                      "usage:read",
+                      "tokens:read",
+                      "tokens:write"
                     ]
                   }
                 }
@@ -28958,16 +28969,35 @@
           },
           "allowed_scopes": {
             "type": "array",
-            "maxItems": 2,
+            "maxItems": 8,
             "uniqueItems": true,
             "items": {
               "type": "string",
               "enum": [
+                "openid",
                 "profile",
-                "email"
+                "email",
+                "offline_access",
+                "balance:read",
+                "usage:read",
+                "tokens:read",
+                "tokens:write"
               ]
             },
-            "minItems": 1
+            "minItems": 1,
+            "not": {
+              "items": {
+                "enum": [
+                  "openid",
+                  "email",
+                  "offline_access",
+                  "balance:read",
+                  "usage:read",
+                  "tokens:read",
+                  "tokens:write"
+                ]
+              }
+            }
           },
           "audience": {
             "type": "string",

@@ -79,6 +79,14 @@ OAUTH_PROVIDER_UPSTREAM_URL=https://hydra:4444
 
 Access tokens are opaque and last one hour in the example. Refresh tokens last 720 hours. Login and consent challenges are capped at 30 minutes by the example. That cap was taken from the Hydra v26.2.0 schema default and the explicit setting; it was not measured on a running Hydra.
 
+## Scopes
+
+Consent grants only the intersection of three lists: the scopes the client requested, the scopes registered for that client, and the scopes the user left checked. The known list, in order, is `openid`, `profile`, `email`, `offline_access`, `balance:read`, `usage:read`, `tokens:read`, and `tokens:write`. `profile` is required. The browser selection is not trusted; the server recomputes the intersection before it accepts the consent.
+
+Those names map to personal access token scopes as `profile` or `email` to `profile:read`, `balance:read` to `wallet:read`, `usage:read` to `usage:read`, `tokens:read` to `api_key:read`, and `tokens:write` to `api_key:write`. `tokens:read` does not include key reveal. `openid` and `offline_access` do not map to a resource scope. A resource request whose granted scope does not contain the endpoint's scope is rejected with `insufficient_scope`. An OAuth resource identity uses the session id prefix `oauth:` and is rejected by organization APIs, organization proof, and the login/consent decision, the same way `pat:` is rejected.
+
+The public token response includes `refresh_token` only when its `scope` contains `offline_access` as its own token. A response with no scope drops the refresh token. Register `offline_access` on the Hydra client when the desktop client needs refresh.
+
 ## Limits
 
 - ID token signatures are not verified. The proxy only checks that an `iss` claim matches the configured issuer before forwarding the token. Clients must validate the signature against the published JWKS.

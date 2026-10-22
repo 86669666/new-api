@@ -277,18 +277,28 @@ func TestOAuthPublicProxyHTTP(t *testing.T) {
 		form := url.Values{"grant_type": {"authorization_code"}, "code": {"auth-code"}, "redirect_uri": {loopback}, "client_id": {"boxo"}, "code_verifier": {strings.Repeat("a", 43)}}
 		w := call(http.MethodPost, "/oauth2/token", form.Encode(), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})
 		assert.Equal(t, http.StatusOK, w.Code)
-		assert.JSONEq(t, `{"access_token":"access-token-canary","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-token-canary","scope":"openid profile email","id_token":"`+idToken+`"}`, w.Body.String())
+		assert.JSONEq(t, `{"access_token":"access-token-canary","token_type":"Bearer","expires_in":3600,"scope":"openid profile email","id_token":"`+idToken+`"}`, w.Body.String())
+		assert.NotContains(t, w.Body.String(), "refresh-token-canary")
 		assert.NotContains(t, w.Body.String(), canary)
+		offlineBody := `{"access_token":"access-token-canary","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-offline","scope":"openid profile email offline_access","id_token":"` + idToken + `"}`
+		setReply(http.StatusOK, "", offlineBody)
+		w = call(http.MethodPost, "/oauth2/token", form.Encode(), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.JSONEq(t, `{"access_token":"access-token-canary","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-offline","scope":"openid profile email offline_access","id_token":"`+idToken+`"}`, w.Body.String())
 		mu.Lock()
 		assert.NotContains(t, lastBody, "client_secret")
 		assert.Contains(t, lastBody, "code=auth-code")
 		mu.Unlock()
 
-		setReply(http.StatusOK, "", `{"access_token":"next-access","token_type":"Bearer","expires_in":1800,"refresh_token":"next-refresh"}`)
+		setReply(http.StatusOK, "", `{"access_token":"next-access","token_type":"Bearer","expires_in":1800,"refresh_token":"next-refresh","scope":"openid profile"}`)
 		refresh := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"refresh-token-canary"}, "client_id": {"boxo"}}
 		w = call(http.MethodPost, "/oauth2/token", refresh.Encode(), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})
 		assert.Equal(t, http.StatusOK, w.Code)
-		assert.JSONEq(t, `{"access_token":"next-access","token_type":"Bearer","expires_in":1800,"refresh_token":"next-refresh"}`, w.Body.String())
+		assert.JSONEq(t, `{"access_token":"next-access","token_type":"Bearer","expires_in":1800,"scope":"openid profile"}`, w.Body.String())
+		setReply(http.StatusOK, "", `{"access_token":"next-access","token_type":"Bearer","expires_in":1800,"refresh_token":"next-refresh","scope":"openid offline_access"}`)
+		w = call(http.MethodPost, "/oauth2/token", refresh.Encode(), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.JSONEq(t, `{"access_token":"next-access","token_type":"Bearer","expires_in":1800,"refresh_token":"next-refresh","scope":"openid offline_access"}`, w.Body.String())
 
 		setReply(http.StatusBadRequest, "", `{"error":"invalid_grant","error_description":"`+canary+`","cause":"`+canary+`"}`)
 		w = call(http.MethodPost, "/oauth2/token", form.Encode(), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})

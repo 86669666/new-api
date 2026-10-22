@@ -495,7 +495,11 @@ func oauthTokenSuccess(body []byte, issuer string) ([]byte, error) {
 		if common.Unmarshal(value, &refresh) != nil || !oauthVisibleASCII(refresh, 4096) {
 			return nil, ErrOAuthResourceUnavailable
 		}
-		out["refresh_token"] = refresh
+		// A refresh token is returned only when the token response scope grants
+		// offline_access. A missing scope fails closed and drops the token.
+		if oauthScopeGrantsOfflineAccess(scope) {
+			out["refresh_token"] = refresh
+		}
 	}
 	if value, ok := fields["id_token"]; ok {
 		if common.Unmarshal(value, &idToken) != nil || !oauthVisibleASCII(idToken, 8192) || oauthIDTokenIssuer(idToken, issuer) != nil {
@@ -602,6 +606,15 @@ func (b *OAuthProviderBridge) filterDiscovery(body []byte) ([]byte, error) {
 	return encoded, nil
 }
 
+func oauthScopeGrantsOfflineAccess(scope string) bool {
+	for item := range strings.SplitSeq(scope, " ") {
+		if item == "offline_access" {
+			return true
+		}
+	}
+	return false
+}
+
 func filterOAuthScopeNames(scopes []string) []string {
 	out := []string{}
 	for _, scope := range scopes {
@@ -615,7 +628,7 @@ func filterOAuthScopeNames(scopes []string) []string {
 				break
 			}
 		}
-		if safe {
+		if safe && slices.Contains(oauthProviderKnownScopes, scope) {
 			out = append(out, scope)
 		}
 	}

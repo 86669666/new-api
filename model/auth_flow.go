@@ -104,6 +104,14 @@ type AuthFlowAuthorization struct {
 	Method      string `json:"method"`
 }
 
+// NonDashboardSessionID reports session ids that must not enter dashboard
+// login, consent, organization APIs, or organization proof. pat: is a personal
+// access token, legacy is a retired access token, and oauth: is an OAuth
+// resource identity. The prefix is a rejection, not a grant.
+func NonDashboardSessionID(sessionID string) bool {
+	return strings.HasPrefix(sessionID, AccessTokenSessionPrefix) || strings.HasPrefix(sessionID, "legacy") || strings.HasPrefix(sessionID, "oauth:")
+}
+
 // ValidateAuthSessionWithTx rechecks the authoritative identity while holding the
 // user/session locks until the caller's credential change or flow consumption commits.
 // Token-bound identities (pat:<id>) are checked against user_access_tokens instead.
@@ -322,7 +330,7 @@ func (e *OrganizationVerificationBudgetError) Error() string {
 // OrganizationVerificationStateWithTx shares the caller's existing locks and
 // transaction; no cache or nested transaction participates in factor policy.
 func OrganizationVerificationStateWithTx(tx *gorm.DB, identity AuthSessionIdentity) (*UserVerificationState, *UserSession, error) {
-	if identity.UserID <= 0 || identity.SessionID == "" || strings.HasPrefix(identity.SessionID, "pat:") || strings.HasPrefix(identity.SessionID, "legacy") {
+	if identity.UserID <= 0 || identity.SessionID == "" || NonDashboardSessionID(identity.SessionID) {
 		return nil, nil, ErrUserSessionInactive
 	}
 	if err := ValidateAuthSessionWithTx(tx, identity); err != nil {

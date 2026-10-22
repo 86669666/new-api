@@ -45,7 +45,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
   const [ceremony] = useState(() => entry.read())
   const [deadline] = useState(() => Date.now() + 300_000)
   const [state, setState] = useState<AuthorizationState>({ kind: 'loading' })
-  const [email, setEmail] = useState(false)
+  const [omitted, setOmitted] = useState<ReadonlySet<string>>(() => new Set())
   const mounted = useRef(false)
   const invalidated = useRef(false)
   const submitted = useRef(false)
@@ -259,7 +259,9 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
         {
           preview,
           approve,
-          email: email && preview.allowed_scopes.includes('email'),
+          scopes: preview.allowed_scopes.filter(
+            (scope) => scope === 'profile' || !omitted.has(scope)
+          ),
         }
       )
       if (
@@ -278,5 +280,19 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
       stop()
     }
   }
-  return { state, email, setEmail, decide, resume, cancel: stop }
+  function setScope(scope: string, checked: boolean) {
+    if (scope === 'profile') {
+      return
+    }
+    setOmitted((current) => {
+      const next = new Set(current)
+      if (checked) {
+        next.delete(scope)
+      } else {
+        next.add(scope)
+      }
+      return next
+    })
+  }
+  return { state, omitted, setScope, decide, resume, cancel: stop }
 }

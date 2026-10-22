@@ -57,6 +57,7 @@ type OAuthResourceIdentity struct {
 	expiresAt   int64
 	notBefore   int64
 	email       bool
+	scopes      []string
 }
 
 // OAuthUserInfoAccess keeps the bearer private and request-local. Neither the
@@ -268,10 +269,11 @@ func (r *OAuthUserInfoResource) introspect(ctx context.Context, credential strin
 	if expires <= now || notBefore < 0 || notBefore > now {
 		return identity, ErrOAuthInvalidToken
 	}
-	scopes := map[string]bool{}
+	granted := []string{}
+	seen := map[string]bool{}
 	if scope != "" {
 		for item := range strings.SplitSeq(scope, " ") {
-			if item == "" || scopes[item] {
+			if item == "" || seen[item] {
 				return identity, ErrOAuthInvalidToken
 			}
 			for _, c := range item {
@@ -279,11 +281,27 @@ func (r *OAuthUserInfoResource) introspect(ctx context.Context, credential strin
 					return identity, ErrOAuthInvalidToken
 				}
 			}
-			scopes[item] = true
+			seen[item] = true
+			granted = append(granted, item)
 		}
 	}
-	if !scopes["profile"] {
-		return identity, ErrOAuthInsufficientScope
+	identity = OAuthResourceIdentity{userID: int(id), authVersion: authVersion, issuer: issuer, clientID: clientID, expiresAt: expires, notBefore: notBefore, email: seen["email"], scopes: granted}
+	if err := identity.Require("profile"); err != nil {
+		return OAuthResourceIdentity{}, err
 	}
-	return OAuthResourceIdentity{userID: int(id), authVersion: authVersion, issuer: issuer, clientID: clientID, expiresAt: expires, notBefore: notBefore, email: scopes["email"]}, nil
+	return identity, nil
+}
+
+func (id OAuthResourceIdentity) Require(scope string) error {
+	return OAuthResourceRequireScope(id.scopes, scope)
+}
+
+// OAuthResourceRequireScope fails closed unless the access token's granted
+// scope contains the exact resource scope. A mapped personal-access-token
+// name is not a substitute.
+func OAuthResourceRequireScope(granted []string, required string) error {
+	if required == "" || !slices.Contains(oauthProviderKnownScopes, required) || !slices.Contains(granted, required) {
+		return ErrOAuthInsufficientScope
+	}
+	return nil
 }

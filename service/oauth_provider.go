@@ -288,16 +288,10 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 	} else if phase == "login" && input.Decision == "continue" && len(input.SelectedScopes) == 0 {
 		body = map[string]any{"subject": strconv.Itoa(actor.UserID), "remember": false}
 	} else if phase == "consent" && input.Decision == "approve" {
-		selected := input.SelectedScopes
-		if len(selected) == 0 || len(selected) > 2 || !slices.Contains(selected, "profile") {
+		if oauthProviderGrantScopes(input.SelectedScopes, request.allowed) != nil {
 			return nil, ErrOAuthProviderDenied
 		}
-		for i, scope := range selected {
-			if !slices.Contains(request.allowed, scope) || slices.Contains(selected[:i], scope) {
-				return nil, ErrOAuthProviderDenied
-			}
-		}
-		body = map[string]any{"remember": false, "grant_scope": selected, "grant_access_token_audience": []string{b.resource.audience},
+		body = map[string]any{"remember": false, "grant_scope": input.SelectedScopes, "grant_access_token_audience": []string{b.resource.audience},
 			"session": map[string]any{"access_token": map[string]string{"newapi_auth_version": strconv.FormatInt(actor.UserAuthVersion, 10)}}}
 	} else {
 		return nil, ErrOAuthProviderRequest
@@ -356,7 +350,7 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 }
 
 func currentOAuthProviderActor(ctx context.Context, actor AuthIdentity) (*model.User, *model.UserSession, error) {
-	if actor.UserID <= 0 || actor.UserAuthVersion <= 0 || actor.SessionVersion <= 0 || actor.SessionID == "" || strings.HasPrefix(actor.SessionID, "pat:") || strings.HasPrefix(actor.SessionID, "legacy") {
+	if actor.UserID <= 0 || actor.UserAuthVersion <= 0 || actor.SessionVersion <= 0 || actor.SessionID == "" || model.NonDashboardSessionID(actor.SessionID) {
 		return nil, nil, ErrOAuthInvalidToken
 	}
 	user, err := model.GetOAuthUserInfoByID(ctx, actor.UserID)
@@ -430,14 +424,9 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 	if audience, exists := q["audience"]; exists && !sameOAuthProviderSet(audience, *value.Audience) {
 		return nil, ErrOAuthProviderDenied
 	}
-	allowed := []string{}
-	for _, scope := range []string{"profile", "email"} {
-		if slices.Contains(requested, scope) && slices.Contains(registered, scope) {
-			allowed = append(allowed, scope)
-		}
-	}
-	if !slices.Contains(allowed, "profile") {
-		return nil, ErrOAuthProviderDenied
+	allowed, allowErr := oauthProviderAllowedScopes(requested, registered)
+	if allowErr != nil {
+		return nil, allowErr
 	}
 	encoded, err := common.Marshal(value)
 	if err != nil {
@@ -530,6 +519,67 @@ func validOAuthProviderCapability(value string) bool {
 		}
 	}
 	return true
+}
+
+// oauthProviderKnownScopes is the only scope set consent may grant. Order is
+// the consent and discovery order.
+var oauthProviderKnownScopes = []string{
+	"openid", "profile", "email", "offline_access",
+	"balance:read", "usage:read", "tokens:read", "tokens:write",
+}
+
+func oauthProviderAllowedScopes(requested, registered []string) ([]string, error) {
+	allowed := []string{}
+	for _, scope := range oauthProviderKnownScopes {
+		if slices.Contains(requested, scope) && slices.Contains(registered, scope) {
+			allowed = append(allowed, scope)
+		}
+	}
+	if !slices.Contains(allowed, "profile") {
+		return nil, ErrOAuthProviderDenied
+	}
+	return allowed, nil
+}
+
+func oauthProviderGrantScopes(selected, allowed []string) error {
+	if len(selected) == 0 || len(selected) > len(oauthProviderKnownScopes) || !slices.Contains(selected, "profile") {
+		return ErrOAuthProviderDenied
+	}
+	for i, scope := range selected {
+		if !slices.Contains(allowed, scope) || slices.Contains(selected[:i], scope) {
+			return ErrOAuthProviderDenied
+		}
+	}
+	return nil
+}
+
+// OAuthAccessTokenScopes maps a granted OAuth scope set onto personal access
+// token scopes. profile and email share profile:read. tokens:read is
+// api_key:read and does not include reveal. openid and offline_access do not
+// map to a resource scope.
+func OAuthAccessTokenScopes(granted []string) []string {
+	mapped := []string{}
+	for _, scope := range granted {
+		var target string
+		switch scope {
+		case "profile", "email":
+			target = "profile:read"
+		case "balance:read":
+			target = "wallet:read"
+		case "usage:read":
+			target = "usage:read"
+		case "tokens:read":
+			target = "api_key:read"
+		case "tokens:write":
+			target = "api_key:write"
+		default:
+			continue
+		}
+		if !slices.Contains(mapped, target) {
+			mapped = append(mapped, target)
+		}
+	}
+	return mapped
 }
 
 func oauthProviderScopeSet(value string) ([]string, error) {

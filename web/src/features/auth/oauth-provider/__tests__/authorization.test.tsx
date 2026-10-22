@@ -101,8 +101,8 @@ function preview(phase: AuthorizationPhase): AuthorizationPreview {
     client_id: 'synthetic-client',
     client_name: '<img src=x onerror=CANARY>',
     username: 'Synthetic account',
-    requested_scopes: ['profile', 'email', 'tokens:read'],
-    allowed_scopes: ['profile', 'email'],
+    requested_scopes: ['profile', 'email', 'tokens:read', 'offline_access'],
+    allowed_scopes: ['profile', 'email', 'offline_access', 'tokens:read'],
     audience: 'newapi-userinfo',
   }
 }
@@ -239,8 +239,13 @@ describe('explicit dashboard-session provider authorization', () => {
         const email = screen.getByRole('checkbox', {
           name: 'Email address (optional)',
         })
-        expect(email).not.toBeChecked()
+        expect(email).toBeChecked()
         await user.click(email)
+        expect(email).not.toBeChecked()
+        const keys = screen.getByRole('checkbox', { name: 'Read API keys' })
+        expect(keys).toBeChecked()
+        const refresh = screen.getByRole('checkbox', { name: 'Refresh access' })
+        expect(refresh).toBeChecked()
       }
       await user.click(approve)
       await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
@@ -259,7 +264,7 @@ describe('explicit dashboard-session provider authorization', () => {
               challenge: capability,
               preview_token: 'owned-preview-token',
               decision: 'approve',
-              selected_scopes: ['profile', 'email'],
+              selected_scopes: ['profile', 'offline_access', 'tokens:read'],
             }
       )
       for (const config of requests) {
