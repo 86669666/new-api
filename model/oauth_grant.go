@@ -143,7 +143,7 @@ func withCurrentOAuthGrant(ctx context.Context, ref string, userID int, action f
 			}
 		}
 		var user User
-		if err := lockForUpdate(tx).Select("id", "username", "display_name", "email", "group", "status", "auth_version").First(&user, userID).Error; err != nil {
+		if err := lockForUpdate(tx).Select("id", "username", "display_name", "email", "group", "status", "auth_version", "quota", "used_quota").First(&user, userID).Error; err != nil {
 			return err
 		}
 		var session UserSession
@@ -190,9 +190,17 @@ type OAuthGrantAuthorization struct {
 	Activate                                               bool
 }
 
-func AuthorizeOAuthGrant(ctx context.Context, claims OAuthGrantAuthorization) (*User, error) {
-	var profile *User
-	err := withCurrentOAuthGrant(ctx, OAuthGrantRef(claims.Issuer, claims.GrantID), claims.UserID, func(tx *gorm.DB, user *User, _ *UserSession, grant *OAuthGrant) error {
+// OAuthGrantSnapshot is the locked user projection and authorization revision.
+// SourceSessionExpiresAt permits deadline checks after the transaction commits.
+type OAuthGrantSnapshot struct {
+	User                   *User
+	Revision               int64
+	SourceSessionExpiresAt int64
+}
+
+func AuthorizeOAuthGrant(ctx context.Context, claims OAuthGrantAuthorization) (*OAuthGrantSnapshot, error) {
+	var snapshot *OAuthGrantSnapshot
+	err := withCurrentOAuthGrant(ctx, OAuthGrantRef(claims.Issuer, claims.GrantID), claims.UserID, func(tx *gorm.DB, user *User, session *UserSession, grant *OAuthGrant) error {
 		var scopes []string
 		now := time.Now().Unix()
 		if grant.Issuer != claims.Issuer || grant.GrantID != claims.GrantID || grant.ClientID != claims.ClientID || grant.Subject != claims.Subject || grant.UserAuthVersion != claims.AuthVersion || grant.ExpiresAt != claims.GrantExpiresAt || claims.TokenExpiresAt <= now || claims.NotBefore > now || common.UnmarshalJsonStr(grant.Scopes, &scopes) != nil {
@@ -219,8 +227,21 @@ func AuthorizeOAuthGrant(ctx context.Context, claims OAuthGrantAuthorization) (*
 		} else if grant.State != "active" {
 			return ErrOAuthGrantInvalid
 		}
-		profile = user
+		revision := grant.Revision
+		if claims.Activate {
+			revision++
+		}
+		snapshot = &OAuthGrantSnapshot{User: user, Revision: revision, SourceSessionExpiresAt: session.ExpiresAt}
 		return nil
 	})
-	return profile, err
+	if err != nil {
+		return nil, err
+	}
+	// COMMIT may itself wait. Do not publish a projection that expired while
+	// the transaction was finishing, even though its locked reads were valid.
+	now := time.Now().Unix()
+	if claims.TokenExpiresAt <= now || claims.GrantExpiresAt <= now || snapshot.SourceSessionExpiresAt <= now || claims.NotBefore > now {
+		return nil, ErrOAuthGrantInvalid
+	}
+	return snapshot, nil
 }

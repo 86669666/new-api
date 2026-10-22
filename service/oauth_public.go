@@ -22,7 +22,7 @@ import (
 
 const OAuthPublicCapabilityLimit = 16384
 
-var oauthPublicScopes = []string{"openid", "profile", "email", "offline_access"}
+var oauthPublicScopes = []string{"openid", "profile", "email", "offline_access", "balance:read"}
 var oauthPublicCookieName = regexp.MustCompile(`^__Host-newapi_oauth_(login|consent)_csrf_[0-9]{1,10}$`)
 
 type OAuthPublicConfig struct {
@@ -69,7 +69,7 @@ func NewOAuthPublic(config OAuthPublicConfig, bridge *OAuthProviderBridge) (*OAu
 	bridge.public = p
 	bridge.resource.grantsRequired = true
 	// Invalidate previews made under the earlier profile/email-only policy.
-	bridge.policy += ":public-v1:openid-profile-email-offline:7d"
+	bridge.policy += ":public-v2:openid-profile-email-offline-balance:7d"
 	return p, nil
 }
 

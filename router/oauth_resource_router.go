@@ -13,6 +13,8 @@ func SetOAuthResourceRouter(router *gin.Engine, resource *service.OAuthUserInfoR
 	}
 	group := router.Group("/api/v1/oauth")
 	group.Use(middleware.RouteTag("api"), middleware.OAuthResourceNoStore, middleware.GlobalAPIRateLimit())
+	group.Any("/balance", middleware.OAuthBalanceBoundary, middleware.OAuthBalanceAuth(resource), controller.GetOAuthBalance)
+	group.Any("/balance/*trailing", middleware.OAuthBalanceBoundary)
 	// Explicitly reject the slash variant instead of letting Gin redirect and
 	// reflect a rejected URL credential in Location. It never serves a profile.
 	group.GET("/userinfo/", func(c *gin.Context) { middleware.WriteOAuthResourceError(c, service.ErrOAuthInvalidToken) })

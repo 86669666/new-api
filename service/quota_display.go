@@ -68,11 +68,16 @@ func WalletQuotaErrorPresentation(apiErr *types.NewAPIError) (message, remaining
 // Intl rounds the shortest decimal representation of a Number; toFixed (token
 // abbreviations) instead rounds the exact binary value. Neither changes quota.
 func formatWalletQuotaRemaining(quota int) string {
+	return formatWalletQuotaSnapshot(quota, common.QuotaPerUnit, *operation_setting.GetGeneralSetting(), operation_setting.USDExchangeRate)
+}
+
+// formatWalletQuotaSnapshot uses only captured configuration, so a resource can
+// finish all external authorization waits before formatting its returned quota.
+func formatWalletQuotaSnapshot(quota int, unit float64, cfg operation_setting.GeneralSetting, usdToCNY float64) string {
 	const maxSafe = 9007199254740991
 	if int64(quota) > maxSafe || int64(quota) < -maxSafe {
 		return ""
 	}
-	cfg := *operation_setting.GetGeneralSetting()
 	value := float64(quota)
 	if cfg.QuotaDisplayType == operation_setting.QuotaDisplayTypeTokens {
 		if math.Abs(value) < 1000 {
@@ -95,12 +100,12 @@ func formatWalletQuotaRemaining(quota int) string {
 		}
 		return text + "k"
 	}
-	unit, rate, symbol := common.QuotaPerUnit, 1.0, "$"
+	rate, symbol := 1.0, "$"
 	custom := false
 	switch cfg.QuotaDisplayType {
 	case operation_setting.QuotaDisplayTypeUSD:
 	case operation_setting.QuotaDisplayTypeCNY:
-		rate, symbol = operation_setting.USDExchangeRate, "¥"
+		rate, symbol = usdToCNY, "¥"
 	case operation_setting.QuotaDisplayTypeCustom:
 		custom = true
 		rate = cfg.CustomCurrencyExchangeRate

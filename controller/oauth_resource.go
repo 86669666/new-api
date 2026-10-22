@@ -27,3 +27,22 @@ func GetOAuthUserInfo(c *gin.Context) {
 	}
 	c.Data(http.StatusOK, "application/json", data)
 }
+
+func GetOAuthBalance(c *gin.Context) {
+	access, ok := middleware.GetOAuthUserInfoAccess(c)
+	if !ok {
+		middleware.WriteOAuthResourceError(c, service.ErrOAuthInvalidToken, "balance:read")
+		return
+	}
+	balance, err := access.ReadBalance(c.Request.Context())
+	if err != nil {
+		middleware.WriteOAuthResourceError(c, err, "balance:read")
+		return
+	}
+	data, err := common.Marshal(balance)
+	if err != nil {
+		middleware.WriteOAuthResourceError(c, service.ErrOAuthResourceUnavailable, "balance:read")
+		return
+	}
+	c.Data(http.StatusOK, "application/json", data)
+}

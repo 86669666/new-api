@@ -151,6 +151,43 @@ export function ProviderAuthorizationPage(props: {
                 </Label>
               </div>
             )}
+            {state.preview.allowed_scopes.includes('balance:read') && (
+              <div className='space-y-2'>
+                <div className='flex items-center gap-2'>
+                  <Checkbox
+                    id='provider-balance'
+                    checked={authorization.balance}
+                    aria-describedby='provider-balance-description'
+                    onCheckedChange={(checked) =>
+                      authorization.setBalance(checked === true)
+                    }
+                  />
+                  <Label htmlFor='provider-balance'>
+                    {t('Personal wallet balance and account usage (optional)')}
+                  </Label>
+                </div>
+                <div
+                  id='provider-balance-description'
+                  className='text-muted-foreground space-y-1 text-sm'
+                >
+                  <p>
+                    {t(
+                      'Allow this client to read your personal wallet balance and accumulated account usage, including subscription usage.'
+                    )}
+                  </p>
+                  <p>
+                    {t(
+                      'This does not include organization balances, remaining subscription quotas, or usage history.'
+                    )}
+                  </p>
+                  <p>
+                    {t(
+                      'Access lasts up to seven days and ends when this sign-in session ends.'
+                    )}
+                  </p>
+                </div>
+              </div>
+            )}
           </fieldset>
         )}
         <div className='flex flex-wrap gap-3'>

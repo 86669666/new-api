@@ -288,7 +288,7 @@ func TestQuotaRemainingDisplayHTTP(t *testing.T) {
 			{"CUSTOM", 502500, 2, " 🐱 ", "🐱 2.01"}, {"CUSTOM", 500000000, 2, " ", "¤ 2,000"},
 			{"TOKENS", 999, 1, "", "999"}, {"TOKENS", 1000, 1, "", "1k"}, {"TOKENS", 1050, 1, "", "1.1k"},
 			{"TOKENS", 1250, 1, "", "1.3k"}, {"TOKENS", -1250, 1, "", "-1.3k"}, {"TOKENS", 502500, 1, "", "502.5k"},
-			{"USD", 9007199254740992, 1, "", ""}, {"INVALID", 100, 1, "", ""},
+			{"USD", 9007199254740992, 1, "", ""}, {"USD", -9007199254740992, 1, "", ""}, {"INVALID", 100, 1, "", ""},
 			{"CNY", 100, math.NaN(), "", ""}, {"CUSTOM", 100, 0, "x", ""}, {"CUSTOM", 100, 2, "x\ny", ""},
 		} {
 			t.Run(fmt.Sprintf("%s_%d_%s", tc.mode, tc.quota, tc.symbol), func(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"gorm.io/gorm"
 )
 
@@ -60,6 +62,7 @@ type OAuthResourceIdentity struct {
 	notBefore      int64
 	email          bool
 	scopes         []string
+	grantRevision  int64
 	grantID        string
 	grantExpiresAt int64
 }
@@ -181,7 +184,7 @@ func (a *OAuthUserInfoAccess) Read(ctx context.Context) (*OAuthUserInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	if identity.userID != a.identity.userID || identity.authVersion != a.identity.authVersion || identity.issuer != a.identity.issuer || identity.clientID != a.identity.clientID || (a.identity.email && !identity.email) || identity.grantID != a.identity.grantID || identity.grantExpiresAt != a.identity.grantExpiresAt {
+	if identity.userID != a.identity.userID || identity.authVersion != a.identity.authVersion || identity.issuer != a.identity.issuer || identity.clientID != a.identity.clientID || (a.identity.email && !identity.email) || identity.grantID != a.identity.grantID || identity.grantExpiresAt != a.identity.grantExpiresAt || identity.grantRevision != a.identity.grantRevision {
 		return nil, ErrOAuthInvalidToken
 	}
 	profile := &OAuthUserInfo{ID: user.Id, Username: user.Username, DisplayName: user.DisplayName, Group: user.Group}
@@ -194,14 +197,64 @@ func (a *OAuthUserInfoAccess) Read(ctx context.Context) (*OAuthUserInfo, error) 
 	return profile, nil
 }
 
+// OAuthBalance exposes persisted personal account counters, not a billing ledger.
+// UsedQuota may include subscription consumption; no other funding data is read.
+type OAuthBalance struct {
+	Quota         int     `json:"quota"`
+	UsedQuota     int     `json:"used_quota"`
+	QuotaPerUnit  float64 `json:"quota_per_unit"`
+	DisplayAmount string  `json:"display_amount,omitempty"`
+	DisplayLocale string  `json:"display_locale"`
+}
+
+func (a *OAuthUserInfoAccess) RequireBalanceScope() error {
+	if a == nil || a.resource == nil || !a.resource.grantsRequired || a.identity.grantID == "" {
+		return ErrOAuthInvalidToken
+	}
+	if !slices.Contains(a.identity.scopes, "balance:read") {
+		return ErrOAuthInsufficientScope
+	}
+	return nil
+}
+
+func (a *OAuthUserInfoAccess) ReadBalance(ctx context.Context) (*OAuthBalance, error) {
+	if err := a.RequireBalanceScope(); err != nil {
+		return nil, err
+	}
+	identity, err := a.resource.introspect(ctx, a.credential)
+	if err != nil {
+		return nil, err
+	}
+	unit, cfg, rate := common.QuotaPerUnit, *operation_setting.GetGeneralSetting(), operation_setting.USDExchangeRate
+	snapshot, err := authorizeOAuthGrant(ctx, identity, false)
+	if err != nil {
+		return nil, err
+	}
+	if identity.userID != a.identity.userID || identity.authVersion != a.identity.authVersion || identity.issuer != a.identity.issuer || identity.clientID != a.identity.clientID || identity.grantID != a.identity.grantID || identity.grantExpiresAt != a.identity.grantExpiresAt || snapshot.Revision != a.identity.grantRevision || !slices.Equal(identity.scopes, a.identity.scopes) {
+		return nil, ErrOAuthInvalidToken
+	}
+	if !slices.Contains(identity.scopes, "balance:read") {
+		return nil, ErrOAuthInsufficientScope
+	}
+	user := snapshot.User
+	if int64(user.Quota) < -common.MaxWalletQuota || int64(user.Quota) > common.MaxWalletQuota || int64(user.UsedQuota) < -common.MaxWalletQuota || int64(user.UsedQuota) > common.MaxWalletQuota || unit <= 0 || math.IsNaN(unit) || math.IsInf(unit, 0) {
+		return nil, ErrOAuthResourceUnavailable
+	}
+	return &OAuthBalance{Quota: user.Quota, UsedQuota: user.UsedQuota, QuotaPerUnit: unit, DisplayAmount: formatWalletQuotaSnapshot(user.Quota, unit, cfg, rate), DisplayLocale: "en-US"}, nil
+}
+
 func (r *OAuthUserInfoResource) readCurrentIdentity(ctx context.Context, credential string) (OAuthResourceIdentity, *model.User, error) {
 	identity, err := r.introspect(ctx, credential)
 	if err != nil {
 		return identity, nil, err
 	}
 	if r.grantsRequired {
-		user, err := authorizeOAuthGrant(ctx, identity, false)
-		return identity, user, err
+		snapshot, err := authorizeOAuthGrant(ctx, identity, false)
+		if err != nil {
+			return identity, nil, err
+		}
+		identity.grantRevision = snapshot.Revision
+		return identity, snapshot.User, nil
 	}
 	user, err := model.GetOAuthUserInfoByID(ctx, identity.userID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -315,6 +368,11 @@ func (r *OAuthUserInfoResource) introspectPurpose(ctx context.Context, credentia
 	var grantID, grantExpiry string
 	var grantExpires int64
 	if r.grantsRequired {
+		for scope := range scopes {
+			if !slices.Contains(oauthPublicScopes, scope) {
+				return identity, ErrOAuthInvalidToken
+			}
+		}
 		if common.Unmarshal(extra["newapi_grant_id"], &grantID) != nil || len(grantID) != 43 || !validOAuthHydraCapability(grantID) || common.Unmarshal(extra["newapi_grant_expires_at"], &grantExpiry) != nil {
 			return identity, ErrOAuthInvalidToken
 		}

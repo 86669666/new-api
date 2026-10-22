@@ -47,6 +47,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
   const [state, setState] = useState<AuthorizationState>({ kind: 'loading' })
   const [email, setEmail] = useState(false)
   const [offline, setOffline] = useState(false)
+  const [balance, setBalance] = useState(false)
   const mounted = useRef(false)
   const invalidated = useRef(false)
   const submitted = useRef(false)
@@ -262,6 +263,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
           approve,
           email: email && preview.allowed_scopes.includes('email'),
           offline: offline && preview.allowed_scopes.includes('offline_access'),
+          balance: balance && preview.allowed_scopes.includes('balance:read'),
         }
       )
       if (
@@ -286,6 +288,8 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
     setEmail,
     offline,
     setOffline,
+    balance,
+    setBalance,
     decide,
     resume,
     cancel: stop,

@@ -960,6 +960,109 @@ describe('provider authorization with synchronous browser history', () => {
 })
 
 describe('public OIDC consent', () => {
+  it.each(['unselected', 'selected', 'unticked', 'denied'])(
+    'balance consent %s is explicit and scoped',
+    async (choice) => {
+      const user = userEvent.setup()
+      providerHTTP.defaults.adapter = async (config) => {
+        requests.push(config)
+        const value = preview('consent')
+        value.requested_scopes = [
+          'openid',
+          'profile',
+          'email',
+          'offline_access',
+          'balance:read',
+        ]
+        value.allowed_scopes = [...value.requested_scopes]
+        return response(
+          config,
+          config.url?.endsWith('/preview')
+            ? value
+            : {
+                redirect_to:
+                  'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+              }
+        )
+      }
+      await mountPage('consent')
+      const balance = await screen.findByRole('checkbox', {
+        name: 'Personal wallet balance and account usage (optional)',
+      })
+      expect(balance).not.toBeChecked()
+      expect(balance).toHaveAccessibleDescription(
+        /including subscription usage/
+      )
+      expect(balance).toHaveAccessibleDescription(
+        /ends when this sign-in session ends/
+      )
+      if (choice !== 'unselected') {
+        balance.focus()
+        await user.keyboard(' ')
+        expect(balance).toBeChecked()
+      }
+      if (choice === 'unticked') await user.click(balance)
+      await user.click(
+        screen.getByRole('button', {
+          name: choice === 'denied' ? 'Deny' : 'Approve',
+        })
+      )
+      await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+      expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual(
+        choice === 'denied'
+          ? []
+          : [
+              'profile',
+              'openid',
+              ...(choice === 'selected' ? ['balance:read'] : []),
+            ]
+      )
+    }
+  )
+
+  it('does not display or grant balance when it is not allowed', async () => {
+    const user = userEvent.setup()
+    providerHTTP.defaults.adapter = async (config) => {
+      requests.push(config)
+      return response(
+        config,
+        config.url?.endsWith('/preview')
+          ? preview('consent')
+          : {
+              redirect_to:
+                'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+            }
+      )
+    }
+    await mountPage('consent')
+    await screen.findByRole('button', { name: 'Approve' })
+    expect(
+      screen.queryByRole('checkbox', {
+        name: 'Personal wallet balance and account usage (optional)',
+      })
+    ).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+    expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual([
+      'profile',
+    ])
+  })
+
+  it('rejects a balance preview when the client did not request balance', async () => {
+    providerHTTP.defaults.adapter = async (config) => {
+      requests.push(config)
+      const value = preview('consent')
+      value.allowed_scopes.push('balance:read')
+      return response(config, value)
+    }
+    await mountPage('consent')
+    await screen.findByText('Authorization could not be completed.')
+    expect(
+      screen.queryByRole('button', { name: 'Approve' })
+    ).not.toBeInTheDocument()
+    expect(requests).toHaveLength(1)
+  })
+
   it.each([false, true])(
     'offline choice %s preserves requested identity scope',
     async (offlineSelected) => {

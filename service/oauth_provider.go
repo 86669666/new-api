@@ -290,7 +290,7 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 		selected := input.SelectedScopes
 		limit := 2
 		if b.public != nil {
-			limit = 4
+			limit = len(oauthPublicScopes)
 		}
 		if len(selected) == 0 || len(selected) > limit || !slices.Contains(selected, "profile") || b.public != nil && slices.Contains(request.requested, "openid") && !slices.Contains(selected, "openid") {
 			return nil, ErrOAuthProviderDenied

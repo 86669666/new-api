@@ -2,14 +2,18 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -23,14 +27,17 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	sqlmysql "github.com/go-sql-driver/mysql"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
@@ -49,6 +56,7 @@ func TestOAuthPublicHTTP(t *testing.T) {
 	gin.DefaultWriter = &logs
 	t.Cleanup(func() { gin.DefaultWriter = old })
 	middleware.SetUpLogger(engine)
+	engine.Use(middleware.OAuthBalanceBoundary)
 	SetOAuthProviderRouter(engine, nil)
 	engine.NoRoute(func(c *gin.Context) { c.String(200, "frontend") })
 	for _, path := range []string{"/oauth2/auth?state=SECRET", "/oauth2/token?code=SECRET", "/oauth2/unknown?token=SECRET", "//oauth2/auth?state=SECRET", "/oauth2/auth/?state=SECRET", "/%6fauth2/auth?state=SECRET", "/.well-known/openid-configuration?code=SECRET"} {
@@ -57,6 +65,18 @@ func TestOAuthPublicHTTP(t *testing.T) {
 		assert.GreaterOrEqual(t, w.Code, 400, path)
 		assert.Empty(t, w.Header().Get("Location"), path)
 		assert.Contains(t, w.Header().Get("Cache-Control"), "no-store", path)
+	}
+	for _, path := range []string{"/api/v1/oauth/balance", "/api/v1/oauth/balance?access_token=SECRET", "/api/v1/oauth/balance/"} {
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		want := 400
+		if path == "/api/v1/oauth/balance" {
+			want = 401
+		}
+		assert.Equal(t, want, w.Code)
+		assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+		assert.Equal(t, "no-referrer", w.Header().Get("Referrer-Policy"))
+		assert.NotContains(t, w.Body.String(), "frontend")
 	}
 	assert.NotContains(t, logs.String(), "SECRET")
 }
@@ -469,6 +489,71 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		assert.NotEmpty(t, withoutOffline.ID)
 		assert.Empty(t, withoutOffline.Refresh)
 	})
+
+	t.Run("balance_explicit_consent_and_refresh", func(t *testing.T) {
+		c.t = t
+		grant := c.grant("openid profile email offline_access balance:read")
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Updates(map[string]any{"quota": -1, "used_quota": 123}).Error)
+		status, headers, data := c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", grant.Access)
+		require.Equal(t, 200, status)
+		assert.Equal(t, "no-referrer", headers.Get("Referrer-Policy"))
+		assert.Contains(t, headers.Get("Cache-Control"), "no-store")
+		var balance service.OAuthBalance
+		require.NoError(t, common.Unmarshal(data, &balance))
+		assert.Equal(t, -1, balance.Quota)
+		assert.Equal(t, 123, balance.UsedQuota)
+		status, next := c.refresh(grant)
+		require.Equal(t, 200, status)
+		status, _, _ = c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", next.Access)
+		assert.Equal(t, 200, status)
+		for _, token := range []string{next.Refresh, grant.ID, f.bearer["owner"]} {
+			status, _, _ = c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", token)
+			assert.Equal(t, 401, status)
+		}
+		status, declined := c.exchange(c.code("openid profile offline_access balance:read", "openid", "profile", "offline_access"))
+		require.Equal(t, 200, status)
+		status, headers, _ = c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", declined.Access)
+		assert.Equal(t, 403, status)
+		assert.Equal(t, `Bearer error="insufficient_scope", scope="balance:read"`, headers.Get("WWW-Authenticate"))
+		status, refreshed := c.refresh(declined)
+		require.Equal(t, 200, status)
+		status, _, _ = c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", refreshed.Access)
+		assert.Equal(t, 403, status)
+		independent := c.grant("profile balance:read")
+		mutations <- func() error {
+			return f.db.Model(&model.OAuthGrant{}).Where("user_id = ?", f.users["owner"].Id).UpdateColumn("state", "revoked").Error
+		}
+		changeAt.Store(introspections.Load() + 2)
+		status, _, _ = c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", independent.Access)
+		assert.Equal(t, 401, status)
+	})
+	t.Run("balance_root_privacy", func(t *testing.T) {
+		c.t = t
+		c.secrets = append(c.secrets, "BALANCE_QUERY_CANARY")
+		for _, path := range []string{"api/v1/oauth/balance?", "api/v1/oauth/balance?org_id=0", "api/v1/oauth/balance?org_id=&org_id=1", "api/v1/oauth/balance?ORG_ID=0", "api/v1/oauth/balance?x=%ZZ", "api/v1/oauth/balance?access_token=BALANCE_QUERY_CANARY", "api/v1/oauth/balance/", "api/v1/oauth/%62alance", "api/v1/oauth/%2562alance", "api//v1/oauth/balance", "API/V1/OAUTH/BALANCE"} {
+			status, headers, _ := c.request("GET", input.Issuer+path, "", "", "")
+			assert.Equal(t, 400, status, path)
+			assert.Contains(t, headers.Get("Cache-Control"), "no-store", path)
+			assert.Equal(t, "no-referrer", headers.Get("Referrer-Policy"), path)
+			assert.Empty(t, headers.Get("Location"), path)
+		}
+		for _, method := range []string{"POST", "HEAD", "OPTIONS", "PUT"} {
+			status, headers, _ := c.request(method, input.Issuer+"api/v1/oauth/balance", "", "", "")
+			assert.Equal(t, 400, status)
+			assert.Equal(t, "no-referrer", headers.Get("Referrer-Policy"))
+		}
+		for _, values := range [][]string{{""}, {"0"}, {"1", "2"}} {
+			req, err := http.NewRequest("GET", input.Issuer+"api/v1/oauth/balance", nil)
+			require.NoError(t, err)
+			req.Header["X-Organization-Id"] = values
+			res, err := c.http.Do(req)
+			require.NoError(t, err)
+			res.Body.Close()
+			assert.Equal(t, 400, res.StatusCode)
+			assert.Contains(t, res.Header.Get("Cache-Control"), "no-store")
+			assert.Equal(t, "no-referrer", res.Header.Get("Referrer-Policy"))
+		}
+	})
 	t.Run("wrong_pkce", func(t *testing.T) {
 		c.t = t
 		grant := c.code("openid profile offline_access")
@@ -715,6 +800,9 @@ func oauthPublicDatabase(t *testing.T, f *organizationHTTPFixture) {
 	t.Helper()
 	kind := os.Getenv("NEWAPI_W01_MAIN_KIND")
 	if kind == "" || kind == "sqlite" {
+		var version string
+		require.NoError(t, f.db.Raw("SELECT sqlite_version()").Scan(&version).Error)
+		t.Logf("OAuth primary database=sqlite version=%s", version)
 		return
 	}
 	require.Contains(t, []string{"mysql", "postgres"}, kind)
@@ -1022,6 +1110,16 @@ func TestOAuthGrantStore(t *testing.T) {
 func TestOAuthGrantUserInfo(t *testing.T) {
 	f := newOrganizationHTTPFixture(t)
 	oauthPublicDatabase(t, f)
+
+	// Keep pending batch deltas and Redis observations in a random fixture identity.
+	randomID := make([]byte, 4)
+	_, randomErr := rand.Read(randomID)
+	require.NoError(t, randomErr)
+	ownerID := 1000000000 + int(new(big.Int).SetBytes(randomID).Int64()%1000000000)
+	previousID := f.users["owner"].Id
+	require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", previousID).UpdateColumn("id", ownerID).Error)
+	require.NoError(t, f.db.Model(&model.UserSession{}).Where("user_id = ?", previousID).UpdateColumn("user_id", ownerID).Error)
+	f.users["owner"].Id = ownerID
 	common.IsMasterNode = true
 	require.NoError(t, model.InitOAuthGrantStore(true))
 	common.IsMasterNode = false
@@ -1069,10 +1167,13 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 		return resource
 	}
 	public, legacy := gin.New(), gin.New()
+	public.Use(middleware.OAuthBalanceBoundary)
+	legacy.Use(middleware.OAuthBalanceBoundary)
 	SetOAuthResourceRouter(public, makeResource(true))
 	SetOAuthResourceRouter(legacy, makeResource(false))
+	scope := "profile"
 	setClaims := func(extra map[string]any) {
-		value := map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": issuer, "aud": []string{"userinfo"}, "client_id": clientID, "sub": grant.Subject, "exp": time.Now().Unix() + 600, "scope": "profile", "ext": extra}
+		value := map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": issuer, "aud": []string{"userinfo"}, "client_id": clientID, "sub": grant.Subject, "exp": time.Now().Unix() + 600, "scope": scope, "ext": extra}
 		payload.Store(&value)
 	}
 	extras := func() map[string]any {
@@ -1170,9 +1271,293 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 			require.Equal(t, 200, serve(public))
 		})
 	}
+	t.Run("balance", func(t *testing.T) {
+		oldUnit, oldConfig, oldRate := common.QuotaPerUnit, *operation_setting.GetGeneralSetting(), operation_setting.USDExchangeRate
+		oldBatch, oldRedis, oldRDB := common.BatchUpdateEnabled, common.RedisEnabled, common.RDB
+		t.Cleanup(func() {
+			common.QuotaPerUnit = oldUnit
+			*operation_setting.GetGeneralSetting() = oldConfig
+			operation_setting.USDExchangeRate = oldRate
+			common.BatchUpdateEnabled, common.RedisEnabled, common.RDB = oldBatch, oldRedis, oldRDB
+		})
+		common.QuotaPerUnit = 500000
+		operation_setting.GetGeneralSetting().QuotaDisplayType = "USD"
+		balance := func() *httptest.ResponseRecorder {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/api/v1/oauth/balance", nil)
+			req.Header.Set("Authorization", "Bearer synthetic-opaque-token")
+			public.ServeHTTP(w, req)
+			assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+			assert.Equal(t, "no-referrer", w.Header().Get("Referrer-Policy"))
+			return w
+		}
+		setClaims(extras())
+		w := balance()
+		require.Equal(t, 403, w.Code)
+		assert.Equal(t, `Bearer error="insufficient_scope", scope="balance:read"`, w.Header().Get("WWW-Authenticate"))
+		scope = "profile balance:read"
+		require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("scopes", `["profile","balance:read"]`).Error)
+		setClaims(extras())
+		for _, tc := range []struct {
+			quota, used int
+			status      int
+			display     string
+		}{
+			{0, 0, 200, "$0"}, {-1, -7, 200, "-$0.0001"}, {9007199254740991, 9007199254740991, 200, "$18,014,398,509.48"},
+			{-9007199254740991, -9007199254740991, 200, "-$18,014,398,509.48"},
+			{9007199254740992, 0, 503, ""}, {-9007199254740992, 0, 503, ""}, {0, 9007199254740992, 503, ""}, {0, -9007199254740992, 503, ""},
+		} {
+			t.Run(fmt.Sprintf("numbers_%d_%d", tc.quota, tc.used), func(t *testing.T) {
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).Updates(map[string]any{"quota": tc.quota, "used_quota": tc.used}).Error)
+				w := balance()
+				require.Equal(t, tc.status, w.Code)
+				var data map[string]any
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
+				if tc.status == 200 {
+					assert.Len(t, data, 5)
+					assert.Equal(t, float64(tc.quota), data["quota"])
+					assert.Equal(t, float64(tc.used), data["used_quota"])
+					assert.Equal(t, float64(500000), data["quota_per_unit"])
+					assert.Equal(t, tc.display, data["display_amount"])
+					assert.Equal(t, "en-US", data["display_locale"])
+				} else {
+					assert.Equal(t, map[string]any{"error": "temporarily_unavailable"}, data)
+				}
+			})
+		}
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).Updates(map[string]any{"quota": 100, "used_quota": 17}).Error)
+		for _, unit := range []float64{0, -1, math.NaN(), math.Inf(1)} {
+			common.QuotaPerUnit = unit
+			require.Equal(t, 503, balance().Code)
+		}
+		common.QuotaPerUnit = 500000
+		t.Run("optional_display", func(t *testing.T) {
+			for _, tc := range []struct {
+				mode, symbol, want string
+				rate               float64
+			}{
+				{"USD", "", "$0.0002", 1}, {"CNY", "", "¥0.0014", 7}, {"CUSTOM", " ", "¤ 0.0004", 2}, {"TOKENS", "", "100", 1}, {"CUSTOM", "x\ny", "", 1}, {"CNY", "", "", math.NaN()},
+			} {
+				cfg := operation_setting.GetGeneralSetting()
+				cfg.QuotaDisplayType = tc.mode
+				cfg.CustomCurrencySymbol = tc.symbol
+				cfg.CustomCurrencyExchangeRate = tc.rate
+				operation_setting.USDExchangeRate = tc.rate
+				w := balance()
+				require.Equal(t, 200, w.Code)
+				var data map[string]any
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
+				if tc.want == "" {
+					assert.NotContains(t, data, "display_amount")
+				} else {
+					assert.Equal(t, tc.want, data["display_amount"])
+				}
+			}
+			operation_setting.GetGeneralSetting().QuotaDisplayType = "USD"
+		})
+		t.Run("same_row_and_captured_config", func(t *testing.T) {
+			var reads atomic.Int32
+			name := "oauth_balance_config_capture"
+			require.NoError(t, f.db.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
+				if tx.Statement.Table == "users" && reads.Add(1) == 2 {
+					common.QuotaPerUnit = 1
+					operation_setting.GetGeneralSetting().QuotaDisplayType = "TOKENS"
+				}
+			}))
+			w := balance()
+			require.NoError(t, f.db.Callback().Query().Remove(name))
+			common.QuotaPerUnit = 500000
+			operation_setting.GetGeneralSetting().QuotaDisplayType = "USD"
+			require.Equal(t, 200, w.Code)
+			assert.Equal(t, int32(2), reads.Load())
+			assert.JSONEq(t, `{"quota":100,"used_quota":17,"quota_per_unit":500000,"display_amount":"$0.0002","display_locale":"en-US"}`, w.Body.String())
+		})
+		t.Run("final_gate_changes", func(t *testing.T) {
+			for _, tc := range []struct {
+				name             string
+				table            any
+				where            string
+				value            any
+				column           string
+				invalid, restore any
+			}{
+				{"revision", &model.OAuthGrant{}, "grant_ref = ?", grant.GrantRef, "revision", 4, 3},
+				{"grant_revoke", &model.OAuthGrant{}, "grant_ref = ?", grant.GrantRef, "state", "revoked", "active"},
+				{"sid_logout", &model.UserSession{}, "sid = ?", grant.OriginSID, "revoked_at", 1, 0},
+				{"sid_version", &model.UserSession{}, "sid = ?", grant.OriginSID, "version", 2, 1},
+				{"auth_version", &model.User{}, "id = ?", grant.UserID, "auth_version", 2, 1},
+				{"disabled", &model.User{}, "id = ?", grant.UserID, "status", 2, common.UserStatusEnabled},
+				{"deleted", &model.User{}, "id = ?", grant.UserID, "deleted_at", time.Now(), nil},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					mutations := func() error {
+						return f.db.Model(tc.table).Where(tc.where, tc.value).UpdateColumn(tc.column, tc.invalid).Error
+					}
+					mutation <- mutations
+					mutateAt.Store(calls.Load() + 2)
+					assert.Equal(t, 401, balance().Code)
+					require.NoError(t, f.db.Unscoped().Model(tc.table).Where(tc.where, tc.value).UpdateColumn(tc.column, tc.restore).Error)
+					require.Equal(t, 200, balance().Code)
+				})
+			}
+		})
+		t.Run("final_row_fault_is_not_zero", func(t *testing.T) {
+			var reads atomic.Int32
+			name := "oauth_balance_read_fault"
+			require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(name, func(tx *gorm.DB) {
+				if tx.Statement.Table == "users" && reads.Add(1) == 2 {
+					tx.AddError(errors.New("private database diagnostic"))
+				}
+			}))
+			w := balance()
+			require.NoError(t, f.db.Callback().Query().Remove(name))
+			require.Equal(t, 503, w.Code)
+			assert.NotContains(t, w.Body.String(), "diagnostic")
+		})
+		t.Run("account_binding", func(t *testing.T) {
+			value := *payload.Load()
+			value["sub"] = strconv.Itoa(f.users["foreign"].Id)
+			payload.Store(&value)
+			assert.Equal(t, 401, balance().Code)
+			setClaims(extras())
+		})
+
+		t.Run("valid_other_account_and_independent_grant", func(t *testing.T) {
+			other := &model.OAuthGrant{Issuer: issuer, ClientID: clientID, Subject: strconv.Itoa(f.users["foreign"].Id), UserID: f.users["foreign"].Id, ConsentRequestID: "balance-foreign", HydraLoginSessionID: "balance-foreign-login", OriginSID: f.sids["foreign"], SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile","balance:read"]`, PolicyHash: strings.Repeat("a", 64)}
+			bytes := make([]byte, 32)
+			_, err := rand.Read(bytes)
+			require.NoError(t, err)
+			other.GrantID = base64.RawURLEncoding.EncodeToString(bytes)
+			require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, other) }))
+			require.NoError(t, model.ApproveOAuthGrant(t.Context(), other))
+			_, err = model.AuthorizeOAuthGrant(t.Context(), model.OAuthGrantAuthorization{Issuer: issuer, GrantID: other.GrantID, ClientID: clientID, Subject: other.Subject, UserID: other.UserID, AuthVersion: 1, GrantExpiresAt: other.ExpiresAt, TokenExpiresAt: time.Now().Unix() + 600, Scopes: []string{"profile", "balance:read"}, Activate: true})
+			require.NoError(t, err)
+			require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", other.UserID).Updates(map[string]any{"quota": 456, "used_quota": 789}).Error)
+			value := *payload.Load()
+			value["sub"] = other.Subject
+			value["ext"] = map[string]any{"newapi_auth_version": "1", "newapi_grant_id": other.GrantID, "newapi_grant_expires_at": strconv.FormatInt(other.ExpiresAt, 10)}
+			payload.Store(&value)
+			w := balance()
+			require.Equal(t, 200, w.Code)
+			var data service.OAuthBalance
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
+			assert.Equal(t, 456, data.Quota)
+			assert.Equal(t, 789, data.UsedQuota)
+			require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", other.GrantRef).UpdateColumn("state", "revoked").Error)
+			assert.Equal(t, 401, balance().Code)
+			setClaims(extras())
+			w = balance()
+			require.Equal(t, 200, w.Code)
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
+			assert.Equal(t, 100, data.Quota)
+			assert.Equal(t, 17, data.UsedQuota)
+		})
+		t.Run("batch_and_redis_are_not_balance_sources", func(t *testing.T) {
+			endpoint := os.Getenv("NEWAPI_W01_REDIS_ADDR")
+			require.NotEmpty(t, endpoint, "real Redis endpoint required for balance matrix")
+			rdb := redis.NewClient(&redis.Options{Addr: endpoint, DB: 15})
+			require.NoError(t, rdb.Ping(t.Context()).Err())
+			defer rdb.Close()
+			// UUID-prefixed DB fixtures use random user IDs, and this key is leased only
+			// after verifying it does not exist. GET neither fetches nor populates it.
+			key := fmt.Sprintf("user:%d", grant.UserID)
+			count, err := rdb.Exists(t.Context(), key).Result()
+			require.NoError(t, err)
+			require.Zero(t, count)
+			defer rdb.Del(context.Background(), key)
+			common.RDB = rdb
+			for _, batch := range []bool{false, true} {
+				for _, redisOn := range []bool{false, true} {
+					common.BatchUpdateEnabled, common.RedisEnabled = batch, redisOn
+					require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).Updates(map[string]any{"quota": 100, "used_quota": 17}).Error)
+					model.UpdateUserUsedQuota(grant.UserID, 9)
+					expected := 26
+					if batch {
+						expected = 17
+					}
+					for _, cache := range []string{"miss", "stale", "wrong_type"} {
+						require.NoError(t, rdb.Del(t.Context(), key).Err())
+						if cache == "stale" {
+							require.NoError(t, rdb.HSet(t.Context(), key, "Quota", 999999).Err())
+						}
+						if cache == "wrong_type" {
+							require.NoError(t, rdb.Set(t.Context(), key, "invalid", 0).Err())
+						}
+						w := balance()
+						require.Equal(t, 200, w.Code)
+						var data service.OAuthBalance
+						require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
+						assert.Equal(t, 100, data.Quota)
+						assert.Equal(t, expected, data.UsedQuota)
+					}
+					if batch {
+						model.UpdateUserUsedQuota(grant.UserID, -9)
+					} // cancel this fixture's queued delta; never flush GET
+				}
+			}
+			common.BatchUpdateEnabled, common.RedisEnabled, common.RDB = oldBatch, oldRedis, oldRDB
+		})
+		t.Run("commit_deadline", func(t *testing.T) {
+			var savedSession model.UserSession
+			require.NoError(t, f.db.Where("sid = ?", grant.OriginSID).First(&savedSession).Error)
+			var savedGrant model.OAuthGrant
+			require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).First(&savedGrant).Error)
+			sqlDB, err := f.db.DB()
+			require.NoError(t, err)
+			for _, deadline := range []string{"token", "grant", "session"} {
+				t.Run(deadline, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						now := time.Now().Unix()
+						tokenExpiry, grantExpiry, sessionExpiry := now+60, now+60, now+60
+						switch deadline {
+						case "token":
+							tokenExpiry = now + 1
+						case "grant":
+							grantExpiry = now + 1
+						case "session":
+							sessionExpiry = now + 1
+							grantExpiry = sessionExpiry
+						}
+						require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", grant.OriginSID).UpdateColumn("expires_at", sessionExpiry).Error)
+						require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("expires_at", grantExpiry).Error)
+						db := f.db.Session(&gorm.Session{NewDB: true}).WithContext(context.Background())
+						db.Statement.ConnPool = &oauthCommitDelayPool{DB: sqlDB}
+						model.DB = db
+						_, err := model.AuthorizeOAuthGrant(context.Background(), model.OAuthGrantAuthorization{Issuer: issuer, GrantID: grant.GrantID, ClientID: clientID, Subject: grant.Subject, UserID: grant.UserID, AuthVersion: 1, GrantExpiresAt: grantExpiry, TokenExpiresAt: tokenExpiry, Scopes: []string{"profile", "balance:read"}})
+						model.DB = f.db
+						require.ErrorIs(t, err, model.ErrOAuthGrantInvalid)
+					})
+				})
+			}
+			require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", grant.OriginSID).UpdateColumn("expires_at", savedSession.ExpiresAt).Error)
+			require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("expires_at", savedGrant.ExpiresAt).Error)
+		})
+	})
 	// A schema/connection failure is unavailable, never interpreted as missing
 	// authorization or used to fall back to legacy authorization.
 	require.NoError(t, f.db.Migrator().DropTable(&model.OAuthGrant{}))
 	require.Equal(t, 503, serve(public))
 	require.Equal(t, 401, serve(legacy))
+}
+
+// The virtual delay represents COMMIT acknowledgment after successful DB work.
+// synctest advances time deterministically; no wall-clock sleep or fake DB.
+type oauthCommitDelayPool struct{ *sql.DB }
+
+func (p *oauthCommitDelayPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	tx, err := p.DB.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &oauthCommitDelayTx{Tx: tx}, nil
+}
+
+type oauthCommitDelayTx struct{ *sql.Tx }
+
+func (t *oauthCommitDelayTx) Commit() error {
+	err := t.Tx.Commit()
+	if err == nil {
+		time.Sleep(2 * time.Second)
+	}
+	return err
 }
