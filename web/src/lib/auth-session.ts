@@ -61,6 +61,75 @@ export interface AuthTokenRotation {
   session: LoginSession
 }
 
+export type ExpectedAuthIdentity = Readonly<{ userId: number; sid: string }>
+
+export function isOrganizationAuthReplacement(
+  value: unknown,
+  source: LoginSession
+): value is AuthTokenRotation {
+  if (!isAuthTokenRotation(value)) return false
+  const now = Math.floor(Date.now() / 1000)
+  const session = value.session
+  return (
+    value.access_token.trim().length > 0 &&
+    Number.isSafeInteger(value.access_expires_at) &&
+    value.access_expires_at > now &&
+    value.access_expires_at <= session.expires_at &&
+    session.sid.trim().length > 0 &&
+    session.sid !== source.sid &&
+    Number.isSafeInteger(source.expires_at) &&
+    source.expires_at > now &&
+    Number.isSafeInteger(session.expires_at) &&
+    session.expires_at > now &&
+    session.expires_at <= source.expires_at &&
+    Number.isSafeInteger(session.created_at) &&
+    session.created_at >= 0 &&
+    Number.isSafeInteger(session.last_active_at) &&
+    session.last_active_at >= session.created_at &&
+    session.last_active_at < session.expires_at
+  )
+}
+
+// Explicitly opt in to this operation's new SID; ordinary rotation stays same-SID.
+// The caller must also retain its live operation ticket before invoking this.
+export function applyOrganizationAuthReplacement(
+  value: unknown,
+  expected: ExpectedAuthIdentity,
+  signal: AbortSignal
+): void {
+  const auth = useAuthStore.getState().auth
+  if (
+    signal.aborted ||
+    !Number.isSafeInteger(expected.userId) ||
+    expected.userId <= 0 ||
+    !expected.sid.trim() ||
+    !auth.user ||
+    auth.user.id !== expected.userId ||
+    !auth.session ||
+    auth.session.sid !== expected.sid ||
+    !isOrganizationAuthReplacement(value, auth.session)
+  ) {
+    throw new AuthRotationError('Invalid authentication rotation response')
+  }
+  const session = value.session
+  applyAuthBundle({
+    access_token: value.access_token,
+    token_type: value.token_type,
+    access_expires_at: value.access_expires_at,
+    user: auth.user,
+    session: {
+      sid: session.sid,
+      current: session.current,
+      login_method: session.login_method,
+      ip: session.ip,
+      user_agent: session.user_agent,
+      created_at: session.created_at,
+      last_active_at: session.last_active_at,
+      expires_at: session.expires_at,
+    },
+  })
+}
+
 export class AuthRotationError extends Error {
   constructor(message: string) {
     super(message)

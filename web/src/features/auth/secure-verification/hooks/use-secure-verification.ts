@@ -18,8 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 
+import type { ExpectedAuthIdentity } from '@/lib/api'
 import { AuthOperationError } from '@/lib/secure-verification'
-import type { AuthBundle } from '@/stores/auth-store'
+import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 
 import type { PasskeyDomains } from '../../passkey/assertion'
 import {
@@ -28,15 +29,18 @@ import {
   verify,
   verifyLogin,
 } from '../api'
-import type {
-  RequestVerificationOptions,
-  RequestLoginVerificationOptions,
-  VerificationRequest,
-  LoginChallenge,
-  SecureVerificationState,
-  SecurityProof,
-  VerificationInput,
-  VerificationRequirements,
+import {
+  type RequestVerificationOptions,
+  type RequestLoginVerificationOptions,
+  type VerificationRequest,
+  type LoginChallenge,
+  type SecureVerificationState,
+  type SecurityProof,
+  type VerificationInput,
+  type VerificationRequirements,
+  type VerificationProofFor,
+  isOrganizationVerificationScope,
+  projectOrganizationVerificationError,
 } from '../types'
 
 type VerificationAction =
@@ -117,6 +121,7 @@ function verificationReducer(
 }
 
 interface PendingVerificationBase {
+  expectedAuthIdentity?: ExpectedAuthIdentity
   controller: AbortController
   reject: (error: unknown) => void
   submitting: boolean
@@ -157,6 +162,21 @@ export function useSecureVerification() {
 
   useEffect(() => cancel, [cancel])
 
+  useEffect(
+    () =>
+      useAuthStore.subscribe((state) => {
+        const expected = pending.current?.expectedAuthIdentity
+        if (
+          expected &&
+          (state.auth.user?.id !== expected.userId ||
+            state.auth.session?.sid !== expected.sid)
+        ) {
+          cancel()
+        }
+      }),
+    [cancel]
+  )
+
   const loadRequirements = useCallback(async (current: PendingVerification) => {
     dispatch({ type: 'loading', request: current.request })
     try {
@@ -168,7 +188,8 @@ export function useSecureVerification() {
             )
           : await checkVerificationMethods(
               current.request.scope,
-              current.controller.signal
+              current.controller.signal,
+              current.expectedAuthIdentity
             )
       if (pending.current !== current) return
       const initialPassword = current.initialPassword
@@ -185,7 +206,9 @@ export function useSecureVerification() {
             { method: 'password', password: initialPassword },
             current.request,
             requirements.password_encryption_enabled,
-            current.controller.signal
+            current.controller.signal,
+            undefined,
+            current.expectedAuthIdentity
           )
           if (pending.current !== current) return
           pending.current = null
@@ -195,7 +218,11 @@ export function useSecureVerification() {
           if (pending.current !== current) return
           pending.current = null
           dispatch({ type: 'reset' })
-          current.reject(error)
+          current.reject(
+            current.expectedAuthIdentity
+              ? projectOrganizationVerificationError(error)
+              : error
+          )
         }
         return
       }
@@ -224,24 +251,54 @@ export function useSecureVerification() {
       if (pending.current === current) {
         dispatch({
           type: 'error',
-          error: AuthOperationError.from(error).message,
+          error: (current.expectedAuthIdentity
+            ? projectOrganizationVerificationError(error)
+            : AuthOperationError.from(error)
+          ).message,
         })
       }
     }
   }, [])
 
   const requestVerification = useCallback(
-    (
-      request: RequestVerificationOptions,
+    <T extends RequestVerificationOptions>(
+      request: T,
       initialPassword?: string
-    ): Promise<SecurityProof | null> => {
+    ): Promise<VerificationProofFor<T> | null> => {
       if (pending.current) return Promise.resolve(null)
+      let expectedAuthIdentity: ExpectedAuthIdentity | undefined
+      if (isOrganizationVerificationScope(request.scope)) {
+        const auth = useAuthStore.getState().auth
+        if (
+          !auth.user ||
+          !Number.isSafeInteger(auth.user.id) ||
+          auth.user.id <= 0 ||
+          !auth.session
+        ) {
+          return Promise.reject(
+            projectOrganizationVerificationError({ code: 'AUTH_CANCELLED' })
+          )
+        }
+        expectedAuthIdentity = { userId: auth.user.id, sid: auth.session.sid }
+      }
+      let cloned: T
+      try {
+        cloned = structuredClone(request)
+      } catch (error) {
+        return Promise.reject(
+          expectedAuthIdentity
+            ? projectOrganizationVerificationError(error)
+            : error
+        )
+      }
       return new Promise((resolve, reject) => {
         const current: PendingVerification = {
           kind: 'operation',
-          request: structuredClone(request),
-          resolve,
+          request: cloned,
+          // The organization producer validates the discriminated result before resolution.
+          resolve: (proof) => resolve(proof as VerificationProofFor<T> | null),
           reject,
+          expectedAuthIdentity,
           initialPassword,
           controller: new AbortController(),
           submitting: false,
@@ -310,7 +367,8 @@ export function useSecureVerification() {
             current.controller.signal,
             (domains) => {
               if (pending.current === current) setPasskeyDomains(domains)
-            }
+            },
+            current.expectedAuthIdentity
           )
           if (pending.current !== current) return
           current.resolve(proof)
@@ -319,7 +377,9 @@ export function useSecureVerification() {
         dispatch({ type: 'reset' })
       } catch (error) {
         if (pending.current !== current) return
-        const failure = AuthOperationError.from(error)
+        const failure = current.expectedAuthIdentity
+          ? projectOrganizationVerificationError(error)
+          : AuthOperationError.from(error)
         if (failure.code === 'AUTH_CANCELLED') {
           cancel()
           return

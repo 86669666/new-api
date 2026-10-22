@@ -20,11 +20,12 @@ For commercial licensing, please contact support@quantumnous.com
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { AxiosError } from 'axios'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/api'
 import { STATUS_QUERY_KEY } from '@/lib/status-query'
-import type { AuthBundle } from '@/stores/auth-store'
+import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 
 import { verify, verifyLogin } from '../../secure-verification/api'
 import { SecureVerificationDialog } from '../../secure-verification/components/secure-verification-dialog'
@@ -32,6 +33,7 @@ import { useSecureVerification } from '../../secure-verification/hooks/use-secur
 import type { SecurityProof } from '../../secure-verification/types'
 import { PasskeyDomainSelector } from '../components/passkey-domain-selector'
 
+const originalAdapter = api.defaults.adapter
 const storageKey = 'passkey:last-successful-rp-id'
 const operation = {
   scope: 'channel.key.read',
@@ -124,6 +126,8 @@ function DomainVerificationHarness(props: {
 
 beforeEach(() => localStorage.clear())
 afterEach(() => {
+  api.defaults.adapter = originalAdapter
+  useAuthStore.getState().auth.reset('idle')
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   localStorage.clear()
@@ -445,3 +449,143 @@ it.each([
   expect(screen.queryAllByRole('link')).toHaveLength(0)
   expect(screen.queryByText('https://api.example.com')).not.toBeInTheDocument()
 })
+
+it.each(['begin', 'finish', 'result'] as const)(
+  'projects organization Passkey %s failures without retaining credentials',
+  async (phase) => {
+    const now = Math.floor(Date.now() / 1000)
+    const bundle: AuthBundle = {
+      access_token: 'passkey-access-canary',
+      token_type: 'Bearer',
+      access_expires_at: now + 600,
+      user: { id: 7, username: 'user', role: 1 },
+      session: {
+        sid: 'source-sid',
+        current: true,
+        login_method: 'passkey',
+        ip: '',
+        user_agent: '',
+        created_at: now - 1,
+        last_active_at: now - 1,
+        expires_at: now + 3600,
+      },
+    }
+    useAuthStore.getState().auth.setBundle(bundle)
+    vi.stubGlobal('PublicKeyCredential', class {})
+    vi.stubGlobal('navigator', {
+      credentials: {
+        get: vi.fn().mockResolvedValue({
+          ...credential,
+          id: 'assertion-credential-canary',
+        }),
+      },
+    })
+    const requests: string[] = []
+    api.defaults.adapter = async (config) => {
+      requests.push(config.url ?? '')
+      expect(config).toMatchObject({
+        singleUseAuthorization: true,
+        skipAuthRefresh: true,
+        expectedAuthIdentity: { userId: 7, sid: 'source-sid' },
+      })
+      if (config.url?.endsWith(`/${phase}`)) {
+        throw new AxiosError(
+          'passkey-error-secret-canary',
+          'ERR_BAD_REQUEST',
+          config,
+          { flow: 'passkey-flow-canary' },
+          {
+            config,
+            status: 403,
+            statusText: 'Rejected',
+            headers: {},
+            data: {
+              code: 'SECURITY_VERIFICATION_FAILED',
+              secret: 'passkey-response-secret-canary',
+            },
+          }
+        )
+      }
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          success: true,
+          data: config.url?.endsWith('/begin')
+            ? {
+                flow_token: 'passkey-flow-canary',
+                rp_ids: ['example.com'],
+                options: {
+                  publicKey: { challenge: 'AQID', rpId: 'example.com' },
+                },
+              }
+            : {
+                proof_token: 'passkey-proof-canary',
+                scope: 'organization.remove',
+                method: 'passkey',
+                expires_at: now + 30,
+                auth_bundle: { access_token: 'passkey-returned-access-canary' },
+              },
+        },
+      }
+    }
+    const failure = await verify(
+      { method: 'passkey', rpID: 'example.com' },
+      {
+        scope: 'organization.remove',
+        context: {
+          schema_version: 1,
+          command: {
+            organization_id: '9007199254740993',
+            target_user_id: '9007199254740995',
+            revision: '9007199254740997',
+          },
+          snapshot: { target_role: 'admin' },
+        },
+      },
+      false,
+      new AbortController().signal
+    ).catch((error: unknown) => error)
+    expect(failure).toMatchObject({
+      code:
+        phase === 'result'
+          ? 'SECURITY_PROOF_INVALID'
+          : 'SECURITY_VERIFICATION_FAILED',
+    })
+    expect(failure).not.toHaveProperty('cause')
+    const pending: unknown[] = [failure]
+    const seen = new Set<unknown>()
+    while (pending.length) {
+      const value = pending.pop()
+      if (typeof value === 'string') {
+        for (const secret of [
+          'passkey-access-canary',
+          'passkey-flow-canary',
+          'passkey-error-secret-canary',
+          'passkey-response-secret-canary',
+          'passkey-proof-canary',
+          'passkey-returned-access-canary',
+          'assertion-credential-canary',
+        ]) {
+          expect(value).not.toContain(secret)
+        }
+      }
+      if (
+        !value ||
+        (typeof value !== 'object' && typeof value !== 'function') ||
+        seen.has(value)
+      ) {
+        continue
+      }
+      seen.add(value)
+      for (const key of Reflect.ownKeys(value)) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        if (descriptor && 'value' in descriptor) pending.push(descriptor.value)
+      }
+    }
+    expect(requests).toHaveLength(phase === 'begin' ? 1 : 2)
+    expect(localStorage.getItem(storageKey)).toBeNull()
+  }
+)

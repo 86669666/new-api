@@ -28,10 +28,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 import type { PasskeyDomains } from '../../passkey/assertion'
 import { PasskeyDomainSelector } from '../../passkey/components/passkey-domain-selector'
-import type {
-  SecureVerificationState,
-  VerificationInput,
-  VerificationMethod,
+import {
+  type SecureVerificationState,
+  type VerificationInput,
+  type VerificationMethod,
+  isOrganizationVerificationScope,
 } from '../types'
 
 interface SecureVerificationDialogProps {
@@ -62,13 +63,18 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
   const verifying = state.phase === 'verifying'
   const login = state.request.scope === 'auth.login'
   const acceptsBackupCode =
-    state.request.scope !== '2fa.backup_codes.regenerate'
+    state.request.scope !== '2fa.backup_codes.regenerate' &&
+    !isOrganizationVerificationScope(state.request.scope)
   let canVerify = state.phase === 'ready' && Boolean(input)
   if (input?.method === 'password') {
     canVerify = canVerify && input.password.length > 0
   }
   if (input?.method === '2fa') {
-    canVerify = canVerify && input.code.trim().length >= 6
+    canVerify =
+      canVerify &&
+      (isOrganizationVerificationScope(state.request.scope)
+        ? /^[0-9]{6}$(?![\s\S])/.test(input.code)
+        : input.code.trim().length >= 6)
   }
   // Linked-account verification starts from the provider button itself.
   const showSubmit = state.phase !== 'error' && input?.method !== 'oauth'

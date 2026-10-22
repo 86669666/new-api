@@ -24,6 +24,7 @@ import {
   clearAuthentication,
   getFreshAuthHeaders,
   refreshAuthentication,
+  type ExpectedAuthIdentity,
 } from '@/lib/auth-session'
 import { getAppBasePath, appPath } from '@/lib/deployment-path'
 import { handleServerError } from '@/lib/handle-server-error'
@@ -42,10 +43,26 @@ declare module 'axios' {
     authRetry?: boolean
     acceptAuthRotation?: boolean
     singleUseAuthorization?: boolean
+    expectedAuthIdentity?: ExpectedAuthIdentity
   }
 }
 
 export type ApiRequestConfig = AxiosRequestConfig
+
+/** Required opt-in for organization previews, producers and future member writes. */
+export function organizationRequestOptions(
+  expected: ExpectedAuthIdentity,
+  signal?: AbortSignal
+): ApiRequestConfig {
+  return {
+    expectedAuthIdentity: { ...expected },
+    singleUseAuthorization: true,
+    skipErrorHandler: true,
+    skipBusinessError: true,
+    disableDuplicate: true,
+    signal,
+  }
+}
 
 export const api = axios.create({
   baseURL: getAppBasePath(),
@@ -60,7 +77,9 @@ const inFlightGet = new Map<string, Promise<unknown>>()
 const originalGet = api.get.bind(api)
 
 api.get = ((url: string, config: ApiRequestConfig = {}) => {
-  if (config.disableDuplicate) return originalGet(url, config)
+  if (config.disableDuplicate || config.expectedAuthIdentity) {
+    return originalGet(url, config)
+  }
 
   const params = config.params ? JSON.stringify(config.params) : '{}'
   const sessionSID = useAuthStore.getState().auth.session?.sid || 'anonymous'
@@ -84,8 +103,25 @@ function redirectToSignIn(): void {
   }
 }
 
+function assertExpectedAuthIdentity(config?: ApiRequestConfig): void {
+  const expected = config?.expectedAuthIdentity
+  if (!expected) return
+  const auth = useAuthStore.getState().auth
+  if (
+    config?.signal?.aborted ||
+    !Number.isSafeInteger(expected.userId) ||
+    expected.userId <= 0 ||
+    !expected.sid ||
+    auth.user?.id !== expected.userId ||
+    auth.session?.sid !== expected.sid
+  ) {
+    throw new axios.CanceledError('Authentication identity changed')
+  }
+}
+
 api.interceptors.response.use(
   (response) => {
+    assertExpectedAuthIdentity(response.config)
     if (response.config.acceptAuthRotation && response.data?.success === true) {
       applyAuthRotation(response.data.data)
     }
@@ -94,6 +130,7 @@ api.interceptors.response.use(
   },
   async (error) => {
     const config = error?.config as ApiRequestConfig | undefined
+    assertExpectedAuthIdentity(config)
     const skipErrorHandler = config?.skipErrorHandler
     const status = error?.response?.status
 
@@ -146,6 +183,15 @@ api.interceptors.response.use(
 )
 
 api.interceptors.request.use(async (config) => {
+  assertExpectedAuthIdentity(config)
+  if (config.expectedAuthIdentity) {
+    const adapter = axios.getAdapter(config.adapter ?? api.defaults.adapter)
+    config.adapter = (request) => {
+      // Axios transforms and promise callbacks run after request interceptors.
+      assertExpectedAuthIdentity(request)
+      return adapter(request)
+    }
+  }
   if (config.singleUseAuthorization || config.headers.has('X-Security-Proof')) {
     // Refresh before spending a proof/flow, never by replaying its request.
     config.skipAuthRefresh = true
@@ -155,13 +201,16 @@ api.interceptors.request.use(async (config) => {
         config.headers.set(name, value)
       }
     } catch (error) {
+      assertExpectedAuthIdentity(config)
       throw axios.AxiosError.from(error, undefined, config)
     }
+    assertExpectedAuthIdentity(config)
     return config
   }
   const accessToken = useAuthStore.getState().auth.accessToken
   if (accessToken) {
     config.headers.Authorization = `Bearer ${accessToken}`
   }
+  assertExpectedAuthIdentity(config)
   return config
 })

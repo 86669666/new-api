@@ -23,6 +23,8 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 export {
   applyAuthBundle,
   applyAuthRotation,
+  applyOrganizationAuthReplacement,
+  isOrganizationAuthReplacement,
   bootstrapAuthentication,
   clearAuthenticatedClientState,
   clearAuthentication,
@@ -33,8 +35,13 @@ export {
   resolveAuthentication,
   AuthRotationError,
 } from '@/lib/auth-session'
-export type { AuthTokenRotation, RefreshOutcome } from '@/lib/auth-session'
+export type {
+  AuthTokenRotation,
+  RefreshOutcome,
+  ExpectedAuthIdentity,
+} from '@/lib/auth-session'
 export { api }
+export { organizationRequestOptions } from '@/lib/http-client'
 export type { ApiRequestConfig } from '@/lib/http-client'
 
 // ============================================================================

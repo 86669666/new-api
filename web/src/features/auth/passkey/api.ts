@@ -16,12 +16,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { api } from '@/lib/api'
+import {
+  api,
+  organizationRequestOptions,
+  type ExpectedAuthIdentity,
+} from '@/lib/api'
 import { authRequestOptions, authResult } from '@/lib/secure-verification'
+import { useAuthStore } from '@/stores/auth-store'
 
-import type {
-  SecurityProof,
-  VerificationOperation,
+import {
+  type OrganizationVerificationScope,
+  type SecurityProof,
+  type VerificationOperation,
+  isOrganizationVerificationScope,
+  parseOrganizationSecurityProof,
+  projectOrganizationVerificationError,
 } from '../secure-verification/types'
 import type { ApiResponse, PasskeyOptionsPayload, PasskeyStatus } from './types'
 
@@ -109,8 +118,31 @@ export async function finishPasskeyLogin(
 export function beginPasskeyVerification(
   operation: VerificationOperation,
   signal?: AbortSignal,
-  rpID?: string
+  rpID?: string,
+  expected?: ExpectedAuthIdentity
 ): Promise<PasskeyOptionsPayload> {
+  if (isOrganizationVerificationScope(operation.scope)) {
+    if (!expected) {
+      return Promise.reject(
+        projectOrganizationVerificationError({ code: 'AUTH_CANCELLED' })
+      )
+    }
+    return authResult<PasskeyOptionsPayload>(
+      api.post(
+        '/api/user/passkey/verify/begin',
+        {
+          scope: operation.scope,
+          context: operation.context,
+          ...(rpID ? { rp_id: rpID } : {}),
+        },
+        organizationRequestOptions(expected, signal)
+      )
+    ).catch((error: unknown) => {
+      throw projectOrganizationVerificationError(
+        signal?.aborted ? { code: 'AUTH_CANCELLED' } : error
+      )
+    })
+  }
   return authResult(
     api.post(
       '/api/user/passkey/verify/begin',
@@ -124,11 +156,46 @@ export function beginPasskeyVerification(
   )
 }
 
-export function finishPasskeyVerification(
+export async function finishPasskeyVerification(
   flowToken: string,
   payload: Record<string, unknown>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  organization?: {
+    expectedAuthIdentity: ExpectedAuthIdentity
+    scope: OrganizationVerificationScope
+  }
 ): Promise<SecurityProof> {
+  if (organization) {
+    try {
+      const auth = useAuthStore.getState().auth
+      if (
+        !auth.session ||
+        auth.user?.id !== organization.expectedAuthIdentity.userId ||
+        auth.session.sid !== organization.expectedAuthIdentity.sid
+      ) {
+        throw projectOrganizationVerificationError({ code: 'AUTH_CANCELLED' })
+      }
+      const source = { ...auth.session }
+      const result = await authResult<unknown>(
+        api.post(
+          '/api/user/passkey/verify/finish',
+          { flow_token: flowToken, credential: payload },
+          organizationRequestOptions(organization.expectedAuthIdentity, signal)
+        )
+      )
+      signal?.throwIfAborted()
+      return parseOrganizationSecurityProof(
+        result,
+        organization.scope,
+        'passkey',
+        source
+      )
+    } catch (error) {
+      throw projectOrganizationVerificationError(
+        signal?.aborted ? { code: 'AUTH_CANCELLED' } : error
+      )
+    }
+  }
   return authResult(
     api.post(
       '/api/user/passkey/verify/finish',

@@ -16,7 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { api, isAuthBundle } from '@/lib/api'
+import { z } from 'zod'
+
+import {
+  api,
+  isAuthBundle,
+  organizationRequestOptions,
+  type ExpectedAuthIdentity,
+} from '@/lib/api'
 import { buildOAuthAuthorizationUrl } from '@/lib/oauth'
 import { isPasskeySupported } from '@/lib/passkey'
 import {
@@ -24,7 +31,7 @@ import {
   authRequestOptions,
   authResult,
 } from '@/lib/secure-verification'
-import type { AuthBundle } from '@/stores/auth-store'
+import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 
 import { createOAuthAuthorization } from '../api'
 import { openOAuthPopup } from '../lib/oauth-popup'
@@ -40,19 +47,118 @@ import {
 } from '../passkey/assertion'
 import type { PasskeyOptionsPayload } from '../passkey/types'
 import type { SystemStatus } from '../types'
-import type {
-  SecurityProof,
-  LoginChallenge,
-  SecurityProofScope,
-  VerificationInput,
-  VerificationOperation,
-  VerificationRequirements,
+import {
+  type OrganizationSecurityProof,
+  type OrganizationVerificationOperation,
+  type SecurityProof,
+  type LoginChallenge,
+  type SecurityProofScope,
+  type VerificationInput,
+  type VerificationOperation,
+  type VerificationRequirements,
+  isOrganizationVerificationScope,
+  projectOrganizationVerificationError,
+  parseOrganizationSecurityProof,
 } from './types'
+
+const organizationId = z
+  .string()
+  .regex(/^[1-9][0-9]{0,18}$(?![\s\S])/)
+  .refine((value) => BigInt(value) <= 9223372036854775807n)
+const organizationCommand = z.object({
+  organization_id: organizationId,
+  revision: organizationId,
+  target_user_id: organizationId,
+})
+const organizationOperation = z.discriminatedUnion('scope', [
+  z
+    .object({
+      scope: z.literal('organization.change_role'),
+      context: z
+        .object({
+          schema_version: z.literal(1),
+          command: organizationCommand
+            .extend({ role: z.enum(['admin', 'member']) })
+            .strict(),
+          snapshot: z.object({}).strict(),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      scope: z.literal('organization.remove'),
+      context: z
+        .object({
+          schema_version: z.literal(1),
+          command: organizationCommand.strict(),
+          snapshot: z.object({ target_role: z.literal('admin') }).strict(),
+        })
+        .strict(),
+    })
+    .strict(),
+])
+
+function organizationIdentity(expected?: ExpectedAuthIdentity) {
+  const auth = useAuthStore.getState().auth
+  if (
+    !auth.user ||
+    !auth.session ||
+    !Number.isSafeInteger(auth.user.id) ||
+    auth.user.id <= 0 ||
+    (expected &&
+      (auth.user.id !== expected.userId || auth.session.sid !== expected.sid))
+  ) {
+    throw new AuthOperationError(
+      'Verification failed. Please try again.',
+      'AUTH_CANCELLED'
+    )
+  }
+  return {
+    expected: { userId: auth.user.id, sid: auth.session.sid },
+    source: { ...auth.session },
+  }
+}
 
 export async function checkVerificationMethods(
   scope: SecurityProofScope,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  expected?: ExpectedAuthIdentity
 ): Promise<VerificationRequirements> {
+  if (isOrganizationVerificationScope(scope)) {
+    try {
+      const identity = organizationIdentity(expected)
+      const [value, supported] = await Promise.all([
+        authResult<unknown>(
+          api.get('/api/verify/methods', {
+            ...organizationRequestOptions(identity.expected, signal),
+            params: { scope },
+          })
+        ),
+        isPasskeySupported(),
+      ])
+      signal?.throwIfAborted()
+      organizationIdentity(identity.expected)
+      const requirements = z
+        .object({
+          scope: z.literal(scope),
+          methods: z.array(
+            z.object({
+              method: z.enum(['password', '2fa', 'passkey']),
+              available: z.boolean(),
+            })
+          ),
+          oauth_providers: z.array(z.never()).max(0),
+          password_encryption_enabled: z.boolean(),
+        })
+        .parse(value)
+      return withDeviceAvailability(requirements, supported)
+    } catch (error) {
+      throw projectOrganizationVerificationError(
+        signal?.aborted ? { code: 'AUTH_CANCELLED' } : error
+      )
+    }
+  }
   const [requirements, passkeySupported] = await Promise.all([
     authResult<VerificationRequirements>(
       api.get('/api/verify/methods', {
@@ -199,13 +305,111 @@ export async function verifyLogin(
   return result
 }
 
+export function verify(
+  input: VerificationInput,
+  operation: OrganizationVerificationOperation,
+  passwordEncryptionEnabled: boolean,
+  signal: AbortSignal,
+  onDomains?: (domains: PasskeyDomains) => void,
+  expected?: ExpectedAuthIdentity
+): Promise<OrganizationSecurityProof>
+export function verify(
+  input: VerificationInput,
+  operation: VerificationOperation,
+  passwordEncryptionEnabled: boolean,
+  signal: AbortSignal,
+  onDomains?: (domains: PasskeyDomains) => void,
+  expected?: ExpectedAuthIdentity
+): Promise<SecurityProof>
 export async function verify(
   input: VerificationInput,
   operation: VerificationOperation,
   passwordEncryptionEnabled: boolean,
   signal: AbortSignal,
-  onDomains?: (domains: PasskeyDomains) => void
+  onDomains?: (domains: PasskeyDomains) => void,
+  expected?: ExpectedAuthIdentity
 ): Promise<SecurityProof> {
+  if (isOrganizationVerificationScope(operation.scope)) {
+    try {
+      const identity = organizationIdentity(expected)
+      signal.throwIfAborted()
+      const op = organizationOperation.parse({
+        scope: operation.scope,
+        context: operation.context,
+      })
+      const options = organizationRequestOptions(identity.expected, signal)
+      let result: unknown
+      if (input.method === 'password') {
+        const fields = passwordEncryptionEnabled
+          ? await encryptPassword(input.password)
+          : { password: input.password }
+        signal.throwIfAborted()
+        result = await authResult(
+          api.post(
+            '/api/verify',
+            { method: input.method, ...op, ...fields },
+            options
+          )
+        )
+      } else if (input.method === '2fa') {
+        if (!/^[0-9]{6}$(?![\s\S])/.test(input.code)) {
+          throw new AuthOperationError(
+            'Verification failed. Please try again.',
+            'SECURITY_VERIFICATION_FAILED'
+          )
+        }
+        result = await authResult(
+          api.post(
+            '/api/verify',
+            { method: input.method, ...op, code: input.code },
+            options
+          )
+        )
+      } else if (input.method === 'passkey') {
+        const passkey = await requestPasskeyAssertion(
+          (selected) =>
+            beginPasskeyVerification(op, signal, selected, identity.expected),
+          signal,
+          { rpID: input.rpID, onDomains }
+        )
+        result = await finishPasskeyVerification(
+          passkey.flowToken,
+          passkey.assertion,
+          signal,
+          { expectedAuthIdentity: identity.expected, scope: op.scope }
+        )
+        // Remember a domain only after the complete organization result validates.
+        const parsed = parseOrganizationSecurityProof(
+          result,
+          op.scope,
+          'passkey',
+          identity.source
+        )
+        signal.throwIfAborted()
+        organizationIdentity(identity.expected)
+        rememberPasskeyRPID(passkey.rpID)
+        return parsed
+      } else {
+        throw new AuthOperationError(
+          'This verification method is not allowed for this action.',
+          'SECURITY_PROOF_METHOD_MISMATCH'
+        )
+      }
+      signal.throwIfAborted()
+      organizationIdentity(identity.expected)
+      const parsed = parseOrganizationSecurityProof(
+        result,
+        op.scope,
+        input.method,
+        identity.source
+      )
+      return parsed
+    } catch (error) {
+      throw projectOrganizationVerificationError(
+        signal?.aborted ? { code: 'AUTH_CANCELLED' } : error
+      )
+    }
+  }
   try {
     const operationFields = {
       scope: operation.scope,

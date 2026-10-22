@@ -19,11 +19,12 @@ For commercial licensing, please contact support@quantumnous.com
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { useState } from 'react'
+import { AxiosError, type InternalAxiosRequestConfig } from 'axios'
+import { useEffect, useState } from 'react'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/api'
-import type { AuthBundle } from '@/stores/auth-store'
+import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 
 import { OAUTH_POPUP_CALLBACK_MESSAGE } from '../../constants'
 import { SecureVerificationDialog } from '../components/secure-verification-dialog'
@@ -33,6 +34,8 @@ import type {
   SecurityProof,
   VerificationRequirements,
 } from '../types'
+
+const originalAdapter = api.defaults.adapter
 
 const passwordRequirements: VerificationRequirements = {
   scope: 'passkey.register',
@@ -98,6 +101,8 @@ function pendingResponse<T>() {
 }
 
 afterEach(() => {
+  api.defaults.adapter = originalAdapter
+  useAuthStore.getState().auth.reset('idle')
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   window.sessionStorage.clear()
@@ -568,4 +573,265 @@ it('verifies with the clicked provider when several linked accounts are availabl
   expect(
     screen.getByRole('button', { name: 'Continue with Linux DO' })
   ).toBeDisabled()
+})
+
+const orgOperation = {
+  scope: 'organization.change_role',
+  context: {
+    schema_version: 1,
+    command: {
+      organization_id: '9007199254740993',
+      target_user_id: '9007199254740995',
+      revision: '9007199254740997',
+      role: 'admin',
+    },
+    snapshot: {},
+  },
+} as const
+
+function OrganizationHarness(props: {
+  initialPassword?: string
+  onFailure: (error: unknown) => void
+  onResult: (proof: SecurityProof | null) => void
+  onState: (state: unknown) => void
+}) {
+  const verification = useSecureVerification()
+  const state = verification.dialogProps.state
+  const onState = props.onState
+  useEffect(() => onState(state), [onState, state])
+  return (
+    <>
+      <button
+        type='button'
+        onClick={() =>
+          void verification
+            .requestVerification(orgOperation, props.initialPassword)
+            .then(props.onResult, props.onFailure)
+        }
+      >
+        Organization action
+      </button>
+      <SecureVerificationDialog {...verification.dialogProps} />
+    </>
+  )
+}
+
+function setOrganizationSession() {
+  const now = Math.floor(Date.now() / 1000)
+  const bundle: AuthBundle = {
+    access_token: 'hook-access-canary',
+    token_type: 'Bearer',
+    access_expires_at: now + 600,
+    user: { id: 42, username: 'user', role: 1 },
+    session: {
+      sid: 'hook-source-sid',
+      current: true,
+      login_method: 'password',
+      ip: '',
+      user_agent: '',
+      created_at: now - 1,
+      last_active_at: now - 1,
+      expires_at: now + 3600,
+    },
+  }
+  useAuthStore.getState().auth.setBundle(bundle)
+  return bundle
+}
+
+function assertSafeOrganizationState(value: unknown) {
+  const pending: unknown[] = [value]
+  const seen = new Set<unknown>()
+  while (pending.length) {
+    const item = pending.pop()
+    if (typeof item === 'string') {
+      for (const secret of [
+        'hook-password-canary',
+        'hook-access-canary',
+        'hook-proof-canary',
+        'hook-response-access-canary',
+        '123456',
+      ]) {
+        expect(item).not.toContain(secret)
+      }
+    }
+    if (
+      !item ||
+      (typeof item !== 'object' && typeof item !== 'function') ||
+      seen.has(item)
+    ) {
+      continue
+    }
+    seen.add(item)
+    for (const key of Reflect.ownKeys(item)) {
+      const descriptor = Object.getOwnPropertyDescriptor(item, key)
+      if (descriptor && 'value' in descriptor) pending.push(descriptor.value)
+    }
+  }
+}
+
+it.each([true, false])(
+  'organization hook errors expose no credential references in initial-password shortcut: %s',
+  async (shortcut) => {
+    setOrganizationSession()
+    const failure = vi.fn()
+    const state = vi.fn()
+    const result = vi.fn()
+    api.defaults.adapter = async (config) => {
+      if (config.method === 'get') {
+        return {
+          config,
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          data: {
+            success: true,
+            data: {
+              scope: orgOperation.scope,
+              methods: [
+                { method: shortcut ? 'password' : '2fa', available: true },
+              ],
+              oauth_providers: [],
+              password_encryption_enabled: false,
+            },
+          },
+        }
+      }
+      throw new AxiosError(
+        'hook-password-canary',
+        'ERR_BAD_REQUEST',
+        config,
+        { proof: 'hook-proof-canary' },
+        {
+          config,
+          status: 403,
+          statusText: 'Rejected',
+          headers: {},
+          data: {
+            code: 'SECURITY_VERIFICATION_FAILED',
+            auth_bundle: { access_token: 'hook-response-access-canary' },
+          },
+        }
+      )
+    }
+    const user = userEvent.setup()
+    render(
+      <OrganizationHarness
+        initialPassword={shortcut ? 'hook-password-canary' : undefined}
+        onFailure={failure}
+        onState={state}
+        onResult={result}
+      />
+    )
+    await user.click(
+      screen.getByRole('button', { name: 'Organization action' })
+    )
+    if (shortcut) {
+      await waitFor(() => expect(failure).toHaveBeenCalledTimes(1))
+      expect(failure.mock.calls[0][0]).not.toHaveProperty('cause')
+      assertSafeOrganizationState(failure.mock.calls[0][0])
+    } else {
+      const code = await screen.findByRole('textbox', {
+        name: 'Authenticator code',
+      })
+      expect(code).toHaveAttribute('maxLength', '6')
+      expect(
+        screen.queryByText('Authenticator code or backup code')
+      ).not.toBeInTheDocument()
+      await user.type(code, 'ABCDEF')
+      expect(screen.getByRole('button', { name: 'Verify' })).toBeDisabled()
+      await user.clear(code)
+      await user.type(code, '123456')
+      await user.click(screen.getByRole('button', { name: 'Verify' }))
+      await screen.findByRole('alert')
+      expect(code).toHaveValue('')
+      expect(failure).not.toHaveBeenCalled()
+      expect(
+        screen.queryByRole('tab', { name: 'Linked account' })
+      ).not.toBeInTheDocument()
+    }
+    assertSafeOrganizationState(state.mock.calls.at(-1)?.[0])
+    expect(result).not.toHaveBeenCalled()
+  }
+)
+
+it('cancels an organization hook on identity change and discards a late proof without installing it', async () => {
+  const bundle = setOrganizationSession()
+  const result = vi.fn()
+  const state = vi.fn()
+  const failure = vi.fn()
+  let finish!: () => void
+  let started!: () => void
+  const sent = new Promise<void>((resolve) => {
+    started = resolve
+  })
+  api.defaults.adapter = async (config: InternalAxiosRequestConfig) => {
+    if (config.method === 'get') {
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          success: true,
+          data: {
+            scope: orgOperation.scope,
+            methods: [{ method: 'password', available: true }],
+            oauth_providers: [],
+            password_encryption_enabled: false,
+          },
+        },
+      }
+    }
+    started()
+    return new Promise((resolve) => {
+      finish = () =>
+        resolve({
+          config,
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          data: {
+            success: true,
+            data: {
+              proof_token: 'hook-proof-canary',
+              scope: orgOperation.scope,
+              method: 'password',
+              expires_at: Math.floor(Date.now() / 1000) + 30,
+              auth_bundle: {
+                access_token: 'hook-response-access-canary',
+                token_type: 'Bearer',
+                access_expires_at: bundle.access_expires_at,
+                session: { ...bundle.session, sid: 'returned-sid' },
+              },
+            },
+          },
+        })
+    })
+  }
+  const user = userEvent.setup()
+  render(
+    <OrganizationHarness
+      initialPassword='hook-password-canary'
+      onFailure={failure}
+      onState={state}
+      onResult={result}
+    />
+  )
+  await user.click(screen.getByRole('button', { name: 'Organization action' }))
+  await sent
+  act(() =>
+    useAuthStore.getState().auth.setBundle({
+      ...bundle,
+      user: { ...bundle.user, id: 84 },
+      session: { ...bundle.session, sid: 'external-sid' },
+    })
+  )
+  await waitFor(() => expect(result).toHaveBeenCalledWith(null))
+  await act(async () => {
+    finish()
+  })
+  expect(result).toHaveBeenCalledTimes(1)
+  expect(failure).not.toHaveBeenCalled()
+  expect(useAuthStore.getState().auth.session?.sid).toBe('external-sid')
+  assertSafeOrganizationState(state.mock.calls.at(-1)?.[0])
 })

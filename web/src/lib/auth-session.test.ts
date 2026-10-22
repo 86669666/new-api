@@ -17,11 +17,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient } from '@tanstack/react-query'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { useAuthStore, type AuthBundle } from '../stores/auth-store'
 import {
   applyAuthRotation,
+  applyOrganizationAuthReplacement,
   bootstrapAuthentication,
   clearAuthenticatedClientState,
   createRefreshRunner,
@@ -323,4 +324,148 @@ describe('authentication session coordination', () => {
       undefined
     )
   })
+})
+
+test('accepts only the expected active identity when adopting an organization replacement', () => {
+  const now = Math.floor(Date.now() / 1000)
+  const current = {
+    ...bundle,
+    session: { ...bundle.session, expires_at: now + 3600 },
+  }
+  useAuthStore.getState().auth.setBundle(current)
+  const replacement = {
+    access_token: 'organization-new-access',
+    token_type: 'Bearer',
+    access_expires_at: now + 600,
+    session: {
+      ...current.session,
+      sid: 'organization-new-sid',
+      created_at: now,
+      last_active_at: now,
+    },
+  }
+  const controller = new AbortController()
+  applyOrganizationAuthReplacement(
+    replacement,
+    { userId: 42, sid: 'session-a' },
+    controller.signal
+  )
+  expect(useAuthStore.getState().auth.user).toBe(current.user)
+  expect(useAuthStore.getState().auth.session?.sid).toBe('organization-new-sid')
+  expect(() =>
+    applyOrganizationAuthReplacement(
+      replacement,
+      { userId: 42, sid: 'session-a' },
+      controller.signal
+    )
+  ).toThrow()
+})
+
+test.each([
+  ['same SID', { session: { sid: 'session-a' } }],
+  ['not current', { session: { current: false } }],
+  ['non Bearer', { token_type: 'Custom' }],
+  ['empty token', { access_token: '   ' }],
+  ['fractional access deadline', { access_expires_at: 1.5 }],
+  ['nonfinite access deadline', { access_expires_at: Infinity }],
+  ['unsafe session deadline', { session: { expires_at: 9007199254740992 } }],
+  [
+    'extended absolute deadline',
+    { session: { expires_at: Math.floor(Date.now() / 1000) + 7200 } },
+  ],
+  ['invalid activity time', { session: { last_active_at: -1 } }],
+])(
+  'rejects organization replacement with %s without changing authentication',
+  (_label, invalid) => {
+    const now = Math.floor(Date.now() / 1000)
+    const current = {
+      ...bundle,
+      session: { ...bundle.session, expires_at: now + 3600 },
+    }
+    useAuthStore.getState().auth.setBundle(current)
+    const replacement = {
+      access_token: 'new-access',
+      token_type: 'Bearer',
+      access_expires_at: now + 600,
+      ...invalid,
+      session: {
+        ...current.session,
+        sid: 'new-sid',
+        created_at: now,
+        last_active_at: now,
+        ...('session' in invalid ? invalid.session : {}),
+      },
+    }
+    expect(() =>
+      applyOrganizationAuthReplacement(
+        replacement,
+        { userId: 42, sid: 'session-a' },
+        new AbortController().signal
+      )
+    ).toThrow()
+    expect(useAuthStore.getState().auth.accessToken).toBe(bundle.access_token)
+    expect(useAuthStore.getState().auth.session?.sid).toBe('session-a')
+  }
+)
+
+test('cancelled or superseded adoption cannot overwrite another session and emits only the existing auth event', () => {
+  const broadcast =
+    typeof BroadcastChannel !== 'undefined'
+      ? vi.spyOn(BroadcastChannel.prototype, 'postMessage')
+      : undefined
+  const storage = vi.spyOn(Storage.prototype, 'setItem')
+  const now = Math.floor(Date.now() / 1000)
+  const current = {
+    ...bundle,
+    session: { ...bundle.session, expires_at: now + 3600 },
+  }
+  const replacement = {
+    access_token: 'new-access-canary',
+    token_type: 'Bearer',
+    access_expires_at: now + 600,
+    session: {
+      ...current.session,
+      sid: 'new-sid',
+      created_at: now,
+      last_active_at: now,
+    },
+  }
+  useAuthStore.getState().auth.setBundle(current)
+  const aborted = new AbortController()
+  aborted.abort()
+  expect(() =>
+    applyOrganizationAuthReplacement(
+      replacement,
+      { userId: 42, sid: 'session-a' },
+      aborted.signal
+    )
+  ).toThrow()
+  useAuthStore.getState().auth.setBundle({
+    ...current,
+    user: { ...current.user, id: 84 },
+    session: { ...current.session, sid: 'external-sid' },
+  })
+  expect(() =>
+    applyOrganizationAuthReplacement(
+      replacement,
+      { userId: 42, sid: 'session-a' },
+      new AbortController().signal
+    )
+  ).toThrow()
+  expect(useAuthStore.getState().auth.session?.sid).toBe('external-sid')
+  useAuthStore.getState().auth.setBundle(current)
+  applyOrganizationAuthReplacement(
+    replacement,
+    { userId: 42, sid: 'session-a' },
+    new AbortController().signal
+  )
+  const event = broadcast
+    ? broadcast.mock.calls.at(-1)?.[0]
+    : JSON.parse(
+        storage.mock.calls.find(
+          ([key]) => key === 'new-api:auth-session:event'
+        )?.[1] ?? '{}'
+      )
+  expect(event).toMatchObject({ kind: 'authenticated', sid: 'new-sid' })
+  expect(JSON.stringify(event)).not.toContain('new-access-canary')
 })
