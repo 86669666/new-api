@@ -6232,6 +6232,7 @@
     "The following models have billing type conflicts (fixed price vs ratio billing). Confirm to proceed with the changes.": "以下模型存在计费类型冲突（固定价格 vs 比例计费）。确认以继续更改。",
     "The following models in the model redirect have not been added to the \"Models\" list and may fail during invocation due to missing available models:": "模型重定向里的下列模型尚未添加到\"模型\"列表，调用时会因为缺少可用模型而失败：",
     "The gateway rejected this plugin": "网关拒绝了该插件",
+    "The idempotency key was already used for a different organization request.": "该幂等键已用于不同的组织请求。",
     "The index could not be fetched or parsed: {{message}}. The host may block cross-origin requests.": "索引无法拉取或解析：{{message}}。该主机可能禁止跨域请求。",
     "The legacy token stops working on {{date}}. Create a new token to replace it.": "旧版令牌将于 {{date}} 停用，请创建新令牌替换。",
     "The login session is no longer active.": "登录会话已失效。",

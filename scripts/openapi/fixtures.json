@@ -14543,5 +14543,120 @@
       "authorization_response_iss_parameter_supported": true
     },
     "valid": false
+  },
+  {
+    "name": "organization create idempotency minimal",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "a",
+    "valid": true
+  },
+  {
+    "name": "organization create idempotency punctuation",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "Ab_1.-:x",
+    "valid": true
+  },
+  {
+    "name": "organization create idempotency maximum",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "valid": true
+  },
+  {
+    "name": "organization create idempotency empty",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "",
+    "valid": false
+  },
+  {
+    "name": "organization create idempotency too-long",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "valid": false
+  },
+  {
+    "name": "organization create idempotency first-symbol",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "_a",
+    "valid": false
+  },
+  {
+    "name": "organization create idempotency space",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "a b",
+    "valid": false
+  },
+  {
+    "name": "organization create idempotency newline",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "a\n",
+    "valid": false
+  },
+  {
+    "name": "organization create idempotency unicode",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": "a中",
+    "valid": false
+  },
+  {
+    "name": "organization create idempotency null",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationCreateIdempotencyKey",
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "organization create idempotency replay receipt",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleW01Result",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "organization_id": "9007199254740993",
+        "revision": "1",
+        "action": "create",
+        "event_id": "9007199254740993",
+        "object_kind": "organization",
+        "object_id": "9007199254740993",
+        "generation": null,
+        "status": null
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization create idempotency conflict",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "value": {
+      "success": false,
+      "message": "The idempotency key was already used for a different organization request.",
+      "code": "ORG_IDEMPOTENCY_CONFLICT"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization create idempotency conflict revision leak",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "value": {
+      "success": false,
+      "message": "conflict",
+      "code": "ORG_IDEMPOTENCY_CONFLICT",
+      "data": {
+        "revision": "1"
+      }
+    },
+    "valid": false
   }
 ]

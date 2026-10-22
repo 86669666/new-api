@@ -209,6 +209,7 @@ void balanceCall;
 import { Service, OrganizationsService } from './api';
 import type { RequestAccessContext } from './api';
 export function compileContractCalls() {
+  OrganizationsService.organizationCreate({ requestBody: { name: 'Fixture' }, idempotencyKey: 'fixture-create-v1' });
   nativeSearch.${nativeSearchService}.searchDeepSeekTools({ requestBody: { query: 'owned', count: 10, need_content: false, ori_question: null, localization: '' } });
   // @ts-expect-error a native search query is required
   nativeSearch.${nativeSearchService}.searchDeepSeekTools({ requestBody: { count: 10 } });
@@ -625,6 +626,26 @@ await Promise.all([
   api.OrganizationsService.getOrganizationRequestContext({ xOrganizationId: '2' }),
 ]);
 assert.deepEqual(calls.slice(-2).map(call => new Headers(call.init.headers).get('X-Organization-Id')), ['1', '2']);
+// Create-only durable idempotency is a caller-chosen header, never an automatic retry.
+const idempotentCreate = invocationMap.find(operation => operation.contract_id === 'W01');
+const idempotentReceipt = allFixtures.find(fixture => fixture.name === 'organization create idempotency replay receipt').value;
+for (const status of [201, 200]) {
+  responseStatus = status;
+  responseBody = idempotentReceipt;
+  const before = calls.length;
+  assert.deepEqual(await api[idempotentCreate.service][idempotentCreate.method]({ requestBody: { name: 'Fixture' }, idempotencyKey: 'fixture-create-v1' }), idempotentReceipt);
+  assert.equal(calls.length, before + 1);
+  assert.equal(new Headers(calls.at(-1).init.headers).get('Idempotency-Key'), 'fixture-create-v1');
+}
+responseStatus = 409;
+responseBody = { success: false, message: 'Conflict', code: 'ORG_IDEMPOTENCY_CONFLICT' };
+const beforeIdempotencyConflict = calls.length;
+await assert.rejects(api[idempotentCreate.service][idempotentCreate.method]({ requestBody: { name: 'Changed' }, idempotencyKey: 'fixture-create-v1' }), error => error.status === 409 && error.body.code === 'ORG_IDEMPOTENCY_CONFLICT');
+assert.equal(calls.length, beforeIdempotencyConflict + 1);
+responseStatus = 201;
+responseBody = idempotentReceipt;
+await api[idempotentCreate.service][idempotentCreate.method]({ requestBody: { name: 'Fixture' } });
+assert.equal(new Headers(calls.at(-1).init.headers).has('Idempotency-Key'), false);
 const beforeLifecycleRequests = calls.length;
 for (let index = 0; index < invocationMap.length; index++) {
   const operation = invocationMap[index];

@@ -349,6 +349,7 @@ func migrateDB() error {
 		&OrganizationInvitation{},
 		&OrganizationOwnershipTransfer{},
 		&OrganizationEvent{},
+		&OrganizationCreationRequest{},
 		&OrganizationWallet{},
 		&OrganizationWalletEntry{},
 		&UserSession{},

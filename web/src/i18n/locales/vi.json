@@ -6232,6 +6232,7 @@
     "The following models have billing type conflicts (fixed price vs ratio billing). Confirm to proceed with the changes.": "Các mô hình sau có xung đột loại thanh toán (giá cố định so với thanh toán theo tỷ lệ). Xác nhận để tiếp tục với các thay đổi.",
     "The following models in the model redirect have not been added to the \"Models\" list and may fail during invocation due to missing available models:": "Các mô hình sau trong chuyển hướng mô hình chưa được thêm vào danh sách \"Mô hình\" và có thể gọi thất bại do thiếu các mô hình có sẵn:",
     "The gateway rejected this plugin": "Cổng đã từ chối plugin này",
+    "The idempotency key was already used for a different organization request.": "Khóa chống trùng lặp này đã được dùng cho một yêu cầu tổ chức khác.",
     "The index could not be fetched or parsed: {{message}}. The host may block cross-origin requests.": "Không thể tải hoặc phân tích chỉ mục: {{message}}. Máy chủ có thể chặn yêu cầu cross-origin.",
     "The legacy token stops working on {{date}}. Create a new token to replace it.": "Token cũ sẽ ngừng hoạt động vào {{date}}. Hãy tạo token mới để thay thế.",
     "The login session is no longer active.": "Phiên đăng nhập không còn hoạt động.",

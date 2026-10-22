@@ -762,7 +762,8 @@ def check_organization_create_rate(api):
     assert limited['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
     assert 'empty body' in operation['responses']['500']['description']
     assert operation['responses']['500']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OrganizationLifecycleError500'}
-    assert 'Idempotency-Key' in operation['x-forbidden-request-headers']
+    assert 'Idempotency-Key' not in operation['x-forbidden-request-headers']
+    assert api['x-organization-create-idempotency']['replay_counts_as_rate_attempt'] is True
     assert operation['x-automatic-retry'] is False
     return {'route': 'POST /api/organizations', 'empty_429': True, 'empty_limiter_500': True,
             'quantity_cap': False, 'idempotency': False, 'live_http': False}
@@ -791,7 +792,7 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
     conflict = schemas['OrganizationLifecycleError409']
     assert conflict['properties']['code']['enum'] == [
         'ORG_STATE_CHANGED', 'ORG_NAME_TAKEN', 'ORG_CREATED_LIMIT_REACHED', 'ORG_JOINED_LIMIT_REACHED',
-        'ORG_DISABLED', 'ORG_REQUEST_RESOLVED',
+        'ORG_IDEMPOTENCY_CONFLICT', 'ORG_DISABLED', 'ORG_REQUEST_RESOLVED',
         'ORG_ALREADY_MEMBER', 'ORG_INVITATION_EXISTS', 'ORG_WALLET_REQUEST_CONFLICT',
         'ORG_WALLET_ALREADY_REVERSED', 'ORG_WALLET_INSUFFICIENT_AVAILABLE',
         'ORG_WALLET_LIMIT_EXCEEDED', 'ORG_WALLET_NOT_EMPTY',
@@ -865,7 +866,17 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
             else:
                 assert op['requestBody']['required'] is True
                 validate_value(api, op['requestBody']['content']['application/json']['schema'], fixture['request'])
-            assert 'Idempotency-Key' in op['x-forbidden-request-headers']
+            if route['id'] == 'W01':
+                assert 'Idempotency-Key' not in op['x-forbidden-request-headers']
+                key = [p for p in parameters if p.get('name') == 'Idempotency-Key']
+                assert len(key) == 1 and key[0]['required'] is False
+                assert key[0]['schema'] == {'$ref': '#/components/schemas/OrganizationCreateIdempotencyKey'}
+                assert op['responses']['200']['content'] == op['responses']['201']['content']
+                assert api['x-organization-create-idempotency']['automatic_retry'] is False
+                assert api['x-organization-create-idempotency']['replay_status'] == 200
+                assert api['x-organization-create-idempotency']['replay_requires_current_authority'] is True
+            else:
+                assert 'Idempotency-Key' in op['x-forbidden-request-headers']
         # Include the four shared producer routes: their organization branches
         # have the same header policy, including pre-authentication errors.
         for status in [fixture['status'], *fixture['errors']]:

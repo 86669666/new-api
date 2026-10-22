@@ -6232,6 +6232,7 @@
     "The following models have billing type conflicts (fixed price vs ratio billing). Confirm to proceed with the changes.": "Les modèles suivants présentent des conflits de type de facturation (prix fixe vs facturation au ratio). Confirmez pour procéder aux changements.",
     "The following models in the model redirect have not been added to the \"Models\" list and may fail during invocation due to missing available models:": "Les modèles suivants dans la redirection du modèle n'ont pas été ajoutés à la liste \"Modèles\" et peuvent échouer lors de l'invocation en raison de modèles disponibles manquants :",
     "The gateway rejected this plugin": "La passerelle a rejeté ce plugin",
+    "The idempotency key was already used for a different organization request.": "Cette clé d’idempotence a déjà servi à une autre demande d’organisation.",
     "The index could not be fetched or parsed: {{message}}. The host may block cross-origin requests.": "Impossible de récupérer ou d’analyser l’index : {{message}}. L’hôte bloque peut-être les requêtes cross-origin.",
     "The legacy token stops working on {{date}}. Create a new token to replace it.": "L’ancien jeton cessera de fonctionner le {{date}}. Créez un nouveau jeton pour le remplacer.",
     "The login session is no longer active.": "La session de connexion n’est plus active.",

@@ -14070,7 +14070,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "none_or_zero",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: valid session. Proof policy: forbidden. Owner-scoped name uniqueness uses trimmed Unicode simple case folding in Go, independent of database collation; it does not normalize Unicode, remove accents or width, or apply full case folding. A different non-dissolved organization of the owner reserves its name even while disabled. Conflicts return fixed 409 ORG_NAME_TAKEN without data or conflicting organization details. Dissolution releases the name on commit. Existing duplicate rows are preserved. Exact self-name rename retains ORG_STATE_CHANGED; a case-only rename is allowed only when no other row conflicts. Ownership transfer acceptance checks the destination owner namespace in both preview and final execution. The existing owner User mutex serializes formal API writes; no direct-SQL uniqueness constraint is added. Organization creation also uses the existing CRITICAL_RATE_LIMIT settings after UserAuth, keyed by user ID and organization-create scope. The default is 20 attempts per 1200 seconds; CRITICAL_RATE_LIMIT_ENABLE=false disables only this layer. Authenticated attempts rejected by later validation can consume the bucket. Changing session or client IP does not obtain a new user bucket. Memory mode is process-local; Redis shares a fixed window. This is not a total organization cap or idempotency mechanism. Valid positive rate settings are assumed; existing invalid-setting behavior is unchanged. Rate-limit rejection has an empty HTTP 429 body and Retry-After seconds. A Redis limiter error has an empty HTTP 500 body and creates no organization, owner membership or event; lifecycle failures can still return their documented JSON errors. Creation checks both owned and joined capacity under the actor User lock; HTTP 409 ORG_CREATED_LIMIT_REACHED or ORG_JOINED_LIMIT_REACHED has no data field. Missing/zero configured limits mean unlimited, preserving existing deployments. Quantity settings are separate from the attempt limiter; no idempotency is added.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. Without an Idempotency-Key, a response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: valid session. Proof policy: forbidden. Owner-scoped name uniqueness uses trimmed Unicode simple case folding in Go, independent of database collation; it does not normalize Unicode, remove accents or width, or apply full case folding. A different non-dissolved organization of the owner reserves its name even while disabled. Conflicts return fixed 409 ORG_NAME_TAKEN without data or conflicting organization details. Dissolution releases the name on commit. Existing duplicate rows are preserved. Exact self-name rename retains ORG_STATE_CHANGED; a case-only rename is allowed only when no other row conflicts. Ownership transfer acceptance checks the destination owner namespace in both preview and final execution. The existing owner User mutex serializes formal API writes; no direct-SQL uniqueness constraint is added. Organization creation also uses the existing CRITICAL_RATE_LIMIT settings after UserAuth, keyed by user ID and organization-create scope. The default is 20 attempts per 1200 seconds; CRITICAL_RATE_LIMIT_ENABLE=false disables only this layer. Authenticated attempts rejected by later validation can consume the bucket. Changing session or client IP does not obtain a new user bucket. Memory mode is process-local; Redis shares a fixed window. This is not a total organization cap or idempotency mechanism. Valid positive rate settings are assumed; existing invalid-setting behavior is unchanged. Rate-limit rejection has an empty HTTP 429 body and Retry-After seconds. A Redis limiter error has an empty HTTP 500 body and creates no organization, owner membership or event; lifecycle failures can still return their documented JSON errors. Creation checks both owned and joined capacity under the actor User lock; HTTP 409 ORG_CREATED_LIMIT_REACHED or ORG_JOINED_LIMIT_REACHED has no data field. Missing/zero configured limits mean unlimited, preserving existing deployments. Quantity settings are separate from the attempt limiter and durable idempotency receipts. Optional Idempotency-Key is accepted only here: one ASCII value of 1..128 characters, first alphanumeric, remaining alphanumeric or ._:-. A permanent success receipt is committed atomically with the organization, owner membership and event. Scope is authenticated user plus create/v1 key, independent of SID; payload is the exact trimmed name, so case-only differences conflict. First success returns 201; a matching replay returns 200 with the immutable original receipt after fresh session, user, organization and membership validation. No pending or failed receipt is retained. Different payload returns 409 ORG_IDEMPOTENCY_CONFLICT without data. Missing membership or dissolved organization returns 404 before disabled 409. Replay creates no duplicate audit/event, skips fresh name/capacity admission, and still counts toward the existing attempt limiter. Stored key hashes and receipts have no TTL. This does not make another lifecycle operation idempotent.",
         "parameters": [
           {
             "name": "X-Organization-Id",
@@ -14095,13 +14095,21 @@
               ]
             },
             "description": "Optional single selector; never supply both header and query. Only absent or zero allowed."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/OrganizationCreateIdempotencyKey"
+            },
+            "description": "Only exact POST /api/organizations accepts this header. A matching committed request returns its original receipt after current session, membership and organization checks. No automatic retry."
           }
         ],
         "x-query-allowlist": [
           "org_id"
         ],
         "x-forbidden-request-headers": [
-          "Idempotency-Key",
           "X-Security-Proof"
         ],
         "responses": {
@@ -14182,6 +14190,24 @@
                 }
               }
             }
+          },
+          "200": {
+            "description": "Previously committed immutable create receipt, after current authorization checks; no new organization or event.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Organization lifecycle/organization-scope responses, including errors, are private, no-store. Existing personal flows retain their own headers."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationLifecycleW01Result"
+                }
+              }
+            }
           }
         },
         "requestBody": {
@@ -14216,6 +14242,9 @@
           "contract": "x-organization-lifecycle-contract.count_limits",
           "owned_limit": true,
           "joined_limit": true
+        },
+        "x-organization-create-idempotency": {
+          "contract": "x-organization-create-idempotency"
         }
       }
     },
@@ -28672,6 +28701,7 @@
               "ORG_NAME_TAKEN",
               "ORG_CREATED_LIMIT_REACHED",
               "ORG_JOINED_LIMIT_REACHED",
+              "ORG_IDEMPOTENCY_CONFLICT",
               "ORG_DISABLED",
               "ORG_REQUEST_RESOLVED",
               "ORG_ALREADY_MEMBER",
@@ -28737,6 +28767,7 @@
             "properties": {
               "code": {
                 "enum": [
+                  "ORG_IDEMPOTENCY_CONFLICT",
                   "ORG_DISABLED",
                   "ORG_REQUEST_RESOLVED",
                   "ORG_ALREADY_MEMBER",
@@ -33006,6 +33037,13 @@
             ]
           }
         }
+      },
+      "OrganizationCreateIdempotencyKey": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?![\\s\\S])",
+        "description": "One optional ASCII key, exact bytes, scoped to the authenticated user and organization create/v1. Not an authentication credential. Never reuse it for different normalized names."
       }
     },
     "responses": {
@@ -34923,5 +34961,22 @@
       ],
       "contradictions": "Complete capabilities normalize the three legacy booleans and reject contradictory explicit flags; partial booleans cannot establish capabilities."
     }
+  },
+  "x-organization-create-idempotency": {
+    "version": "create/v1",
+    "method": "POST",
+    "path": "/api/organizations",
+    "header": "Idempotency-Key",
+    "scope": "authenticated user + exact key bytes",
+    "payload": "Go strings.TrimSpace(name); case-sensitive payload identity",
+    "first_status": 201,
+    "replay_status": 200,
+    "conflict_code": "ORG_IDEMPOTENCY_CONFLICT",
+    "retention": "permanent successful receipts; no TTL",
+    "failed_receipts": false,
+    "automatic_retry": false,
+    "replay_requires_current_authority": true,
+    "replay_counts_as_rate_attempt": true,
+    "overrides": "Only Idempotency-Key/create non-idempotent statements of the frozen S3 v1.1 transport and strict-transport amendment; all other routes and safeguards retain that contract."
   }
 }
