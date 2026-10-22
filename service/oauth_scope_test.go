@@ -1,8 +1,15 @@
 package service
 
 import (
+	"context"
+	"crypto/x509"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -124,4 +131,105 @@ func TestOAuthRegisteredRedirectIsNotHostRewritten(t *testing.T) {
 	require.NoError(t, db.Model(&model.OAuthClient{}).Where("client_id = ?", "oc_test").Update("enabled", false).Error)
 	_, err = bridge.rewriteLocation("https://app.example/oauth/callback", nil)
 	assert.ErrorIs(t, err, ErrOAuthResourceUnavailable)
+}
+
+func TestDesktopOAuthStatus(t *testing.T) {
+	var hits atomic.Int32
+	var fail atomic.Bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health/ready" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		if fail.Load() {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	resource, err := NewOAuthUserInfoResource(OAuthUserInfoConfig{
+		Enabled: true, IntrospectionURL: server.URL + "/admin/oauth2/introspect",
+		Issuer: "https://auth.example/", Audience: "newapi-userinfo", ClientIDs: []string{"env-client"},
+	}, pool)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	bridge, err := NewOAuthProviderBridge(OAuthProviderConfig{
+		Enabled: true, RevocationEnabled: true, PublicProxy: true,
+		AdminBaseURL: server.URL, AuthorizationURL: "https://auth.example/oauth2/auth",
+		UpstreamURL: "https://hydra.example:4444",
+	}, resource)
+	require.NoError(t, err)
+	previous := UseOAuthProviderBridge(nil)
+	t.Cleanup(func() { UseOAuthProviderBridge(previous) })
+
+	disabled, feature := DesktopOAuthStatus(context.Background())
+	assert.Equal(t, map[string]any{"enabled": false}, disabled)
+	assert.False(t, feature)
+	assert.Equal(t, int32(0), hits.Load())
+
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "oauth-status.db")), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	previousDB := model.DB
+	t.Cleanup(func() { model.DB = previousDB })
+	model.DB = db
+	t.Setenv("OAUTH_USERINFO_ENABLED", "true")
+	require.NoError(t, model.MigrateOAuthClientsIfEnabled(db))
+	boxoID := "oc_" + strings.Repeat("a", 32)
+	cherryID := "oc_" + strings.Repeat("b", 32)
+	require.NoError(t, model.CreateOAuthClient(&model.OAuthClient{
+		ClientID: boxoID, Name: "Boxo", RedirectURIs: `["http://127.0.0.1/oauth/callback"]`, Scopes: "openid profile", Enabled: true,
+	}))
+
+	UseOAuthProviderBridge(bridge)
+	status, feature := DesktopOAuthStatus(context.Background())
+	assert.True(t, feature)
+	assert.Equal(t, true, status["enabled"])
+	assert.Equal(t, "https://auth.example/", status["issuer"])
+	assert.Equal(t, boxoID, status["desktop_client_id"])
+	assert.Equal(t, map[string]string{"boxo": boxoID}, status["desktop_clients"])
+	assert.Equal(t, int32(1), hits.Load())
+	encoded, err := common.Marshal(status)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), server.URL)
+	assert.NotContains(t, string(encoded), "client_secret")
+	assert.NotContains(t, string(encoded), "env-client")
+
+	status, feature = DesktopOAuthStatus(context.Background())
+	assert.True(t, feature)
+	assert.Equal(t, int32(1), hits.Load())
+
+	require.NoError(t, model.CreateOAuthClient(&model.OAuthClient{
+		ClientID: cherryID, Name: "Cherry", RedirectURIs: `["http://127.0.0.1:29873/oauth/callback"]`, Scopes: "openid profile", Enabled: true,
+	}))
+	status, _ = DesktopOAuthStatus(context.Background())
+	assert.Equal(t, boxoID, status["desktop_client_id"])
+	assert.Equal(t, map[string]string{"boxo": boxoID, "cherry_studio": cherryID}, status["desktop_clients"])
+	assert.Equal(t, int32(1), hits.Load())
+
+	bridge.readyUntil = time.Time{}
+	fail.Store(true)
+	status, feature = DesktopOAuthStatus(context.Background())
+	assert.False(t, feature)
+	assert.Equal(t, map[string]any{"enabled": false}, status)
+	assert.Equal(t, int32(2), hits.Load())
+	status, feature = DesktopOAuthStatus(context.Background())
+	assert.False(t, feature)
+	assert.Equal(t, int32(2), hits.Load())
+
+	local, err := NewOAuthProviderBridge(OAuthProviderConfig{
+		Enabled: true, AdminBaseURL: server.URL, AuthorizationURL: "https://auth.example/oauth2/auth",
+	}, resource)
+	require.NoError(t, err)
+	UseOAuthProviderBridge(local)
+	status, feature = DesktopOAuthStatus(context.Background())
+	assert.False(t, feature)
+	assert.Equal(t, map[string]any{"enabled": false}, status)
+	assert.Equal(t, int32(2), hits.Load())
 }

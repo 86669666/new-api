@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -19,6 +20,11 @@ import (
 var ErrOAuthUnsupportedGrant = errors.New("unsupported_grant_type")
 
 const oauthPublicBodyLimit = 65536
+
+// oauthAdminReadyTTL bounds how often anonymous /api/status probes Hydra.
+// A failed probe is cached too, so a down admin endpoint fails closed without
+// a request storm. A cancelled caller does not poison the cache.
+var oauthAdminReadyTTL = 15 * time.Second
 
 var oauthTokenErrorText = map[string]string{
 	"invalid_request":         "The request is invalid.",
@@ -61,6 +67,38 @@ func oauthProxyHost(raw string) string {
 		return ""
 	}
 	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Hostname()) + ":" + oauthDefaultPort(u)
+}
+
+// PublicProxyReady reports whether Hydra's admin /health/ready returned 200.
+// The result is cached for oauthAdminReadyTTL. Callers do not learn the admin URL.
+func (b *OAuthProviderBridge) PublicProxyReady(ctx context.Context) bool {
+	if b == nil || !b.PublicProxyEnabled() || b.admin == "" || b.resource == nil || b.resource.client == nil {
+		return false
+	}
+	b.readyMu.Lock()
+	defer b.readyMu.Unlock()
+	if time.Now().Before(b.readyUntil) {
+		return b.readyOK
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, b.admin+"/health/ready", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := b.resource.client.Do(req)
+	if err != nil {
+		if ctx.Err() == nil {
+			b.readyOK = false
+			b.readyUntil = time.Now().Add(oauthAdminReadyTTL)
+		}
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	b.readyOK = resp.StatusCode == http.StatusOK
+	b.readyUntil = time.Now().Add(oauthAdminReadyTTL)
+	return b.readyOK
 }
 
 func (b *OAuthProviderBridge) publicOrigin() (string, error) {

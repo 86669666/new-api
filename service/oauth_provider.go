@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,12 +42,15 @@ type OAuthProviderConfig struct {
 }
 
 type OAuthProviderBridge struct {
-	resource  *OAuthUserInfoResource
-	admin     string
-	authorize string
-	policy    string
-	revoke    string
-	upstream  string
+	resource   *OAuthUserInfoResource
+	admin      string
+	authorize  string
+	policy     string
+	revoke     string
+	upstream   string
+	readyMu    sync.Mutex
+	readyUntil time.Time
+	readyOK    bool
 }
 
 type OAuthProviderPreview struct {
@@ -196,6 +200,13 @@ func NewOAuthProviderBridge(config OAuthProviderConfig, resource *OAuthUserInfoR
 }
 
 func (b *OAuthProviderBridge) PublicProxyEnabled() bool { return b != nil && b.upstream != "" }
+
+func (b *OAuthProviderBridge) PublicIssuer() string {
+	if b == nil || b.resource == nil {
+		return ""
+	}
+	return b.resource.issuer
+}
 
 func (b *OAuthProviderBridge) RevocationEnabled() bool { return b != nil && b.revoke != "" }
 

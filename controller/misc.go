@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,11 @@ func TestStatus(c *gin.Context) {
 }
 
 func GetStatus(c *gin.Context) {
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	oauthDiscovery, oauthEnabled := service.DesktopOAuthStatus(ctx)
 
 	cs := console_setting.GetConsoleSetting()
 	passkeySetting := system_setting.PasskeySettingsSnapshot()
@@ -58,8 +64,8 @@ func GetStatus(c *gin.Context) {
 			common.OptionMap["SidebarModulesAdmin"], common.OptionMap["HeaderNavModules"]),
 		// These describe the new desktop integration contracts, independently
 		// of existing login providers, legacy token logs and pricing APIs.
-		"oauth":                       gin.H{"enabled": false},
-		"client_features":             gin.H{"token_usage_logs": false, "oauth": false, "model_metadata": false},
+		"oauth":                       oauthDiscovery,
+		"client_features":             gin.H{"token_usage_logs": false, "oauth": oauthEnabled, "model_metadata": false},
 		"version":                     common.Version,
 		"start_time":                  common.StartTime,
 		"email_verification":          common.EmailVerificationEnabled,
