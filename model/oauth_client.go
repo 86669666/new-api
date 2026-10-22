@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -49,6 +50,32 @@ func MigrateOAuthClientsIfEnabled(db *gorm.DB) error {
 
 func oauthClientTableReady() bool {
 	return DB != nil && DB.Migrator().HasTable(&OAuthClient{})
+}
+
+// FirstEnabledOAuthClientID returns the oldest enabled client whose redirect
+// set equals redirects. A missing table or database error yields an empty id.
+func FirstEnabledOAuthClientID(redirects []string) string {
+	if len(redirects) == 0 || !oauthClientTableReady() {
+		return ""
+	}
+	want := slices.Clone(redirects)
+	slices.Sort(want)
+	var rows []OAuthClient
+	if err := DB.Where("enabled = ?", true).Order("id asc").Find(&rows).Error; err != nil {
+		return ""
+	}
+	for _, row := range rows {
+		list, err := row.RedirectList()
+		if err != nil {
+			continue
+		}
+		got := slices.Clone(list)
+		slices.Sort(got)
+		if slices.Equal(got, want) {
+			return row.ClientID
+		}
+	}
+	return ""
 }
 
 func OAuthClientEnabled(clientID string) bool {

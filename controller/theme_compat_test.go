@@ -44,4 +44,10 @@ func TestGetStatusAdvertisesDefaultDashboard(t *testing.T) {
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
 	assert.True(t, payload.Success)
 	assert.Equal(t, "default", payload.Data["theme"])
+	assert.Equal(t, map[string]any{"enabled": false}, payload.Data["oauth"])
+	features, ok := payload.Data["client_features"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, false, features["oauth"])
+	assert.Equal(t, false, features["token_usage_logs"])
+	assert.Equal(t, false, features["model_metadata"])
 }

@@ -135,7 +135,7 @@ def check_oauth_userinfo(api, source_root):
     for status in ('200', '401', '403', '429', '503'):
         assert 'private, no-store' in operation['responses'][status]['headers']['Cache-Control']['description']
     assert 'Hydra does not generate this local binding' in operation['description']
-    assert 'status oauth.enabled and client_features.oauth remain false' in operation['description']
+    assert 'status oauth.enabled and client_features.oauth follow public proxy health' in operation['description']
     startup = go_function((source_root / 'main.go').read_text(), 'InitResources')
     assert startup.index('service.InitOAuthUserInfoResource()') < startup.index('model.InitDB()')
     routes = (source_root / 'router/oauth_resource_router.go').read_text()
@@ -167,7 +167,7 @@ def check_oauth_provider(api, source_root):
         for item in operation['responses'].values():
             assert 'private, no-store' in item['headers']['Cache-Control']['description']
         for phrase in ('both current versions', 'at least 24 hours', 'TTL <=30 minutes',
-                       'commit before one Admin PUT', 'status oauth.enabled and client_features.oauth remain false'):
+                       'commit before one Admin PUT', 'status oauth.enabled and client_features.oauth follow public proxy health'):
             assert phrase in operation['description']
     for name, fields in {
         'OAuthProviderPreviewInput': ['challenge'],
@@ -236,7 +236,7 @@ def check_oauth_revocation(api, source_root):
             'type': 'object', 'additionalProperties': False, 'required': ['error'],
             'properties': {'error': {'type': 'string', 'enum': [code]}}}
     for phrase in ('does not prove actual invalidation', 'mask wrong-client and internal storage failures',
-                   'status oauth.enabled and client_features.oauth remain false', 'GetBody=nil'):
+                   'status oauth.enabled and client_features.oauth follow public proxy health', 'GetBody=nil'):
         assert phrase in operation['description']
     return {'route': '/oauth2/revoke', 'default_off': True, 'database_changes': False,
             'fixed_issuer_ingress': True, 'actual_issuer_invalidation_proved': False}
@@ -1108,17 +1108,32 @@ def check_site_description(api):
         assert {k: v for k, v in link.items() if k != 'description'} == {
             'type': 'string', 'nullable': True, 'pattern': r'^https?://[^/?#@\s\\]+(?:/[^?#\s\\]*)?$(?![\s\S])'}
         assert route in link['description']
-    for name, flags in [('DesktopOAuthDiscovery', ['enabled']), ('ClientFeatureFlags', ['token_usage_logs', 'oauth', 'model_metadata'])]:
-        schema = schemas[name]
-        assert {k: v for k, v in schema.items() if k != 'description'} == {
-            'type': 'object', 'additionalProperties': False, 'required': flags,
-            'properties': {key: {'type': 'boolean', 'enum': [False]} for key in flags}}
-        assert schema['description']
-    assert all(path in schemas['ClientFeatureFlags']['description'] for path in
+    discovery = schemas['DesktopOAuthDiscovery']
+    assert 'GitHub/OIDC' in discovery['description'] and '/health/ready' in discovery['description']
+    disabled, enabled = discovery['oneOf']
+    assert disabled == {'type': 'object', 'additionalProperties': False, 'required': ['enabled'],
+                        'properties': {'enabled': {'type': 'boolean', 'enum': [False]}}}
+    assert enabled['type'] == 'object' and enabled['additionalProperties'] is False
+    assert enabled['required'] == ['enabled', 'issuer', 'desktop_client_id', 'desktop_clients']
+    assert enabled['properties']['enabled'] == {'type': 'boolean', 'enum': [True]}
+    assert enabled['properties']['issuer']['pattern'].startswith('^https://')
+    assert enabled['properties']['desktop_client_id']['pattern'] == '^oc_[0-9a-f]{32}$'
+    clients = enabled['properties']['desktop_clients']
+    assert clients['additionalProperties'] is False and clients['minProperties'] == 1
+    assert set(clients['properties']) == {'boxo', 'cherry_studio'}
+    assert all(item['pattern'] == '^oc_[0-9a-f]{32}$' for item in clients['properties'].values())
+    features = schemas['ClientFeatureFlags']
+    assert {k: v for k, v in features.items() if k != 'description'} == {
+        'type': 'object', 'additionalProperties': False,
+        'required': ['token_usage_logs', 'oauth', 'model_metadata'],
+        'properties': {'token_usage_logs': {'type': 'boolean', 'enum': [False]},
+                       'oauth': {'type': 'boolean'},
+                       'model_metadata': {'type': 'boolean', 'enum': [False]}}}
+    assert features['description']
+    assert all(path in features['description'] for path in
                ('/api/log/token', '/api/log/self', '/api/data/self', '/api/pricing'))
-    assert 'GitHub/OIDC' in schemas['DesktopOAuthDiscovery']['description']
     return {'anonymous': True, 'additive_fields': list(fields), 'links': routes,
-            'future_contracts_enabled': False, 'live_http': False}
+            'future_contracts_enabled': False, 'oauth_follows_proxy_health': True, 'live_http': False}
 
 
 def main():

@@ -79,6 +79,12 @@ OAUTH_PROVIDER_UPSTREAM_URL=https://hydra:4444
 
 Access tokens are opaque and last one hour in the example. Refresh tokens last 720 hours. Login and consent challenges are capped at 30 minutes by the example. That cap was taken from the Hydra v26.2.0 schema default and the explicit setting; it was not measured on a running Hydra.
 
+## Status discovery
+
+Anonymous `GET /api/status` keeps `oauth.enabled` and `client_features.oauth` false unless all of the following are true: the public proxy is on, the issuer is the configured HTTPS issuer, at least one enabled preset client exists, and `GET {OAUTH_PROVIDER_ADMIN_BASE_URL}/health/ready` returns 200. The health result is cached for 15 seconds. A failure is cached too, so a down admin endpoint fails closed and is not probed on every status request. A cancelled status request does not cache that failure.
+
+When those checks pass, `oauth` is `{enabled, issuer, desktop_client_id, desktop_clients}`. `issuer` is the same configured issuer discovery publishes. `desktop_client_id` is the Boxo client's generated `oc_` id when that preset is enabled, and otherwise the Cherry Studio id. `desktop_clients` contains `boxo` and `cherry_studio` only for the presets that are enabled. No secret, admin URL, or startup allowlist id is included. A client that is not one of those two presets is not advertised.
+
 ## Client registry
 
 The registry is available only while `OAUTH_USERINFO_ENABLED=true`. With that flag off, `/api/oauth/clients` and `/api/oauth/authorizations` return JSON `404` and the tables `oauth_clients` and `oauth_authorizations` are not created. Turning the flag on migrates both tables. They do not change the tokens table.

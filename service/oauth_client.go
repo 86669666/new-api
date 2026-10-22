@@ -79,6 +79,53 @@ func ValidOAuthClientRedirect(raw string) bool {
 
 // OAuthClientPreset returns the documented public-client redirect and the full
 // known scope list. The client id is not part of the preset.
+func oauthGeneratedClientID(id string) bool {
+	if len(id) != 35 || !strings.HasPrefix(id, "oc_") {
+		return false
+	}
+	for _, c := range id[3:] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// DesktopOAuthStatus is the anonymous /api/status oauth object and the
+// client_features.oauth flag. Both stay false unless the public proxy is on,
+// a preset desktop client is enabled, and the admin health check succeeds.
+func DesktopOAuthStatus(ctx context.Context) (map[string]any, bool) {
+	disabled := map[string]any{"enabled": false}
+	bridge := CurrentOAuthProviderBridge()
+	if bridge == nil || !bridge.PublicProxyEnabled() || !strings.HasPrefix(bridge.PublicIssuer(), "https://") {
+		return disabled, false
+	}
+	clients := map[string]string{}
+	for _, name := range []string{"boxo", "cherry_studio"} {
+		redirects, _, ok := OAuthClientPreset(name)
+		if !ok {
+			continue
+		}
+		id := model.FirstEnabledOAuthClientID(redirects)
+		if oauthGeneratedClientID(id) {
+			clients[name] = id
+		}
+	}
+	desktop := clients["boxo"]
+	if desktop == "" {
+		desktop = clients["cherry_studio"]
+	}
+	if desktop == "" || !bridge.PublicProxyReady(ctx) {
+		return disabled, false
+	}
+	return map[string]any{
+		"enabled":           true,
+		"issuer":            bridge.PublicIssuer(),
+		"desktop_client_id": desktop,
+		"desktop_clients":   clients,
+	}, true
+}
+
 func OAuthClientPreset(name string) (redirects []string, scopes []string, ok bool) {
 	switch name {
 	case "boxo":
