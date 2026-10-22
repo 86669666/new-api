@@ -100,6 +100,9 @@ const dataService = dataServices[0].name;
 const oauthUserInfoServices = services.filter(service => service.source.includes('    public static getOAuthUserInfo('));
 assert.equal(oauthUserInfoServices.length, 1, 'Exactly one generated delegated userinfo method is required');
 const oauthUserInfoService = oauthUserInfoServices[0].name;
+const oauthBalanceServices = services.filter(service => service.source.includes('    public static getOAuthBalance('));
+assert.equal(oauthBalanceServices.length, 1, 'Exactly one generated balance method is required');
+const oauthBalanceService = oauthBalanceServices[0].name;
 const revocationServices = services.filter(service => service.source.includes('    public static revokeOAuthToken('));
 assert.equal(revocationServices.length, 1, 'Exactly one generated public revocation method is required');
 const revocationService = revocationServices[0].name;
@@ -200,6 +203,9 @@ await writeFile(path.join(output, 'operation-invocation-map.json'), JSON.stringi
 const consumer = path.join(output, 'generated/consumer.ts');
 await writeFile(consumer, `import { GeminiService } from './relay';
 import * as nativeSearch from './relay';
+import * as balanceApi from './api';
+const balanceCall: PromiseLike<balanceApi.OAuthBalanceResult> = balanceApi.${oauthBalanceService}.getOAuthBalance();
+void balanceCall;
 import { Service, OrganizationsService } from './api';
 import type { RequestAccessContext } from './api';
 export function compileContractCalls() {
@@ -974,6 +980,52 @@ for (const [status, code] of [[401, 'invalid_token'], [403, 'insufficient_scope'
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const oauthUserInfoStubbedRequests = calls.length - beforeOAuthUserInfoRequests;
+const beforeOAuthBalanceRequests = calls.length;
+const balanceConfig = { TOKEN: api.OpenAPI.TOKEN, HEADERS: api.OpenAPI.HEADERS, WITH_CREDENTIALS: api.OpenAPI.WITH_CREDENTIALS };
+api.OpenAPI.TOKEN = 'fixture-public-oauth-balance';
+api.OpenAPI.HEADERS = undefined;
+api.OpenAPI.WITH_CREDENTIALS = false;
+for (const name of ['oauth balance success', 'oauth balance display only', 'oauth balance zero negative usage fractional scale']) {
+  responseStatus = 200;
+  responseBody = allFixtures.find(fixture => fixture.name === name).value;
+  const value = await api[oauthBalanceService].getOAuthBalance();
+  assert.deepEqual(value, responseBody);
+  assert.equal(value.success, true);
+  assert.equal(value.message, '');
+  assert.equal(value.data.quota_per_unit, responseBody.data.quota_per_unit);
+  const request = calls.at(-1);
+  assert.equal(request.url, api.OpenAPI.BASE + '/api/v1/oauth/balance');
+  assert.equal(request.init.method, 'GET');
+  assert.equal(request.init.body, undefined);
+  assert.equal(new Headers(request.init.headers).get('Authorization'), 'Bearer fixture-public-oauth-balance');
+  assert.equal(new Headers(request.init.headers).has('X-Organization-Id'), false);
+  assert.equal(new Headers(request.init.headers).has('X-Security-Proof'), false);
+}
+for (const [status, code] of [[400, 'invalid_request'], [401, 'invalid_token'], [403, 'insufficient_scope'], [503, 'temporarily_unavailable']]) {
+  responseStatus = status;
+  responseBody = { error: code };
+  const before = calls.length;
+  await assert.rejects(api[oauthBalanceService].getOAuthBalance(), error => {
+    assert.equal(error.status, status);
+    assert.deepEqual(error.body, responseBody);
+    return true;
+  });
+  assert.equal(calls.length, before + 1, 'balance errors must not automatically retry');
+}
+for (const status of [429, 500]) {
+  responseStatus = status;
+  responseBody = undefined;
+  const before = calls.length;
+  await assert.rejects(api[oauthBalanceService].getOAuthBalance(), error => {
+    assert.equal(error.status, status);
+    assert.equal(error.body, undefined);
+    return true;
+  });
+  assert.equal(calls.length, before + 1);
+}
+Object.assign(api.OpenAPI, balanceConfig);
+const oauthBalanceStubbedRequests = calls.length - beforeOAuthBalanceRequests;
+await writeFile(path.join(output, 'oauth-balance-client-results.json'), JSON.stringify({ requests: oauthBalanceStubbedRequests, live_http: false, generated_client_response_validation: false, success_envelope: true, no_automatic_retry: true }, null, 2) + '\n');
 const beforeOAuthProviderRequests = calls.length;
 api.OpenAPI.TOKEN = 'fixture-dashboard-session';
 api.OpenAPI.HEADERS = undefined;

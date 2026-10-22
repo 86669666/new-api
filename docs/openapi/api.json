@@ -19843,7 +19843,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server; the separately enabled public issuer mode adds login/consent/issuance, while delegated key/balance/usage resources remain incomplete; status oauth.enabled and client_features.oauth remain false. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: the optional trusted producer bridge must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Dashboard-session logout is not claimed to revoke independent grants. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent. Public grant mode additionally validates grant identity and absolute grant expiry on both introspections and includes sub.",
+        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server; the separately enabled public issuer mode adds login/consent/issuance, while delegated key/usage resources remain incomplete; the separate balance resource requires public grant mode; status oauth.enabled and client_features.oauth remain false. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: the optional trusted producer bridge must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Legacy bridge-only mode does not claim source-session logout revocation. Public grants are bound to the originating current sign-in session. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent. Public grant mode additionally validates grant identity and absolute grant expiry on both introspections and includes sub.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -23441,6 +23441,214 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/oauth/balance": {
+      "get": {
+        "operationId": "getOAuthBalance",
+        "summary": "Read a delegated personal wallet balance",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Requires the independently enabled public issuer and a live public grant with explicitly selected balance:read scope (unchecked by default); profile remains mandatory during consent. A dashboard JWT, PAT, relay key, cookie, refresh token or legacy bridge token cannot authorize this resource. Only the exact GET path is accepted: no query, organization selector or method override. Recheck live introspection, grant revision, current user and the originating sign-in session, including fresh time after database waits, before publishing quota and used_quota from the same final user row. This request-level observation is not an atomic cross-system snapshot. Absolute grant lifetime is at most seven days and ends with its source session. Negative JavaScript-safe integer quota values are preserved; invalid required numbers fail closed, optional display formatting may be omitted. No organization balance, subscription remaining quota, history or funding-source attribution. Errors are flat OAuth error objects; success uses the management success envelope. Even when disabled, the global boundary handles the canonical route with 401 rather than an SPA response. status oauth.enabled and client_features.oauth remain false.",
+        "security": [
+          {
+            "OAuthResourceBearer": []
+          }
+        ],
+        "x-required-scopes": [
+          "balance:read"
+        ],
+        "x-query-policy": "forbidden",
+        "x-organization-selection": "any selector presence rejected",
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "200": {
+            "description": "Current personal wallet balance and account usage.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global balance boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthBalanceResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Any query including empty ?, organization selector header presence, method override, wrong method or noncanonical path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global balance boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthBalanceInvalidRequest"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Inactive or invalid public access token, user, grant, or source session. Legacy bridge-only mode is rejected.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global balance boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"invalid_token\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInvalidToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing exact balance:read scope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global balance boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"insufficient_scope\", scope=\"balance:read\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInsufficientScope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Global API rate limit; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global balance boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Global API limiter storage failure; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global balance boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Issuer/database uncertainty or invalid required numeric values; no fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global balance boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthResourceUnavailable"
                 }
               }
             }
@@ -31415,7 +31623,7 @@
           },
           "selected_scopes": {
             "type": "array",
-            "maxItems": 4,
+            "maxItems": 5,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -31423,7 +31631,8 @@
                 "openid",
                 "profile",
                 "email",
-                "offline_access"
+                "offline_access",
+                "balance:read"
               ]
             }
           }
@@ -31443,7 +31652,8 @@
                     "enum": [
                       "openid",
                       "email",
-                      "offline_access"
+                      "offline_access",
+                      "balance:read"
                     ]
                   }
                 }
@@ -31516,7 +31726,7 @@
           },
           "allowed_scopes": {
             "type": "array",
-            "maxItems": 4,
+            "maxItems": 5,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -31524,7 +31734,8 @@
                 "openid",
                 "profile",
                 "email",
-                "offline_access"
+                "offline_access",
+                "balance:read"
               ]
             },
             "minItems": 1
@@ -32544,8 +32755,8 @@
           },
           "scopes_supported": {
             "type": "array",
-            "minItems": 4,
-            "maxItems": 4,
+            "minItems": 5,
+            "maxItems": 5,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -32553,7 +32764,8 @@
                 "openid",
                 "profile",
                 "email",
-                "offline_access"
+                "offline_access",
+                "balance:read"
               ]
             }
           },
@@ -32711,6 +32923,87 @@
             "items": {
               "$ref": "#/components/schemas/OAuthPublicJWK"
             }
+          }
+        }
+      },
+      "OAuthBalanceData": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "quota",
+          "used_quota",
+          "quota_per_unit",
+          "display_locale"
+        ],
+        "properties": {
+          "quota": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "Current personal wallet quota points. Negative balances are preserved."
+          },
+          "used_quota": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "Accumulated account usage, which may include subscription usage; not wallet debits or funding provenance."
+          },
+          "quota_per_unit": {
+            "type": "number",
+            "minimum": 0,
+            "exclusiveMinimum": true,
+            "description": "Finite positive quota points per base USD unit."
+          },
+          "display_locale": {
+            "type": "string",
+            "enum": [
+              "en-US"
+            ]
+          },
+          "display_amount": {
+            "type": "string",
+            "description": "Optional formatted display string. Display only; do not parse as an amount."
+          }
+        }
+      },
+      "OAuthBalanceResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/OAuthBalanceData"
+          }
+        }
+      },
+      "OAuthBalanceInvalidRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "invalid_request"
+            ]
           }
         }
       }
@@ -33532,7 +33825,7 @@
       "OAuthResourceBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider."
+        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected."
       },
       "ClientEventsBearer": {
         "type": "http",

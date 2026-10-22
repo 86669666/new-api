@@ -14055,5 +14055,493 @@
       "code": "ORG_JOINED_LIMIT_REACHED",
       "count": 3
     }
+  },
+  {
+    "name": "oauth balance success",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth balance display only",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US",
+        "display_amount": "-$0.000002"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth balance flat response rejected",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "quota": -1,
+      "used_quota": 9007199254740991,
+      "quota_per_unit": 500000,
+      "display_locale": "en-US"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance missing success",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance missing message",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance missing data",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": ""
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid outer success",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": false,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid outer message",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "ok",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid outer organization_id",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      },
+      "organization_id": 1
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data quota 9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": 9007199254740992,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data used_quota -9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": -9007199254740992,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data quota 0.5",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": 0.5,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data quota None",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": null,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data quota_per_unit 0",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 0,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data quota_per_unit -1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": -1,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data quota_per_unit None",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": null,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data display_locale zhCN",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "zhCN"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data display_amount 1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US",
+        "display_amount": 1
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance invalid data organization_id 1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US",
+        "organization_id": 1
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance missing data quota",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance missing data used_quota",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "quota_per_unit": 500000,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance missing data quota_per_unit",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance missing data display_locale",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": -1,
+        "used_quota": 9007199254740991,
+        "quota_per_unit": 500000
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance zero negative usage fractional scale",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthBalanceResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "quota": 0,
+        "used_quota": -1,
+        "quota_per_unit": 0.5,
+        "display_locale": "en-US"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth balance explicit consent",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "profile",
+        "balance:read"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth balance scope cannot replace profile",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "balance:read"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth balance discovery five scopes",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicMetadata",
+    "value": {
+      "issuer": "https://issuer.example/issuer",
+      "authorization_endpoint": "https://issuer.example/authorization_endpoint",
+      "token_endpoint": "https://issuer.example/token_endpoint",
+      "revocation_endpoint": "https://issuer.example/revocation_endpoint",
+      "jwks_uri": "https://issuer.example/jwks_uri",
+      "userinfo_endpoint": "https://issuer.example/userinfo_endpoint",
+      "scopes_supported": [
+        "openid",
+        "profile",
+        "email",
+        "offline_access",
+        "balance:read"
+      ],
+      "response_types_supported": [
+        "code"
+      ],
+      "response_modes_supported": [
+        "query"
+      ],
+      "grant_types_supported": [
+        "authorization_code",
+        "refresh_token"
+      ],
+      "token_endpoint_auth_methods_supported": [
+        "none"
+      ],
+      "subject_types_supported": [
+        "public"
+      ],
+      "id_token_signing_alg_values_supported": [
+        "RS256"
+      ],
+      "code_challenge_methods_supported": [
+        "S256"
+      ],
+      "authorization_response_iss_parameter_supported": true
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth balance discovery missing scope",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicMetadata",
+    "value": {
+      "issuer": "https://issuer.example/issuer",
+      "authorization_endpoint": "https://issuer.example/authorization_endpoint",
+      "token_endpoint": "https://issuer.example/token_endpoint",
+      "revocation_endpoint": "https://issuer.example/revocation_endpoint",
+      "jwks_uri": "https://issuer.example/jwks_uri",
+      "userinfo_endpoint": "https://issuer.example/userinfo_endpoint",
+      "scopes_supported": [
+        "openid",
+        "profile",
+        "email",
+        "offline_access"
+      ],
+      "response_types_supported": [
+        "code"
+      ],
+      "response_modes_supported": [
+        "query"
+      ],
+      "grant_types_supported": [
+        "authorization_code",
+        "refresh_token"
+      ],
+      "token_endpoint_auth_methods_supported": [
+        "none"
+      ],
+      "subject_types_supported": [
+        "public"
+      ],
+      "id_token_signing_alg_values_supported": [
+        "RS256"
+      ],
+      "code_challenge_methods_supported": [
+        "S256"
+      ],
+      "authorization_response_iss_parameter_supported": true
+    },
+    "valid": false
   }
 ]

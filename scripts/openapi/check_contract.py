@@ -146,6 +146,56 @@ def check_oauth_userinfo(api, source_root):
             'independent_credential': True, 'public_issuer_contract': True, 'live_http': False}
 
 
+def check_oauth_balance(api, source_root):
+    path = '/api/v1/oauth/balance'
+    assert set(api['paths'][path]) == {'get'}
+    operation = api['paths'][path]['get']
+    assert operation['operationId'] == 'getOAuthBalance'
+    assert operation['security'] == [{'OAuthResourceBearer': []}]
+    assert operation['x-required-scopes'] == ['balance:read']
+    assert operation['x-query-policy'] == 'forbidden'
+    assert operation['x-automatic-retry'] is False and operation['x-default-off'] is True
+    assert not operation.get('parameters') and 'requestBody' not in operation
+    assert set(operation['responses']) == {'200', '400', '401', '403', '429', '500', '503'}
+    schemas = api['components']['schemas']
+    result = schemas['OAuthBalanceResult']
+    assert result == {'type': 'object', 'additionalProperties': False,
+                      'required': ['success', 'message', 'data'],
+                      'properties': {'success': {'type': 'boolean', 'enum': [True]},
+                                     'message': {'type': 'string', 'enum': ['']},
+                                     'data': {'$ref': '#/components/schemas/OAuthBalanceData'}}}
+    data = schemas['OAuthBalanceData']
+    assert data['additionalProperties'] is False
+    assert data['required'] == ['quota', 'used_quota', 'quota_per_unit', 'display_locale']
+    assert set(data['properties']) == set(data['required']) | {'display_amount'}
+    for name in ['quota', 'used_quota']:
+        field = data['properties'][name]
+        assert field['type'] == 'integer' and field['minimum'] == -9007199254740991 and field['maximum'] == 9007199254740991
+    scale = data['properties']['quota_per_unit']
+    assert scale['type'] == 'number' and scale['minimum'] == 0 and scale['exclusiveMinimum'] is True
+    assert data['properties']['display_locale'] == {'type': 'string', 'enum': ['en-US']}
+    assert data['properties']['display_amount']['type'] == 'string'
+    for status, schema in [('200', 'OAuthBalanceResult'), ('400', 'OAuthBalanceInvalidRequest'),
+                           ('401', 'OAuthInvalidToken'), ('403', 'OAuthInsufficientScope'), ('503', 'OAuthResourceUnavailable')]:
+        assert operation['responses'][status]['content']['application/json']['schema'] == {'$ref': '#/components/schemas/' + schema}
+    for status in ['429', '500']:
+        assert 'content' not in operation['responses'][status]
+    for response in operation['responses'].values():
+        assert 'private, no-store' in response['headers']['Cache-Control']['description']
+        assert response['headers']['Referrer-Policy']['schema']['enum'] == ['no-referrer']
+    assert operation['responses']['403']['headers']['WWW-Authenticate']['schema']['enum'] == ['Bearer error="insufficient_scope", scope="balance:read"']
+    supported = schemas['OAuthPublicMetadata']['properties']['scopes_supported']
+    assert supported['minItems'] == supported['maxItems'] == 5
+    assert supported['items']['enum'] == ['openid', 'profile', 'email', 'offline_access', 'balance:read']
+    routes = (source_root / 'router/oauth_resource_router.go').read_text()
+    assert 'OAuthBalanceAuth(resource)' in routes and 'controller.GetOAuthBalance' in routes
+    root_routes = (source_root / 'router/main.go').read_text()
+    assert root_routes.index('OAuthBalanceBoundary') < root_routes.index('OrganizationSelectionBoundary')
+    assert 'OAuthBalancePath' in (source_root / 'middleware/logger.go').read_text()
+    return {'route': path, 'success_envelope': True, 'public_grant_only': True,
+            'safe_integer_quota': True, 'optional_display_only': True, 'live_http': False}
+
+
 def check_oauth_provider(api, source_root):
     schemas = api['components']['schemas']
     expected = {
@@ -184,11 +234,11 @@ def check_oauth_provider(api, source_root):
     consent = schemas['OAuthProviderConsentDecision']
     assert consent['properties']['decision']['enum'] == ['approve', 'deny']
     assert consent['properties']['selected_scopes'] == {
-        'type': 'array', 'maxItems': 4, 'uniqueItems': True,
-        'items': {'type': 'string', 'enum': ['openid', 'profile', 'email', 'offline_access']}}
+        'type': 'array', 'maxItems': 5, 'uniqueItems': True,
+        'items': {'type': 'string', 'enum': ['openid', 'profile', 'email', 'offline_access', 'balance:read']}}
     assert consent['oneOf'] == [
         {'properties': {'decision': {'enum': ['approve']},
-                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': ['openid', 'email', 'offline_access']}}}}},
+                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': ['openid', 'email', 'offline_access', 'balance:read']}}}}},
         {'properties': {'decision': {'enum': ['deny']}, 'selected_scopes': {'maxItems': 0}}}]
     assert schemas['OAuthProviderError']['properties'] == {'error': {'type': 'string', 'enum': [
         'invalid_request', 'invalid_token', 'access_denied', 'invalid_grant', 'temporarily_unavailable']}}
@@ -1333,6 +1383,7 @@ def main():
     results['personal_log_range_error'] = check_personal_log_range_error(api)
     results['personal_quota_series'] = check_personal_quota_series(api)
     results['oauth_userinfo'] = check_oauth_userinfo(api, source_root)
+    results['oauth_balance'] = check_oauth_balance(api, source_root)
     results['oauth_provider'] = check_oauth_provider(api, source_root)
     results['oauth_revocation'] = check_oauth_revocation(api, source_root)
     results['organization_lifecycle'] = check_organization_lifecycle(api, relay, fixtures, args.design_gate)
