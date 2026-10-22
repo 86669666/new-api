@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"math/big"
 	"net"
@@ -247,6 +248,80 @@ func (c *oauthHydraClient) active(token string) bool {
 func (c *oauthHydraClient) userinfo(token string) int {
 	status, _, _ := c.request("GET", c.input.Issuer+"api/v1/oauth/userinfo", "", "", token)
 	return status
+}
+
+// usage uses the formal HTTP resource with a credential returned by the real
+// issuer. Exact successful payloads are compared at the call site; this shared
+// assertion protects the privacy/error envelope on both success and rejection.
+func (c *oauthHydraClient) usage(path, token string, want int) map[string]any {
+	c.t.Helper()
+	status, headers, raw := c.request(http.MethodGet, c.input.Issuer+path, "", "", token)
+	require.Equal(c.t, want, status, "real Hydra usage resource status")
+	assert.Contains(c.t, headers.Get("Cache-Control"), "no-store")
+	assert.Equal(c.t, "no-referrer", headers.Get("Referrer-Policy"))
+	assert.Empty(c.t, headers.Get("Location"))
+	var body map[string]any
+	require.NoError(c.t, common.Unmarshal(raw, &body))
+	if want != http.StatusOK {
+		assert.NotContains(c.t, body, "data")
+		if want == http.StatusForbidden {
+			assert.Equal(c.t, "insufficient_scope", body["error"])
+			assert.Equal(c.t, `Bearer error="insufficient_scope", scope="usage:read"`, headers.Get("WWW-Authenticate"))
+		} else if want == http.StatusUnauthorized {
+			assert.Equal(c.t, "invalid_token", body["error"])
+		}
+		return body
+	}
+	keys := []string{"success", "message", "data", "data_complete", "quota_per_unit"}
+	if strings.Contains(path, "/stat?") {
+		keys = append(keys, "granularity")
+	}
+	assert.ElementsMatch(c.t, keys, slices.Collect(maps.Keys(body)))
+	assert.Equal(c.t, true, body["success"])
+	assert.Equal(c.t, "", body["message"])
+	assert.Equal(c.t, false, body["data_complete"], "persisted history never promises complete accounting")
+	assert.Equal(c.t, float64(500000), body["quota_per_unit"])
+	return body
+}
+
+// The signed-session fixture may start in SQLite even when oauthPublicDatabase
+// moves the current primary to MySQL/PostgreSQL. Allocate a second private DB of
+// that actual primary kind, never use the initial fixture's LOG_DB or alias main.
+// organizationTestDB validates the existing owned loopback receipt, logs its
+// exact generated name, and registers close -> DROP -> admin-close cleanup (or
+// a real SQLite TempDir file). No shared infrastructure or DSN is written/logged.
+func oauthPublicUsageDatabase(t *testing.T, f *organizationHTTPFixture) {
+	t.Helper()
+	kind := f.db.Dialector.Name()
+	require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
+	if selected := os.Getenv("NEWAPI_W01_MAIN_KIND"); selected != "" {
+		require.Equal(t, selected, kind)
+	}
+	t.Setenv("NEWAPI_S2_MAIN", kind)
+	t.Setenv("NEWAPI_S2_LOG", kind)
+	if kind != "sqlite" {
+		t.Setenv("NEWAPI_S2_"+strings.ToUpper(kind)+"_PORT", os.Getenv("NEWAPI_W01_MAIN_PORT"))
+	}
+	logDB, _ := organizationTestDB(t, kind, os.Getenv("NEWAPI_W01_MAIN_DSN"))
+	require.NotSame(t, f.db, logDB)
+	require.NoError(t, f.db.AutoMigrate(&model.Token{}, &model.Log{}, &model.QuotaData{}))
+	require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
+	previousLog := model.LOG_DB
+	previousMain, previousLogKind := common.MainDatabaseType(), common.LogDatabaseType()
+	model.LOG_DB = logDB
+	common.SetDatabaseTypes(common.DatabaseType(kind), common.DatabaseType(kind))
+	t.Cleanup(func() {
+		model.LOG_DB = previousLog
+		common.SetDatabaseTypes(previousMain, previousLogKind)
+	})
+	query := "SELECT version()"
+	if kind == "sqlite" {
+		query = "SELECT sqlite_version()"
+	}
+	var mainVersion, logVersion string
+	require.NoError(t, f.db.Raw(query).Scan(&mainVersion).Error)
+	require.NoError(t, logDB.Raw(query).Scan(&logVersion).Error)
+	t.Logf("OAuth usage stores: main_engine=%s main_version=%s log_engine=%s log_version=%s independent_log=true cleanup=registered", kind, mainVersion, logDB.Dialector.Name(), logVersion)
 }
 
 func TestOAuthPublicHydraHTTP(t *testing.T) {
@@ -493,6 +568,59 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 
 	t.Run("explicit_usage_scope_and_old_grant_refresh", func(t *testing.T) {
 		c.t = t
+		oauthPublicUsageDatabase(t, f)
+		oldConsume, oldExport, oldUnit := common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit
+		oldRange := operation_setting.GetLogSetting().MaxRangeDays
+		common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit = true, true, 500000
+		operation_setting.GetLogSetting().MaxRangeDays = 2
+		t.Cleanup(func() {
+			common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit = oldConsume, oldExport, oldUnit
+			operation_setting.GetLogSetting().MaxRangeDays = oldRange
+		})
+		base := time.Now().UTC().Truncate(24 * time.Hour).Add(-48 * time.Hour).Unix()
+		start, end := base+23*3600+1, base+25*3600+20
+		window := fmt.Sprintf("start_timestamp=%d&end_timestamp=%d", start, end)
+		const largeQuota = 1<<40 + 3 // JS-safe, above int32; not an overflow matrix.
+		var usageTokens []model.Token
+		for _, name := range []string{"hydra-usage-live", "hydra-usage-deleted"} {
+			key, err := common.GenerateKey()
+			require.NoError(t, err)
+			c.secrets = append(c.secrets, key)
+			token := model.Token{UserId: f.users["owner"].Id, Key: key, Name: name, Status: common.TokenStatusEnabled, ExpiredTime: -1}
+			require.NoError(t, f.db.Create(&token).Error)
+			usageTokens = append(usageTokens, token)
+		}
+		require.NoError(t, f.db.Delete(&usageTokens[1]).Error)
+		var activeDeleted int64
+		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", usageTokens[1].Id).Count(&activeDeleted).Error)
+		require.Zero(t, activeDeleted, "deleted-token history must not rely on a live token row")
+		logs := []model.Log{
+			{UserId: f.users["owner"].Id, TokenId: usageTokens[0].Id, CreatedAt: start, Type: model.LogTypeConsume, ModelName: "live", Quota: 11, PromptTokens: 2, CompletionTokens: 3, UseTime: 4, IsStream: true, Group: "default"},
+			{UserId: f.users["owner"].Id, TokenId: 0, CreatedAt: base + 24*3600, Type: model.LogTypeConsume, ModelName: "zero", Quota: 17},
+			{UserId: f.users["owner"].Id, TokenId: usageTokens[1].Id, CreatedAt: end, Type: model.LogTypeConsume, ModelName: "deleted", Quota: largeQuota},
+			{UserId: f.users["foreign"].Id, TokenId: 0, CreatedAt: start, Type: model.LogTypeConsume, ModelName: "subject-B", Quota: 9000},
+		}
+		for i := range logs {
+			logs[i].Ip, logs[i].ChannelId, logs[i].Other = "203.0.113.88", 99, `{"private":"usage-canary"}`
+			logs[i].RequestId = fmt.Sprintf("hydra-usage-private-%d", i)
+			require.NoError(t, model.LOG_DB.Create(&logs[i]).Error)
+		}
+		// If the reader accidentally uses main rather than LOG_DB, this row
+		// appears instead of the exact three account-attributed history rows.
+		require.NoError(t, f.db.Create(&model.Log{UserId: f.users["owner"].Id, CreatedAt: start, Type: model.LogTypeConsume, ModelName: "wrong-main-database", Quota: 777}).Error)
+		require.NoError(t, f.db.Create(&[]model.QuotaData{
+			{UserID: f.users["owner"].Id, TokenID: usageTokens[0].Id, CreatedAt: base + 23*3600, Quota: 11, Count: 1, TokenUsed: 5},
+			{UserID: f.users["owner"].Id, TokenID: 0, CreatedAt: base + 24*3600, Quota: 17, Count: 2, TokenUsed: 7},
+			{UserID: f.users["owner"].Id, TokenID: usageTokens[1].Id, CreatedAt: base + 25*3600, Quota: largeQuota, Count: 3, TokenUsed: 11},
+			{UserID: f.users["foreign"].Id, CreatedAt: base + 23*3600, Quota: 9000, Count: 9, TokenUsed: 90},
+		}).Error)
+		usageCases := []struct{ path, data string }{
+			{"api/v1/oauth/usage/logs?" + window + "&page_size=10", fmt.Sprintf(`{"items":[{"created_at":%d,"model_name":"deleted","prompt_tokens":0,"completion_tokens":0,"quota":%d,"use_time":0,"is_stream":false,"group":""},{"created_at":%d,"model_name":"zero","prompt_tokens":0,"completion_tokens":0,"quota":17,"use_time":0,"is_stream":false,"group":""},{"created_at":%d,"model_name":"live","prompt_tokens":2,"completion_tokens":3,"quota":11,"use_time":4,"is_stream":true,"group":"default"}],"total":3,"page":1,"page_size":10}`, end, largeQuota, base+24*3600, start)},
+			{"api/v1/oauth/usage/stat?" + window + "&granularity=hour", fmt.Sprintf(`[{"ts":%d,"quota":11,"requests":1,"tokens":5},{"ts":%d,"quota":17,"requests":2,"tokens":7},{"ts":%d,"quota":%d,"requests":3,"tokens":11}]`, base+23*3600, base+24*3600, base+25*3600, largeQuota)},
+			{"api/v1/oauth/usage/stat?" + window + "&granularity=day", fmt.Sprintf(`[{"ts":%d,"quota":11,"requests":1,"tokens":5},{"ts":%d,"quota":%d,"requests":5,"tokens":18}]`, base, base+86400, largeQuota+17)},
+		}
+		var selectedGrant oauthHydraGrant
+		var selectedGrantRef string
 		freshNarrow := c.grant("openid profile offline_access balance:read")
 		clientURL := input.Admin + "/admin/clients/" + url.PathEscape(c.clientID)
 		status, _, raw := c.request("GET", clientURL, "", "", "")
@@ -558,15 +686,53 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 			require.NoError(t, common.UnmarshalJsonStr(stored.Scopes, &persisted))
 			assert.Equal(t, choice, slices.Contains(persisted, "usage:read"))
 			before := stored.Scopes
-			status, refreshed := c.refresh(grant)
-			require.Equal(t, 200, status)
-			assert.Equal(t, choice, slices.Contains(strings.Fields(introspect(refreshed.Access)["scope"].(string)), "usage:read"))
+			refreshed := grant
+			for _, refreshBeforeRead := range []bool{false, true} {
+				token := grant.Access
+				if refreshBeforeRead {
+					status, refreshed = c.refresh(grant)
+					require.Equal(t, 200, status)
+					assert.Equal(t, choice, slices.Contains(strings.Fields(introspect(refreshed.Access)["scope"].(string)), "usage:read"))
+					token = refreshed.Access
+				}
+				for _, tc := range usageCases {
+					if !choice {
+						c.usage(tc.path, token, http.StatusForbidden)
+						continue
+					}
+					body := c.usage(tc.path, token, http.StatusOK)
+					encoded, err := common.Marshal(body["data"])
+					require.NoError(t, err)
+					assert.JSONEq(t, tc.data, string(encoded), "real issued/refreshed token must consume exact subject usage")
+					if strings.Contains(tc.path, "granularity=") {
+						assert.Equal(t, strings.Split(tc.path, "granularity=")[1], body["granularity"])
+					} else {
+						items := body["data"].(map[string]any)["items"].([]any)
+						actual := items[0].(map[string]any)["quota"].(float64)
+						assert.Equal(t, float64(largeQuota), actual)
+						assert.Equal(t, math.Trunc(actual), actual)
+						assert.LessOrEqual(t, actual, float64(model.OAuthUsageMaxInteger))
+					}
+				}
+			}
 			require.NoError(t, f.db.Where("grant_ref = ?", stored.GrantRef).First(&stored).Error)
 			assert.Equal(t, before, stored.Scopes, "refresh must not alter stored consent")
+			for _, tc := range usageCases[:2] {
+				c.usage(tc.path, grant.Access, http.StatusUnauthorized)
+			}
+			if choice {
+				selectedGrant, selectedGrantRef = refreshed, stored.GrantRef
+				for _, tc := range usageCases[:2] {
+					c.usage(tc.path, refreshed.Refresh, http.StatusUnauthorized)
+				}
+			}
 		}
 		status, refreshed := c.refresh(freshNarrow)
 		require.Equal(t, 200, status)
 		assert.NotContains(t, strings.Fields(introspect(refreshed.Access)["scope"].(string)), "usage:read")
+		for _, tc := range usageCases[:2] {
+			c.usage(tc.path, refreshed.Access, http.StatusForbidden)
+		}
 		form := url.Values{"client_id": {c.clientID}, "grant_type": {"refresh_token"}, "refresh_token": {refreshed.Refresh}, "scope": {"usage:read"}}
 		status, _, _ = c.request("POST", input.Issuer+"oauth2/token", "application/x-www-form-urlencoded", form.Encode(), "")
 		assert.Equal(t, 400, status)
@@ -624,6 +790,60 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		assert.Equal(t, legacyBefore.UserAuthVersion, legacyStored.UserAuthVersion)
 		assert.Equal(t, legacyBefore.GrantID, legacyStored.GrantID)
 		assert.Equal(t, legacyBefore.State, legacyStored.State)
+		for _, tc := range usageCases[:2] {
+			c.usage(tc.path, legacyRefreshed.Access, http.StatusForbidden)
+		}
+
+		for _, tc := range usageCases[:2] {
+			for _, selector := range []string{"&user_id=" + strconv.Itoa(f.users["foreign"].Id), "&org_id=0"} {
+				c.usage(tc.path+selector, selectedGrant.Access, http.StatusBadRequest)
+			}
+			req, err := http.NewRequest(http.MethodGet, input.Issuer+tc.path, nil)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer "+selectedGrant.Access)
+			req.Header.Set("X-Organization-Id", "0")
+			response, err := c.http.Do(req)
+			if err != nil {
+				t.Fatal("usage organization selector request failed; credential details withheld")
+			}
+			raw, readErr := io.ReadAll(io.LimitReader(response.Body, 65537))
+			require.NoError(t, response.Body.Close())
+			require.NoError(t, readErr)
+			require.LessOrEqual(t, len(raw), 65536)
+			assert.Equal(t, http.StatusBadRequest, response.StatusCode)
+			assert.Contains(t, response.Header.Get("Cache-Control"), "no-store")
+			assert.Equal(t, "no-referrer", response.Header.Get("Referrer-Policy"))
+			assert.Empty(t, response.Header.Get("Location"))
+			assert.JSONEq(t, `{"error":"invalid_request"}`, string(raw))
+		}
+
+		// Grant revocation uses the real local lifecycle, without claiming that
+		// the issuer has completed remote cleanup or single-token RFC7009.
+		require.NotEmpty(t, selectedGrantRef)
+		require.NoError(t, model.RevokeOAuth(t.Context(), f.users["owner"].Id, "grant", selectedGrantRef))
+		for _, tc := range usageCases[:2] {
+			c.usage(tc.path, selectedGrant.Access, http.StatusUnauthorized)
+		}
+
+		// The other existing dashboard actor obtains an actual Hydra grant.
+		// No issuer/introspection is fabricated and no OAuth token is signed here.
+		ownerBearer := f.bearer["owner"]
+		f.bearer["owner"] = f.bearer["foreign"]
+		t.Cleanup(func() { f.bearer["owner"] = ownerBearer })
+		foreignGrant := c.grant("openid profile usage:read")
+		f.bearer["owner"] = ownerBearer
+		foreignBody := c.usage(usageCases[0].path, foreignGrant.Access, http.StatusOK)
+		foreignData := foreignBody["data"].(map[string]any)
+		assert.Equal(t, float64(1), foreignData["total"])
+		require.Len(t, foreignData["items"], 1)
+		assert.Equal(t, "subject-B", foreignData["items"].([]any)[0].(map[string]any)["model_name"])
+		revoked, err := model.RevokeUserSession(f.users["foreign"].Id, f.sids["foreign"], "logout")
+		require.NoError(t, err)
+		require.True(t, revoked)
+		for _, tc := range usageCases[:2] {
+			c.usage(tc.path, foreignGrant.Access, http.StatusUnauthorized)
+		}
+		t.Log("Combined real Hydra chain exercised issued/refreshed access -> independent log DB and primary hourly/day usage; withheld scope and local revocation reject resource reads")
 
 		binding["policy_hash"] = legacyPolicy
 		data, err = common.Marshal(binding)
