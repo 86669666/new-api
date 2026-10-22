@@ -403,6 +403,9 @@ func migrateDB() error {
 	if err := MigrateOAuthClientsIfEnabled(DB); err != nil {
 		return err
 	}
+	if err := MigrateOAuthRevocationJobsIfEnabled(DB); err != nil {
+		return err
+	}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 		if err := ensureSubscriptionPlanTableSQLite(); err != nil {
 			return err

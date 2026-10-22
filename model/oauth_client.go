@@ -192,18 +192,26 @@ func oauthGrantLabel(name string) string {
 }
 
 func RevokeOAuthAuthorization(userID int, clientID string) error {
-	if userID <= 0 || clientID == "" || !DB.Migrator().HasTable(&OAuthAuthorization{}) {
+	if userID <= 0 || clientID == "" || DB == nil || !DB.Migrator().HasTable(&OAuthAuthorization{}) {
 		return gorm.ErrRecordNotFound
 	}
-	var row OAuthAuthorization
-	err := DB.Where("user_id = ? AND client_id = ? AND revoked_at = ?", userID, clientID, 0).First(&row).Error
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var row OAuthAuthorization
+		err := lockForUpdate(tx).Where("user_id = ? AND client_id = ? AND revoked_at = ?", userID, clientID, 0).First(&row).Error
+		if err != nil {
+			return err
+		}
+		if err = ScheduleOAuthRevocation(tx, userID, clientID); err != nil {
+			return err
+		}
+		now := common.GetTimestamp()
+		return tx.Model(&row).Select("revoked_at", "updated_at").Updates(map[string]any{
+			"revoked_at": now, "updated_at": now,
+		}).Error
+	})
 	if err != nil {
 		return err
 	}
-	if err = DisableOAuthIssuedTokens(userID, clientID); err != nil {
-		return err
-	}
-	return DB.Model(&row).Select("revoked_at", "updated_at").Updates(map[string]any{
-		"revoked_at": common.GetTimestamp(), "updated_at": common.GetTimestamp(),
-	}).Error
+	WakeOAuthRevocation()
+	return nil
 }

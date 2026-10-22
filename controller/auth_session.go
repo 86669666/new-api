@@ -64,7 +64,7 @@ func AuthLogout(c *gin.Context) {
 				writeAuthSessionError(c, err)
 				return
 			}
-			if err := model.DisableOAuthIssuedTokensForUser(identity.UserID); err != nil {
+			if err := model.QueueOAuthUserRevocation(identity.UserID); err != nil {
 				writeAuthSessionError(c, err)
 				return
 			}
@@ -96,7 +96,7 @@ func AuthLogout(c *gin.Context) {
 	}
 	if sid, ok := service.RefreshTokenSID(rawRefreshToken); ok {
 		if session, err := model.GetUserSessionBySID(sid); err == nil {
-			if err := model.DisableOAuthIssuedTokensForUser(session.UserID); err != nil {
+			if err := model.QueueOAuthUserRevocation(session.UserID); err != nil {
 				writeAuthSessionError(c, err)
 				return
 			}

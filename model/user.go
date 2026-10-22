@@ -809,6 +809,7 @@ func (user *User) Update(updatePassword bool) error {
 		return err
 	}
 	if user.AuthVersion > previousAuthVersion {
+		WakeOAuthRevocation()
 		_, err := RevokeAllUserSessions(user.Id, "user_security_changed")
 		return err
 	}
@@ -870,6 +871,7 @@ func (user *User) Edit(updatePassword bool) error {
 		return err
 	}
 	if user.AuthVersion > previousAuthVersion {
+		WakeOAuthRevocation()
 		_, err := RevokeAllUserSessions(user.Id, "user_security_changed")
 		return err
 	}
@@ -996,6 +998,7 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 	}); err != nil {
 		return 0, err
 	}
+	WakeOAuthRevocation()
 	if err := publishCommittedUserAuthVersion(user.Id, nextAuthVersion); err != nil {
 		return revokedAccessTokens, err
 	}
@@ -1038,6 +1041,7 @@ func (user *User) HardDelete() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	WakeOAuthRevocation()
 	if err := publishCommittedUserAuthVersion(user.Id, deletedAuthVersion); err != nil {
 		common.SysError(common.LogText("failed to publish auth tombstone after hard deleting user %d: %v", user.Id, err))
 	}
@@ -1220,6 +1224,7 @@ func ResetUserPasswordByEmail(email string, password string) error {
 	}); err != nil {
 		return err
 	}
+	WakeOAuthRevocation()
 	if err := PublishUserAuthCache(user.Id); err != nil {
 		return err
 	}
