@@ -1092,12 +1092,27 @@ func TestSecurityEnrollmentPasskeyProofProtectsChannelKeyRead(t *testing.T) {
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
 	require.True(t, body.Success, body.Message)
 	require.NoError(t, common.Unmarshal(body.Data, &begin))
+	credential := securityPasskeyResponse(t, key, begin.Options.PublicKey.Challenge, false, 1)
 	assertionBody, err := common.Marshal(map[string]any{
-		"flow_token": begin.FlowToken, "credential": securityPasskeyResponse(t, key, begin.Options.PublicKey.Challenge, false, 1),
+		"flow_token": begin.FlowToken, "credential": credential,
 		"scope": "passkey.delete", "context": map[string]any{"channel_id": 456},
 	})
 	require.NoError(t, err)
 	response = securityEnrollmentRequest("POST", "/api/user/passkey/verify/finish", string(assertionBody), "", identity, PasskeyVerifyFinish)
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	var rejected securityEnrollmentResponse
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &rejected))
+	assert.False(t, rejected.Success)
+	assert.Equal(t, "ORG_REQUEST_INVALID", rejected.Code)
+	assert.Empty(t, rejected.Data)
+
+	// Rejected envelope fields must not consume the challenge or its assertion.
+	assertionBody, err = common.Marshal(passkeyFinishRequest{
+		FlowToken: begin.FlowToken, Credential: credential,
+	})
+	require.NoError(t, err)
+	response = securityEnrollmentRequest("POST", "/api/user/passkey/verify/finish", string(assertionBody), "", identity, PasskeyVerifyFinish)
+	require.Equal(t, http.StatusOK, response.Code)
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
 	require.True(t, body.Success, body.Message)
 	var proof service.SecurityProof
@@ -1105,6 +1120,7 @@ func TestSecurityEnrollmentPasskeyProofProtectsChannelKeyRead(t *testing.T) {
 	assert.Equal(t, "passkey", proof.Method)
 	assert.Equal(t, "channel.key.read", proof.Scope, "finish cannot replace the operation approved at begin")
 
+	personalAccessToken, _ := createScopedAccessToken(t, user.Id, 0, "profile:read")
 	router := gin.New()
 	router.POST("/api/channel/:id/key", middleware.RootAuth(), middleware.SecureVerificationRequired(), GetChannelKey)
 	for _, test := range []struct {
@@ -1113,6 +1129,7 @@ func TestSecurityEnrollmentPasskeyProofProtectsChannelKeyRead(t *testing.T) {
 	}{
 		{"login token only", "/api/channel/123/key", "", "SECURITY_PROOF_REQUIRED", "", http.StatusForbidden},
 		{"access token as proof", "/api/channel/123/key", rotation.AccessToken, "SECURITY_PROOF_INVALID", "", http.StatusForbidden},
+		{"personal access token as proof", "/api/channel/123/key", personalAccessToken, "SECURITY_PROOF_INVALID", "", http.StatusForbidden},
 		{"other channel", "/api/channel/456/key", proof.ProofToken, "SECURITY_PROOF_CONTEXT_MISMATCH", "", http.StatusForbidden},
 		{"authorized channel", "/api/channel/123/key", proof.ProofToken, "", "first-channel-secret", http.StatusOK},
 		{"replay", "/api/channel/123/key", proof.ProofToken, "SECURITY_PROOF_CONSUMED", "", http.StatusForbidden},
