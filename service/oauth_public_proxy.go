@@ -377,12 +377,17 @@ func (b *OAuthProviderBridge) rewriteLocation(raw string, forbiddenHosts []strin
 		loc.Scheme = pub.Scheme
 		loc.Host = pub.Host
 	}
-	if !oauthLocationAllowed(loc, pub) {
+	// A registered redirect is an exact https URL, a loopback path, or a custom
+	// scheme an administrator stored. The port is not rewritten. An unregistered
+	// https host is still rejected.
+	registered := OAuthRedirectRegistered(loc.String())
+	if !oauthLocationAllowed(loc, pub) && !registered {
 		return "", ErrOAuthResourceUnavailable
 	}
-	// Loopback and the registered custom callback are not rewritten from the
-	// caller. Reject any other location whose host was supplied by the caller.
-	if !oauthLoopbackOrCustomCallback(loc) {
+	// Loopback, the built-in custom callback, and a registered redirect are not
+	// rewritten from the caller. Reject any other location whose host was
+	// supplied by the caller.
+	if !registered && !oauthLoopbackOrCustomCallback(loc) {
 		for _, forbidden := range forbiddenHosts {
 			if forbidden != "" && strings.EqualFold(loc.Hostname(), forbidden) && !strings.EqualFold(loc.Hostname(), pub.Hostname()) {
 				return "", ErrOAuthResourceUnavailable

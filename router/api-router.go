@@ -278,6 +278,22 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.GET("/waffo-pancake/subscription-product-options", controller.ListWaffoPancakeSubscriptionProductOptions)
 		}
 
+		// Public OAuth clients this server accepts. The gate is 404 until userinfo is on.
+		oauthClientRoute := apiRouter.Group("/oauth/clients")
+		oauthClientRoute.Use(controller.OAuthClientGate, middleware.AdminAuth())
+		{
+			oauthClientRoute.GET("", controller.ListOAuthClients)
+			oauthClientRoute.POST("", controller.CreateOAuthClient)
+			oauthClientRoute.PUT("/:id", controller.UpdateOAuthClient)
+			oauthClientRoute.DELETE("/:id", controller.DeleteOAuthClient)
+		}
+		oauthAuthorizationRoute := apiRouter.Group("/oauth/authorizations")
+		oauthAuthorizationRoute.Use(controller.OAuthClientGate, middleware.UserAuth())
+		{
+			oauthAuthorizationRoute.GET("", controller.ListOAuthAuthorizations)
+			oauthAuthorizationRoute.DELETE("/:client_id", controller.DeleteOAuthAuthorization)
+		}
+
 		// Custom OAuth provider management (root only)
 		customOAuthRoute := apiRouter.Group("/custom-oauth-provider")
 		customOAuthRoute.Use(middleware.RootAuth())
