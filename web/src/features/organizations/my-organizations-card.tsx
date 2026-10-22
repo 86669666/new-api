@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { EmptyState } from '@/components/empty-state'
@@ -29,6 +29,7 @@ import { TitledCard } from '@/components/ui/titled-card'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getMyOrganizations } from './api'
+import { OrganizationDetailsDialog } from './organization-details-dialog'
 
 export function MyOrganizationsCard() {
   const actorId = useAuthStore((state) => state.auth.user?.id)
@@ -40,6 +41,18 @@ export function MyOrganizationsCard() {
 function Directory(props: { actorId: number; sid: string }) {
   const { t } = useTranslation()
   const [cursors, setCursors] = useState(['0'])
+  const [selectedOrgId, setSelectedOrgId] = useState<string | null>(null)
+  const returnFocus = useRef<{
+    orgId: string
+    element: HTMLButtonElement
+  } | null>(null)
+  const refreshButton = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    if (selectedOrgId || !returnFocus.current) return
+    const entry = returnFocus.current.element
+    const target = entry.isConnected ? entry : refreshButton.current
+    target?.focus()
+  }, [selectedOrgId])
   const afterId = cursors.at(-1) ?? '0'
   const query = useQuery({
     queryKey: [
@@ -84,7 +97,31 @@ function Directory(props: { actorId: number; sid: string }) {
             className='flex min-w-0 flex-wrap items-center justify-between gap-2 py-3'
           >
             <span className='min-w-0 break-all'>{organization.name}</span>
-            <Badge variant='secondary'>{roles[organization.my_role]}</Badge>
+            <div className='flex flex-wrap items-center gap-2'>
+              <Badge variant='secondary'>{roles[organization.my_role]}</Badge>
+              <Button
+                variant='outline'
+                size='sm'
+                aria-label={t('View {{name}}', { name: organization.name })}
+                ref={(element) => {
+                  if (
+                    element &&
+                    returnFocus.current?.orgId === organization.org_id
+                  ) {
+                    returnFocus.current.element = element
+                  }
+                }}
+                onClick={(event) => {
+                  returnFocus.current = {
+                    orgId: organization.org_id,
+                    element: event.currentTarget,
+                  }
+                  setSelectedOrgId(organization.org_id)
+                }}
+              >
+                {t('View organization')}
+              </Button>
+            </div>
           </li>
         ))}
       </ul>
@@ -100,6 +137,9 @@ function Directory(props: { actorId: number; sid: string }) {
         <Button
           variant='outline'
           size='sm'
+          ref={refreshButton}
+          className='data-disabled:opacity-50'
+          focusableWhenDisabled
           disabled={query.isFetching}
           onClick={() => void query.refetch()}
         >
@@ -108,6 +148,15 @@ function Directory(props: { actorId: number; sid: string }) {
       }
     >
       <div aria-busy={query.isFetching}>{content}</div>
+      <OrganizationDetailsDialog
+        actorId={props.actorId}
+        sid={props.sid}
+        orgId={selectedOrgId ?? ''}
+        open={selectedOrgId !== null}
+        onOpenChange={(open) => {
+          if (!open) setSelectedOrgId(null)
+        }}
+      />
       <div className='mt-3 flex flex-wrap justify-between gap-2'>
         <Button
           variant='outline'
