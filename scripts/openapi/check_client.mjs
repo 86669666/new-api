@@ -152,6 +152,23 @@ const revocationAdaptation = {
   raw_form_data_incompatible: true, raw_response_header_masks_error_body: true, sdk_native_compatibility_claimed: false,
 };
 await writeFile(path.join(output, 'generator-revocation-adaptation.json'), JSON.stringify(revocationAdaptation, null, 2) + '\n');
+const publicOAuthOperations = ['exchangeOAuthPublicToken', 'getOAuthOpenIdConfiguration', 'getOAuthAuthorizationServerMetadata', 'getOAuthPublicJwks'].map(method => {
+  const matches = services.filter(service => service.source.includes(`    public static ${method}(`));
+  assert.equal(matches.length, 1, method);
+  return { method, service: matches[0].name };
+});
+// Bounded harness adaptation only: the raw pinned generator sends FormData.
+const publicTokenFile = path.join(output, 'generated/api/services', publicOAuthOperations[0].service + '.ts');
+const publicTokenSource = await readFile(publicTokenFile, 'utf8');
+const publicTokenStart = publicTokenSource.indexOf('    public static exchangeOAuthPublicToken(');
+const publicTokenEnd = publicTokenSource.indexOf('\n    }\n', publicTokenStart) + '\n    }'.length;
+assert(publicTokenStart >= 0 && publicTokenEnd > publicTokenStart);
+const publicTokenMethod = publicTokenSource.slice(publicTokenStart, publicTokenEnd);
+assert.equal(publicTokenMethod.split('formData: formData,').length, 2);
+assert.equal(publicTokenMethod.includes('responseHeader:'), false);
+const adaptedPublicTokenMethod = publicTokenMethod.replace('formData: formData,', 'body: new URLSearchParams(Object.entries(formData).filter((entry): entry is [string, string] => entry[1] !== undefined)).toString(),');
+await writeFile(publicTokenFile, publicTokenSource.slice(0, publicTokenStart) + adaptedPublicTokenMethod + publicTokenSource.slice(publicTokenEnd));
+await writeFile(path.join(output, 'generator-public-token-adaptation.json'), JSON.stringify({ method: 'exchangeOAuthPublicToken', raw_sha256: createHash('sha256').update(publicTokenMethod).digest('hex'), adapted_sha256: createHash('sha256').update(adaptedPublicTokenMethod).digest('hex'), change: 'only formData to URLSearchParams body', shipped_sdk_compatible: false }, null, 2));
 const clientEventsServices = services.filter(service => service.source.includes('    public static receiveClientEvents('));
 assert.equal(clientEventsServices.length, 1, 'Exactly one generated receiver method is required');
 const clientEventsService = clientEventsServices[0].name;
@@ -340,6 +357,7 @@ export async function compileOAuthUserInfo() {
   const id: number = profile.id;
   const group: string = profile.group;
   const email: string | undefined = profile.email;
+  const subject: string | undefined = profile.sub;
   // @ts-expect-error a delegated profile never contains private auth binding fields
   const privateBinding: client.OAuthUserInfo = { id: 1, username: 'fixture', display_name: '', group: 'default', auth_version: 1 };
   // @ts-expect-error unknown email is omitted, not null
@@ -354,7 +372,7 @@ export async function compileOAuthProvider() {
   const expires: number = preview.expires_at;
   const login = await client.${oauthProviderOperations[1].service}.decideOAuthProviderLogin({ requestBody: { challenge: 'fixture', preview_token: token, decision: 'continue' } });
   const consent = await client.${oauthProviderOperations[2].service}.previewOAuthProviderConsent({ requestBody: { challenge: 'fixture' } });
-  const resume = await client.${oauthProviderOperations[3].service}.decideOAuthProviderConsent({ requestBody: { challenge: 'fixture', preview_token: consent.preview_token, decision: 'approve', selected_scopes: ['profile'] } });
+  const resume = await client.${oauthProviderOperations[3].service}.decideOAuthProviderConsent({ requestBody: { challenge: 'fixture', preview_token: consent.preview_token, decision: 'approve', selected_scopes: ['openid', 'profile', 'email', 'offline_access'] } });
   // @ts-expect-error local subject is server-owned, never a caller assertion
   const identity: client.OAuthProviderLoginDecision = { challenge: 'fixture', preview_token: token, decision: 'continue', subject: '1' };
   // @ts-expect-error explicit scope selection is an array, never a string
@@ -995,7 +1013,7 @@ for (const hint of [undefined, '', 'refresh_token', 'unknown']) {
   assert.deepEqual([...new URLSearchParams(request.init.body)], Object.entries(formData));
   assert.equal(headers.get('Content-Type').includes('multipart'), false);
 }
-for (const [status, code] of [[400, 'invalid_request'], [401, 'invalid_client'], [404, 'not_found'], [503, 'temporarily_unavailable']]) {
+for (const [status, code] of [[400, 'invalid_request'], [401, 'invalid_client'], [404, 'not_found'], [429, 'temporarily_unavailable'], [503, 'temporarily_unavailable']]) {
   responseStatus = status;
   responseBody = { error: code };
   const before = calls.length;
@@ -1010,6 +1028,47 @@ for (const [status, code] of [[400, 'invalid_request'], [401, 'invalid_client'],
 }
 const revocationStubbedRequests = calls.length - beforeRevocationRequests;
 Object.assign(api.OpenAPI, revokePublicConfig);
+const beforePublicOAuthRequests = calls.length;
+const publicOAuthConfig = { TOKEN: api.OpenAPI.TOKEN, HEADERS: api.OpenAPI.HEADERS, WITH_CREDENTIALS: api.OpenAPI.WITH_CREDENTIALS, CREDENTIALS: api.OpenAPI.CREDENTIALS };
+api.OpenAPI.TOKEN = undefined;
+api.OpenAPI.HEADERS = undefined;
+api.OpenAPI.WITH_CREDENTIALS = true;
+api.OpenAPI.CREDENTIALS = 'omit';
+for (const formData of [
+  { grant_type: 'authorization_code', client_id: 'desktop-public', code: 'fixture-code', redirect_uri: 'cherrystudio://oauth/callback', code_verifier: 'a'.repeat(43) },
+  { grant_type: 'refresh_token', client_id: 'desktop-public', refresh_token: 'fixture-refresh' },
+]) {
+  responseStatus = 200;
+  responseBody = { access_token: 'fixture-access', token_type: 'bearer', expires_in: 900, scope: 'openid profile offline_access', id_token: 'fixture-id', refresh_token: 'fixture-refresh-next' };
+  assert.deepEqual(await api[publicOAuthOperations[0].service].exchangeOAuthPublicToken({ formData }), responseBody);
+  const request = calls.at(-1);
+  assert.equal(request.url, api.OpenAPI.BASE + '/oauth2/token');
+  assert.equal(request.init.credentials, 'omit');
+  assert.equal(new Headers(request.init.headers).has('Authorization'), false);
+  assert.equal(new Headers(request.init.headers).get('Content-Type'), 'application/x-www-form-urlencoded');
+  assert.deepEqual([...new URLSearchParams(request.init.body)], Object.entries(formData));
+}
+for (const status of [400, 429, 503]) {
+  responseStatus = status;
+  responseBody = { error: status === 400 ? 'invalid_grant' : 'temporarily_unavailable' };
+  const before = calls.length;
+  await assert.rejects(api[publicOAuthOperations[0].service].exchangeOAuthPublicToken({ formData: { grant_type: 'refresh_token', client_id: 'desktop-public', refresh_token: 'fixture-refresh' } }), error => {
+    assert.equal(error.status, status); assert.deepEqual(error.body, responseBody); return true;
+  });
+  assert.equal(calls.length, before + 1, 'no automatic token replay');
+}
+for (const operation of publicOAuthOperations.slice(1)) {
+  responseStatus = 200;
+  responseBody = operation.method === 'getOAuthPublicJwks' ? { keys: [{ kty: 'RSA', kid: 'fixture', use: 'sig', alg: 'RS256', n: 'fixture-n', e: 'AQAB' }] } : {
+    issuer: 'https://issuer.example.invalid/', authorization_endpoint: 'https://issuer.example.invalid/oauth2/auth', token_endpoint: 'https://issuer.example.invalid/oauth2/token', revocation_endpoint: 'https://issuer.example.invalid/oauth2/revoke', jwks_uri: 'https://issuer.example.invalid/.well-known/jwks.json', userinfo_endpoint: 'https://issuer.example.invalid/api/v1/oauth/userinfo',
+    scopes_supported: ['openid', 'profile', 'email', 'offline_access'], response_types_supported: ['code'], response_modes_supported: ['query'], grant_types_supported: ['authorization_code', 'refresh_token'], token_endpoint_auth_methods_supported: ['none'], subject_types_supported: ['public'], id_token_signing_alg_values_supported: ['RS256'], code_challenge_methods_supported: ['S256'], authorization_response_iss_parameter_supported: true,
+  };
+  assert.deepEqual(await api[operation.service][operation.method](), responseBody);
+  assert.equal(calls.at(-1).init.body, undefined);
+  assert.equal(new Headers(calls.at(-1).init.headers).has('Authorization'), false);
+}
+Object.assign(api.OpenAPI, publicOAuthConfig);
+const publicOAuthStubbedRequests = calls.length - beforePublicOAuthRequests;
 const beforeTokenSeriesRequests = calls.length;
 api.OpenAPI.TOKEN = 'sk-token-series-fixture';
 api.OpenAPI.HEADERS = undefined;
@@ -1064,4 +1123,4 @@ for (const [status, code] of [[400, 'INVALID'], [401, 'UNAUTHORIZED'], [403, 'FO
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const clientEventsStubbedRequests = calls.length - beforeClientEventsRequests;
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_authentication_stubbed_requests: tokenAuthenticationStubbedRequests, wallet_quota_stubbed_requests: walletQuotaStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_series_stubbed_requests: tokenSeriesStubbedRequests, token_pricing_stubbed_requests: pricingStubbedRequests, model_metadata_stubbed_requests: modelMetadataStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, personal_data_series_stubbed_requests: personalSeriesStubbedRequests, collection_status_stubbed_requests: collectionStatusStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_authentication_stubbed_requests: tokenAuthenticationStubbedRequests, wallet_quota_stubbed_requests: walletQuotaStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_series_stubbed_requests: tokenSeriesStubbedRequests, token_pricing_stubbed_requests: pricingStubbedRequests, model_metadata_stubbed_requests: modelMetadataStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, personal_data_series_stubbed_requests: personalSeriesStubbedRequests, collection_status_stubbed_requests: collectionStatusStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, oauth_public_stubbed_requests: publicOAuthStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Public authorize redirects require browser navigation/cookies; generated fetch is not an accepted authorization browser. Public token form encoding is adapted only in this harness, not a shipped SDK.', 'Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));

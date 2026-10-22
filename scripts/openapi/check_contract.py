@@ -120,6 +120,7 @@ def check_oauth_userinfo(api, source_root):
         'properties': {'id': {'type': 'integer', 'minimum': 1},
                        'username': {'type': 'string'}, 'display_name': {'type': 'string'},
                        'group': {'type': 'string'},
+                       'sub': {'type': 'string', 'pattern': r'^[1-9][0-9]*(?![\s\S])', 'description': 'Canonical local user id, present only for the public issuer grant mode; omitted by legacy bridge-only mode.'},
                        'email': {'type': 'string', 'description': 'Present only when the current access token grants the exact email scope.'}},
     }
     for name, code in [('OAuthInvalidToken', 'invalid_token'), ('OAuthInsufficientScope', 'insufficient_scope'),
@@ -142,7 +143,7 @@ def check_oauth_userinfo(api, source_root):
     assert 'OAuthUserInfoAuth(resource)' in routes and 'GlobalAPIRateLimit()' in routes
     assert 'UserAuth(' not in routes and 'AccessTokenAudit(' not in routes
     return {'route': path, 'default_off': True, 'profile_scope': True, 'optional_email': True,
-            'independent_credential': True, 'provider_login_delivered': False, 'live_http': False}
+            'independent_credential': True, 'public_issuer_contract': True, 'live_http': False}
 
 
 def check_oauth_provider(api, source_root):
@@ -159,7 +160,7 @@ def check_oauth_provider(api, source_root):
         assert operation['operationId'] == operation_id
         assert operation['security'] == [{'DashboardJWT': []}]
         assert operation['x-pat-policy'] == 'session-only'
-        assert operation['x-query-policy'] == 'forbidden' and operation['x-request-max-bytes'] == 16384
+        assert operation['x-query-policy'] == 'forbidden' and operation['x-request-max-bytes'] == 65536
         assert operation['x-automatic-retry'] is False
         assert operation['requestBody'] == {'required': True, 'content': {'application/json': {'schema': {'$ref': '#/components/schemas/' + request}}}}
         assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/' + response}
@@ -183,11 +184,11 @@ def check_oauth_provider(api, source_root):
     consent = schemas['OAuthProviderConsentDecision']
     assert consent['properties']['decision']['enum'] == ['approve', 'deny']
     assert consent['properties']['selected_scopes'] == {
-        'type': 'array', 'maxItems': 2, 'uniqueItems': True,
-        'items': {'type': 'string', 'enum': ['profile', 'email']}}
+        'type': 'array', 'maxItems': 4, 'uniqueItems': True,
+        'items': {'type': 'string', 'enum': ['openid', 'profile', 'email', 'offline_access']}}
     assert consent['oneOf'] == [
         {'properties': {'decision': {'enum': ['approve']},
-                        'selected_scopes': {'minItems': 1, 'not': {'maxItems': 1, 'items': {'enum': ['email']}}}}},
+                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': ['openid', 'email', 'offline_access']}}}}},
         {'properties': {'decision': {'enum': ['deny']}, 'selected_scopes': {'maxItems': 0}}}]
     assert schemas['OAuthProviderError']['properties'] == {'error': {'type': 'string', 'enum': [
         'invalid_request', 'invalid_token', 'access_denied', 'invalid_grant', 'temporarily_unavailable']}}
@@ -196,8 +197,8 @@ def check_oauth_provider(api, source_root):
     assert 'UserAuth()' in routes and 'CriticalRateLimit()' in routes and 'OAuthResourceNoStore' in routes
     startup = go_function((source_root / 'main.go').read_text(), 'InitResources')
     assert startup.index('service.InitOAuthProviderBridge()') < startup.index('model.InitDB()')
-    return {'routes': 4, 'default_off': True, 'real_session_only': True, 'backend_producer_only': True,
-            'ui_or_live_issuer': False, 'bounded_local_replay_hours': 24, 'required_verified_challenge_minutes': 30}
+    return {'routes': 4, 'default_off': True, 'real_session_only': True, 'public_issuer_contract': True,
+            'live_issuer_executed_by_this_check': False, 'bounded_local_replay_hours': 24, 'required_verified_challenge_minutes': 30}
 
 
 def check_oauth_revocation(api, source_root):
@@ -220,7 +221,8 @@ def check_oauth_revocation(api, source_root):
     assert 'enum' not in schema['properties']['token_type_hint'], 'RFC7009 unknown hints are ignored'
     responses = operation['responses']
     assert set(responses) == {'200', '400', '401', '403', '404', '405', '429', '503'}
-    assert 'content' not in responses['200'] and 'content' not in responses['429']
+    assert 'content' not in responses['200']
+    assert responses['429']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OAuthResourceUnavailable'}
     for status in ('200', '400', '401', '404', '405', '429', '503'):
         assert 'private, no-store' in responses[status]['headers']['Cache-Control']['description']
         assert 'Location' not in responses[status]['headers'] and 'Set-Cookie' not in responses[status]['headers']
@@ -234,6 +236,32 @@ def check_oauth_revocation(api, source_root):
         assert phrase in operation['description']
     return {'route': '/oauth2/revoke', 'default_off': True, 'database_changes': False,
             'fixed_issuer_ingress': True, 'actual_issuer_invalidation_proved': False}
+
+
+def check_oauth_public(api):
+    expected = {'/oauth2/auth': ('get', 'authorizeOAuthPublicClient'),
+                '/oauth2/token': ('post', 'exchangeOAuthPublicToken'),
+                '/.well-known/openid-configuration': ('get', 'getOAuthOpenIDConfiguration'),
+                '/.well-known/oauth-authorization-server': ('get', 'getOAuthAuthorizationServerMetadata'),
+                '/.well-known/jwks.json': ('get', 'getOAuthPublicJWKS'),
+                '/oauth2/error': ('get', 'getOAuthPublicError')}
+    for path, (method, operation_id) in expected.items():
+        assert set(api['paths'][path]) == {method}
+        operation = api['paths'][path][method]
+        assert operation['operationId'] == operation_id and operation['security'] == []
+        assert operation['x-default-off'] is True and operation['x-automatic-retry'] is False
+        assert operation['responses']['403']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OAuthOrganizationSelectionError'}
+    auth = api['paths']['/oauth2/auth']['get']
+    assert {'302', '303'} <= set(auth['responses']) and auth['x-query-max-bytes'] == 32768
+    assert 'maxLength' not in next(p['schema'] for p in auth['parameters'] if p['name'] == 'redirect_uri')
+    token = api['paths']['/oauth2/token']['post']
+    assert token['x-request-max-bytes'] == 16384
+    assert token['requestBody']['content']['application/x-www-form-urlencoded']['schema'] == {'$ref': '#/components/schemas/OAuthPublicTokenRequest'}
+    for name in ['OAuthPublicTokenRequest', 'OAuthPublicTokenResponse', 'OAuthPublicMetadata', 'OAuthPublicJWK', 'OAuthPublicJWKS']:
+        assert api['components']['schemas'][name]['additionalProperties'] is False
+    assert api['components']['schemas']['OAuthPublicTokenResponse']['properties']['token_type']['enum'] == ['bearer']
+    assert api['components']['schemas']['OAuthPublicTokenResponse']['properties']['expires_in']['maximum'] == 900
+    return {'routes': 6, 'default_off': True, 'live_issuer': False, 'consumer_acceptance': False}
 
 
 def check_conditional_authorization(source_root):
@@ -1203,6 +1231,7 @@ def main():
 
     api, relay = documents['api'], documents['relay']
     results['no_available_channel_detail'] = check_no_available_channel_detail(relay)
+    results['oauth_public'] = check_oauth_public(api)
     results['native_search'] = check_native_search(relay)
     access = api['components']['schemas']['OrganizationAccess']['properties']['capabilities']
     context_access = api['components']['schemas']['RequestAccessContext']['properties']['organization']['properties']['capabilities']

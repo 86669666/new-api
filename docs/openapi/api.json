@@ -19790,7 +19790,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server, not a delivered login/consent/issuance flow; status oauth.enabled and client_features.oauth remain false. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: the optional trusted producer bridge must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Dashboard-session logout is not claimed to revoke independent grants. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent.",
+        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server; the separately enabled public issuer mode adds login/consent/issuance, while delegated key/balance/usage resources remain incomplete; status oauth.enabled and client_features.oauth remain false. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: the optional trusted producer bridge must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Dashboard-session logout is not claimed to revoke independent grants. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent. Public grant mode additionally validates grant identity and absolute grant expiry on both introspections and includes sub.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -19929,7 +19929,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_PROVIDER_BRIDGE_ENABLED=false by default; absent while disabled. Requires the configured userinfo resource, a matching fixed HTTPS Admin base, exact public authorization endpoint and allowed client/audience policy. Backend protocol producer only: no login/consent UI or deployed authorization server, and status oauth.enabled and client_features.oauth remain false. One current real dashboard Bearer session is required; PAT, legacy, relay, OAuth resource credentials and cookie-only requests cannot decide. POST JSON only, no query parameters, duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Configured Origin/Referer and the existing omitted-origin native policy apply; cross-site Fetch Metadata rejects. Preview creates only an opaque local binding, valid at most five minutes and no later than session expiry. Decision re-fetches and binds the exact challenge, issuer/client policy, request, actor, SID and both current versions. Ordinary public-client authorization_code/code with canonical S256, state and exact registered redirect is supported; only the numeric loopback port may vary. Skip, silent/fresh-auth requirements, PAR/JAR and unsupported interaction/response modes reject. Explicit approval grants selected intersect requested intersect registered intersect server profile/email policy with profile mandatory, exact configured audience and remember=false. Only canonical local subject and current AuthVersion are sent as access-token claims; never SID or ID-token claims. Local preview consumption and a cross-preview challenge claim commit before one Admin PUT; no database locks span HTTP. Failed or unknown external outcomes are not retried: start a new authorization challenge. Existing cleanup gives at least 24 hours of local attempt exclusion, not permanent replay prevention. Before real activation the operator must verify effective Hydra challenge TTL <=30 minutes including old outstanding requests; no live issuer TTL or grant interoperability is established here. Current local identity is checked immediately before PUT and before publishing a validated same-endpoint phase-verifier resume URL. Later revocation may withhold the URL but cannot undo an already accepted external decision. Successful capabilities exist only in no-store JSON; fixed errors never contain upstream causes/capabilities. Wrong methods are absent; POST slash variants reject without Location redirects.",
+        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth remain false. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
         "security": [
           {
             "DashboardJWT": []
@@ -19938,7 +19938,7 @@
         "x-pat-policy": "session-only",
         "x-automatic-retry": false,
         "x-query-policy": "forbidden",
-        "x-request-max-bytes": 16384,
+        "x-request-max-bytes": 65536,
         "requestBody": {
           "required": true,
           "content": {
@@ -20120,7 +20120,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_PROVIDER_BRIDGE_ENABLED=false by default; absent while disabled. Requires the configured userinfo resource, a matching fixed HTTPS Admin base, exact public authorization endpoint and allowed client/audience policy. Backend protocol producer only: no login/consent UI or deployed authorization server, and status oauth.enabled and client_features.oauth remain false. One current real dashboard Bearer session is required; PAT, legacy, relay, OAuth resource credentials and cookie-only requests cannot decide. POST JSON only, no query parameters, duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Configured Origin/Referer and the existing omitted-origin native policy apply; cross-site Fetch Metadata rejects. Preview creates only an opaque local binding, valid at most five minutes and no later than session expiry. Decision re-fetches and binds the exact challenge, issuer/client policy, request, actor, SID and both current versions. Ordinary public-client authorization_code/code with canonical S256, state and exact registered redirect is supported; only the numeric loopback port may vary. Skip, silent/fresh-auth requirements, PAR/JAR and unsupported interaction/response modes reject. Explicit approval grants selected intersect requested intersect registered intersect server profile/email policy with profile mandatory, exact configured audience and remember=false. Only canonical local subject and current AuthVersion are sent as access-token claims; never SID or ID-token claims. Local preview consumption and a cross-preview challenge claim commit before one Admin PUT; no database locks span HTTP. Failed or unknown external outcomes are not retried: start a new authorization challenge. Existing cleanup gives at least 24 hours of local attempt exclusion, not permanent replay prevention. Before real activation the operator must verify effective Hydra challenge TTL <=30 minutes including old outstanding requests; no live issuer TTL or grant interoperability is established here. Current local identity is checked immediately before PUT and before publishing a validated same-endpoint phase-verifier resume URL. Later revocation may withhold the URL but cannot undo an already accepted external decision. Successful capabilities exist only in no-store JSON; fixed errors never contain upstream causes/capabilities. Wrong methods are absent; POST slash variants reject without Location redirects.",
+        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth remain false. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
         "security": [
           {
             "DashboardJWT": []
@@ -20129,7 +20129,7 @@
         "x-pat-policy": "session-only",
         "x-automatic-retry": false,
         "x-query-policy": "forbidden",
-        "x-request-max-bytes": 16384,
+        "x-request-max-bytes": 65536,
         "requestBody": {
           "required": true,
           "content": {
@@ -20311,7 +20311,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_PROVIDER_BRIDGE_ENABLED=false by default; absent while disabled. Requires the configured userinfo resource, a matching fixed HTTPS Admin base, exact public authorization endpoint and allowed client/audience policy. Backend protocol producer only: no login/consent UI or deployed authorization server, and status oauth.enabled and client_features.oauth remain false. One current real dashboard Bearer session is required; PAT, legacy, relay, OAuth resource credentials and cookie-only requests cannot decide. POST JSON only, no query parameters, duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Configured Origin/Referer and the existing omitted-origin native policy apply; cross-site Fetch Metadata rejects. Preview creates only an opaque local binding, valid at most five minutes and no later than session expiry. Decision re-fetches and binds the exact challenge, issuer/client policy, request, actor, SID and both current versions. Ordinary public-client authorization_code/code with canonical S256, state and exact registered redirect is supported; only the numeric loopback port may vary. Skip, silent/fresh-auth requirements, PAR/JAR and unsupported interaction/response modes reject. Explicit approval grants selected intersect requested intersect registered intersect server profile/email policy with profile mandatory, exact configured audience and remember=false. Only canonical local subject and current AuthVersion are sent as access-token claims; never SID or ID-token claims. Local preview consumption and a cross-preview challenge claim commit before one Admin PUT; no database locks span HTTP. Failed or unknown external outcomes are not retried: start a new authorization challenge. Existing cleanup gives at least 24 hours of local attempt exclusion, not permanent replay prevention. Before real activation the operator must verify effective Hydra challenge TTL <=30 minutes including old outstanding requests; no live issuer TTL or grant interoperability is established here. Current local identity is checked immediately before PUT and before publishing a validated same-endpoint phase-verifier resume URL. Later revocation may withhold the URL but cannot undo an already accepted external decision. Successful capabilities exist only in no-store JSON; fixed errors never contain upstream causes/capabilities. Wrong methods are absent; POST slash variants reject without Location redirects.",
+        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth remain false. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
         "security": [
           {
             "DashboardJWT": []
@@ -20320,7 +20320,7 @@
         "x-pat-policy": "session-only",
         "x-automatic-retry": false,
         "x-query-policy": "forbidden",
-        "x-request-max-bytes": 16384,
+        "x-request-max-bytes": 65536,
         "requestBody": {
           "required": true,
           "content": {
@@ -20502,7 +20502,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_PROVIDER_BRIDGE_ENABLED=false by default; absent while disabled. Requires the configured userinfo resource, a matching fixed HTTPS Admin base, exact public authorization endpoint and allowed client/audience policy. Backend protocol producer only: no login/consent UI or deployed authorization server, and status oauth.enabled and client_features.oauth remain false. One current real dashboard Bearer session is required; PAT, legacy, relay, OAuth resource credentials and cookie-only requests cannot decide. POST JSON only, no query parameters, duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Configured Origin/Referer and the existing omitted-origin native policy apply; cross-site Fetch Metadata rejects. Preview creates only an opaque local binding, valid at most five minutes and no later than session expiry. Decision re-fetches and binds the exact challenge, issuer/client policy, request, actor, SID and both current versions. Ordinary public-client authorization_code/code with canonical S256, state and exact registered redirect is supported; only the numeric loopback port may vary. Skip, silent/fresh-auth requirements, PAR/JAR and unsupported interaction/response modes reject. Explicit approval grants selected intersect requested intersect registered intersect server profile/email policy with profile mandatory, exact configured audience and remember=false. Only canonical local subject and current AuthVersion are sent as access-token claims; never SID or ID-token claims. Local preview consumption and a cross-preview challenge claim commit before one Admin PUT; no database locks span HTTP. Failed or unknown external outcomes are not retried: start a new authorization challenge. Existing cleanup gives at least 24 hours of local attempt exclusion, not permanent replay prevention. Before real activation the operator must verify effective Hydra challenge TTL <=30 minutes including old outstanding requests; no live issuer TTL or grant interoperability is established here. Current local identity is checked immediately before PUT and before publishing a validated same-endpoint phase-verifier resume URL. Later revocation may withhold the URL but cannot undo an already accepted external decision. Successful capabilities exist only in no-store JSON; fixed errors never contain upstream causes/capabilities. Wrong methods are absent; POST slash variants reject without Location redirects.",
+        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth remain false. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
         "security": [
           {
             "DashboardJWT": []
@@ -20511,7 +20511,7 @@
         "x-pat-policy": "session-only",
         "x-automatic-retry": false,
         "x-query-policy": "forbidden",
-        "x-request-max-bytes": 16384,
+        "x-request-max-bytes": 65536,
         "requestBody": {
           "required": true,
           "content": {
@@ -20914,7 +20914,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_PROVIDER_REVOCATION_ENABLED=false by default; requires the enabled provider bridge and existing userinfo trust. The reserved endpoint, slash/encoded variants and descendants reject locally even when off or for wrong methods; no frontend redirect or SPA fallthrough and no Location. Other OAuth routes retain their behavior. The exact fixed HTTPS issuer-prefix /oauth2/revoke target is derived from the validated authorization URL; no request Host/Forwarded routing, redirects or caller-header forwarding. This public-client token-possession request accepts no Authorization, client_secret, client assertion or dashboard fallback; client_id is an exact configured allowlisted public identifier, not authentication. The issuer must register that client with public/none and owns token-client association. No local user/token lookup or grant/key/session writes. Body-only unique form fields, strict percent encoding, decoded ASCII limits and an8192-byte encoded body bound; no query including empty ForceQuery, duplicate encoded keys, unknown fields or ambiguous Content-Type. Empty/unknown valid hint is ignored, and only token/client_id is sent. Cookies are never authority or forwarded. One bounded context-aware HTTPS POST with GetBody=nil, no application retry or sent-body transport replay. Trusted issuer200 maps to fixed empty200, but does not prove actual invalidation: the pinned issuer can mask wrong-client and internal storage failures as200. Actual token-family cascade is issuer-defined, not exactly-one-token or subject-wide revocation. Only bounded parsed exact invalid_client from trusted400/401 maps to fixed401; network/TLS/timeout/redirect/non-success or unclassifiable explicit responses map to fixed503, without raw body/description/cause/headers. A503 leaves the outcome unknown; clients must assume the token remains usable. Successful-style200 is not actual Hydra/refresh/client acceptance. Before real activation verify public registration, ownership rejection, access/refresh invalidation and issuer storage-failure behavior. Existing status oauth.enabled and client_features.oauth remain false; no discovery, issuance, refresh lifecycle, UI or key grant is delivered. Use a separate unauthenticated generated-client configuration with TOKEN/Authorization unset.",
+        "description": "Startup-only revocation, off by default; status oauth.enabled and client_features.oauth remain false. Body-only unique token/client_id and optional ignored hint,8192-byte form bound, no Authorization or query including bare ?. No caller cookies/headers, client secret, redirect or retry. Fixed issuer target; one bounded HTTPS POST with GetBody=nil. Bridge-only issuer200 does not prove actual invalidation: Hydra may mask wrong-client and internal storage failures as200. Public mode therefore requires a fresh private introspection after issuer200 and exact active:false; still-active, malformed, unknown or failed verification returns503. Clients must assume the target remains usable after503; no automatic replay. Family cascade is issuer-defined, not all grants for a subject/client. No local derived-key/session revocation is delivered. Global selector errors use the nested relay envelope before this handler. Use an unauthenticated client configuration with TOKEN/Authorization unset.",
         "security": [],
         "x-pat-policy": "unsupported",
         "x-credential-kind": "public-client-token-possession",
@@ -20934,7 +20934,7 @@
         },
         "responses": {
           "200": {
-            "description": "Fixed empty success-style issuer response; not proof of token invalidation or client ownership.",
+            "description": "Empty200: public mode confirmed target inactive; bridge-only mode preserves issuer success-style response without that proof.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -20957,7 +20957,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OAuthRevocationInvalidRequest"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthRevocationInvalidRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                    }
+                  ]
                 }
               }
             }
@@ -21017,13 +21024,25 @@
             }
           },
           "429": {
-            "description": "Existing endpoint rate limiter; empty body.",
+            "description": "Rate limited with fixed JSON error and Retry-After.",
             "headers": {
               "Cache-Control": {
                 "schema": {
                   "type": "string"
                 },
                 "description": "private, no-store; set before local rejection and both API/critical limiters. No Location or Set-Cookie is emitted."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthResourceUnavailable"
+                }
               }
             }
           },
@@ -21046,7 +21065,22 @@
             }
           },
           "403": {
-            "$ref": "#/components/responses/OrganizationSelectionUnsupported"
+            "description": "Earlier global organization scope refusal.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                }
+              }
+            }
           }
         }
       }
@@ -21479,6 +21513,1886 @@
         "x-automatic-retry": false,
         "x-data-complete": false,
         "x-auth-source": "middleware/token_usage.go:TokenUsageCredentialBoundary + TokenAuthReadOnly + GetTokenUsageToken"
+      }
+    },
+    "/oauth2/auth": {
+      "get": {
+        "operationId": "authorizeOAuthPublicClient",
+        "summary": "Start or resume a public PKCE authorization",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. Single, nonempty known query fields only, raw query <=32768 bytes. Scopes are distinct single-space members of openid/profile/email/offline_access; profile is mandatory and offline_access requires openid. Redirect must match registration exactly except a numeric port on a registered 127.0.0.1 or [::1] loopback callback. HTTP loopback permits only those IP literals, not localhost or wildcard hosts; HTTPS callbacks match exact registration. One Hydra phase verifier at most. Authorization is ignored and never forwarded. Across all case-insensitive Cookie header keys/values, total size including join separators is bounded at16384 before parsing; only whitelisted __Host-newapi_oauth login/consent CSRF cookies cross the boundary. Redirects preserve registered callback query values, state and fixed iss; unregistered error descriptions/hints/debug are stripped. Callback code XOR allowed OAuth error is enforced. Browser navigation and cookie handling are required, not a JSON fetch API.",
+        "security": [],
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "400": {
+            "description": "Fixed local or allowlisted issuer protocol error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthPublicError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid public client.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Disabled or noncanonical reserved path; no SPA fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Unsupported method on the enabled canonical reserved path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited; no automatic retry of a submitted credential body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Limiter retry interval; no automatic credential replay."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable, invalid issuer response or unknown outcome; no body replay.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Earlier global positive organization selector refusal; relay envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                }
+              }
+            }
+          },
+          "302": {
+            "description": "Validated fixed-issuer phase or registered callback redirect, empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Validated phase/callback destination only."
+              },
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Optional whitelisted CSRF cookies only: Secure, HttpOnly, SameSite=Lax, Path=/, no Domain, MaxAge<=1800; no dashboard or Hydra session cookies."
+              }
+            }
+          },
+          "303": {
+            "description": "Validated fixed-issuer phase or registered callback redirect, empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Validated phase/callback destination only."
+              },
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Optional whitelisted CSRF cookies only: Secure, HttpOnly, SameSite=Lax, Path=/, no Domain, MaxAge<=1800; no dashboard or Hydra session cookies."
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "in": "query",
+            "name": "client_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          {
+            "in": "query",
+            "name": "response_type",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "code"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "redirect_uri",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+            }
+          },
+          {
+            "in": "query",
+            "name": "code_challenge",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 43,
+              "maxLength": 43,
+              "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048](?![\\s\\S])"
+            }
+          },
+          {
+            "in": "query",
+            "name": "code_challenge_method",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "S256"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "response_mode",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "query"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "prompt",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "consent"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "audience",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "nonce",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+            }
+          },
+          {
+            "in": "query",
+            "name": "login_verifier",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16384,
+              "pattern": "^(?:[A-Za-z0-9._~-]+|(?:[A-Za-z0-9._~-]{4})*(?:[A-Za-z0-9._~-]{2}==|[A-Za-z0-9._~-]{3}=))(?![\\s\\S])"
+            }
+          },
+          {
+            "in": "query",
+            "name": "consent_verifier",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16384,
+              "pattern": "^(?:[A-Za-z0-9._~-]+|(?:[A-Za-z0-9._~-]{4})*(?:[A-Za-z0-9._~-]{2}==|[A-Za-z0-9._~-]{3}=))(?![\\s\\S])"
+            }
+          }
+        ],
+        "x-query-max-bytes": 32768
+      }
+    },
+    "/oauth2/token": {
+      "post": {
+        "operationId": "exchangeOAuthPublicToken",
+        "summary": "Exchange a public authorization code or rotate refresh token",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. Exactly one application/x-www-form-urlencoded Content-Type, optional charset=utf-8. Encoded body <=16384 bytes; reject query including bare ?, Authorization, duplicate/unknown/empty fields, client secrets and assertions. scope input is always rejected: unsupported scopes use invalid_scope, known-only scope uses invalid_request. No cookie/dashboard fallback or forwarding. One bounded issuer request, no automatic replay. A profile-only grant issues access only; openid adds ID token, selected offline_access adds refresh. Responses are validated before publication; refresh replay family invalidation depends on the pinned configured issuer.",
+        "security": [],
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "400": {
+            "description": "Fixed local or allowlisted issuer protocol error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthPublicError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid public client.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Disabled or noncanonical reserved path; no SPA fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Unsupported method on the enabled canonical reserved path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited; no automatic retry of a submitted credential body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Limiter retry interval; no automatic credential replay."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable, invalid issuer response or unknown outcome; no body replay.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Earlier global positive organization selector refusal; relay envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Validated token projection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicTokenResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-request-max-bytes": 16384,
+        "x-query-policy": "forbidden-including-force-query",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthPublicTokenRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/.well-known/openid-configuration": {
+      "get": {
+        "operationId": "getOAuthOpenIDConfiguration",
+        "summary": "Read fixed public issuer metadata or verification keys",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
+        "security": [],
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "400": {
+            "description": "Fixed local or allowlisted issuer protocol error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthPublicError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid public client.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Disabled or noncanonical reserved path; no SPA fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Unsupported method on the enabled canonical reserved path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited; no automatic retry of a submitted credential body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Limiter retry interval; no automatic credential replay."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable, invalid issuer response or unknown outcome; no body replay.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Earlier global positive organization selector refusal; relay envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Closed fixed issuer projection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicMetadata"
+                }
+              }
+            }
+          }
+        },
+        "x-query-policy": "forbidden-including-force-query"
+      }
+    },
+    "/.well-known/oauth-authorization-server": {
+      "get": {
+        "operationId": "getOAuthAuthorizationServerMetadata",
+        "summary": "Read fixed public issuer metadata or verification keys",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
+        "security": [],
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "400": {
+            "description": "Fixed local or allowlisted issuer protocol error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthPublicError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid public client.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Disabled or noncanonical reserved path; no SPA fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Unsupported method on the enabled canonical reserved path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited; no automatic retry of a submitted credential body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Limiter retry interval; no automatic credential replay."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable, invalid issuer response or unknown outcome; no body replay.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Earlier global positive organization selector refusal; relay envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Closed fixed issuer projection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicMetadata"
+                }
+              }
+            }
+          }
+        },
+        "x-query-policy": "forbidden-including-force-query"
+      }
+    },
+    "/.well-known/jwks.json": {
+      "get": {
+        "operationId": "getOAuthPublicJWKS",
+        "summary": "Read fixed public issuer metadata or verification keys",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
+        "security": [],
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "400": {
+            "description": "Fixed local or allowlisted issuer protocol error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthPublicError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid public client.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Disabled or noncanonical reserved path; no SPA fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Unsupported method on the enabled canonical reserved path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited; no automatic retry of a submitted credential body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Limiter retry interval; no automatic credential replay."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable, invalid issuer response or unknown outcome; no body replay.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Earlier global positive organization selector refusal; relay envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Closed fixed issuer projection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicJWKS"
+                }
+              }
+            }
+          }
+        },
+        "x-query-policy": "forbidden-including-force-query"
+      }
+    },
+    "/oauth2/error": {
+      "get": {
+        "operationId": "getOAuthPublicError",
+        "summary": "Return a safe local OAuth error",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. Local terminus; query ignored and never reflected or forwarded. No successful response or redirect.",
+        "security": [],
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "400": {
+            "description": "Enabled local error terminus or earlier selector failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "error"
+                      ],
+                      "properties": {
+                        "error": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_request"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid public client.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Disabled or noncanonical reserved path; no SPA fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Unsupported method on the enabled canonical reserved path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited; no automatic retry of a submitted credential body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Limiter retry interval; no automatic credential replay."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable, invalid issuer response or unknown outcome; no body replay.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              },
+              "Pragma": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-cache"
+                  ]
+                }
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthPublicError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Earlier global positive organization selector refusal; relay envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store. Earlier global selector failures only guarantee this header."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthOrganizationSelectionError"
+                }
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -29315,6 +31229,11 @@
           "email": {
             "type": "string",
             "description": "Present only when the current access token grants the exact email scope."
+          },
+          "sub": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*(?![\\s\\S])",
+            "description": "Canonical local user id, present only for the public issuer grant mode; omitted by legacy bridge-only mode."
           }
         }
       },
@@ -29373,8 +31292,8 @@
           "challenge": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 2048,
-            "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+            "maxLength": 16384,
+            "pattern": "^(?:[A-Za-z0-9._~-]+|(?:[A-Za-z0-9._~-]{4})*(?:[A-Za-z0-9._~-]{2}==|[A-Za-z0-9._~-]{3}=))(?![\\s\\S])"
           }
         }
       },
@@ -29390,8 +31309,8 @@
           "challenge": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 2048,
-            "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+            "maxLength": 16384,
+            "pattern": "^(?:[A-Za-z0-9._~-]+|(?:[A-Za-z0-9._~-]{4})*(?:[A-Za-z0-9._~-]{2}==|[A-Za-z0-9._~-]{3}=))(?![\\s\\S])"
           },
           "preview_token": {
             "type": "string",
@@ -29421,8 +31340,8 @@
           "challenge": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 2048,
-            "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+            "maxLength": 16384,
+            "pattern": "^(?:[A-Za-z0-9._~-]+|(?:[A-Za-z0-9._~-]{4})*(?:[A-Za-z0-9._~-]{2}==|[A-Za-z0-9._~-]{3}=))(?![\\s\\S])"
           },
           "preview_token": {
             "type": "string",
@@ -29439,13 +31358,15 @@
           },
           "selected_scopes": {
             "type": "array",
-            "maxItems": 2,
+            "maxItems": 4,
             "uniqueItems": true,
             "items": {
               "type": "string",
               "enum": [
+                "openid",
                 "profile",
-                "email"
+                "email",
+                "offline_access"
               ]
             }
           }
@@ -29461,10 +31382,11 @@
               "selected_scopes": {
                 "minItems": 1,
                 "not": {
-                  "maxItems": 1,
                   "items": {
                     "enum": [
-                      "email"
+                      "openid",
+                      "email",
+                      "offline_access"
                     ]
                   }
                 }
@@ -29537,13 +31459,15 @@
           },
           "allowed_scopes": {
             "type": "array",
-            "maxItems": 2,
+            "maxItems": 4,
             "uniqueItems": true,
             "items": {
               "type": "string",
               "enum": [
+                "openid",
                 "profile",
-                "email"
+                "email",
+                "offline_access"
               ]
             },
             "minItems": 1
@@ -30303,6 +32227,432 @@
               "days": {
                 "type": "integer"
               }
+            }
+          }
+        }
+      },
+      "OAuthOrganizationSelectionError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "message",
+              "type",
+              "param",
+              "code"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "invalid_request_error"
+                ]
+              },
+              "param": {
+                "type": "string",
+                "enum": [
+                  "org_id"
+                ]
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "organization_selector_invalid",
+                  "organization_selector_conflict",
+                  "organization_scope_unsupported"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "OAuthPublicError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "invalid_request",
+              "invalid_scope",
+              "invalid_client",
+              "invalid_grant",
+              "unsupported_grant_type",
+              "unauthorized_client",
+              "access_denied",
+              "temporarily_unavailable",
+              "not_found"
+            ]
+          }
+        }
+      },
+      "OAuthPublicTokenRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "grant_type",
+          "client_id"
+        ],
+        "properties": {
+          "grant_type": {
+            "type": "string",
+            "enum": [
+              "authorization_code",
+              "refresh_token"
+            ]
+          },
+          "client_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[!-~]+(?![\\s\\S])"
+          },
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[!-~]+(?![\\s\\S])"
+          },
+          "redirect_uri": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[!-~]+(?![\\s\\S])"
+          },
+          "code_verifier": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._~-]+(?![\\s\\S])"
+          },
+          "refresh_token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[!-~]+(?![\\s\\S])"
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "code",
+              "redirect_uri",
+              "code_verifier"
+            ],
+            "properties": {
+              "grant_type": {
+                "enum": [
+                  "authorization_code"
+                ]
+              }
+            },
+            "not": {
+              "required": [
+                "refresh_token"
+              ]
+            }
+          },
+          {
+            "required": [
+              "refresh_token"
+            ],
+            "properties": {
+              "grant_type": {
+                "enum": [
+                  "refresh_token"
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "code"
+                  ]
+                },
+                {
+                  "required": [
+                    "redirect_uri"
+                  ]
+                },
+                {
+                  "required": [
+                    "code_verifier"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "OAuthPublicTokenResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "access_token",
+          "token_type",
+          "expires_in",
+          "scope"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "token_type": {
+            "type": "string",
+            "enum": [
+              "bearer"
+            ]
+          },
+          "expires_in": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 900
+          },
+          "scope": {
+            "type": "string",
+            "minLength": 1
+          },
+          "refresh_token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "id_token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16384
+          }
+        },
+        "description": "Closed validated projection. scope contains profile and only the four supported scopes. refresh_token is present iff offline_access was actually granted (which requires openid). id_token appears only for openid; required after authorization_code+openid, optional after refresh+openid. expires_in is bounded by remaining access expiry and the original seven-day absolute grant cap. No session, grant id or AuthVersion is exposed. These response/request-dependent conditions are enforced by the server; a response schema alone cannot prove them."
+      },
+      "OAuthPublicMetadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "issuer",
+          "authorization_endpoint",
+          "token_endpoint",
+          "revocation_endpoint",
+          "jwks_uri",
+          "userinfo_endpoint",
+          "scopes_supported",
+          "response_types_supported",
+          "response_modes_supported",
+          "grant_types_supported",
+          "token_endpoint_auth_methods_supported",
+          "subject_types_supported",
+          "id_token_signing_alg_values_supported",
+          "code_challenge_methods_supported",
+          "authorization_response_iss_parameter_supported"
+        ],
+        "properties": {
+          "issuer": {
+            "type": "string",
+            "format": "uri"
+          },
+          "authorization_endpoint": {
+            "type": "string",
+            "format": "uri"
+          },
+          "token_endpoint": {
+            "type": "string",
+            "format": "uri"
+          },
+          "revocation_endpoint": {
+            "type": "string",
+            "format": "uri"
+          },
+          "jwks_uri": {
+            "type": "string",
+            "format": "uri"
+          },
+          "userinfo_endpoint": {
+            "type": "string",
+            "format": "uri"
+          },
+          "scopes_supported": {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "openid",
+                "profile",
+                "email",
+                "offline_access"
+              ]
+            }
+          },
+          "response_types_supported": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "code"
+              ]
+            }
+          },
+          "response_modes_supported": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "query"
+              ]
+            }
+          },
+          "grant_types_supported": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "authorization_code",
+                "refresh_token"
+              ]
+            }
+          },
+          "token_endpoint_auth_methods_supported": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          },
+          "subject_types_supported": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "public"
+              ]
+            }
+          },
+          "id_token_signing_alg_values_supported": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "RS256"
+              ]
+            }
+          },
+          "code_challenge_methods_supported": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "S256"
+              ]
+            }
+          },
+          "authorization_response_iss_parameter_supported": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        }
+      },
+      "OAuthPublicJWK": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kty",
+          "kid",
+          "use",
+          "alg",
+          "n",
+          "e"
+        ],
+        "properties": {
+          "kty": {
+            "type": "string",
+            "minLength": 1,
+            "enum": [
+              "RSA"
+            ]
+          },
+          "kid": {
+            "type": "string",
+            "minLength": 1
+          },
+          "use": {
+            "type": "string",
+            "minLength": 1,
+            "enum": [
+              "sig"
+            ]
+          },
+          "alg": {
+            "type": "string",
+            "minLength": 1,
+            "enum": [
+              "RS256"
+            ]
+          },
+          "n": {
+            "type": "string",
+            "minLength": 1
+          },
+          "e": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "OAuthPublicJWKS": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+              "$ref": "#/components/schemas/OAuthPublicJWK"
             }
           }
         }

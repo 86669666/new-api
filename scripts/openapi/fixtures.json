@@ -13718,5 +13718,268 @@
       "remaining_display": "$1"
     },
     "valid": false
+  },
+  {
+    "name": "public authorization code form",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenRequest",
+    "value": {
+      "grant_type": "authorization_code",
+      "client_id": "desktop-public",
+      "code": "fixture-code",
+      "redirect_uri": "cherrystudio://oauth/callback",
+      "code_verifier": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "valid": true
+  },
+  {
+    "name": "public refresh form",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenRequest",
+    "value": {
+      "grant_type": "refresh_token",
+      "client_id": "desktop-public",
+      "refresh_token": "fixture-refresh"
+    },
+    "valid": true
+  },
+  {
+    "name": "public code form missing verifier",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenRequest",
+    "value": {
+      "grant_type": "authorization_code",
+      "client_id": "desktop-public",
+      "code": "fixture-code",
+      "redirect_uri": "cherrystudio://oauth/callback"
+    },
+    "valid": false
+  },
+  {
+    "name": "public form rejects scope input",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenRequest",
+    "value": {
+      "grant_type": "refresh_token",
+      "client_id": "desktop-public",
+      "refresh_token": "fixture-refresh",
+      "scope": "profile"
+    },
+    "valid": false
+  },
+  {
+    "name": "public form rejects secret",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenRequest",
+    "value": {
+      "grant_type": "authorization_code",
+      "client_id": "desktop-public",
+      "code": "fixture-code",
+      "redirect_uri": "cherrystudio://oauth/callback",
+      "code_verifier": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "client_secret": "never"
+    },
+    "valid": false
+  },
+  {
+    "name": "public form mixed grants",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenRequest",
+    "value": {
+      "grant_type": "authorization_code",
+      "client_id": "desktop-public",
+      "code": "fixture-code",
+      "redirect_uri": "cherrystudio://oauth/callback",
+      "code_verifier": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "refresh_token": "fixture-refresh"
+    },
+    "valid": false
+  },
+  {
+    "name": "public form nonascii client",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenRequest",
+    "value": {
+      "grant_type": "refresh_token",
+      "client_id": "中文",
+      "refresh_token": "fixture-refresh"
+    },
+    "valid": false
+  },
+  {
+    "name": "public access response",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenResponse",
+    "value": {
+      "access_token": "fixture-access",
+      "token_type": "bearer",
+      "expires_in": 900,
+      "scope": "profile"
+    },
+    "valid": true
+  },
+  {
+    "name": "public OIDC offline response",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenResponse",
+    "value": {
+      "access_token": "fixture-access",
+      "token_type": "bearer",
+      "expires_in": 900,
+      "scope": "openid profile offline_access",
+      "id_token": "fixture-id",
+      "refresh_token": "fixture-refresh"
+    },
+    "valid": true
+  },
+  {
+    "name": "public response private binding",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenResponse",
+    "value": {
+      "access_token": "fixture-access",
+      "token_type": "bearer",
+      "expires_in": 900,
+      "scope": "profile",
+      "auth_version": 1
+    },
+    "valid": false
+  },
+  {
+    "name": "public response excessive expiry",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenResponse",
+    "value": {
+      "access_token": "fixture-access",
+      "token_type": "bearer",
+      "expires_in": 901,
+      "scope": "profile"
+    },
+    "valid": false
+  },
+  {
+    "name": "public response null ID",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicTokenResponse",
+    "value": {
+      "access_token": "fixture-access",
+      "token_type": "bearer",
+      "expires_in": 900,
+      "scope": "profile",
+      "id_token": null
+    },
+    "valid": false
+  },
+  {
+    "name": "public userinfo sub",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": 1,
+      "username": "fixture",
+      "display_name": "Display",
+      "group": "default",
+      "sub": "1"
+    },
+    "valid": true
+  },
+  {
+    "name": "public userinfo null sub",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUserInfo",
+    "value": {
+      "id": 1,
+      "username": "fixture",
+      "display_name": "Display",
+      "group": "default",
+      "sub": null
+    },
+    "valid": false
+  },
+  {
+    "name": "public consent four scopes padded challenge",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "abc=",
+      "preview_token": "ppppppppppppppppppppppppppppppppppppppppppp",
+      "decision": "approve",
+      "selected_scopes": [
+        "openid",
+        "profile",
+        "email",
+        "offline_access"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "public consent missing profile",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "abc=",
+      "preview_token": "ppppppppppppppppppppppppppppppppppppppppppp",
+      "decision": "approve",
+      "selected_scopes": [
+        "openid",
+        "email"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "public challenge bad padding",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "abc==",
+      "preview_token": "ppppppppppppppppppppppppppppppppppppppppppp",
+      "decision": "approve",
+      "selected_scopes": [
+        "openid",
+        "profile",
+        "email",
+        "offline_access"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "public JWKS closed key",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicJWKS",
+    "value": {
+      "keys": [
+        {
+          "kty": "RSA",
+          "kid": "fixture",
+          "use": "sig",
+          "alg": "RS256",
+          "n": "fixture-n",
+          "e": "AQAB"
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "public JWKS no private key",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthPublicJWKS",
+    "value": {
+      "keys": [
+        {
+          "kty": "RSA",
+          "kid": "fixture",
+          "use": "sig",
+          "alg": "RS256",
+          "n": "fixture-n",
+          "e": "AQAB",
+          "d": "private"
+        }
+      ]
+    },
+    "valid": false
   }
 ]
