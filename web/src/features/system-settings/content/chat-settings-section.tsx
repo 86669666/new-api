@@ -23,6 +23,7 @@ import { useTranslation } from 'react-i18next'
 import * as z from 'zod'
 
 import { JsonCodeEditor } from '@/components/json-code-editor'
+import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
@@ -33,7 +34,11 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { CHERRY_V2_TEMPLATE } from '@/features/chat/lib/chat-links'
+import {
+  BOXO_V2_TEMPLATE,
+  CHERRY_V2_TEMPLATE,
+  withBoxoV2Preset,
+} from '@/features/chat/lib/chat-links'
 
 import { SettingsForm } from '../components/settings-form-layout'
 import { SettingsPageFormActions } from '../components/settings-page-context'
@@ -136,6 +141,38 @@ export function ChatSettingsSection({
         )}{' '}
         <code className='break-all'>{CHERRY_V2_TEMPLATE}</code>
       </p>
+      <div className='flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between'>
+        <p className='text-muted-foreground text-sm'>
+          {t(
+            'To enable Boxo v2, add a preset using this exact template, then save. Other schemes that contain the v2 placeholder stay rejected.'
+          )}{' '}
+          <code className='break-all'>{BOXO_V2_TEMPLATE}</code>
+        </p>
+        <Button
+          type='button'
+          variant='outline'
+          className='shrink-0'
+          onClick={() => {
+            try {
+              form.setValue(
+                'Chats',
+                withBoxoV2Preset(form.getValues('Chats')),
+                {
+                  shouldDirty: true,
+                  shouldValidate: true,
+                }
+              )
+            } catch {
+              form.setError('Chats', {
+                type: 'manual',
+                message: t('Invalid JSON string.'),
+              })
+            }
+          }}
+        >
+          {t('Add Boxo preset')}
+        </Button>
+      </div>
       <Form {...form}>
         {/* eslint-disable-next-line react-hooks/refs */}
         <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>

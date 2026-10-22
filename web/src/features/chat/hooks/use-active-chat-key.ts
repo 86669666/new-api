@@ -37,6 +37,8 @@ import { statusQueryOptions } from '@/lib/status-query'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
+  BOXO_V2_ERROR,
+  BOXO_V2_TEMPLATE,
   buildCherryV2Url,
   CHERRY_V2_ERROR,
   validateCherryV2Site,
@@ -236,11 +238,19 @@ export async function prepareCherryV2Import(
     ) {
       throw new Error(CHERRY_V2_ERROR)
     }
-    return buildCherryV2Url(site, revealed.key, group, window.location.origin)
+    return buildCherryV2Url(
+      site,
+      revealed.key,
+      group,
+      window.location.origin,
+      template
+    )
   } catch (error) {
     if (error instanceof CherryImportCancelled) throw error
     // Do not propagate a raw server response, Axios config, key or cause.
-    throw new Error(CHERRY_V2_ERROR)
+    throw new Error(
+      template === BOXO_V2_TEMPLATE ? BOXO_V2_ERROR : CHERRY_V2_ERROR
+    )
   }
 }
 
@@ -296,10 +306,16 @@ export function useCherryStudioV2Import(selection: string): {
         window.open(result.url, '_blank', 'noopener,noreferrer')
       } catch (error) {
         if (isCurrent() && !(error instanceof CherryImportCancelled)) {
+          const boxoFailed =
+            error instanceof Error && error.message === BOXO_V2_ERROR
           toast.error(
-            translate(
-              'Unable to prepare Cherry Studio v2 import. Check the site configuration and selected API key.'
-            )
+            boxoFailed
+              ? translate(
+                  'Unable to prepare Boxo v2 import. Check the site configuration and selected API key.'
+                )
+              : translate(
+                  'Unable to prepare Cherry Studio v2 import. Check the site configuration and selected API key.'
+                )
           )
         }
       } finally {

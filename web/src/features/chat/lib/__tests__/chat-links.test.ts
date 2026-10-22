@@ -27,12 +27,15 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import { prepareCherryV2Import } from '../../hooks/use-active-chat-key'
 import {
+  BOXO_V2_ERROR,
+  BOXO_V2_TEMPLATE,
   CHERRY_V2_TEMPLATE,
   CHERRY_V2_ERROR,
   buildCherryV2Url,
   detectChatLinkType,
   parseChatConfig,
   resolveChatUrl,
+  withBoxoV2Preset,
 } from '../chat-links'
 
 const site = {
@@ -70,6 +73,99 @@ describe('Cherry Studio explicit v2 contract', () => {
       'cherrystudio://providers/api-keys'
     )
     expect(url.searchParams.get('v')).toBe('2')
+  })
+
+  it('encodes the same v2 payload for the exact Boxo template and no other scheme', () => {
+    const result = buildCherryV2Url(
+      site,
+      'selected-synthetic-key',
+      '分组',
+      'http://localhost',
+      BOXO_V2_TEMPLATE
+    )
+    const url = new URL(result.url)
+    expect(`${url.protocol}//${url.host}${url.pathname}`).toBe(
+      'boxo://providers/api-keys'
+    )
+    expect(url.searchParams.get('v')).toBe('2')
+    const encoded = url.searchParams.get('data') ?? ''
+    expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/)
+    expect(encoded.endsWith('=')).toBe(false)
+    expect(
+      JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'))
+    ).toEqual({
+      v: 2,
+      site_id: site.instance_id,
+      type: 'new-api',
+      name: site.system_name,
+      baseUrl: 'https://gateway.example/prefix',
+      apiKey: 'sk-selected-synthetic-key',
+      group: '分组',
+      recommended_models: [],
+      default_model: '',
+    })
+    expect(() =>
+      buildCherryV2Url(
+        site,
+        'selected-synthetic-key',
+        '分组',
+        'http://localhost',
+        'boxo://providers/api-keys?v=2&data={cherryConfigV2}&extra=1'
+      )
+    ).toThrow(CHERRY_V2_ERROR)
+    expect(
+      resolveChatUrl({
+        template: 'boxo://providers/api-keys?v=2&data={cherryConfigV2}',
+        apiKey: 'never-send',
+        serverAddress: 'https://site.example',
+      })
+    ).toBe('')
+  })
+
+  it('adds the Boxo preset once and leaves an existing exact template unchanged', () => {
+    const added = withBoxoV2Preset(
+      JSON.stringify([
+        {
+          'Cherry Studio':
+            'cherrystudio://providers/api-keys?v=1&data={cherryConfig}',
+        },
+      ])
+    )
+    expect(JSON.parse(added)).toEqual([
+      {
+        'Cherry Studio':
+          'cherrystudio://providers/api-keys?v=1&data={cherryConfig}',
+      },
+      { Boxo: BOXO_V2_TEMPLATE },
+    ])
+    expect(withBoxoV2Preset(added)).toBe(added)
+    const renamed = withBoxoV2Preset(
+      JSON.stringify([{ Boxo: 'boxo://custom?key={key}' }])
+    )
+    expect(JSON.parse(renamed)).toEqual([
+      { Boxo: 'boxo://custom?key={key}' },
+      { 'Boxo 2': BOXO_V2_TEMPLATE },
+    ])
+    expect(() => withBoxoV2Preset('{"not":"an array"}')).toThrow(BOXO_V2_ERROR)
+    expect(() =>
+      withBoxoV2Preset(
+        JSON.stringify([
+          { Evil: 'evil://providers/api-keys?v=2&data={cherryConfigV2}' },
+        ])
+      )
+    ).not.toThrow()
+    expect(
+      JSON.parse(
+        withBoxoV2Preset(
+          JSON.stringify([
+            { Evil: 'evil://providers/api-keys?v=2&data={cherryConfigV2}' },
+          ])
+        )
+      )
+    ).toEqual([
+      { Evil: 'evil://providers/api-keys?v=2&data={cherryConfigV2}' },
+      { Boxo: BOXO_V2_TEMPLATE },
+    ])
   })
 
   it('keeps all v2 attempts non-web without filtering or reindexing presets', () => {
@@ -216,9 +312,43 @@ it.each(['named', '', 'auto'])(
   }
 )
 
+it('prepares a Boxo v2 link for the selected token only', async () => {
+  const { client, post } = importFixture('named')
+  const result = await prepareCherryV2Import(client, BOXO_V2_TEMPLATE, 7)
+  const url = new URL(result.url)
+  expect(`${url.protocol}//${url.host}${url.pathname}`).toBe(
+    'boxo://providers/api-keys'
+  )
+  const payload = JSON.parse(
+    Buffer.from(url.searchParams.get('data') ?? '', 'base64url').toString(
+      'utf8'
+    )
+  )
+  expect(payload.apiKey).toBe('sk-selected-synthetic-key')
+  expect(payload).not.toHaveProperty('keys')
+  expect(Object.keys(payload).sort()).toEqual([
+    'apiKey',
+    'baseUrl',
+    'default_model',
+    'group',
+    'name',
+    'recommended_models',
+    'site_id',
+    'type',
+    'v',
+  ])
+  expect(post).toHaveBeenCalledExactlyOnceWith(
+    '/api/token/7/key',
+    undefined,
+    expect.objectContaining({ skipErrorHandler: true, skipAuthRefresh: true })
+  )
+})
+
 it.each([
   'https://attacker.example/?data={cherryConfigV2}&key={key}',
   'other://providers/api-keys?v=2&data={cherryConfigV2}',
+  'boxo://providers/api-keys?v=2&data={cherryConfigV2}&next=1',
+  'boxo://evil/api-keys?v=2&data={cherryConfigV2}',
   `${CHERRY_V2_TEMPLATE}&redirect=https://attacker.example`,
   `${CHERRY_V2_TEMPLATE}#fragment`,
   'cherrystudio://attacker/api-keys?v=2&data={cherryConfigV2}',
