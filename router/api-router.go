@@ -42,7 +42,7 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content", middleware.UserAuth(), controller.OrganizationTaskReadHandler("content"))
 		apiRouter.HEAD("/organizations/:org_id/tasks/:task_row_id/artifacts/:artifact_key/content", middleware.UserAuth(), controller.OrganizationTaskReadHandler("content"))
 
-		apiRouter.POST("/organizations", middleware.UserAuth(), controller.OrganizationLifecycleHandler("create"))
+		apiRouter.POST("/organizations", middleware.UserAuth(), middleware.UserCriticalRateLimit("organization-create"), controller.OrganizationLifecycleHandler("create"))
 		apiRouter.PATCH("/organizations/:org_id/name", middleware.UserAuth(), controller.OrganizationLifecycleHandler("rename"))
 		apiRouter.POST("/organizations/:org_id/self-state", middleware.UserAuth(), controller.OrganizationLifecycleHandler("self_disable"))
 		apiRouter.POST("/platform/organizations/:org_id/state", middleware.UserAuth(), controller.OrganizationLifecycleHandler("platform_disable"))

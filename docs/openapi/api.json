@@ -14070,7 +14070,7 @@
         "x-automatic-retry": false,
         "x-organization-body-limit-bytes": 16384,
         "x-organization-selection": "none_or_zero",
-        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: valid session. Proof policy: forbidden. Owner-scoped name uniqueness uses trimmed Unicode simple case folding in Go, independent of database collation; it does not normalize Unicode, remove accents or width, or apply full case folding. A different non-dissolved organization of the owner reserves its name even while disabled. Conflicts return fixed 409 ORG_NAME_TAKEN without data or conflicting organization details. Dissolution releases the name on commit. Existing duplicate rows are preserved. Exact self-name rename retains ORG_STATE_CHANGED; a case-only rename is allowed only when no other row conflicts. Ownership transfer acceptance checks the destination owner namespace in both preview and final execution. The existing owner User mutex serializes formal API writes; no direct-SQL uniqueness constraint is added.",
+        "description": "Requires a current dashboard Bearer JWT session for organization operations; PATs (including root/wildcard/legacy), relay keys and cookies cannot authenticate this branch. Current database authorization is rechecked. IDs/revisions/generations are canonical decimal strings, never JSON numbers, bounded by signed int64. Only listed queries are allowed once. Use at most one optional X-Organization-Id header OR org_id query, never both; on path routes it must match the path, on pathless routes it must be absent or zero. Duplicate headers/JSON keys at every depth, invalid UTF-8, unknown typed fields, trailing JSON, null required fields, Idempotency-Key and method overrides are rejected. JSON writes require application/json. Names are trimmed to 1..64 Unicode characters without controls; reasons preserve exact text up to 128 characters without controls and must be empty when disabled=false. Explicit false is required and preserved. Same-origin writes use a configured exact Origin allowlist; secure-cookie settings do not disable it; untrusted forwarding headers do not establish origin. Native Bearer JSON without browser Origin metadata is permitted. Request timeout 30s; transaction timeout 10s. No automatic retry. A response-lost create cannot be safely deduplicated. Revision/generation CAS is not response caching. A repeated old request can return 409 before inspecting a consumed proof. Sensitive commands require X-Security-Proof from the matching canonical preview and factor ceremony, under the newly returned SID/JWT. Actual proof consumption commits separately before the business transaction and is never restored after business failure. Proof expiration is checked after locks with no leeway; old SID/session rotation, scope, method, command and snapshot must match. No proof may be supplied to reads, preview or nonsensitive commands. Permission: valid session. Proof policy: forbidden. Owner-scoped name uniqueness uses trimmed Unicode simple case folding in Go, independent of database collation; it does not normalize Unicode, remove accents or width, or apply full case folding. A different non-dissolved organization of the owner reserves its name even while disabled. Conflicts return fixed 409 ORG_NAME_TAKEN without data or conflicting organization details. Dissolution releases the name on commit. Existing duplicate rows are preserved. Exact self-name rename retains ORG_STATE_CHANGED; a case-only rename is allowed only when no other row conflicts. Ownership transfer acceptance checks the destination owner namespace in both preview and final execution. The existing owner User mutex serializes formal API writes; no direct-SQL uniqueness constraint is added. Organization creation also uses the existing CRITICAL_RATE_LIMIT settings after UserAuth, keyed by user ID and organization-create scope. The default is 20 attempts per 1200 seconds; CRITICAL_RATE_LIMIT_ENABLE=false disables only this layer. Authenticated attempts rejected by later validation can consume the bucket. Changing session or client IP does not obtain a new user bucket. Memory mode is process-local; Redis shares a fixed window. This is not a total organization cap or idempotency mechanism. Valid positive rate settings are assumed; existing invalid-setting behavior is unchanged. Rate-limit rejection has an empty HTTP 429 body and Retry-After seconds. A Redis limiter error has an empty HTTP 500 body and creates no organization, owner membership or event; lifecycle failures can still return their documented JSON errors.",
         "parameters": [
           {
             "name": "X-Organization-Id",
@@ -14148,10 +14148,40 @@
             "$ref": "#/components/responses/OrganizationLifecycleError415"
           },
           "429": {
-            "$ref": "#/components/responses/OrganizationLifecycleError429"
+            "description": "Empty rate-limit rejection. No JSON error envelope. No organization, owner membership or event is created.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Organization lifecycle/organization-scope responses, including errors, are private, no-store. Existing personal flows retain their own headers."
+              },
+              "Retry-After": {
+                "description": "Positive wait in seconds for valid positive rate settings; callers must not assume creation succeeded.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
           },
           "500": {
-            "$ref": "#/components/responses/OrganizationLifecycleError500"
+            "description": "AUTH_INTERNAL_ERROR; ORG_INTERNAL_ERROR The user-scoped Redis limiter can also return HTTP 500 with an empty body before the lifecycle handler; no create side effect occurs.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Organization lifecycle/organization-scope responses, including errors, are private, no-store. Existing personal flows retain their own headers."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationLifecycleError500"
+                }
+              }
+            }
           }
         },
         "requestBody": {
@@ -14163,6 +14193,24 @@
               }
             }
           }
+        },
+        "x-organization-create-rate-limit": {
+          "key": "authenticated user ID + organization-create scope",
+          "configuration": [
+            "CRITICAL_RATE_LIMIT_ENABLE",
+            "CRITICAL_RATE_LIMIT",
+            "CRITICAL_RATE_LIMIT_DURATION"
+          ],
+          "defaults": {
+            "enabled": true,
+            "requests": 20,
+            "window_seconds": 1200
+          },
+          "scope": "attempts after UserAuth; independent of session, client IP and other user-critical scopes",
+          "memory": "process-local sliding window",
+          "redis": "shared fixed window; limiter error fails closed with HTTP 500 and empty body",
+          "quantity_cap": false,
+          "idempotency": false
         }
       }
     },

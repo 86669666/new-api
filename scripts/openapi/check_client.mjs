@@ -661,6 +661,7 @@ for (let index = 0; index < invocationMap.length; index++) {
   for (const status of fixture.errors) {
     responseStatus = status;
     responseBody = { success: false, message: 'Fixture rejection', code: apiDocument.components.schemas['OrganizationLifecycleError' + status].properties.code.enum[0] };
+    if (fixture.contract_id === 'W01' && status === 429) responseBody = undefined;
     const beforeError = calls.length;
     await assert.rejects(invoke(operation.arguments), error => {
       assert.equal(error.status, status);
@@ -670,7 +671,6 @@ for (let index = 0; index < invocationMap.length; index++) {
     assert.equal(calls.length, beforeError + 1, 'No retry of error responses');
   }
 }
-const lifecycleStubbedRequests = calls.length - beforeLifecycleRequests;
 // A rejected transport on create must not be retried: the server may have committed.
 const savedFetch = globalThis.fetch;
 let networkAttempts = 0;
@@ -679,6 +679,17 @@ const create = invocationMap.find(operation => operation.contract_id === 'W01');
 await assert.rejects(api[create.service][create.method](create.arguments), /Fixture ambiguous network failure/);
 assert.equal(networkAttempts, 1);
 globalThis.fetch = savedFetch;
+// The create limiter may fail closed before the JSON lifecycle handler.
+responseStatus = 500;
+responseBody = undefined;
+const beforeCreateLimiterFailure = calls.length;
+await assert.rejects(api[create.service][create.method](create.arguments), error => {
+  assert.equal(error.status, 500);
+  assert.equal(error.body, undefined);
+  return true;
+});
+assert.equal(calls.length, beforeCreateLimiterFailure + 1, 'No retry after an empty limiter failure');
+const lifecycleStubbedRequests = calls.length - beforeLifecycleRequests;
 await writeFile(path.join(output, 'lifecycle-client-results.json'), JSON.stringify({ operations: invocationMap.length, typed_positive_calls: invocationMap.length + 2, typed_negative_calls: lifecycleTypeNegatives, stubbed_requests: lifecycleStubbedRequests, network_failure_attempts: networkAttempts, live_http: false, server_authorization_verified: false }, null, 2) + '\n');
 const imageClient = await readFile(path.join(output, 'generated/relay/services/ImagesService.ts'), 'utf8');
 

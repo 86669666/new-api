@@ -700,6 +700,24 @@ def check_token_usage_series(api):
             'legacy_management_errors_preserved': True, 'live_http': False}
 
 
+def check_organization_create_rate(api):
+    operation = api['paths']['/api/organizations']['post']
+    rate = operation['x-organization-create-rate-limit']
+    assert rate['configuration'] == ['CRITICAL_RATE_LIMIT_ENABLE', 'CRITICAL_RATE_LIMIT', 'CRITICAL_RATE_LIMIT_DURATION']
+    assert rate['defaults'] == {'enabled': True, 'requests': 20, 'window_seconds': 1200}
+    assert rate['quantity_cap'] is False and rate['idempotency'] is False
+    limited = operation['responses']['429']
+    assert 'content' not in limited and '$ref' not in limited
+    assert limited['headers']['Retry-After']['schema'] == {'type': 'integer', 'minimum': 1}
+    assert limited['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
+    assert 'empty body' in operation['responses']['500']['description']
+    assert operation['responses']['500']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OrganizationLifecycleError500'}
+    assert 'Idempotency-Key' in operation['x-forbidden-request-headers']
+    assert operation['x-automatic-retry'] is False
+    return {'route': 'POST /api/organizations', 'empty_429': True, 'empty_limiter_500': True,
+            'quantity_cap': False, 'idempotency': False, 'live_http': False}
+
+
 def check_organization_lifecycle(api, relay, fixtures, design_gate):
     check_organization_wallet(api, relay)
     contract = api['x-organization-lifecycle-contract']
@@ -1305,6 +1323,7 @@ def main():
 
     fixtures = json.loads((Path(__file__).with_name('fixtures.json')).read_text())
     results['token_usage'] = check_token_usage(api)
+    results['organization_create_rate'] = check_organization_create_rate(api)
     results['token_usage_series'] = check_token_usage_series(api)
     results['token_pricing'] = check_token_pricing(api)
     results['client_events'] = check_client_events(api, source_root)
