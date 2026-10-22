@@ -13635,5 +13635,88 @@
       }
     },
     "valid": true
+  },
+  {
+    "name": "wallet display omitted",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayError",
+    "value": {
+      "message": "Insufficient user quota",
+      "type": "new_api_error",
+      "code": "insufficient_user_quota"
+    },
+    "valid": true
+  },
+  {
+    "name": "wallet display present",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayError",
+    "value": {
+      "message": "Insufficient user quota",
+      "type": "new_api_error",
+      "code": "insufficient_user_quota",
+      "remaining_display": "$0.0001"
+    },
+    "valid": true
+  },
+  {
+    "name": "wallet display null",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayError",
+    "value": {
+      "message": "Insufficient user quota",
+      "type": "new_api_error",
+      "code": "insufficient_user_quota",
+      "remaining_display": null
+    },
+    "valid": false
+  },
+  {
+    "name": "wallet display empty",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayError",
+    "value": {
+      "message": "Insufficient user quota",
+      "type": "new_api_error",
+      "code": "insufficient_user_quota",
+      "remaining_display": ""
+    },
+    "valid": false
+  },
+  {
+    "name": "wallet display numeric",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayError",
+    "value": {
+      "message": "Insufficient user quota",
+      "type": "new_api_error",
+      "code": "insufficient_user_quota",
+      "remaining_display": 1
+    },
+    "valid": false
+  },
+  {
+    "name": "wallet display wrong code",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayError",
+    "value": {
+      "message": "Insufficient user quota",
+      "type": "new_api_error",
+      "code": "pre_consume_token_quota_failed",
+      "remaining_display": "$1"
+    },
+    "valid": false
+  },
+  {
+    "name": "wallet display wrong type",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayError",
+    "value": {
+      "message": "Insufficient user quota",
+      "type": "upstream_error",
+      "code": "insufficient_user_quota",
+      "remaining_display": "$1"
+    },
+    "valid": false
   }
 ]

@@ -293,11 +293,12 @@ def check_conditional_authorization(source_root):
 def check_no_available_channel_detail(relay):
     schema = relay['components']['schemas']['RelayError']
     assert schema['type'] == 'object' and schema['required'] == ['message', 'type']
-    assert set(schema['properties']) == {'message', 'type', 'param', 'code', 'code_detail', 'group', 'model'}
+    assert set(schema['properties']) == {'message', 'type', 'param', 'code', 'code_detail', 'group', 'model', 'remaining_display'}
+    assert {k: v for k, v in schema['properties']['remaining_display'].items() if k != 'description'} == {'type': 'string', 'minLength': 1}
     assert schema['properties']['message'] == {'type': 'string'}
     assert schema['properties']['type'] == {'type': 'string'}
     assert schema['properties']['param'] == {'nullable': True}
-    assert schema['properties']['code'] == {'nullable': True}
+    assert {k: v for k, v in schema['properties']['code'].items() if k != 'description'} == {'nullable': True}
     assert {key: value for key, value in schema['properties']['code_detail'].items() if key != 'description'} == {
         'type': 'string', 'enum': ['no_available_channel'],
     }

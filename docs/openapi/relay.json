@@ -7278,6 +7278,11 @@
           "model": {
             "type": "string",
             "description": "Original request model used by the distributor, not an upstream mapped model."
+          },
+          "remaining_display": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional host wallet rejection observation, formatted using the site currency settings and en-US console profile. Only emitted before an OpenAI-compatible HTTP response is written, with HTTP 403 and insufficient_user_quota, after a fresh primary-database token check permits user-quota disclosure. The same authorization controls the balance in message. Missing permission, uncertain identity, read failure or invalid display configuration omits this field; no null or empty string is emitted. Not a post-refund or transactional balance promise. Token-quota, subscription, upstream, native vendor and WebSocket failures are not enriched."
           }
         },
         "required": [
@@ -7336,7 +7341,40 @@
           "legacy": "new_api_error type, localized generic invalid-token message and request-id suffix unchanged; database faults remain HTTP500",
           "precedence": "Stored non-enabled state first; for an enabled token expiry precedes quota exhaustion",
           "read_only": "Does not change read-only token access for expired or exhausted tokens"
-        }
+        },
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "not": {
+                  "required": [
+                    "remaining_display"
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "remaining_display",
+                  "code"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "enum": [
+                      "insufficient_user_quota"
+                    ]
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "new_api_error"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
       },
       "ImageEditMultipartRequest": {
         "type": "object",
