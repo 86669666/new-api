@@ -85,3 +85,5 @@ token_usage.range_too_wide: "The time range cannot exceed {{.Days}} days"
 token_usage.logs_disabled: "Token usage log collection is disabled."
 token_usage.stat_unavailable: "Token usage statistics are unavailable."
 token_usage.query_failed: "Failed to query token usage."
+
+quota.user_insufficient_private: "Insufficient user quota"

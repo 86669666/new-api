@@ -232,12 +232,10 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 		if errors.Is(err, ErrInsufficientWalletQuota) {
 			userQuota, quotaErr := model.GetUserQuota(s.relayInfo.UserId, false)
 			if quotaErr != nil {
-				userQuota = 0
+				return newWalletQuotaError(s.relayInfo, i18n.StatedLang(c), nil, "")
 			}
-			return types.NewErrorWithStatusCode(
-				errors.New(i18n.T(c, i18n.MsgQuotaUserInsufficient, map[string]any{"Remaining": logger.FormatQuota(userQuota)})),
-				types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
-				types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			return newWalletQuotaError(s.relayInfo, i18n.StatedLang(c), &userQuota,
+				i18n.T(c, i18n.MsgQuotaUserInsufficient, map[string]any{"Remaining": logger.FormatQuota(userQuota)}))
 		}
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "no active subscription") || strings.Contains(errMsg, "subscription quota insufficient") {
@@ -265,7 +263,11 @@ func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) e
 				return types.NewError(errors.New("search wallet reservation failed"), types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 			}
 			if !reserved {
-				return types.NewErrorWithStatusCode(ErrInsufficientWalletQuota, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+				quota, readErr := model.GetUserQuota(s.relayInfo.UserId, false)
+				if readErr != nil {
+					return newWalletQuotaError(s.relayInfo, s.lang, nil, "")
+				}
+				return newWalletQuotaError(s.relayInfo, s.lang, &quota, ErrInsufficientWalletQuota.Error())
 			}
 			funding.consumed += delta
 			return nil
@@ -275,7 +277,11 @@ func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) e
 			// overrides. Reserve atomically instead of admitting wallet debt.
 			if err := funding.PreConsume(delta); err != nil {
 				if errors.Is(err, ErrInsufficientWalletQuota) {
-					return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+					quota, readErr := model.GetUserQuota(s.relayInfo.UserId, false)
+					if readErr != nil {
+						return newWalletQuotaError(s.relayInfo, s.lang, nil, "")
+					}
+					return newWalletQuotaError(s.relayInfo, s.lang, &quota, err.Error())
 				}
 				return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 			}
@@ -406,16 +412,12 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 			return nil, types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
 		}
 		if userQuota <= 0 {
-			return nil, types.NewErrorWithStatusCode(
-				errors.New(i18n.T(c, i18n.MsgQuotaUserInsufficient, map[string]any{"Remaining": logger.FormatQuota(userQuota)})),
-				types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
-				types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			return nil, newWalletQuotaError(relayInfo, i18n.StatedLang(c), &userQuota,
+				i18n.T(c, i18n.MsgQuotaUserInsufficient, map[string]any{"Remaining": logger.FormatQuota(userQuota)}))
 		}
 		if userQuota-preConsumedQuota < 0 {
-			return nil, types.NewErrorWithStatusCode(
-				errors.New(i18n.T(c, i18n.MsgQuotaPreConsumeInsufficient, map[string]any{"Remaining": logger.FormatQuota(userQuota), "Required": logger.FormatQuota(preConsumedQuota)})),
-				types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
-				types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			return nil, newWalletQuotaError(relayInfo, i18n.StatedLang(c), &userQuota,
+				i18n.T(c, i18n.MsgQuotaPreConsumeInsufficient, map[string]any{"Remaining": logger.FormatQuota(userQuota), "Required": logger.FormatQuota(preConsumedQuota)}))
 		}
 		relayInfo.UserQuota = userQuota
 

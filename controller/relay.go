@@ -135,7 +135,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
-			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			message, remainingDisplay := newAPIError.Error(), ""
+			if !c.Writer.Written() {
+				switch relayFormat {
+				case types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatOpenAIResponsesCompaction,
+					types.RelayFormatDeepSeekToolsSearch, types.RelayFormatOpenAIAlphaSearch, types.RelayFormatOpenAIAudio,
+					types.RelayFormatOpenAIImage, types.RelayFormatRerank, types.RelayFormatEmbedding:
+					message, remainingDisplay = service.WalletQuotaErrorPresentation(newAPIError)
+				}
+			}
+			newAPIError.SetMessage(common.MessageWithRequestId(message, requestId))
 			upstreamURLs := common.UpstreamAddresses(c)
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
@@ -146,8 +155,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 					"error": newAPIError.ToClaudeError(upstreamURLs...),
 				})
 			default:
+				openAIError := newAPIError.ToOpenAIError(upstreamURLs...)
 				c.JSON(newAPIError.StatusCode, gin.H{
-					"error": newAPIError.ToOpenAIError(upstreamURLs...),
+					"error": struct {
+						types.OpenAIError
+						RemainingDisplay string `json:"remaining_display,omitempty"`
+					}{OpenAIError: openAIError, RemainingDisplay: remainingDisplay},
 				})
 			}
 		}

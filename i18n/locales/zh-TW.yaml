@@ -86,3 +86,5 @@ token_usage.range_too_wide: "時間範圍不能超過 {{.Days}} 天"
 token_usage.logs_disabled: "令牌用量日誌收集已關閉"
 token_usage.stat_unavailable: "令牌用量統計暫不可用"
 token_usage.query_failed: "令牌用量查詢失敗"
+
+quota.user_insufficient_private: "使用者額度不足"

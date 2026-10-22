@@ -109,3 +109,5 @@ const (
 	MsgTokenUsageStatUnavailable = "token_usage.stat_unavailable"
 	MsgTokenUsageQueryFailed     = "token_usage.query_failed"
 )
+
+const MsgQuotaUserInsufficientPrivate = "quota.user_insufficient_private"
