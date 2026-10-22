@@ -98,7 +98,7 @@ describe('fixed deployment prefix authentication redirects', () => {
     expect(sanitizeAuthRedirect('/wallet?tab=x#balance', origin)).toBe(
       '/tenant/gateway/wallet?tab=x#balance'
     )
-    expect(sanitizeAuthRedirect('/tenant/gateway/keys', origin)).toBe(
+    expect(sanitizeAuthRedirect('/tenant/gateway/keys', origin, 'public')).toBe(
       '/tenant/gateway/keys'
     )
     expect(
@@ -120,3 +120,16 @@ describe('fixed deployment prefix authentication redirects', () => {
     }
   })
 })
+
+test.each([
+  ['/wallet', '/wallet', '/wallet/wallet'],
+  ['/usage-logs', '/usage-logs/common', '/usage-logs/usage-logs/common'],
+])(
+  'keeps logical redirects inside colliding mount %s',
+  (prefix, target, expected) => {
+    vi.stubEnv('VITE_REACT_APP_BASE_PATH', prefix)
+    expect(sanitizeAuthRedirect(target, origin)).toBe(expected)
+    expect(sanitizeAuthRedirect(origin + expected, origin)).toBe(expected)
+    vi.unstubAllEnvs()
+  }
+)

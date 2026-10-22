@@ -32,12 +32,25 @@ export function getAppBasePath(): string {
   return normalizeBasePath(import.meta.env.VITE_REACT_APP_BASE_PATH)
 }
 
-/** Convert root-relative browser URLs once; absolute external URLs stay unchanged. */
+/** Expand a logical root-relative path, even when it starts with the mount name. */
 export function appPath(value: string, basePath = getAppBasePath()): string {
   if (!value.startsWith('/') || value.startsWith('//') || basePath === '/') {
     return value
   }
-  const pathname = value.split(/[?#]/, 1)[0]
-  if (pathname === basePath || pathname.startsWith(`${basePath}/`)) return value
   return `${basePath}${value}`
+}
+
+/** Accept an already-public href, or expand an unprefixed root-relative URL. */
+export function publicAppHref(
+  value: string,
+  basePath = getAppBasePath()
+): string {
+  const pathname = value.split(/[?#]/, 1)[0]
+  if (
+    basePath !== '/' &&
+    (pathname === basePath || pathname.startsWith(`${basePath}/`))
+  ) {
+    return value
+  }
+  return appPath(value, basePath)
 }

@@ -27,9 +27,19 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { providerHTTP } from '@/features/auth/oauth-provider/api'
 
-import { appPath, getAppBasePath, normalizeBasePath } from '../deployment-path'
+import {
+  appPath,
+  publicAppHref,
+  getAppBasePath,
+  normalizeBasePath,
+} from '../deployment-path'
 
-afterEach(() => vi.unstubAllEnvs())
+vi.mock('@/lib/api', () => ({ api: {}, getFreshAuthHeaders: async () => ({}) }))
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+  vi.unstubAllGlobals()
+})
 
 describe('fixed deployment paths', () => {
   test.each([
@@ -77,7 +87,7 @@ describe('fixed deployment paths', () => {
         `${prefix}/api/user/auth/refresh`
       )
       expect(appPath('/logo.png')).toBe(`${prefix}/logo.png`)
-      expect(appPath(`${prefix}/wallet?q=1#balance`)).toBe(
+      expect(publicAppHref(`${prefix}/wallet?q=1#balance`)).toBe(
         `${prefix}/wallet?q=1#balance`
       )
       expect(appPath('https://images.example/icon.svg')).toBe(
@@ -85,4 +95,50 @@ describe('fixed deployment paths', () => {
       )
     }
   )
+})
+
+test('log export beneath /api requests /api/api before ingress stripping', async () => {
+  vi.stubEnv('VITE_REACT_APP_BASE_PATH', '/api')
+  const fetchMock = vi.fn<
+    (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+  >(async () => new Response('{"success":true,"data":{"count":0}}\n'))
+  vi.stubGlobal('fetch', fetchMock)
+  const { exportLogs } = await import('@/features/usage-logs/api')
+  await exportLogs({}, false, {
+    signal: new AbortController().signal,
+    onLog: vi.fn(),
+  })
+  expect(fetchMock.mock.calls[0][0]).toMatch(/^\/api\/api\/log\/self\/export\?/)
+})
+
+test('a 401 beneath /sign-in redirects to the logical sign-in page within that mount', async () => {
+  vi.stubEnv('VITE_REACT_APP_BASE_PATH', '/sign-in')
+  const replace = vi.fn()
+  vi.stubGlobal('window', {
+    location: { pathname: '/sign-in/wallet', replace },
+    localStorage: window.localStorage,
+  })
+  const { api } = await import('@/lib/http-client')
+  await expect(
+    api.get('/api/user/self', {
+      authRetry: true,
+      skipErrorHandler: true,
+      adapter: async (config) => {
+        throw new axios.AxiosError(
+          'unauthorized',
+          'ERR_BAD_REQUEST',
+          config,
+          undefined,
+          {
+            status: 401,
+            statusText: 'Unauthorized',
+            data: {},
+            headers: {},
+            config,
+          }
+        )
+      },
+    })
+  ).rejects.toThrow()
+  expect(replace).toHaveBeenCalledWith('/sign-in/sign-in')
 })

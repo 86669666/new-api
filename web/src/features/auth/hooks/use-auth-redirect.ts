@@ -95,10 +95,16 @@ export function useAuthRedirect() {
           'Login flow expired. Please sign in again.'
         )
       }
+      const publicRedirect = sanitizeAuthRedirect(
+        redirectTo,
+        window.location.origin
+      )
       useAuthStore.getState().auth.setPendingLoginVerification({
         challenge: result,
-        redirectTo:
-          sanitizeAuthRedirect(redirectTo, window.location.origin) ?? undefined,
+        // Absolute same-origin href retains its public-path identity across MFA.
+        redirectTo: publicRedirect
+          ? `${window.location.origin}${publicRedirect}`
+          : undefined,
       })
       await navigate({ to: '/otp', replace: true })
       return false

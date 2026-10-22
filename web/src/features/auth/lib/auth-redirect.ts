@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { appPath, getAppBasePath } from '@/lib/deployment-path'
+import { appPath, publicAppHref, getAppBasePath } from '@/lib/deployment-path'
 import type { AuthUser } from '@/stores/auth-store'
 
 const allowedRedirectProtocols = new Set(['http:', 'https:'])
@@ -46,7 +46,8 @@ export function getSavedLanguage(user: AuthUser): string | undefined {
 
 export function sanitizeAuthRedirect(
   value: unknown,
-  origin: string
+  origin: string,
+  pathKind: 'logical' | 'public' = 'logical'
 ): string | null {
   if (typeof value !== 'string') return null
 
@@ -103,8 +104,8 @@ export function sanitizeAuthRedirect(
     return null
   }
 
-  return appPath(
-    `${redirectURL.pathname}${redirectURL.search}${redirectURL.hash}`,
-    basePath
-  )
+  const href = `${redirectURL.pathname}${redirectURL.search}${redirectURL.hash}`
+  return target.startsWith('/') && pathKind === 'logical'
+    ? appPath(href, basePath)
+    : publicAppHref(href, basePath)
 }

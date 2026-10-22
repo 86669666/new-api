@@ -16,12 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { appPath } from '@/lib/deployment-path'
+import { publicAppHref } from '@/lib/deployment-path'
 
 export function applyFaviconToDom(url: string) {
   if (typeof document === 'undefined' || !url) return
   try {
-    const next = new URL(appPath(url), window.location.href).href
+    const next = new URL(publicAppHref(url), window.location.href).href
     const existing =
       document.querySelectorAll<HTMLLinkElement>('link[rel~="icon"]')
     if (existing.length === 1 && existing[0].href === next) return
