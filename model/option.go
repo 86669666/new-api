@@ -270,6 +270,10 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if operation_setting.IsOrganizationLimitOption(key) {
+		_, err := operation_setting.ParseOrganizationLimit(value)
+		return err
+	}
 	if key == ModelCapabilityMetadataOptionKey {
 		_, err := ParseModelCapabilityMetadata(value)
 		return err
@@ -296,6 +300,19 @@ func validateOptionValue(key string, value string) error {
 		return setting.ValidateMaxTokenAutoGroups(value)
 	}
 	return nil
+}
+
+// Reject aliases resolved by database collation rather than letting them bypass
+// canonical option validation or diverge from the registered configuration key.
+func validateOrganizationLimitIdentity(requested, stored, value string) error {
+	if !operation_setting.IsOrganizationLimitOption(requested) && !operation_setting.IsOrganizationLimitOption(stored) {
+		return nil
+	}
+	if requested != stored {
+		return common.NewMessage("Invalid parameters")
+	}
+	_, err := operation_setting.ParseOrganizationLimit(value)
+	return err
 }
 
 func UpdateOption(key string, value string) error {
@@ -344,6 +361,9 @@ func UpdateOption(key string, value string) error {
 	if option.Key == siteInstanceIDKey {
 		return common.NewMessage("Invalid parameters")
 	}
+	if err := validateOrganizationLimitIdentity(key, option.Key, value); err != nil {
+		return err
+	}
 	if err := validateModelCapabilityOptionIdentity(key, option.Key, value); err != nil {
 		return err
 	}
@@ -381,6 +401,11 @@ func UpdateOptionsBulk(values map[string]string) error {
 				err := DB.Select("key").Where(&Option{Key: requested}).First(&stored).Error
 				if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 					return err
+				}
+				if stored.Key != "" {
+					if err := validateOrganizationLimitIdentity(requested, stored.Key, values[requested]); err != nil {
+						return err
+					}
 				}
 				if stored.Key == siteInstanceIDKey {
 					return common.NewMessage("Invalid parameters")
@@ -423,6 +448,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 			}
 			if option.Key == siteInstanceIDKey {
 				return common.NewMessage("Invalid parameters")
+			}
+			if err := validateOrganizationLimitIdentity(k, option.Key, v); err != nil {
+				return err
 			}
 			if err := validateModelCapabilityOptionIdentity(k, option.Key, v); err != nil {
 				return err

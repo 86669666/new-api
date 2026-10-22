@@ -218,6 +218,9 @@ func createOrganizationWithReceipt(ctx context.Context, identity AuthSessionIden
 		if err := requireOrganizationNameAvailable(tx, identity.UserID, 0, name); err != nil {
 			return err
 		}
+		if err := requireOrganizationCapacity(tx, identity.UserID, true, true); err != nil {
+			return err
+		}
 		now = organizationNow().Unix()
 		if _, err := validateOrganizationIdentity(tx, identity, now); err != nil {
 			return err
@@ -670,6 +673,9 @@ func resolveOrganizationInvitation(i AuthSessionIdentity, c OrganizationCommand,
 			if s.member(i.UserID) != nil {
 				return ErrOrganizationConflict
 			}
+			if err := requireOrganizationCapacity(s.tx, i.UserID, false, true); err != nil {
+				return err
+			}
 		}
 		if err := s.advance(c); err != nil {
 			return err
@@ -883,6 +889,9 @@ func resolveOrganizationTransfer(i AuthSessionIdentity, c OrganizationCommand, s
 				return err
 			}
 			if err := requireOrganizationNameAvailable(s.tx, v.ToUserID, s.org.ID, s.org.Name); err != nil {
+				return err
+			}
+			if err := requireOrganizationCapacity(s.tx, v.ToUserID, true, false); err != nil {
 				return err
 			}
 		} else if c.Authorization != nil {

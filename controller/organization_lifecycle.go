@@ -51,6 +51,10 @@ func writeOrganizationLifecycleError(c *gin.Context, err error) {
 		status, code, message = 403, "ORG_FORBIDDEN", "Organization operation is forbidden."
 	case errors.Is(err, model.ErrOrganizationConflict):
 		status, code, message = 409, "ORG_STATE_CHANGED", "Organization state changed. Refresh the organization state before retrying."
+	case errors.Is(err, model.ErrOrganizationCreatedLimit):
+		status, code, message = 409, "ORG_CREATED_LIMIT_REACHED", model.ErrOrganizationCreatedLimit.Error()
+	case errors.Is(err, model.ErrOrganizationJoinedLimit):
+		status, code, message = 409, "ORG_JOINED_LIMIT_REACHED", model.ErrOrganizationJoinedLimit.Error()
 	case errors.Is(err, model.ErrOrganizationNameTaken):
 		status, code, message = 409, "ORG_NAME_TAKEN", "Organization name is already in use."
 	case errors.Is(err, model.ErrOrganizationAlreadyMember):

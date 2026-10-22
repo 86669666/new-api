@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -11,16 +12,22 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Exercise the production SetRouter chain, with independent persisted sessions
@@ -215,5 +222,381 @@ func TestOrganizationCreationRatePolicy(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+// Set persisted policy directly so the admission tests cannot accidentally rely
+// on a process-local configuration cache.
+func organizationCountPolicy(t *testing.T, c *organizationLifecycleClient, owned, joined string) {
+	t.Helper()
+	for key, value := range map[string]string{operation_setting.OrganizationCreatedLimitOptionKey: owned, operation_setting.OrganizationJoinedLimitOptionKey: joined} {
+		require.NoError(t, c.db.Save(&model.Option{Key: key, Value: value}).Error)
+	}
+}
+
+func organizationCountDenied(t *testing.T, c *organizationLifecycleClient, request organizationNameWrite, code string) {
+	t.Helper()
+	before := organizationNamesSnapshot(t, c)
+	status, h, b := c.json(t, request.method, request.path, request.actor, request.body, request.proof)
+	organizationError(t, status, h, b, 409, code)
+	assert.Equal(t, before, organizationNamesSnapshot(t, c))
+}
+
+func TestOrganizationCountPolicy(t *testing.T) {
+	create := func(actor, name string) organizationNameWrite {
+		return organizationNameWrite{method: "POST", path: "/api/organizations", actor: actor, body: map[string]any{"name": name}}
+	}
+	t.Run("owned_boundary", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		organizationCountPolicy(t, c, "1", "0")
+		organizationCountDenied(t, c, create("owner", "over capacity"), "ORG_CREATED_LIMIT_REACHED")
+		organizationNamedClient(t, c, "empty", "first owned")
+		organizationCountDenied(t, c, create("empty", "second owned"), "ORG_CREATED_LIMIT_REACHED")
+	})
+	t.Run("unlimited_and_joined_includes_owned", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		organizationNamedClient(t, c, "owner", "missing policy unlimited")
+		organizationCountPolicy(t, c, "0", "0")
+		organizationNamedClient(t, c, "owner", "explicit unlimited")
+		organizationCountPolicy(t, c, "0", "1")
+		organizationCountDenied(t, c, create("foreign", "owned occupies membership"), "ORG_JOINED_LIMIT_REACHED")
+		organizationNamedClient(t, c, "empty", "independent membership")
+		organizationCountDenied(t, c, create("empty", "owned also joined"), "ORG_JOINED_LIMIT_REACHED")
+		status, _, b := c.json(t, "GET", c.path(), "owner", nil, "")
+		require.Equal(t, 200, status, b)
+	})
+	t.Run("disabled_occupies_dissolve_and_leave_release", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		organizationCountPolicy(t, c, "1", "0")
+		for _, field := range []string{"self_disabled_at", "platform_disabled_at"} {
+			require.NoError(t, c.db.Model(&model.Organization{}).Where("id = ?", c.orgA).Update(field, time.Now().Unix()).Error)
+			organizationCountDenied(t, c, create("owner", field), "ORG_CREATED_LIMIT_REACHED")
+			require.NoError(t, c.db.Model(&model.Organization{}).Where("id = ?", c.orgA).Update(field, 0).Error)
+		}
+		c.mutate(t, "owner", "POST", c.path()+"/dissolve", "dissolve", map[string]any{"revision": c.revision(t)}, nil, true)
+		organizationNamedClient(t, c, "owner", "released by dissolve")
+		// Member initially belonged to both fixture organizations. Dissolution freed
+		// one slot; leaving the surviving organization frees the remaining one.
+		fixture := *c.organizationHTTPFixture
+		fixture.orgA = c.orgB
+		other := &organizationLifecycleClient{organizationHTTPFixture: &fixture, passwords: c.passwords, refresh: c.refresh}
+		organizationCountPolicy(t, c, "0", "1")
+		organizationCountDenied(t, c, create("member", "still joined"), "ORG_JOINED_LIMIT_REACHED")
+		other.mutate(t, "member", "POST", other.path()+"/leave", "leave", map[string]any{"revision": other.revision(t)}, nil, false)
+		organizationNamedClient(t, c, "member", "released by leave")
+	})
+	t.Run("invitation_pending_reactivation_and_duplicate", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		invitation := c.mutate(t, "owner", "POST", c.path()+"/invitations", "invite", map[string]any{"revision": c.revision(t), "target_user_id": strconv.Itoa(c.users["empty"].Id), "role": "member"}, nil, false)
+		organizationCountPolicy(t, c, "0", "1")
+		owned := organizationNamedClient(t, c, "empty", "pending did not reserve")
+		request := organizationNameWrite{method: "POST", path: c.path() + "/invitations/" + invitation["object_id"].(string) + "/accept", actor: "empty", body: map[string]any{"revision": c.revision(t), "generation": invitation["generation"]}}
+		organizationCountDenied(t, c, request, "ORG_JOINED_LIMIT_REACHED")
+		owned.mutate(t, "empty", "POST", owned.path()+"/dissolve", "dissolve", map[string]any{"revision": owned.revision(t)}, nil, true)
+		c.mutate(t, "empty", request.method, request.path, "invitation_accept", request.body, nil, false)
+		status, _, b := c.json(t, request.method, request.path, request.actor, request.body, "")
+		require.Equal(t, 409, status, b)
+		assert.NotEqual(t, "ORG_JOINED_LIMIT_REACHED", b["code"])
+		c.mutate(t, "empty", "POST", c.path()+"/leave", "leave", map[string]any{"revision": c.revision(t)}, nil, false)
+		invitation = c.mutate(t, "owner", "POST", c.path()+"/invitations/"+invitation["object_id"].(string)+"/reissue", "reissue", map[string]any{"revision": c.revision(t), "generation": invitation["generation"], "target_user_id": strconv.Itoa(c.users["empty"].Id), "role": "member"}, nil, false)
+		c.mutate(t, "empty", "POST", c.path()+"/invitations/"+invitation["object_id"].(string)+"/accept", "invitation_accept", map[string]any{"revision": c.revision(t), "generation": invitation["generation"]}, nil, false)
+		var count int64
+		require.NoError(t, c.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", c.orgA, c.users["empty"].Id).Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+	})
+	t.Run("over_limit_release_and_transfer_keeps_membership", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		extra := organizationNamedClient(t, c, "owner", "second historical organization")
+		organizationCountPolicy(t, c, "1", "1")
+		organizationCountDenied(t, c, create("owner", "over historical owned"), "ORG_CREATED_LIMIT_REACHED")
+		organizationCountDenied(t, c, create("member", "over historical joined"), "ORG_JOINED_LIMIT_REACHED")
+		status, _, b := c.json(t, "GET", c.path(), "member", nil, "")
+		require.Equal(t, 200, status, b)
+		c.mutate(t, "member", "POST", c.path()+"/leave", "leave", map[string]any{"revision": c.revision(t)}, nil, false)
+		// Admin already belongs to this organization. Ownership transfer is not
+		// a joined-count increase, even at the membership limit.
+		request := organizationNameTransfer(t, c, "owner", "admin", true)
+		status, _, b = c.json(t, request.method, request.path, request.actor, request.body, request.proof)
+		require.Equal(t, 200, status, b)
+		var former model.OrganizationMember
+		require.NoError(t, c.db.Where("organization_id = ? AND user_id = ?", c.orgA, c.users["owner"].Id).First(&former).Error)
+		assert.Zero(t, former.RemovedAt)
+		assert.Equal(t, model.OrganizationRoleAdmin, former.Role)
+		// The original creator no longer owns the transferred organization.
+		extra.mutate(t, "owner", "POST", extra.path()+"/dissolve", "dissolve", map[string]any{"revision": extra.revision(t)}, nil, true)
+		organizationCountPolicy(t, c, "1", "0")
+		organizationNamedClient(t, c, "owner", "current owner count released")
+	})
+	t.Run("configuration_validation", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		previousConfig := config.GlobalConfig.ExportAllConfigs()
+		common.OptionMapRWMutex.Lock()
+		previous := common.OptionMap
+		common.OptionMap = map[string]string{}
+		common.OptionMapRWMutex.Unlock()
+		t.Cleanup(func() {
+			common.OptionMapRWMutex.Lock()
+			common.OptionMap = previous
+			common.OptionMapRWMutex.Unlock()
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{operation_setting.OrganizationCreatedLimitOptionKey: previousConfig[operation_setting.OrganizationCreatedLimitOptionKey], operation_setting.OrganizationJoinedLimitOptionKey: previousConfig[operation_setting.OrganizationJoinedLimitOptionKey]}))
+		})
+		for _, key := range []string{operation_setting.OrganizationCreatedLimitOptionKey, operation_setting.OrganizationJoinedLimitOptionKey} {
+			for _, valid := range []string{"0", "1", "9007199254740991"} {
+				require.NoError(t, model.UpdateOption(key, valid))
+			}
+			require.NoError(t, model.UpdateOption(key, "1"))
+			for _, invalid := range []string{"", "-1", "1.5", "NaN", "Inf", "9007199254740992", "9223372036854775808", "01", "+1", " 1", "1 ", "1e0"} {
+				require.Error(t, model.UpdateOption(key, invalid), invalid)
+				require.Error(t, model.UpdateOptionsBulk(map[string]string{key: invalid, "OrganizationCountSentinel": "changed"}), invalid)
+				var stored model.Option
+				require.NoError(t, c.db.Where(&model.Option{Key: key}).First(&stored).Error)
+				assert.Equal(t, "1", stored.Value)
+				var n int64
+				require.NoError(t, c.db.Model(&model.Option{}).Where(&model.Option{Key: "OrganizationCountSentinel"}).Count(&n).Error)
+				assert.Zero(t, n)
+			}
+		}
+		require.NoError(t, model.UpdateOptionsBulk(map[string]string{operation_setting.OrganizationCreatedLimitOptionKey: "2", operation_setting.OrganizationJoinedLimitOptionKey: "3"}))
+		if c.mainKind == "mysql" {
+			equivalent := 0
+			for _, alias := range []string{strings.ToUpper(operation_setting.OrganizationCreatedLimitOptionKey), operation_setting.OrganizationCreatedLimitOptionKey + " "} {
+				var stored model.Option
+				err := c.db.Where(&model.Option{Key: alias}).First(&stored).Error
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				require.NoError(t, err)
+				require.Equal(t, operation_setting.OrganizationCreatedLimitOptionKey, stored.Key)
+				equivalent++
+				require.Error(t, model.UpdateOption(alias, "0"))
+				require.Error(t, model.UpdateOptionsBulk(map[string]string{alias: "0"}))
+				var unchanged model.Option
+				require.NoError(t, c.db.Where(&model.Option{Key: stored.Key}).First(&unchanged).Error)
+				assert.Equal(t, stored, unchanged)
+			}
+			require.Positive(t, equivalent, "exercise a real collation-equivalent key")
+		}
+		// A corrupt authoritative row must not turn into an unlimited policy, even
+		// if the cached setting was previously valid.
+		organizationCountPolicy(t, c, "garbage", "0")
+		before := organizationNamesSnapshot(t, c)
+		status, _, b := c.json(t, "POST", "/api/organizations", "empty", map[string]any{"name": "corrupt policy"}, "")
+		require.Equal(t, 500, status, b)
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		organizationCountPolicy(t, c, "0", "broken")
+		status, _, b = c.json(t, "POST", "/api/organizations", "empty", map[string]any{"name": "corrupt joined"}, "")
+		require.Equal(t, 500, status, b)
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+	})
+	t.Run("policy_read_failure", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		before := organizationNamesSnapshot(t, c)
+		// A real SQL failure, not a mocked policy read.
+		require.NoError(t, c.db.Migrator().DropTable(&model.Option{}))
+		status, _, b := c.json(t, "POST", "/api/organizations", "empty", map[string]any{"name": "unreadable policy"}, "")
+		require.Equal(t, 500, status, b)
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+	})
+	for _, scenario := range []string{"owned", "joined", "independent", "invitations", "transfer"} {
+		t.Run("race_"+scenario, func(t *testing.T) {
+			c := newOrganizationLifecycleClient(t)
+			first, second := create("empty", "slot one"), create("empty-second", "slot two")
+			code := "ORG_CREATED_LIMIT_REACHED"
+			if scenario == "invitations" {
+				requests := []organizationNameWrite{}
+				for _, owner := range []string{"owner", "foreign"} {
+					source := organizationNamedClient(t, c, owner, "invite source")
+					invitation := source.mutate(t, owner, "POST", source.path()+"/invitations", "invite", map[string]any{"revision": source.revision(t), "target_user_id": strconv.Itoa(c.users["empty"].Id), "role": "member"}, nil, false)
+					requests = append(requests, organizationNameWrite{method: "POST", path: source.path() + "/invitations/" + invitation["object_id"].(string) + "/accept", actor: "empty", body: map[string]any{"revision": source.revision(t), "generation": invitation["generation"]}})
+				}
+				first, second = requests[0], requests[1]
+			}
+			if scenario == "transfer" {
+				first = organizationNameTransfer(t, c, "owner", "empty", true)
+				second = create("empty", "competing owned")
+			}
+			if scenario == "owned" || scenario == "joined" {
+				sid := "count-" + common.NewRequestId()
+				require.NoError(t, model.CreateUserSession(&model.UserSession{SID: sid, UserID: c.users["empty"].Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("b", 64), LoginMethod: "password", ExpiresAt: time.Now().Unix() + 3600}))
+				token, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: c.users["empty"].Id, SessionID: sid, UserAuthVersion: 1, SessionVersion: 1})
+				require.NoError(t, err)
+				c.bearer["empty-second"] = token
+			}
+			if scenario == "joined" || scenario == "invitations" {
+				organizationCountPolicy(t, c, "0", "1")
+				code = "ORG_JOINED_LIMIT_REACHED"
+			} else {
+				organizationCountPolicy(t, c, "1", "0")
+			}
+			if scenario == "independent" {
+				second = create("admin", "different user")
+			}
+			organizationCountRace(t, c, first, second, code, scenario == "independent")
+		})
+	}
+	t.Run("transfer_final_recheck_and_consumed_proof", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		request := organizationNameTransfer(t, c, "owner", "empty", true)
+		organizationCountPolicy(t, c, "1", "0")
+		original, statement := c.db.ConnPool, c.db.Statement.ConnPool
+		pool := &organizationSelectorPool{ConnPool: original, afterRollback: func() error {
+			status, _, b := c.json(t, "POST", "/api/organizations", "empty", map[string]any{"name": "intervening final slot"}, "")
+			if status != 201 || b["success"] != true {
+				return errors.New("intervening creation failed")
+			}
+			return nil
+		}}
+		c.db.ConnPool, c.db.Statement.ConnPool = pool, pool
+		defer func() { c.db.ConnPool, c.db.Statement.ConnPool = original, statement }()
+		status, h, b := c.json(t, request.method, request.path, request.actor, request.body, request.proof)
+		organizationError(t, status, h, b, 409, "ORG_CREATED_LIMIT_REACHED")
+		require.True(t, pool.fired.Load())
+		var org model.Organization
+		require.NoError(t, c.db.First(&org, c.orgA).Error)
+		assert.Equal(t, c.users["owner"].Id, org.OwnerUserID)
+		// Remove capacity pressure so the retry reaches proof validation.
+		organizationCountPolicy(t, c, "0", "0")
+		status, h, b = c.json(t, request.method, request.path, request.actor, request.body, request.proof)
+		organizationError(t, status, h, b, 403, "SECURITY_PROOF_CONSUMED")
+	})
+}
+
+// Hold the winner before its event commits and observe the competing user
+// lock attempt. Both requests must have entered transactions before release.
+func organizationCountRace(t *testing.T, c *organizationLifecycleClient, first, second organizationNameWrite, code string, independent bool) {
+	t.Helper()
+	before := organizationNamesSnapshot(t, c)
+	if c.mainKind == "mysql" {
+		var local, global string
+		err := c.db.Raw("SELECT @@transaction_isolation, @@global.transaction_isolation").Row().Scan(&local, &global)
+		if err != nil {
+			err = c.db.Raw("SELECT @@tx_isolation, @@global.tx_isolation").Row().Scan(&local, &global)
+		}
+		require.NoError(t, err)
+		require.Equal(t, "REPEATABLE-READ", local)
+		require.Equal(t, "REPEATABLE-READ", global)
+		t.Log("count-race transaction isolation: REPEATABLE-READ")
+	}
+	held, attempted, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var winner atomic.Bool
+	var releaseOnce, attemptOnce sync.Once
+	var wg sync.WaitGroup
+	callback := "organization_count_race"
+	require.NoError(t, c.db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table != "organization_events" || !winner.CompareAndSwap(false, true) {
+			return
+		}
+		close(held)
+		select {
+		case <-release:
+		case <-tx.Statement.Context.Done():
+			tx.AddError(tx.Statement.Context.Err())
+		}
+	}))
+	observe := func(tx *gorm.DB) {
+		if !winner.Load() || tx.Statement.Table != "users" {
+			return
+		}
+		if _, ok := tx.Statement.ConnPool.(gorm.TxCommitter); !ok {
+			return
+		}
+		_, lockingRead := tx.Statement.Clauses["FOR"]
+		values, _ := tx.Statement.Dest.(map[string]any)
+		reservation, _ := values["auth_version"].(clause.Expr)
+		if lockingRead || reservation.SQL == "auth_version" {
+			attemptOnce.Do(func() { close(attempted) })
+		}
+	}
+	require.NoError(t, c.db.Callback().Query().Before("gorm:query").Register(callback, observe))
+	require.NoError(t, c.db.Callback().Update().Before("gorm:update").Register(callback, observe))
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		wg.Wait()
+		_ = c.db.Callback().Create().Remove(callback)
+		_ = c.db.Callback().Query().Remove(callback)
+		_ = c.db.Callback().Update().Remove(callback)
+	}()
+	type response struct {
+		status int
+		h      http.Header
+		body   map[string]any
+	}
+	firstDone, secondDone := make(chan response, 1), make(chan response, 1)
+	wg.Go(func() {
+		status, h, body := c.json(t, first.method, first.path, first.actor, first.body, first.proof)
+		firstDone <- response{status, h, body}
+	})
+	select {
+	case <-held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first name writer did not reach its uncommitted event")
+	}
+	wg.Go(func() {
+		status, h, body := c.json(t, second.method, second.path, second.actor, second.body, second.proof)
+		secondDone <- response{status, h, body}
+	})
+	select {
+	case <-attempted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second transaction did not attempt its namespace lock before first commit")
+	}
+	var other response
+	if independent && c.mainKind != "sqlite" {
+		select {
+		case other = <-secondDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a different owner was blocked by the first namespace")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	var initial response
+	select {
+	case initial = <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first writer did not finish")
+	}
+	want := 200
+	if first.path == "/api/organizations" {
+		want = 201
+	}
+	require.Equal(t, want, initial.status)
+	assert.Equal(t, true, initial.body["success"])
+	if !independent || c.mainKind == "sqlite" {
+		select {
+		case other = <-secondDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("second writer did not finish")
+		}
+	}
+	after := organizationNamesSnapshot(t, c)
+	creates, events := 0, 1
+	if first.path == "/api/organizations" {
+		creates++
+	}
+	if independent {
+		creates++
+		events++
+	}
+	assert.Len(t, after.Organizations, len(before.Organizations)+creates)
+	assert.Len(t, after.Events, len(before.Events)+events)
+	memberAdds := creates
+	if strings.Contains(first.path, "/invitations/") {
+		memberAdds++
+	}
+	assert.Len(t, after.Members, len(before.Members)+memberAdds)
+	if strings.Contains(first.path, "/invitations/") {
+		pending := 0
+		for _, invitation := range after.Invitations {
+			if invitation.Status == model.OrganizationPending {
+				pending++
+			}
+		}
+		assert.Equal(t, 1, pending)
+	}
+	if independent {
+		require.Equal(t, 201, other.status)
+		assert.Equal(t, true, other.body["success"])
+	} else {
+		organizationError(t, other.status, other.h, other.body, 409, code)
 	}
 }
