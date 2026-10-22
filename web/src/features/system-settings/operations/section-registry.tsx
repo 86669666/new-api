@@ -25,8 +25,14 @@ import { PerformanceSection } from '../maintenance/performance-section'
 import { UpdateCheckerSection } from '../maintenance/update-checker-section'
 import type { OperationsSettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
+import { OrganizationLimitsSection } from './organization-limits-section'
 
 const OPERATIONS_SECTIONS = [
+  {
+    id: 'organization-limits',
+    titleKey: 'Organization limits',
+    build: () => <OrganizationLimitsSection />,
+  },
   {
     id: 'behavior',
     titleKey: 'System Behavior',

@@ -437,6 +437,18 @@ export function compileWalletQuotaError(error: RelayError) {
   return { display, invalid };
 }
 `);
+await writeFile(consumer, await readFile(consumer, 'utf8') + `
+export function compileOrganizationLimits() {
+  balanceApi.OrganizationsService.getOrganizationLimits();
+  balanceApi.OrganizationsService.updateOrganizationLimits({ requestBody: { max_organizations_created: '0', max_organizations_joined: '9007199254740991' } });
+  // @ts-expect-error both limits are required
+  balanceApi.OrganizationsService.updateOrganizationLimits({ requestBody: { max_organizations_created: '0' } });
+  // @ts-expect-error limits are decimal strings, never numbers
+  balanceApi.OrganizationsService.updateOrganizationLimits({ requestBody: { max_organizations_created: 0, max_organizations_joined: '0' } });
+  // @ts-expect-error selectors are not accepted
+  balanceApi.OrganizationsService.getOrganizationLimits({ xOrganizationId: '0' });
+}
+`);
 execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'), '--strict', '--target', 'ES2020', '--module', 'commonjs', '--lib', 'ES2020,DOM', '--rootDir', path.join(output, 'generated'), '--outDir', path.join(output, 'compiled'), path.join(output, 'generated/api/index.ts'), path.join(output, 'generated/relay/index.ts'), consumer], { stdio: 'inherit' });
 const api = require(path.join(output, 'compiled/api/index.js'));
 const relay = require(path.join(output, 'compiled/relay/index.js'));
@@ -567,6 +579,50 @@ await assert.rejects(api.Service.getDashboardTaskArtifacts({ taskId: 'fixture-hi
   assert.equal('data' in error.body, false);
   return true;
 });
+// Limits use only fixture credentials. This is a generated-client transport
+// contract, not live authorization or generated runtime response validation.
+const limitsSaved = { token: api.OpenAPI.TOKEN, headers: api.OpenAPI.HEADERS, credentials: api.OpenAPI.WITH_CREDENTIALS, status: responseStatus, body: responseBody };
+api.OpenAPI.TOKEN = 'fixture-limits-session';
+api.OpenAPI.HEADERS = undefined;
+api.OpenAPI.WITH_CREDENTIALS = false;
+const limitsBody = { max_organizations_created: '0', max_organizations_joined: '9007199254740991' };
+for (const [method, verb, route, args, success, failure] of [
+  ['getOrganizationLimits', 'GET', '/api/organizations/limits', undefined, { success: true, message: '', data: { max_organizations_created: 0, max_organizations_joined: 9007199254740991 } }, { success: false, code: 'ORG_LIMITS_UNAVAILABLE', message: 'Organization limits are temporarily unavailable.', message_key: 'Organization limits are temporarily unavailable.' }],
+  ['updateOrganizationLimits', 'PUT', '/api/option/organization_limits', { requestBody: limitsBody }, { success: true, message: '' }, { success: false, code: 'ORG_LIMITS_UPDATE_FAILED', message: 'Unable to update organization limits.', message_key: 'Unable to update organization limits.' }],
+]) {
+  for (const status of [200, 401, 403, 503]) {
+    responseStatus = status;
+    responseBody = status === 200 ? success : status === 503 ? failure : { success: false, message: 'fixture-only authentication failure', code: status === 401 ? 'AUTH_SESSION_REVOKED' : 'AUTH_SESSION_REQUIRED' };
+    const before = calls.length;
+    if (status === 200) assert.deepEqual(await api.OrganizationsService[method](args), responseBody);
+    else await assert.rejects(api.OrganizationsService[method](args), error => error.status === status && JSON.stringify(error.body) === JSON.stringify(responseBody));
+    assert.equal(calls.length, before + 1, 'No retry or authentication-refresh replay');
+    const call = calls.at(-1);
+    assert.equal(call.url, api.OpenAPI.BASE + route);
+    assert.equal(call.init.method, verb);
+    assert.equal(call.init.credentials, undefined);
+    const headers = new Headers(call.init.headers);
+    assert.equal(headers.get('Authorization'), 'Bearer fixture-limits-session');
+    for (const name of ['Cookie', 'X-Organization-Id', 'X-Security-Proof', 'Idempotency-Key']) assert.equal(headers.has(name), false);
+    if (verb === 'PUT') assert.deepEqual(JSON.parse(call.init.body), limitsBody);
+    else assert.equal(call.init.body, undefined);
+  }
+  const savedFetch = globalThis.fetch;
+  let attempts = 0;
+  const networkFailure = new TypeError('fixture-only lost response');
+  try {
+    globalThis.fetch = async () => { attempts++; throw networkFailure; };
+    await assert.rejects(api.OrganizationsService[method](args), error => error === networkFailure);
+    assert.equal(attempts, 1, 'Unknown outcomes must not be replayed');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+}
+api.OpenAPI.TOKEN = limitsSaved.token;
+api.OpenAPI.HEADERS = limitsSaved.headers;
+api.OpenAPI.WITH_CREDENTIALS = limitsSaved.credentials;
+responseStatus = limitsSaved.status;
+responseBody = limitsSaved.body;
 const inheritedStubbedRequests = calls.length;
 api.OpenAPI.HEADERS = undefined;
 api.OpenAPI.WITH_CREDENTIALS = false;

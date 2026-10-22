@@ -47,6 +47,8 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/oauth/provider/consent":         accessTokenSessionRule,
 
 	// Organization access is backed only by a live dashboard session.
+	"GET /api/organizations/limits":                                                      accessTokenSessionRule,
+	"PUT /api/option/organization_limits":                                                accessTokenSessionRule,
 	"GET /api/organizations/:org_id/wallet":                                              accessTokenSessionRule,
 	"GET /api/platform/organizations/:org_id/wallet":                                     accessTokenSessionRule,
 	"POST /api/platform/organizations/:org_id/wallet/credits":                            accessTokenSessionRule,

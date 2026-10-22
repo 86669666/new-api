@@ -1062,7 +1062,7 @@ func TestOrganizationCreationIdempotency(t *testing.T) {
 }
 
 func organizationCreationProcess(t *testing.T, mode string) {
-	require.Contains(t, []string{"commit", "replay"}, mode)
+	require.Contains(t, []string{"commit", "replay", "limits"}, mode)
 	input, output := os.NewFile(3, "owned-input"), os.NewFile(4, "owned-output")
 	defer input.Close()
 	defer output.Close()
@@ -1105,6 +1105,29 @@ func organizationCreationProcess(t *testing.T, mode string) {
 	SetRouter(engine, WebAssets{IndexPage: []byte("idempotency-child")})
 	server := httptest.NewServer(engine)
 	defer server.Close()
+	if mode == "limits" {
+		for i := range 2 {
+			if i > 0 {
+				signal := make([]byte, 1)
+				_, err := io.ReadFull(input, signal)
+				require.NoError(t, err)
+			}
+			req, err := http.NewRequest("GET", server.URL+"/api/organizations/limits", nil)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer "+config.Bearer)
+			response, err := server.Client().Do(req)
+			require.NoError(t, err)
+			var body map[string]any
+			require.NoError(t, common.DecodeJson(response.Body, &body))
+			response.Body.Close()
+			require.Equal(t, 200, response.StatusCode)
+			raw, err := common.Marshal(body)
+			require.NoError(t, err)
+			_, err = output.Write(append(raw, '\n'))
+			require.NoError(t, err)
+		}
+		return
+	}
 	req, err := http.NewRequest("POST", server.URL+"/api/organizations", strings.NewReader(`{"name":"survives restart"}`))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+config.Bearer)
@@ -1127,4 +1150,397 @@ func organizationCreationProcess(t *testing.T, mode string) {
 	require.NoError(t, err)
 	_, err = output.Write(raw)
 	require.NoError(t, err)
+}
+
+// Limits use the formal router (including session-only policy and early cache
+// headers), real SQL, and the same fixture as admission/idempotency regressions.
+func TestOrganizationLimitsPublication(t *testing.T) {
+	if os.Getenv("NEWAPI_ORGANIZATION_LIMITS_CHILD") == "read" {
+		organizationCreationProcess(t, "limits")
+		return
+	}
+	previousConfig := config.GlobalConfig.ExportAllConfigs()
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = map[string]string{}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{operation_setting.OrganizationCreatedLimitOptionKey: previousConfig[operation_setting.OrganizationCreatedLimitOptionKey], operation_setting.OrganizationJoinedLimitOptionKey: previousConfig[operation_setting.OrganizationJoinedLimitOptionKey]}))
+	})
+	const read = "/api/organizations/limits"
+	const write = "/api/option/organization_limits"
+	const pair = `{"max_organizations_created":"2","max_organizations_joined":"3"}`
+	headers := http.Header{"Content-Type": {"application/json"}}
+	t.Run("complete_snapshot_and_legacy_single_key", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		status, h, body := f.request(t, "GET", read, "empty", "", nil)
+		require.Equal(t, 200, status, body)
+		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(0), "max_organizations_joined": float64(0)}, body["data"])
+		// A single absent row defaults to zero; cached values are not authoritative.
+		require.NoError(t, f.db.Create(&model.Option{Key: operation_setting.OrganizationCreatedLimitOptionKey, Value: "7"}).Error)
+		status, _, body = f.request(t, "GET", read, "empty", "", nil)
+		require.Equal(t, 200, status, body)
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(7), "max_organizations_joined": float64(0)}, body["data"])
+		status, h, body = f.request(t, "PUT", write, "root", pair, headers)
+		require.Equal(t, 200, status, body)
+		assert.Equal(t, true, body["success"])
+		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		status, _, body = f.request(t, "GET", read, "empty", "", nil)
+		require.Equal(t, 200, status, body)
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(2), "max_organizations_joined": float64(3)}, body["data"])
+		raw, err := common.Marshal(map[string]string{"key": operation_setting.OrganizationCreatedLimitOptionKey, "value": "9007199254740991"})
+		require.NoError(t, err)
+		status, _, body = f.request(t, "PUT", "/api/option/", "root", string(raw), headers)
+		require.Equal(t, 200, status, body)
+		require.Equal(t, true, body["success"])
+		status, _, body = f.request(t, "GET", read, "root", "", nil)
+		require.Equal(t, 200, status, body)
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(9007199254740991), "max_organizations_joined": float64(3)}, body["data"])
+		status, _, body = f.request(t, "PUT", write, "root", `{"max_organizations_created":"0","max_organizations_joined":"9007199254740991"}`, headers)
+		require.Equal(t, 200, status, body)
+		status, _, body = f.request(t, "GET", read, "empty", "", nil)
+		require.Equal(t, 200, status, body)
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(0), "max_organizations_joined": float64(9007199254740991)}, body["data"])
+
+	})
+	t.Run("strict_pair_and_transport", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		for _, raw := range []string{`{}`, `null`, `[]`, pair + `{}`, `{"max_organizations_created":"0"}`, `{"max_organizations_created":null,"max_organizations_joined":"0"}`, `{"max_organizations_created":0,"max_organizations_joined":"0"}`, `{"max_organizations_created":"0","max_organizations_joined":"0","x":"1"}`, `{"max_organizations_created":"1","max_organizations_created":"2","max_organizations_joined":"0"}`} {
+			status, h, b := f.request(t, "PUT", write, "root", raw, headers)
+			organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+		}
+		for _, value := range []string{"", "-1", "+1", "01", "1.0", "1e0", " 1", "1 ", "9007199254740992"} {
+			raw, err := common.Marshal(map[string]string{"max_organizations_created": value, "max_organizations_joined": "0"})
+			require.NoError(t, err)
+			status, h, b := f.request(t, "PUT", write, "root", string(raw), headers)
+			organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+		}
+		for _, method := range []string{"GET", "PUT"} {
+			path, raw := read, ""
+			if method == "PUT" {
+				path, raw = write, pair
+			}
+			for _, suffix := range []string{"?x=1", "?org_id=0", "?org_id=2", "?org_id=bad", "?org_id=1&org_id=2"} {
+				status, h, b := f.request(t, method, path+suffix, "root", raw, headers)
+				assert.Equal(t, 400, status, b)
+				assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+			}
+			for _, key := range []string{"X-Organization-Id", "X-Security-Proof", "Idempotency-Key", "X-HTTP-Method-Override"} {
+				extra := headers.Clone()
+				extra.Set(key, "0")
+				status, h, b := f.request(t, method, path, "root", raw, extra)
+				assert.Equal(t, 400, status, b)
+				assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+			}
+			extra := headers.Clone()
+			extra.Set("Origin", "https://untrusted.invalid")
+			status, h, b := f.request(t, method, path, "root", raw, extra)
+			organizationError(t, status, h, b, 403, "AUTH_ORIGIN_FORBIDDEN")
+			extra = headers.Clone()
+			extra.Set("Sec-Fetch-Site", "cross-site")
+			status, h, b = f.request(t, method, path, "root", raw, extra)
+			organizationError(t, status, h, b, 403, "AUTH_ORIGIN_FORBIDDEN")
+		}
+		status, h, b := f.request(t, "GET", read, "root", "{}", nil)
+		organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+		status, h, b = f.request(t, "PUT", write, "root", pair, http.Header{"Content-Type": {"text/plain"}})
+		organizationError(t, status, h, b, 415, "UNSUPPORTED_MEDIA_TYPE")
+		status, h, b = f.request(t, "PUT", write, "root", strings.Repeat(" ", 1025), headers)
+		organizationError(t, status, h, b, 413, "REQUEST_TOO_LARGE")
+		status, _, b = f.request(t, "GET", fmt.Sprintf("/api/organizations/%d", f.orgA), "owner", "", nil)
+		require.Equal(t, 200, status, b)
+		status, _, b = f.request(t, "GET", "/api/organizations/not-a-number", "owner", "", nil)
+		require.Equal(t, 400, status, b)
+		var n int64
+		require.NoError(t, f.db.Model(&model.Option{}).Where(map[string]any{"key": []string{operation_setting.OrganizationCreatedLimitOptionKey, operation_setting.OrganizationJoinedLimitOptionKey}}).Count(&n).Error)
+		assert.Zero(t, n)
+	})
+	t.Run("session_only_root_and_revocation", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		suffix, err := common.GenerateRandomCharsKey(43)
+		require.NoError(t, err)
+		pat := model.AccessTokenPrefix + suffix
+		row := &model.UserAccessToken{Name: "limits boundary", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat)}
+		require.NoError(t, row.SetScopes([]string{"option:write"}))
+		require.NoError(t, model.CreateUserAccessToken(f.users["root"].Id, row, service.AccessTokenMaxPerUser))
+		legacy, err := common.GenerateRandomCharsKey(32)
+		require.NoError(t, err)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["root"].Id).Update("access_token", legacy).Error)
+		for _, method := range []string{"GET", "PUT"} {
+			path, raw := read, ""
+			if method == "PUT" {
+				path, raw = write, pair
+			}
+			for _, actor := range []string{"", pat, legacy, "relay"} {
+				status, h, b := f.request(t, method, path, actor, raw, headers)
+				assert.Contains(t, []int{401, 403}, status, b)
+				assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+				assert.NotEqual(t, true, b["success"])
+				if actor == pat || actor == legacy {
+					assert.Equal(t, 403, status)
+					assert.Equal(t, "AUTH_SESSION_REQUIRED", b["code"])
+				}
+			}
+			cookie := headers.Clone()
+			cookie.Set("Cookie", "session="+f.bearer["root"])
+			cookie.Set("Origin", "https://untrusted.invalid")
+			status, h, b := f.request(t, method, path, "", raw, cookie)
+			assert.Contains(t, []int{401, 403}, status, b)
+			assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		}
+		status, h, b := f.request(t, "PUT", write, "owner", pair, headers)
+		assert.Equal(t, 403, status, b)
+		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		for _, state := range []string{"expired", "revoked", "disabled", "demoted"} {
+			t.Run(state, func(t *testing.T) {
+				f := newOrganizationHTTPFixture(t)
+				switch state {
+				case "expired":
+					require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["root"]).Update("expires_at", time.Now().Unix()-1).Error)
+				case "revoked":
+					require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["root"]).Update("revoked_at", time.Now().Unix()).Error)
+				case "disabled":
+					require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["root"].Id).Update("status", common.UserStatusDisabled).Error)
+				case "demoted":
+					require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["root"].Id).Update("role", common.RoleCommonUser).Error)
+				}
+				for _, method := range []string{"GET", "PUT"} {
+					if state == "demoted" && method == "GET" {
+						continue
+					}
+					path, raw := read, ""
+					if method == "PUT" {
+						path, raw = write, pair
+					}
+					status, h, b := f.request(t, method, path, "root", raw, headers)
+					assert.Contains(t, []int{401, 403}, status, b)
+					assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+				}
+			})
+		}
+	})
+	t.Run("corrupt_policy_and_sql_failure", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		for _, bad := range []string{"", "01", "bad", "9007199254740992"} {
+			require.NoError(t, f.db.Save(&model.Option{Key: operation_setting.OrganizationCreatedLimitOptionKey, Value: bad}).Error)
+			status, h, b := f.request(t, "GET", read, "empty", "", nil)
+			organizationError(t, status, h, b, 503, "ORG_LIMITS_UNAVAILABLE")
+			assert.NotContains(t, b, "data")
+		}
+		if f.mainKind == "mysql" {
+			require.NoError(t, f.db.Where(&model.Option{Key: operation_setting.OrganizationCreatedLimitOptionKey}).Delete(&model.Option{}).Error)
+			require.NoError(t, f.db.Create(&model.Option{Key: strings.ToUpper(operation_setting.OrganizationCreatedLimitOptionKey), Value: "1"}).Error)
+			status, h, b := f.request(t, "GET", read, "empty", "", nil)
+			organizationError(t, status, h, b, 503, "ORG_LIMITS_UNAVAILABLE")
+			status, h, b = f.request(t, "PUT", write, "root", pair, headers)
+			organizationError(t, status, h, b, 503, "ORG_LIMITS_UPDATE_FAILED")
+		}
+		require.NoError(t, f.db.Migrator().DropTable(&model.Option{}))
+		status, h, b := f.request(t, "GET", read, "empty", "", nil)
+		organizationError(t, status, h, b, 503, "ORG_LIMITS_UNAVAILABLE")
+		status, h, b = f.request(t, "PUT", write, "root", pair, headers)
+		organizationError(t, status, h, b, 503, "ORG_LIMITS_UPDATE_FAILED")
+	})
+	t.Run("unavailable_database_fails_closed", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		conn, err := f.db.DB()
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+		for _, method := range []string{"GET", "PUT"} {
+			path, raw := read, ""
+			if method == "PUT" {
+				path, raw = write, pair
+			}
+			status, h, b := f.request(t, method, path, "root", raw, headers)
+			assert.Contains(t, []int{401, 500, 503}, status, b)
+			assert.NotEqual(t, true, b["success"])
+			assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+			assert.NotContains(t, b, "data")
+		}
+	})
+	t.Run("second_sql_write_rolls_back_pair", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		status, _, b := f.request(t, "PUT", write, "root", pair, headers)
+		require.Equal(t, 200, status, b)
+		writes := 0
+		require.NoError(t, f.db.Callback().Update().Before("gorm:update").Register("limits-second-write-fault", func(tx *gorm.DB) {
+			if tx.Statement.Table == "options" {
+				writes++
+				if writes == 2 {
+					tx.Statement.Table = "missing_limits_table"
+				}
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, f.db.Callback().Update().Remove("limits-second-write-fault")) })
+		status, h, b := f.request(t, "PUT", write, "root", `{"max_organizations_created":"8","max_organizations_joined":"9"}`, headers)
+		organizationError(t, status, h, b, 503, "ORG_LIMITS_UPDATE_FAILED")
+		require.Equal(t, 2, writes)
+		status, _, b = f.request(t, "GET", read, "empty", "", nil)
+		require.Equal(t, 200, status, b)
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(2), "max_organizations_joined": float64(3)}, b["data"])
+	})
+	t.Run("concurrent_complete_snapshots", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		status, _, b := f.request(t, "PUT", write, "root", pair, headers)
+		require.Equal(t, 200, status, b)
+		start := make(chan struct{})
+		results := make(chan int, 2)
+		var wg sync.WaitGroup
+		for _, raw := range []string{`{"max_organizations_created":"10","max_organizations_joined":"11"}`, `{"max_organizations_created":"20","max_organizations_joined":"21"}`} {
+			wg.Go(func() {
+				<-start
+				req, err := http.NewRequest("PUT", f.server.URL+write, strings.NewReader(raw))
+				if err != nil {
+					results <- 0
+					return
+				}
+				req.Header = headers.Clone()
+				req.Header.Set("Authorization", "Bearer "+f.bearer["root"])
+				resp, err := f.client.Do(req)
+				if err != nil {
+					results <- 0
+					return
+				}
+				defer resp.Body.Close()
+				io.Copy(io.Discard, resp.Body)
+				results <- resp.StatusCode
+			})
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		successes := 0
+		for status := range results {
+			assert.Contains(t, []int{200, 503}, status)
+			if status == 200 {
+				successes++
+			}
+		}
+		require.Positive(t, successes)
+		status, _, b = f.request(t, "GET", read, "empty", "", nil)
+		require.Equal(t, 200, status, b)
+		assert.Contains(t, []any{map[string]any{"max_organizations_created": float64(10), "max_organizations_joined": float64(11)}, map[string]any{"max_organizations_created": float64(20), "max_organizations_joined": float64(21)}}, b["data"])
+	})
+	t.Run("no_store_before_global_rate_rejection", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		enabled, num, duration := common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration
+		t.Cleanup(func() {
+			common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = enabled, num, duration
+		})
+		common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = true, 1, 1200
+		engine := gin.New()
+		SetRouter(engine, WebAssets{IndexPage: []byte("limits-rate")})
+		require.NoError(t, engine.SetTrustedProxies(nil))
+		for i, method := range []string{"GET", "PUT"} {
+			path, raw := read, ""
+			if method == "PUT" {
+				path, raw = write, pair
+			}
+			for attempt := range 2 {
+				req := httptest.NewRequest(method, path, strings.NewReader(raw))
+				req.RemoteAddr = fmt.Sprintf("198.18.%d.%d:1234", f.users["root"].Id%250, i+1)
+				req.Header = headers.Clone()
+				req.Header.Set("Authorization", "Bearer "+f.bearer["root"])
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, req)
+				assert.Equal(t, "private, no-store", response.Header().Get("Cache-Control"))
+				if attempt == 0 {
+					require.Equal(t, 200, response.Code, response.Body.String())
+				} else {
+					assert.Equal(t, 429, response.Code)
+				}
+			}
+		}
+	})
+	t.Run("lost_put_response_requires_read_not_replay", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		committed := make(chan struct{})
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			req, err := http.NewRequest("PUT", f.server.URL+write, r.Body)
+			if err != nil {
+				w.WriteHeader(502)
+				return
+			}
+			req.Header = r.Header.Clone()
+			resp, err := f.client.Do(req)
+			if err != nil {
+				w.WriteHeader(502)
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode != 200 {
+				w.WriteHeader(resp.StatusCode)
+				return
+			}
+			close(committed)
+			<-r.Context().Done()
+		}))
+		defer proxy.Close()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, "PUT", proxy.URL+write, strings.NewReader(pair))
+		require.NoError(t, err)
+		req.Header = headers.Clone()
+		req.Header.Set("Authorization", "Bearer "+f.bearer["root"])
+		result := make(chan error, 1)
+		go func() {
+			resp, err := proxy.Client().Do(req)
+			if resp != nil {
+				resp.Body.Close()
+			}
+			result <- err
+		}()
+		select {
+		case <-committed:
+		case <-time.After(10 * time.Second):
+			t.Fatal("PUT did not commit")
+		}
+		cancel()
+		require.Error(t, <-result)
+		// No automatic PUT retry: an explicit read resolves the unknown outcome.
+		status, _, b := f.request(t, "GET", read, "root", "", nil)
+		require.Equal(t, 200, status, b)
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(2), "max_organizations_joined": float64(3)}, b["data"])
+	})
+	t.Run("running_second_process_observes_commit", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		inR, inW, err := os.Pipe()
+		require.NoError(t, err)
+		defer inW.Close()
+		outR, outW, err := os.Pipe()
+		require.NoError(t, err)
+		defer outR.Close()
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOrganizationLimitsPublication$", "-test.count=1")
+		cmd.Env = append(os.Environ(), "NEWAPI_ORGANIZATION_LIMITS_CHILD=read")
+		cmd.ExtraFiles = []*os.File{inR, outW}
+		var logs bytes.Buffer
+		cmd.Stdout = &logs
+		cmd.Stderr = &logs
+		require.NoError(t, cmd.Start())
+		inR.Close()
+		outW.Close()
+		input := organizationBudgetProcessInput{Kind: f.mainKind, DSN: f.mainDSN, Port: os.Getenv("NEWAPI_S2_" + strings.ToUpper(f.mainKind) + "_PORT"), SQLiteRoot: filepath.Dir(f.mainDSN), SessionSecret: common.SessionSecret, Bearer: f.bearer["root"]}
+		raw, err := common.Marshal(input)
+		require.NoError(t, err)
+		_, err = inW.Write(append(raw, '\n'))
+		require.NoError(t, err)
+		var first map[string]any
+		require.NoError(t, common.DecodeJson(outR, &first))
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(0), "max_organizations_joined": float64(0)}, first["data"])
+		status, _, b := f.request(t, "PUT", write, "root", pair, headers)
+		require.Equal(t, 200, status, b)
+		_, err = inW.Write([]byte{1})
+		require.NoError(t, err)
+		var second map[string]any
+		require.NoError(t, common.DecodeJson(outR, &second))
+		assert.Equal(t, map[string]any{"max_organizations_created": float64(2), "max_organizations_joined": float64(3)}, second["data"])
+		require.NoError(t, cmd.Wait(), logs.String())
+	})
 }

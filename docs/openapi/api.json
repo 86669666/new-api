@@ -23684,6 +23684,462 @@
           }
         }
       }
+    },
+    "/api/organizations/limits": {
+      "get": {
+        "operationId": "getOrganizationLimits",
+        "summary": "Read global organization limits",
+        "tags": [
+          "Organizations"
+        ],
+        "description": "Requires a current dashboard Bearer JWT bound to a live login session. PATs, including root, wildcard and legacy PATs, relay keys and cookies cannot authenticate. Existing global selector and rate-limit boundaries and route authentication run before handler validation. No query string, X-Organization-Id (even zero), X-Security-Proof, Idempotency-Key or method override is accepted. Duplicate headers, duplicate JSON keys, malformed UTF-8 and trailing JSON are rejected. Existing configured Origin and Fetch Metadata policy applies, including to GET; native Bearer requests without browser metadata retain the existing policy. Policy values are authoritative database reads, not cached option values. Missing options mean zero/unlimited; malformed or unavailable policy is an error, never a client zero default. No automatic retry or authentication-refresh replay. Any authenticated live dashboard user may read the global pair. Request body must be empty, including chunked bodies. Both response values are integers in 0..9007199254740991; null, absent or malformed values are unknown, not unlimited.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Complete authoritative global limits pair.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationLimitsResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Handler ORG_REQUEST_INVALID, or existing pre-authentication selector error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OrganizationLifecycleError400"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationAccessError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Existing authentication envelope or handler AUTH_SESSION_REVOKED.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationLifecycleError401"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Existing authentication denial; valid PAT AUTH_SESSION_REQUIRED; handler ORG_FORBIDDEN or AUTH_ORIGIN_FORBIDDEN.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/OrganizationLifecycleError403"
+                        },
+                        {
+                          "properties": {
+                            "code": {
+                              "enum": [
+                                "AUTH_SESSION_REQUIRED",
+                                "ORG_FORBIDDEN",
+                                "AUTH_ORIGIN_FORBIDDEN"
+                              ]
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing global API limiter rejection has an empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              },
+              "Retry-After": {
+                "description": "Optional positive retry interval in seconds when provided by the existing limiter.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Existing authentication/storage failure or ORG_INTERNAL_ERROR. Global limiter may instead return an empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationLifecycleError500"
+                    }
+                  ]
+                }
+              }
+            },
+            "x-empty-body-possible": true
+          },
+          "503": {
+            "description": "Outcome must not be automatically retried.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationLimitsUnavailable"
+                }
+              }
+            }
+          }
+        },
+        "x-automatic-retry": false,
+        "x-query-policy": "forbidden",
+        "x-forbidden-request-headers": [
+          "X-Organization-Id",
+          "X-Security-Proof",
+          "Idempotency-Key",
+          "X-HTTP-Method-Override",
+          "X-Method-Override",
+          "X-HTTP-Method"
+        ],
+        "x-pat-policy": "session-only; valid scoped, wildcard, root and legacy PATs rejected",
+        "x-organization-selector-policy": "forbidden",
+        "x-auth-source": "middleware/access_token_routes.go; middleware/organization_scope.go; router/api-router.go; controller/organization_limits.go; model/organization_limits.go",
+        "x-request-body-policy": "empty only, including chunked transfer"
+      }
+    },
+    "/api/option/organization_limits": {
+      "put": {
+        "operationId": "updateOrganizationLimits",
+        "summary": "Update global organization limits",
+        "tags": [
+          "Organizations"
+        ],
+        "description": "Requires a current dashboard Bearer JWT bound to a live login session. PATs, including root, wildcard and legacy PATs, relay keys and cookies cannot authenticate. Existing global selector and rate-limit boundaries and route authentication run before handler validation. No query string, X-Organization-Id (even zero), X-Security-Proof, Idempotency-Key or method override is accepted. Duplicate headers, duplicate JSON keys, malformed UTF-8 and trailing JSON are rejected. Existing configured Origin and Fetch Metadata policy applies, including to GET; native Bearer requests without browser metadata retain the existing policy. Policy values are authoritative database reads, not cached option values. Missing options mean zero/unlimited; malformed or unavailable policy is an error, never a client zero default. No automatic retry or authentication-refresh replay. Root role is rechecked in the database. Both fields are required canonical decimal strings in 0..9007199254740991. JSON body is at most 1024 bytes. The complete pair commits in the existing bulk transaction; authorization is checked in a separate transaction, not atomically coupled to concurrent revocation. No CAS or idempotency receipt exists. Existing single-key option writes remain compatible. Success returns no data: obtain a genuinely later authoritative GET. Disconnect or failure may leave an uncertain committed outcome; never infer rollback or replay the PUT.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Updated without data; refetch authoritative limits.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationLimitsUpdated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Handler ORG_REQUEST_INVALID, or existing pre-authentication selector error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OrganizationLifecycleError400"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationAccessError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Existing authentication envelope or handler AUTH_SESSION_REVOKED.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationLifecycleError401"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Existing authentication denial; valid PAT AUTH_SESSION_REQUIRED; handler ORG_FORBIDDEN or AUTH_ORIGIN_FORBIDDEN.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/OrganizationLifecycleError403"
+                        },
+                        {
+                          "properties": {
+                            "code": {
+                              "enum": [
+                                "AUTH_SESSION_REQUIRED",
+                                "ORG_FORBIDDEN",
+                                "AUTH_ORIGIN_FORBIDDEN"
+                              ]
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing global API limiter rejection has an empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              },
+              "Retry-After": {
+                "description": "Optional positive retry interval in seconds when provided by the existing limiter.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Existing authentication/storage failure or ORG_INTERNAL_ERROR. Global limiter may instead return an empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationLifecycleError500"
+                    }
+                  ]
+                }
+              }
+            },
+            "x-empty-body-possible": true
+          },
+          "503": {
+            "description": "Outcome must not be automatically retried.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationLimitsUpdateFailed"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body too large.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationLifecycleError413"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "JSON content type is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "private, no-store on canonical route success and errors, including authentication and global limiter failures; framework redirects before middleware are excluded."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationLifecycleError415"
+                }
+              }
+            }
+          }
+        },
+        "x-automatic-retry": false,
+        "x-query-policy": "forbidden",
+        "x-forbidden-request-headers": [
+          "X-Organization-Id",
+          "X-Security-Proof",
+          "Idempotency-Key",
+          "X-HTTP-Method-Override",
+          "X-Method-Override",
+          "X-HTTP-Method"
+        ],
+        "x-pat-policy": "session-only; valid scoped, wildcard, root and legacy PATs rejected",
+        "x-organization-selector-policy": "forbidden",
+        "x-auth-source": "middleware/access_token_routes.go; middleware/organization_scope.go; router/api-router.go; controller/organization_limits.go; model/organization_limits.go",
+        "x-request-max-bytes": 1024,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrganizationLimitsUpdate"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -33044,6 +33500,170 @@
         "maxLength": 128,
         "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?![\\s\\S])",
         "description": "One optional ASCII key, exact bytes, scoped to the authenticated user and organization create/v1. Not an authentication credential. Never reuse it for different normalized names."
+      },
+      "OrganizationLimitDecimal": {
+        "type": "string",
+        "pattern": "^(?:0|[1-9][0-9]{0,14}|[1-8][0-9]{15}|900[0-6][0-9]{12}|90070[0-9]{11}|90071[0-8][0-9]{10}|900719[0-8][0-9]{9}|9007199[0-1][0-9]{8}|90071992[0-4][0-9]{7}|900719925[0-3][0-9]{6}|9007199254[0-6][0-9]{5}|90071992547[0-3][0-9]{4}|9007199254740[0-8][0-9]{2}|90071992547409[0-8][0-9]{1}|9007199254740990|9007199254740991)(?![\\s\\S])",
+        "minLength": 1,
+        "maxLength": 16,
+        "description": "Canonical ASCII decimal from 0 through 9007199254740991; zero means unlimited.",
+        "x-maximum-decimal-value": "9007199254740991"
+      },
+      "OrganizationLimits": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "max_organizations_created",
+          "max_organizations_joined"
+        ],
+        "properties": {
+          "max_organizations_created": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "max_organizations_joined": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        }
+      },
+      "OrganizationLimitsUpdate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "max_organizations_created",
+          "max_organizations_joined"
+        ],
+        "properties": {
+          "max_organizations_created": {
+            "$ref": "#/components/schemas/OrganizationLimitDecimal"
+          },
+          "max_organizations_joined": {
+            "$ref": "#/components/schemas/OrganizationLimitDecimal"
+          }
+        }
+      },
+      "OrganizationLimitsResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/OrganizationLimits"
+          }
+        }
+      },
+      "OrganizationLimitsUpdated": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "message"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          }
+        }
+      },
+      "OrganizationLimitsUnavailable": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "ORG_LIMITS_UNAVAILABLE"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              "Organization limits are temporarily unavailable."
+            ]
+          },
+          "message_key": {
+            "type": "string",
+            "enum": [
+              "Organization limits are temporarily unavailable."
+            ]
+          }
+        }
+      },
+      "OrganizationLimitsUpdateFailed": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "ORG_LIMITS_UPDATE_FAILED"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              "Unable to update organization limits."
+            ]
+          },
+          "message_key": {
+            "type": "string",
+            "enum": [
+              "Unable to update organization limits."
+            ]
+          }
+        }
       }
     },
     "responses": {

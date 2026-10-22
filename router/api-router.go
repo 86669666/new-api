@@ -26,6 +26,7 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
 	anonymousRequestBodyLimit := middleware.AnonymousRequestBodyLimit()
 	{
+		apiRouter.GET("/organizations/limits", middleware.UserAuth(), controller.OrganizationLimitsHandler(false))
 		apiRouter.GET("/organizations", middleware.UserAuth(), controller.ListAccessibleOrganizations)
 		apiRouter.GET("/organization-context", middleware.UserAuth(), controller.GetOrganizationRequestContext)
 		apiRouter.GET("/organizations/:org_id", middleware.UserAuth(), controller.GetOrganizationAccess)
@@ -262,6 +263,7 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.GET("/request_policy", controller.GetRequestPolicy)
 			optionRoute.PATCH("/request_policy", controller.UpdateRequestPolicy)
 			optionRoute.PUT("/", controller.UpdateOption)
+			optionRoute.PUT("/organization_limits", controller.OrganizationLimitsHandler(true))
 			optionRoute.PUT("/passkey/domains", controller.UpdatePasskeyDomains)
 			optionRoute.GET("/model_pricing", controller.GetModelPricingConfig)
 			optionRoute.PATCH("/model_pricing", controller.UpdateModelPricingConfig)

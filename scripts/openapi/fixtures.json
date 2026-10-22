@@ -14658,5 +14658,368 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "organization limits read 0",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "max_organizations_created": 0,
+        "max_organizations_joined": 0
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization limits write 0",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "0",
+      "max_organizations_joined": "0"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization limits read 9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "max_organizations_created": 9007199254740991,
+        "max_organizations_joined": 9007199254740991
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "organization limits write 9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "9007199254740991",
+      "max_organizations_joined": "9007199254740991"
+    },
+    "valid": true
+  },
+  {
+    "name": "organization limits invalid read None",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimits",
+    "value": {
+      "max_organizations_created": null,
+      "max_organizations_joined": null
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid read '0'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimits",
+    "value": {
+      "max_organizations_created": "0",
+      "max_organizations_joined": "0"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid read -1",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimits",
+    "value": {
+      "max_organizations_created": -1,
+      "max_organizations_joined": -1
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid read 0.5",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimits",
+    "value": {
+      "max_organizations_created": 0.5,
+      "max_organizations_joined": 0.5
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid read 9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimits",
+    "value": {
+      "max_organizations_created": 9007199254740992,
+      "max_organizations_joined": 9007199254740992
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write None",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": null,
+      "max_organizations_joined": null
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write 0",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": 0,
+      "max_organizations_joined": 0
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '00'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "00",
+      "max_organizations_joined": "00"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '01'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "01",
+      "max_organizations_joined": "01"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '+1'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "+1",
+      "max_organizations_joined": "+1"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '-1'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "-1",
+      "max_organizations_joined": "-1"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write ' 1'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": " 1",
+      "max_organizations_joined": " 1"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '1 '",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "1 ",
+      "max_organizations_joined": "1 "
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '1e1'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "1e1",
+      "max_organizations_joined": "1e1"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '1.0'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "1.0",
+      "max_organizations_joined": "1.0"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '9007199254740992'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "9007199254740992",
+      "max_organizations_joined": "9007199254740992"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits invalid write '9999999999999999'",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "9999999999999999",
+      "max_organizations_joined": "9999999999999999"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits OrganizationLimits missing",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimits",
+    "value": {
+      "max_organizations_created": 0
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits OrganizationLimits extra",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimits",
+    "value": {
+      "max_organizations_created": 0,
+      "max_organizations_joined": 0,
+      "extra": 0
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits OrganizationLimitsUpdate missing",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "0"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits OrganizationLimitsUpdate extra",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "0",
+      "max_organizations_joined": "0",
+      "extra": "0"
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits updated",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdated",
+    "value": {
+      "success": true,
+      "message": ""
+    },
+    "valid": true
+  },
+  {
+    "name": "organization limits updated data forbidden",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdated",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {}
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits Unavailable",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUnavailable",
+    "value": {
+      "success": false,
+      "code": "ORG_LIMITS_UNAVAILABLE",
+      "message": "Organization limits are temporarily unavailable.",
+      "message_key": "Organization limits are temporarily unavailable."
+    },
+    "valid": true
+  },
+  {
+    "name": "organization limits Unavailable data forbidden",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUnavailable",
+    "value": {
+      "success": false,
+      "code": "ORG_LIMITS_UNAVAILABLE",
+      "message": "Organization limits are temporarily unavailable.",
+      "message_key": "Organization limits are temporarily unavailable.",
+      "data": {}
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits Unavailable wrong code",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUnavailable",
+    "value": {
+      "success": false,
+      "code": "ORG_INTERNAL_ERROR",
+      "message": "Organization limits are temporarily unavailable.",
+      "message_key": "Organization limits are temporarily unavailable."
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits UpdateFailed",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdateFailed",
+    "value": {
+      "success": false,
+      "code": "ORG_LIMITS_UPDATE_FAILED",
+      "message": "Unable to update organization limits.",
+      "message_key": "Unable to update organization limits."
+    },
+    "valid": true
+  },
+  {
+    "name": "organization limits UpdateFailed data forbidden",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdateFailed",
+    "value": {
+      "success": false,
+      "code": "ORG_LIMITS_UPDATE_FAILED",
+      "message": "Unable to update organization limits.",
+      "message_key": "Unable to update organization limits.",
+      "data": {}
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits UpdateFailed wrong code",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdateFailed",
+    "value": {
+      "success": false,
+      "code": "ORG_INTERNAL_ERROR",
+      "message": "Unable to update organization limits.",
+      "message_key": "Unable to update organization limits."
+    },
+    "valid": false
+  },
+  {
+    "name": "organization limits decimal trailing newline",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLimitsUpdate",
+    "value": {
+      "max_organizations_created": "1\n",
+      "max_organizations_joined": "0"
+    },
+    "valid": false
   }
 ]

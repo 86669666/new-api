@@ -750,6 +750,52 @@ def check_token_usage_series(api):
             'legacy_management_errors_preserved': True, 'live_http': False}
 
 
+def check_organization_limits(api):
+    schemas = api['components']['schemas']
+    fields = {'max_organizations_created', 'max_organizations_joined'}
+    for name in ['OrganizationLimits', 'OrganizationLimitsUpdate']:
+        schema = schemas[name]
+        assert schema['additionalProperties'] is False
+        assert set(schema['required']) == set(schema['properties']) == fields
+    for field in fields:
+        assert schemas['OrganizationLimits']['properties'][field] == {'type': 'integer', 'minimum': 0, 'maximum': 9007199254740991}
+        assert schemas['OrganizationLimitsUpdate']['properties'][field] == {'$ref': '#/components/schemas/OrganizationLimitDecimal'}
+    decimal = schemas['OrganizationLimitDecimal']
+    assert decimal['type'] == 'string' and decimal['maxLength'] == 16
+    for value in ['0', '1', '9007199254740990', '9007199254740991']:
+        validate_value(api, decimal, value)
+    for value in ['', '00', '+1', '-1', ' 1', '1 ', '1e1', '1\n', '9007199254740992', '9999999999999999', 0, None]:
+        assert list(OAS30Validator(decimal).iter_errors(value)), value
+    for path, method, operation_id, result, failure in [
+        ('/api/organizations/limits', 'get', 'getOrganizationLimits', 'OrganizationLimitsResult', 'OrganizationLimitsUnavailable'),
+        ('/api/option/organization_limits', 'put', 'updateOrganizationLimits', 'OrganizationLimitsUpdated', 'OrganizationLimitsUpdateFailed'),
+    ]:
+        operation = api['paths'][path][method]
+        assert set(api['paths'][path]) == {method}
+        assert operation['operationId'] == operation_id
+        assert operation['security'] == [{'DashboardJWT': []}]
+        assert operation['parameters'] == [] and operation['x-query-policy'] == 'forbidden'
+        assert operation['x-automatic-retry'] is False
+        assert {'X-Organization-Id', 'X-Security-Proof', 'Idempotency-Key'} <= set(operation['x-forbidden-request-headers'])
+        assert set(operation['responses']) == {'200', '400', '401', '403', '429', '500', '503'} | ({'413', '415'} if method == 'put' else set())
+        for response in operation['responses'].values():
+            assert response['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
+        for status, name in [('200', result), ('503', failure)]:
+            assert operation['responses'][status]['content']['application/json']['schema'] == {'$ref': '#/components/schemas/' + name}
+            assert schemas[name]['additionalProperties'] is False
+        assert 'content' not in operation['responses']['429']
+        assert operation['responses']['500']['x-empty-body-possible'] is True
+        if method == 'put':
+            assert operation['x-request-max-bytes'] == 1024
+            assert operation['requestBody'] == {'required': True, 'content': {'application/json': {'schema': {'$ref': '#/components/schemas/OrganizationLimitsUpdate'}}}}
+        else:
+            assert 'requestBody' not in operation
+    assert set(schemas['OrganizationLimitsUpdated']['properties']) == set(schemas['OrganizationLimitsUpdated']['required']) == {'success', 'message'}
+    assert schemas['OrganizationLimitsUnavailable']['properties']['code']['enum'] == ['ORG_LIMITS_UNAVAILABLE']
+    assert schemas['OrganizationLimitsUpdateFailed']['properties']['code']['enum'] == ['ORG_LIMITS_UPDATE_FAILED']
+    return {'routes': 2, 'live_session_only': True, 'safeinteger_pair': True, 'automatic_retry': False, 'live_http': False}
+
+
 def check_organization_create_rate(api):
     operation = api['paths']['/api/organizations']['post']
     rate = operation['x-organization-create-rate-limit']
@@ -1385,6 +1431,7 @@ def main():
 
     fixtures = json.loads((Path(__file__).with_name('fixtures.json')).read_text())
     results['token_usage'] = check_token_usage(api)
+    results['organization_limits'] = check_organization_limits(api)
     results['organization_create_rate'] = check_organization_create_rate(api)
     results['token_usage_series'] = check_token_usage_series(api)
     results['token_pricing'] = check_token_pricing(api)

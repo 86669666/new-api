@@ -198,6 +198,9 @@ var organizationResourceRoutes = map[string]bool{
 func OrganizationSelectionBoundary() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		isAccess, pathSelection, discovery := false, false, false
+		if c.Request.Method == http.MethodGet && c.FullPath() == "/api/organizations/limits" || c.Request.Method == http.MethodPut && c.FullPath() == "/api/option/organization_limits" {
+			isAccess, discovery = true, true
+		}
 		if selection := organizationRequestSelection(c); selection.code == "" && selection.id > 0 && organizationResourceRoutes[c.Request.Method+" "+c.FullPath()] {
 			isAccess = true
 		}
