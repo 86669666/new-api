@@ -78,3 +78,11 @@ channel.upstream_update_more_omitted: "（其余 {{.Count}} 个已省略）"
 organization.selector_invalid: "组织选择参数无效。"
 organization.selector_conflict: "组织选择参数冲突。"
 organization.scope_unsupported: "此接口不支持组织资源。"
+
+# Read-only token usage API errors
+token_usage.query_invalid: "令牌用量查询参数无效"
+token_usage.range_invalid: "令牌用量时间范围无效"
+token_usage.range_too_wide: "时间范围不能超过 {{.Days}} 天"
+token_usage.logs_disabled: "令牌用量日志采集已关闭"
+token_usage.stat_unavailable: "令牌用量统计暂不可用"
+token_usage.query_failed: "令牌用量查询失败"

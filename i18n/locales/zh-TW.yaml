@@ -78,3 +78,11 @@ channel.upstream_update_more_omitted: "（其餘 {{.Count}} 個已省略）"
 organization.selector_invalid: "組織選擇參數無效。"
 organization.selector_conflict: "組織選擇參數衝突。"
 organization.scope_unsupported: "此介面不支援組織資源。"
+
+# Read-only token usage API errors
+token_usage.query_invalid: "令牌用量查詢參數無效"
+token_usage.range_invalid: "令牌用量時間範圍無效"
+token_usage.range_too_wide: "時間範圍不能超過 {{.Days}} 天"
+token_usage.logs_disabled: "令牌用量日誌收集已關閉"
+token_usage.stat_unavailable: "令牌用量統計暫不可用"
+token_usage.query_failed: "令牌用量查詢失敗"

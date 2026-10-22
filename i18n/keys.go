@@ -99,3 +99,13 @@ const (
 	MsgChannelUpstreamUpdateFailedChannels  = "channel.upstream_update_failed_channels"
 	MsgChannelUpstreamUpdateMoreOmitted     = "channel.upstream_update_more_omitted"
 )
+
+// Read-only token usage API errors.
+const (
+	MsgTokenUsageQueryInvalid    = "token_usage.query_invalid"
+	MsgTokenUsageRangeInvalid    = "token_usage.range_invalid"
+	MsgTokenUsageRangeTooWide    = "token_usage.range_too_wide"
+	MsgTokenUsageLogsDisabled    = "token_usage.logs_disabled"
+	MsgTokenUsageStatUnavailable = "token_usage.stat_unavailable"
+	MsgTokenUsageQueryFailed     = "token_usage.query_failed"
+)

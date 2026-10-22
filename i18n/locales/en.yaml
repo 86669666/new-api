@@ -77,3 +77,11 @@ channel.upstream_update_more_omitted: " ({{.Count}} more omitted)"
 organization.selector_invalid: "Invalid organization selector."
 organization.selector_conflict: "Organization selectors conflict."
 organization.scope_unsupported: "Organization resources are not supported on this endpoint."
+
+# Read-only token usage API errors
+token_usage.query_invalid: "Invalid token usage query."
+token_usage.range_invalid: "Invalid token usage time range."
+token_usage.range_too_wide: "The time range cannot exceed {{.Days}} days"
+token_usage.logs_disabled: "Token usage log collection is disabled."
+token_usage.stat_unavailable: "Token usage statistics are unavailable."
+token_usage.query_failed: "Failed to query token usage."
