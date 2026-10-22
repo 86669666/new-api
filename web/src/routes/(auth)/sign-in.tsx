@@ -22,6 +22,7 @@ import { z } from 'zod'
 import { sanitizeAuthRedirect } from '@/features/auth/lib/auth-redirect'
 import { SignIn } from '@/features/auth/sign-in'
 import { resolveAuthentication } from '@/lib/auth-session'
+import { appPath } from '@/lib/deployment-path'
 import { useAuthStore } from '@/stores/auth-store'
 
 const searchSchema = z.object({
@@ -42,7 +43,7 @@ export const Route = createFileRoute('/(auth)/sign-in')({
     if (auth.user) {
       const target =
         sanitizeAuthRedirect(search?.redirect, window.location.origin) ??
-        '/dashboard'
+        appPath('/dashboard')
       throw redirect({ href: target, replace: true })
     }
   },

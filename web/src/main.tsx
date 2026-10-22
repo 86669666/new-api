@@ -22,6 +22,7 @@ import { StrictMode } from 'react'
 import ReactDOM from 'react-dom/client'
 
 import { installBuildMetadata } from '@/lib/build-metadata'
+import { getAppBasePath } from '@/lib/deployment-path'
 import { applyFaviconToDom } from '@/lib/dom-utils'
 import '@/lib/dayjs'
 import { initializeFrontendCache } from '@/lib/frontend-cache'
@@ -50,6 +51,7 @@ const queryClient = createAppQueryClient(() => {
 // Create a new router instance
 const router = createRouter({
   routeTree,
+  basepath: getAppBasePath(),
   context: { queryClient },
   defaultPreload: 'intent',
   defaultPreloadStaleTime: 0,

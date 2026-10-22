@@ -25,6 +25,7 @@ import {
   sanitizeAuthRedirect,
 } from '@/features/auth/lib/auth-redirect'
 import { applyAuthBundle, isAuthBundle } from '@/lib/api'
+import { appPath } from '@/lib/deployment-path'
 import { AuthOperationError } from '@/lib/secure-verification'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 
@@ -64,7 +65,8 @@ export function useAuthRedirect() {
       }
 
       const targetPath =
-        sanitizeAuthRedirect(redirectTo, window.location.origin) ?? '/dashboard'
+        sanitizeAuthRedirect(redirectTo, window.location.origin) ??
+        appPath('/dashboard')
       await navigate({ href: targetPath, replace: true })
     },
     [navigate, sessionID]

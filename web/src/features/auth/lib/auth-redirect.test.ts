@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import type { AuthUser } from '@/stores/auth-store'
 
@@ -87,5 +87,36 @@ describe('saved authentication language', () => {
     expect(getSavedLanguage({ ...user, setting: { language: 123 } })).toBe(
       undefined
     )
+  })
+})
+
+describe('fixed deployment prefix authentication redirects', () => {
+  afterEach(() => vi.unstubAllEnvs())
+
+  test('keeps logical and already-public redirects inside the deployment', () => {
+    vi.stubEnv('VITE_REACT_APP_BASE_PATH', '/tenant/gateway')
+    expect(sanitizeAuthRedirect('/wallet?tab=x#balance', origin)).toBe(
+      '/tenant/gateway/wallet?tab=x#balance'
+    )
+    expect(sanitizeAuthRedirect('/tenant/gateway/keys', origin)).toBe(
+      '/tenant/gateway/keys'
+    )
+    expect(
+      sanitizeAuthRedirect(`${origin}/tenant/gateway/pricing`, origin)
+    ).toBe('/tenant/gateway/pricing')
+  })
+
+  test('rejects absolute targets outside the prefix and ambiguous path escapes', () => {
+    vi.stubEnv('VITE_REACT_APP_BASE_PATH', '/gateway')
+    for (const target of [
+      `${origin}/wallet`,
+      `${origin}/gateway-other/wallet`,
+      '/gateway/../wallet',
+      '/gateway/%2e%2e/wallet',
+      '/wallet\n',
+      '/%2f%2fevil.example',
+    ]) {
+      expect(sanitizeAuthRedirect(target, origin)).toBeNull()
+    }
   })
 })

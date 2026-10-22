@@ -6,6 +6,8 @@ import { pluginReact } from '@rsbuild/plugin-react'
 import { pluginTailwindcss } from '@rsbuild/plugin-tailwindcss'
 import { tanstackRouter } from '@tanstack/router-plugin/rspack'
 
+import { normalizeBasePath } from './src/lib/deployment-path'
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig(({ envMode }) => {
@@ -15,13 +17,26 @@ export default defineConfig(({ envMode }) => {
     env.rawPublicVars.VITE_REACT_APP_SERVER_URL ||
     'http://localhost:3000'
 
+  const basePath = normalizeBasePath(
+    process.env.VITE_REACT_APP_BASE_PATH ??
+      env.rawPublicVars.VITE_REACT_APP_BASE_PATH
+  )
+  const prefix = basePath === '/' ? '' : basePath
+
   const isProd = envMode === 'production'
   const devProxy = Object.fromEntries(
     (['/api', '/v1', '/mj', '/pg'] as const).map((key) => [
-      key,
-      { target: serverUrl, changeOrigin: true },
+      `${prefix}${key}`,
+      {
+        target: serverUrl,
+        changeOrigin: true,
+        pathRewrite: (requestPath: string) => requestPath.slice(prefix.length),
+        cookiePathRewrite: prefix
+          ? { '/': `${prefix}/`, '/api/user/auth': `${prefix}/api/user/auth` }
+          : undefined,
+      },
     ])
-  ) as Record<string, { target: string; changeOrigin: boolean }>
+  )
 
   return {
     plugins: [pluginReact(), pluginTailwindcss({ optimize: false })],
@@ -53,6 +68,9 @@ export default defineConfig(({ envMode }) => {
       },
     },
     source: {
+      define: {
+        'import.meta.env.VITE_REACT_APP_BASE_PATH': JSON.stringify(basePath),
+      },
       entry: {
         index: './src/main.tsx',
       },
@@ -64,14 +82,17 @@ export default defineConfig(({ envMode }) => {
     },
     html: {
       template: './index.html',
+      meta: { 'new-api-base-path': basePath },
       favicon: './public/favicon.ico',
     },
     server: {
+      base: basePath,
       host: '0.0.0.0',
       strictPort: false,
       proxy: devProxy,
     },
     output: {
+      assetPrefix: `${prefix}/`,
       // Production optimizations
       minify: isProd,
       target: 'web',

@@ -25,6 +25,7 @@ import {
   getFreshAuthHeaders,
   refreshAuthentication,
 } from '@/lib/auth-session'
+import { getAppBasePath, appPath } from '@/lib/deployment-path'
 import { handleServerError } from '@/lib/handle-server-error'
 import {
   getServerErrorMessage,
@@ -47,7 +48,7 @@ declare module 'axios' {
 export type ApiRequestConfig = AxiosRequestConfig
 
 export const api = axios.create({
-  baseURL: '',
+  baseURL: getAppBasePath(),
   withCredentials: true,
   headers: {
     // no-store forbids storage; no-cache also revalidates any older cached response.
@@ -77,9 +78,9 @@ api.get = ((url: string, config: ApiRequestConfig = {}) => {
 function redirectToSignIn(): void {
   if (
     typeof window !== 'undefined' &&
-    window.location.pathname !== '/sign-in'
+    window.location.pathname !== appPath('/sign-in')
   ) {
-    window.location.replace('/sign-in')
+    window.location.replace(appPath('/sign-in'))
   }
 }
 

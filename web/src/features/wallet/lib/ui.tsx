@@ -22,6 +22,7 @@ import type { ReactNode } from 'react'
 
 import { IconAlipay, IconWeChat, IconStripe } from '@/assets/brand-icons'
 import { ReactIconByName } from '@/components/react-icon-by-name'
+import { appPath } from '@/lib/deployment-path'
 
 import { PAYMENT_TYPES, PAYMENT_ICON_COLORS } from '../constants'
 
@@ -143,12 +144,12 @@ export function getPaymentIcon(
           style={{ transform: 'scale(2)' }}
         >
           <img
-            src='/waffo-logo-light.svg'
+            src={appPath('/waffo-logo-light.svg')}
             alt={i18next.t('Waffo')}
             className='block h-full w-full object-contain dark:hidden'
           />
           <img
-            src='/waffo-logo-dark.svg'
+            src={appPath('/waffo-logo-dark.svg')}
             alt={i18next.t('Waffo')}
             className='hidden h-full w-full object-contain dark:block'
           />

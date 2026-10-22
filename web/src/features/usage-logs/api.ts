@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api, getFreshAuthHeaders, type ApiRequestConfig } from '@/lib/api'
+import { appPath } from '@/lib/deployment-path'
 import { createServerError } from '@/lib/server-error-message'
 
 import type { UsageLog } from './data/schema'
@@ -102,7 +103,7 @@ export async function exportLogs(
     params as unknown as Record<string, unknown>
   )
   const response = await fetch(
-    `${buildApiPath('/api/log', isAdmin)}/export?${queryParams}`,
+    appPath(`${buildApiPath('/api/log', isAdmin)}/export?${queryParams}`),
     {
       credentials: 'include',
       headers: await getFreshAuthHeaders(),

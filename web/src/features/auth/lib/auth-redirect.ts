@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { appPath, getAppBasePath } from '@/lib/deployment-path'
 import type { AuthUser } from '@/stores/auth-store'
 
 const allowedRedirectProtocols = new Set(['http:', 'https:'])
@@ -50,6 +51,22 @@ export function sanitizeAuthRedirect(
   if (typeof value !== 'string') return null
 
   const target = value.trim()
+  if (
+    [...value].some(
+      (character) =>
+        character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127
+    )
+  ) {
+    return null
+  }
+  // Reject encoded separators and dot segments before URL normalization.
+  const rawPath = target.split(/[?#]/, 1)[0]
+  if (
+    /%(?:2e|2f|5c|25)/i.test(rawPath) ||
+    /(?:^|\/)\.{1,2}(?:\/|$)/.test(rawPath)
+  ) {
+    return null
+  }
   if (!target || target.includes('\\') || target.startsWith('//')) return null
 
   let trustedOrigin: URL
@@ -76,5 +93,18 @@ export function sanitizeAuthRedirect(
     return null
   }
 
-  return `${redirectURL.pathname}${redirectURL.search}${redirectURL.hash}`
+  const basePath = getAppBasePath()
+  if (
+    !target.startsWith('/') &&
+    basePath !== '/' &&
+    redirectURL.pathname !== basePath &&
+    !redirectURL.pathname.startsWith(`${basePath}/`)
+  ) {
+    return null
+  }
+
+  return appPath(
+    `${redirectURL.pathname}${redirectURL.search}${redirectURL.hash}`,
+    basePath
+  )
 }

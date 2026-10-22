@@ -41,6 +41,7 @@ import {
   clearAuthentication,
 } from '@/lib/auth-session'
 import { subscribeAuthSessionEvents } from '@/lib/auth-session-sync'
+import { appPath } from '@/lib/deployment-path'
 import { resolveLegacyRoute } from '@/lib/legacy-route'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -126,7 +127,7 @@ export const Route = createRootRouteWithContext<{
   beforeLoad: async ({ location }) => {
     const legacyTarget = resolveLegacyRoute(location.href)
     if (legacyTarget) {
-      throw redirect({ href: legacyTarget, replace: true })
+      throw redirect({ href: appPath(legacyTarget), replace: true })
     }
 
     const pathname = location?.pathname || ''

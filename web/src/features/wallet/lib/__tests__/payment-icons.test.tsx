@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { render, screen } from '@testing-library/react'
-import { expect, test } from 'vitest'
+import { afterEach, expect, test, vi } from 'vitest'
 
 import { PAYMENT_ICON_COLORS, PAYMENT_TYPES } from '../../constants'
 import { getPaymentIcon } from '../ui'
@@ -47,4 +47,31 @@ test('an admin-configured Simple Icon still resolves through the lazy icon loade
   )
   const title = await screen.findByTitle('Configured Alipay')
   expect(title.closest('svg')).toHaveClass('h-4', 'w-4')
+})
+
+afterEach(() => vi.unstubAllEnvs())
+
+test('built-in Waffo assets follow the mount while configured HTTPS icons stay external', () => {
+  vi.stubEnv('VITE_REACT_APP_BASE_PATH', '/tenant/gateway')
+  const { container } = render(getPaymentIcon(PAYMENT_TYPES.WAFFO_PANCAKE))
+  expect(
+    [...container.querySelectorAll('img')].map((image) =>
+      image.getAttribute('src')
+    )
+  ).toEqual([
+    '/tenant/gateway/waffo-logo-light.svg',
+    '/tenant/gateway/waffo-logo-dark.svg',
+  ])
+  render(
+    getPaymentIcon(
+      PAYMENT_TYPES.ALIPAY,
+      'h-4 w-4',
+      'https://images.example/icon.svg',
+      'External icon'
+    )
+  )
+  expect(screen.getByRole('img', { name: 'External icon' })).toHaveAttribute(
+    'src',
+    'https://images.example/icon.svg'
+  )
 })
