@@ -55,7 +55,12 @@ export async function requestAuthorization(
   phase: AuthorizationPhase,
   signal: AbortSignal,
   challenge: string,
-  decision?: { preview: AuthorizationPreview; approve: boolean; email: boolean }
+  decision?: {
+    preview: AuthorizationPreview
+    approve: boolean
+    email: boolean
+    offline: boolean
+  }
 ): Promise<AuthorizationPreview | string> {
   try {
     if (signal.aborted || !authorizationIdentityMatches(identity)) {
@@ -71,7 +76,14 @@ export async function requestAuthorization(
       body.decision = action
       if (phase === 'consent') {
         body.selected_scopes = decision.approve
-          ? ['profile', ...(decision.email ? ['email'] : [])]
+          ? [
+              'profile',
+              ...(decision.preview.allowed_scopes.includes('openid')
+                ? ['openid']
+                : []),
+              ...(decision.email ? ['email'] : []),
+              ...(decision.offline ? ['offline_access'] : []),
+            ]
           : []
       }
     }
@@ -125,7 +137,9 @@ export async function requestAuthorization(
       !Array.isArray(record.allowed_scopes) ||
       !record.allowed_scopes.includes('profile') ||
       !record.allowed_scopes.every(
-        (scope) => scope === 'profile' || scope === 'email'
+        (scope) =>
+          ['openid', 'profile', 'email', 'offline_access'].includes(scope) &&
+          (record.requested_scopes as string[]).includes(scope)
       ) ||
       new Set(record.allowed_scopes).size !== record.allowed_scopes.length
     ) {

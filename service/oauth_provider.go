@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -44,6 +45,7 @@ type OAuthProviderBridge struct {
 	authorize string
 	policy    string
 	revoke    string
+	public    *OAuthPublic
 }
 
 type OAuthProviderPreview struct {
@@ -91,6 +93,7 @@ type oauthProviderChallenge struct {
 
 type oauthProviderClient struct {
 	ID          string    `json:"client_id"`
+	SubjectType string    `json:"subject_type"`
 	Name        *string   `json:"client_name"`
 	Method      *string   `json:"token_endpoint_auth_method"`
 	Scope       *string   `json:"scope"`
@@ -122,6 +125,13 @@ func InitOAuthProviderBridge() error {
 	}, CurrentOAuthUserInfoResource())
 	if err != nil {
 		return ErrOAuthProviderConfiguration
+	}
+	public := os.Getenv("OAUTH_PROVIDER_PUBLIC_ENABLED")
+	if public != "" && public != "false" && public != "true" {
+		return ErrOAuthProviderConfiguration
+	}
+	if _, err := NewOAuthPublic(OAuthPublicConfig{Enabled: public == "true", BaseURL: os.Getenv("OAUTH_PROVIDER_PUBLIC_BASE_URL")}, bridge); err != nil {
+		return err
 	}
 	currentOAuthProvider.Store(bridge)
 	return nil
@@ -179,7 +189,11 @@ func (b *OAuthProviderBridge) RevokeToken(ctx context.Context, token, clientID s
 		return ErrOAuthProviderRequest
 	}
 	body := url.Values{"token": {token}, "client_id": {clientID}}.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.revoke, strings.NewReader(body))
+	endpoint := b.revoke
+	if b.public != nil {
+		endpoint = b.public.base + "/oauth2/revoke"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
 	if err != nil {
 		return ErrOAuthResourceUnavailable
 	}
@@ -197,6 +211,9 @@ func (b *OAuthProviderBridge) RevokeToken(ctx context.Context, token, clientID s
 		return ErrOAuthResourceUnavailable
 	}
 	if response.StatusCode == http.StatusOK {
+		if b.public != nil {
+			return b.public.verifyRevocation(ctx, token)
+		}
 		return nil
 	}
 	if response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusUnauthorized {
@@ -210,7 +227,7 @@ func (b *OAuthProviderBridge) RevokeToken(ctx context.Context, token, clientID s
 }
 
 func (b *OAuthProviderBridge) Preview(ctx context.Context, actor AuthIdentity, phase, challenge string) (*OAuthProviderPreview, error) {
-	if phase != "login" && phase != "consent" || !validOAuthProviderCapability(challenge) {
+	if phase != "login" && phase != "consent" || !validOAuthHydraCapability(challenge) {
 		return nil, ErrOAuthProviderRequest
 	}
 	if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
@@ -245,7 +262,7 @@ func (b *OAuthProviderBridge) Preview(ctx context.Context, actor AuthIdentity, p
 }
 
 func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, phase string, input OAuthProviderDecision) (*OAuthProviderRedirect, error) {
-	if phase != "login" && phase != "consent" || !validOAuthProviderCapability(input.Challenge) || len(input.PreviewToken) != 43 {
+	if phase != "login" && phase != "consent" || !validOAuthHydraCapability(input.Challenge) || len(input.PreviewToken) != 43 {
 		return nil, ErrOAuthProviderRequest
 	}
 	if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
@@ -266,7 +283,11 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 		body = map[string]any{"subject": strconv.Itoa(actor.UserID), "remember": false}
 	} else if phase == "consent" && input.Decision == "approve" {
 		selected := input.SelectedScopes
-		if len(selected) == 0 || len(selected) > 2 || !slices.Contains(selected, "profile") {
+		limit := 2
+		if b.public != nil {
+			limit = 4
+		}
+		if len(selected) == 0 || len(selected) > limit || !slices.Contains(selected, "profile") || b.public != nil && slices.Contains(request.requested, "openid") && !slices.Contains(selected, "openid") {
 			return nil, ErrOAuthProviderDenied
 		}
 		for i, scope := range selected {
@@ -276,6 +297,13 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 		}
 		body = map[string]any{"remember": false, "grant_scope": selected, "grant_access_token_audience": []string{b.resource.audience},
 			"session": map[string]any{"access_token": map[string]string{"newapi_auth_version": strconv.FormatInt(actor.UserAuthVersion, 10)}}}
+		if b.public != nil {
+			grant := make([]byte, 32)
+			if _, err := rand.Read(grant); err != nil {
+				return nil, ErrOAuthResourceUnavailable
+			}
+			body.(map[string]any)["session"] = map[string]any{"access_token": map[string]string{"newapi_auth_version": strconv.FormatInt(actor.UserAuthVersion, 10), "newapi_grant_id": base64.RawURLEncoding.EncodeToString(grant), "newapi_grant_expires_at": strconv.FormatInt(time.Now().Add(7*24*time.Hour).Unix(), 10)}}
+		}
 	} else {
 		return nil, ErrOAuthProviderRequest
 	}
@@ -371,7 +399,7 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 		return nil, ErrOAuthProviderDenied
 	}
 	for key, values := range q {
-		if !slices.Contains([]string{"client_id", "response_type", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method", "response_mode", "prompt", "audience"}, key) || len(values) == 0 || key != "audience" && len(values) != 1 {
+		if !slices.Contains([]string{"client_id", "response_type", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method", "response_mode", "prompt", "audience", "nonce"}, key) || len(values) == 0 || key != "audience" && len(values) != 1 {
 			return nil, ErrOAuthProviderDenied
 		}
 	}
@@ -392,7 +420,19 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 		return nil, ErrOAuthProviderDenied
 	}
 	allowed := []string{}
-	for _, scope := range []string{"profile", "email"} {
+	supported := []string{"profile", "email"}
+	if b.public != nil {
+		supported = oauthPublicScopes
+		for _, scope := range requested {
+			if !slices.Contains(supported, scope) || !slices.Contains(registered, scope) {
+				return nil, ErrOAuthProviderDenied
+			}
+		}
+		if slices.Contains(requested, "offline_access") && !slices.Contains(requested, "openid") || q.Has("nonce") && !validOAuthProviderCapability(q.Get("nonce")) {
+			return nil, ErrOAuthProviderDenied
+		}
+	}
+	for _, scope := range supported {
 		if slices.Contains(requested, scope) && slices.Contains(registered, scope) {
 			allowed = append(allowed, scope)
 		}
@@ -433,6 +473,7 @@ func (b *OAuthProviderBridge) adminCall(ctx context.Context, method, phase, acti
 	if err != nil {
 		return ErrOAuthResourceUnavailable
 	}
+	req.GetBody = nil
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -470,7 +511,7 @@ func (b *OAuthProviderBridge) validResume(raw, phase string, original url.Values
 		return false
 	}
 	verifier := phase + "_verifier"
-	if len(q[verifier]) != 1 || !validOAuthProviderCapability(q.Get(verifier)) || len(q) != len(original)+1 {
+	if len(q[verifier]) != 1 || !validOAuthHydraCapability(q.Get(verifier)) || len(q) != len(original)+1 {
 		return false
 	}
 	for key, values := range original {

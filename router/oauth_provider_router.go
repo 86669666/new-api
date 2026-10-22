@@ -9,6 +9,7 @@ import (
 )
 
 func SetOAuthProviderRouter(router *gin.Engine, bridge *service.OAuthProviderBridge) {
+	SetOAuthPublicRouter(router, bridge)
 	// Reserve this exact credential path even while off and for unmatched verbs.
 	// Otherwise NoRoute can copy its query into a frontend redirect or SPA.
 	router.Use(func(c *gin.Context) {
@@ -30,7 +31,7 @@ func SetOAuthProviderRouter(router *gin.Engine, bridge *service.OAuthProviderBri
 		c.Next()
 	})
 	revocation := router.Group("/oauth2")
-	revocation.Use(middleware.RouteTag("api"), middleware.GlobalAPIRateLimit(), middleware.CriticalRateLimit())
+	revocation.Use(middleware.RouteTag("api"), middleware.OAuthPublicRateFailure, middleware.GlobalAPIRateLimit(), middleware.CriticalRateLimit())
 	revocation.Any("/revoke", middleware.OAuthRevocationBoundary, controller.RevokeOAuthToken(bridge))
 	// A catch-all also consumes repeated slashes before Gin can issue a TSR.
 	revocation.Any("/revoke/*trailing", func(c *gin.Context) {
@@ -40,7 +41,7 @@ func SetOAuthProviderRouter(router *gin.Engine, bridge *service.OAuthProviderBri
 		return
 	}
 	group := router.Group("/api/oauth/provider")
-	group.Use(middleware.RouteTag("api"), middleware.OAuthResourceNoStore, middleware.GlobalAPIRateLimit(), middleware.CriticalRateLimit())
+	group.Use(middleware.OAuthPublicProviderOrigin(bridge), middleware.RouteTag("api"), middleware.OAuthResourceNoStore, middleware.OAuthPublicRateFailure, middleware.GlobalAPIRateLimit(), middleware.CriticalRateLimit())
 	for _, phase := range []string{"login", "consent"} {
 		for _, preview := range []bool{true, false} {
 			path := "/" + phase

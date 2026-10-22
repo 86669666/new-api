@@ -64,7 +64,7 @@ func OAuthProviderHandler(bridge *service.OAuthProviderBridge, phase string, pre
 			middleware.WriteOAuthProviderError(c, service.ErrOAuthInvalidToken)
 			return
 		}
-		data, err := io.ReadAll(io.LimitReader(c.Request.Body, 16385))
+		data, err := io.ReadAll(io.LimitReader(c.Request.Body, 65537))
 		required := []string{"challenge"}
 		if !preview {
 			required = append(required, "preview_token", "decision")
@@ -72,7 +72,7 @@ func OAuthProviderHandler(bridge *service.OAuthProviderBridge, phase string, pre
 				required = append(required, "selected_scopes")
 			}
 		}
-		if err != nil || len(data) > 16384 || common.ValidateJSONObjectFields(data, required, nil) != nil {
+		if err != nil || len(data) > 65536 || common.ValidateJSONObjectFields(data, required, nil) != nil {
 			middleware.WriteOAuthProviderError(c, service.ErrOAuthProviderRequest)
 			return
 		}

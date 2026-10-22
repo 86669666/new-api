@@ -346,6 +346,9 @@ func InitResources() error {
 		}
 	}
 	model.InitOptionMap()
+	if err := service.ValidateOAuthPublicTopology(context.Background()); err != nil {
+		return err
+	}
 
 	// 清理旧的磁盘缓存文件
 	common.CleanupOldCacheFiles()

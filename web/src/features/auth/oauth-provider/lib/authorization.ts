@@ -51,7 +51,7 @@ export function createAuthorizationEntry(phase: AuthorizationPhase) {
       }
       ceremony = null
       try {
-        if (fragment || !raw.startsWith('?') || raw.length > 8192) {
+        if (fragment || !raw.startsWith('?') || raw.length > 32768) {
           return {}
         }
         const parts = raw.slice(1).split('&')
@@ -70,7 +70,9 @@ export function createAuthorizationEntry(phase: AuthorizationPhase) {
         )
         if (
           key !== `${phase}_challenge` ||
-          !/^[A-Za-z0-9._~-]{1,2048}$/.test(value)
+          value.length > 16384 ||
+          !/^[A-Za-z0-9._~-]+={0,2}$/.test(value) ||
+          (value.includes('=') && value.length % 4 !== 0)
         ) {
           return {}
         }
@@ -142,7 +144,7 @@ export function authorizationIdentityMatches(
 // The own backend validates the issuer and prefix. This is an additional shape
 // check, never a caller-supplied return target or a status-derived authority.
 export function validateAuthorizationRedirect(value: unknown): string {
-  if (typeof value !== 'string' || value.length > 8192) {
+  if (typeof value !== 'string' || value.length > 32768) {
     throw new Error('invalid_redirect')
   }
   const url = new URL(value)

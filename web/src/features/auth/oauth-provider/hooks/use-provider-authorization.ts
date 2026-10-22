@@ -46,6 +46,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
   const [deadline] = useState(() => Date.now() + 300_000)
   const [state, setState] = useState<AuthorizationState>({ kind: 'loading' })
   const [email, setEmail] = useState(false)
+  const [offline, setOffline] = useState(false)
   const mounted = useRef(false)
   const invalidated = useRef(false)
   const submitted = useRef(false)
@@ -260,6 +261,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
           preview,
           approve,
           email: email && preview.allowed_scopes.includes('email'),
+          offline: offline && preview.allowed_scopes.includes('offline_access'),
         }
       )
       if (
@@ -278,5 +280,14 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
       stop()
     }
   }
-  return { state, email, setEmail, decide, resume, cancel: stop }
+  return {
+    state,
+    email,
+    setEmail,
+    offline,
+    setOffline,
+    decide,
+    resume,
+    cancel: stop,
+  }
 }

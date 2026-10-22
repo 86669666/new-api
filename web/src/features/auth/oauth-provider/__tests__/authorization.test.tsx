@@ -326,7 +326,7 @@ describe('explicit dashboard-session provider authorization', () => {
     '?login_challenge=a+b',
     '?login_challenge',
     '?consent_challenge=a',
-    `?login_challenge=${'a'.repeat(2049)}`,
+    `?login_challenge=${'a'.repeat(16385)}`,
     '?login_challenge=a#fragment',
   ])(
     'malformed raw query is scrubbed and cannot start preview: %s',
@@ -957,4 +957,80 @@ describe('provider authorization with synchronous browser history', () => {
       replace.mockRestore()
     }
   })
+})
+
+describe('public OIDC consent', () => {
+  it.each([false, true])(
+    'offline choice %s preserves requested identity scope',
+    async (offlineSelected) => {
+      const user = userEvent.setup()
+      providerHTTP.defaults.adapter = async (config) => {
+        requests.push(config)
+        const value = preview('consent')
+        value.requested_scopes = [
+          'openid',
+          'profile',
+          'email',
+          'offline_access',
+        ]
+        value.allowed_scopes = [...value.requested_scopes]
+        return response(
+          config,
+          config.url?.endsWith('/preview')
+            ? value
+            : {
+                redirect_to:
+                  'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+              }
+        )
+      }
+      await mountPage('consent')
+      const offline = await screen.findByRole('checkbox', {
+        name: 'Offline access for up to seven days (optional)',
+      })
+      expect(offline).not.toBeChecked()
+      expect(
+        screen.getByRole('checkbox', { name: 'Identity sign-in (required)' })
+      ).toBeChecked()
+      if (offlineSelected) await user.click(offline)
+      await user.click(screen.getByRole('button', { name: 'Approve' }))
+      await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+      expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual([
+        'profile',
+        'openid',
+        ...(offlineSelected ? ['offline_access'] : []),
+      ])
+    }
+  )
+})
+
+describe('encrypted issuer challenge capture', () => {
+  it.each(['YWJjZA==', 'YWJjZGU=', 'a'.repeat(4096)])(
+    'retains a supported encrypted capability in memory',
+    (challenge) => {
+      window.history.replaceState(
+        null,
+        '',
+        `/oauth/provider/login?login_challenge=${encodeURIComponent(challenge)}`
+      )
+      const entry = createAuthorizationEntry('login')
+      entry.capture()
+      expect(entry.read()).toEqual({ phase: 'login', challenge, active: true })
+      expect(window.location.search).toBe('')
+    }
+  )
+  it.each(['YW=JjZA=', 'YWJjZA===', 'YWJjZA='])(
+    'rejects malformed encrypted capability %s',
+    (challenge) => {
+      window.history.replaceState(
+        null,
+        '',
+        `/oauth/provider/login?login_challenge=${encodeURIComponent(challenge)}`
+      )
+      const entry = createAuthorizationEntry('login')
+      entry.capture()
+      expect(entry.read()).toBeNull()
+      expect(window.location.search).toBe('')
+    }
+  )
 })

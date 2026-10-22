@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -40,23 +41,27 @@ type OAuthUserInfoConfig struct {
 }
 
 type OAuthUserInfoResource struct {
-	endpoint string
-	issuer   string
-	audience string
-	clients  []string
-	client   *http.Client
+	endpoint       string
+	issuer         string
+	audience       string
+	clients        []string
+	client         *http.Client
+	grantsRequired bool
 }
 
 // OAuthResourceIdentity is deliberately separate from AuthIdentity. It cannot
 // become a dashboard session, PAT authorization or security-proof principal.
 type OAuthResourceIdentity struct {
-	userID      int
-	authVersion int64
-	issuer      string
-	clientID    string
-	expiresAt   int64
-	notBefore   int64
-	email       bool
+	userID         int
+	authVersion    int64
+	issuer         string
+	clientID       string
+	expiresAt      int64
+	notBefore      int64
+	email          bool
+	scopes         []string
+	grantID        string
+	grantExpiresAt int64
 }
 
 // OAuthUserInfoAccess keeps the bearer private and request-local. Neither the
@@ -69,6 +74,7 @@ type OAuthUserInfoAccess struct {
 
 type OAuthUserInfo struct {
 	ID          int     `json:"id"`
+	Sub         string  `json:"sub,omitempty"`
 	Username    string  `json:"username"`
 	DisplayName string  `json:"display_name"`
 	Group       string  `json:"group"`
@@ -175,10 +181,13 @@ func (a *OAuthUserInfoAccess) Read(ctx context.Context) (*OAuthUserInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	if identity.userID != a.identity.userID || identity.authVersion != a.identity.authVersion || identity.issuer != a.identity.issuer || identity.clientID != a.identity.clientID || (a.identity.email && !identity.email) {
+	if identity.userID != a.identity.userID || identity.authVersion != a.identity.authVersion || identity.issuer != a.identity.issuer || identity.clientID != a.identity.clientID || (a.identity.email && !identity.email) || identity.grantID != a.identity.grantID || identity.grantExpiresAt != a.identity.grantExpiresAt {
 		return nil, ErrOAuthInvalidToken
 	}
 	profile := &OAuthUserInfo{ID: user.Id, Username: user.Username, DisplayName: user.DisplayName, Group: user.Group}
+	if a.resource.grantsRequired {
+		profile.Sub = strconv.Itoa(user.Id)
+	}
 	if identity.email {
 		profile.Email = &user.Email
 	}
@@ -199,13 +208,17 @@ func (r *OAuthUserInfoResource) readCurrentIdentity(ctx context.Context, credent
 	}
 	// Re-evaluate time after any database wait, not just at introspection.
 	now := time.Now().Unix()
-	if user.Status != common.UserStatusEnabled || user.AuthVersion != identity.authVersion || identity.expiresAt <= now || identity.notBefore > now {
+	if user.Status != common.UserStatusEnabled || user.AuthVersion != identity.authVersion || identity.expiresAt <= now || identity.notBefore > now || r.grantsRequired && identity.grantExpiresAt <= now {
 		return identity, nil, ErrOAuthInvalidToken
 	}
 	return identity, user, nil
 }
 
 func (r *OAuthUserInfoResource) introspect(ctx context.Context, credential string) (OAuthResourceIdentity, error) {
+	return r.introspectPurpose(ctx, credential, "access_token")
+}
+
+func (r *OAuthUserInfoResource) introspectPurpose(ctx context.Context, credential, purpose string) (OAuthResourceIdentity, error) {
 	var identity OAuthResourceIdentity
 	if r == nil || credential == "" {
 		return identity, ErrOAuthInvalidToken
@@ -217,6 +230,7 @@ func (r *OAuthUserInfoResource) introspect(ctx context.Context, credential strin
 	if err != nil {
 		return identity, ErrOAuthResourceUnavailable
 	}
+	req.GetBody = nil
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 	resp, err := r.client.Do(req)
@@ -242,7 +256,7 @@ func (r *OAuthUserInfoResource) introspect(ctx context.Context, credential strin
 	var extra map[string]common.RawMessage
 	var version string
 	if common.Unmarshal(fields["active"], &active) != nil || !active ||
-		common.Unmarshal(fields["token_use"], &use) != nil || use != "access_token" ||
+		common.Unmarshal(fields["token_use"], &use) != nil || use != purpose ||
 		common.Unmarshal(fields["token_type"], &tokenType) != nil || tokenType != "Bearer" ||
 		common.Unmarshal(fields["iss"], &issuer) != nil || issuer != r.issuer ||
 		common.Unmarshal(fields["aud"], &audience) != nil || !slices.Contains(audience, r.audience) ||
@@ -285,5 +299,21 @@ func (r *OAuthUserInfoResource) introspect(ctx context.Context, credential strin
 	if !scopes["profile"] {
 		return identity, ErrOAuthInsufficientScope
 	}
-	return OAuthResourceIdentity{userID: int(id), authVersion: authVersion, issuer: issuer, clientID: clientID, expiresAt: expires, notBefore: notBefore, email: scopes["email"]}, nil
+	var grantID, grantExpiry string
+	var grantExpires int64
+	if r.grantsRequired {
+		if common.Unmarshal(extra["newapi_grant_id"], &grantID) != nil || len(grantID) != 43 || !validOAuthHydraCapability(grantID) || common.Unmarshal(extra["newapi_grant_expires_at"], &grantExpiry) != nil {
+			return identity, ErrOAuthInvalidToken
+		}
+		grantBytes, err := base64.RawURLEncoding.DecodeString(grantID)
+		if err != nil || len(grantBytes) != 32 || base64.RawURLEncoding.EncodeToString(grantBytes) != grantID {
+			return identity, ErrOAuthInvalidToken
+		}
+		var valid bool
+		grantExpires, valid = oauthGrantExpiry(grantExpiry)
+		if !valid || grantExpires <= now || grantExpires > now+7*24*60*60 {
+			return identity, ErrOAuthInvalidToken
+		}
+	}
+	return OAuthResourceIdentity{userID: int(id), authVersion: authVersion, issuer: issuer, clientID: clientID, expiresAt: expires, notBefore: notBefore, email: scopes["email"], scopes: strings.Split(scope, " "), grantID: grantID, grantExpiresAt: grantExpires}, nil
 }

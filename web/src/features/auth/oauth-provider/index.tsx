@@ -115,6 +115,28 @@ export function ProviderAuthorizationPage(props: {
                 {t('Profile (required)')}
               </Label>
             </div>
+            {state.preview.allowed_scopes.includes('openid') && (
+              <div className='flex items-center gap-2'>
+                <Checkbox id='provider-openid' checked disabled />
+                <Label htmlFor='provider-openid'>
+                  {t('Identity sign-in (required)')}
+                </Label>
+              </div>
+            )}
+            {state.preview.allowed_scopes.includes('offline_access') && (
+              <div className='flex items-center gap-2'>
+                <Checkbox
+                  id='provider-offline'
+                  checked={authorization.offline}
+                  onCheckedChange={(checked) =>
+                    authorization.setOffline(checked === true)
+                  }
+                />
+                <Label htmlFor='provider-offline'>
+                  {t('Offline access for up to seven days (optional)')}
+                </Label>
+              </div>
+            )}
             {state.preview.allowed_scopes.includes('email') && (
               <div className='flex items-center gap-2'>
                 <Checkbox
