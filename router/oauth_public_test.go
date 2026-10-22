@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -490,6 +491,149 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		assert.Empty(t, withoutOffline.Refresh)
 	})
 
+	t.Run("explicit_usage_scope_and_old_grant_refresh", func(t *testing.T) {
+		c.t = t
+		freshNarrow := c.grant("openid profile offline_access balance:read")
+		clientURL := input.Admin + "/admin/clients/" + url.PathEscape(c.clientID)
+		status, _, raw := c.request("GET", clientURL, "", "", "")
+		require.Equal(t, 200, status)
+		var registration map[string]any
+		require.NoError(t, common.Unmarshal(raw, &registration))
+		original, err := common.Marshal(registration)
+		require.NoError(t, err)
+		defer func() {
+			status, _, _ = c.request("PUT", clientURL, "application/json", string(original), "")
+			require.Equal(t, 200, status)
+		}()
+		registered := strings.Fields(registration["scope"].(string))
+		withoutUsage := make([]string, 0, len(registered))
+		for _, scope := range registered {
+			if scope != "usage:read" {
+				withoutUsage = append(withoutUsage, scope)
+			}
+		}
+		registration["scope"] = strings.Join(withoutUsage, " ")
+		encoded, err := common.Marshal(registration)
+		require.NoError(t, err)
+		status, _, _ = c.request("PUT", clientURL, "application/json", string(encoded), "")
+		require.Equal(t, 200, status)
+		pkce := sha256.Sum256([]byte(strings.Repeat("a", 43)))
+		query := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {"http://127.0.0.1:29873/oauth/callback"}, "scope": {"openid profile offline_access usage:read"}, "nonce": {"scope-registration-nonce"}, "state": {"scope-registration-boundary"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(pkce[:])}, "code_challenge_method": {"S256"}}
+		status, _, _ = c.request("GET", input.Issuer+"oauth2/auth?"+query.Encode(), "", "", "")
+		assert.Equal(t, 400, status, "unregistered usage scope must be rejected before consent")
+		registration["scope"] = strings.Join(append(withoutUsage, "usage:read"), " ")
+		encoded, err = common.Marshal(registration)
+		require.NoError(t, err)
+		status, _, _ = c.request("PUT", clientURL, "application/json", string(encoded), "")
+		require.Equal(t, 200, status)
+		status, _, raw = c.request("GET", input.Issuer+".well-known/openid-configuration", "", "", "")
+		require.Equal(t, 200, status)
+		var discovery struct {
+			Scopes []string `json:"scopes_supported"`
+		}
+		require.NoError(t, common.Unmarshal(raw, &discovery))
+		assert.Contains(t, discovery.Scopes, "usage:read")
+		introspect := func(token string) map[string]any {
+			status, _, raw := c.request("POST", input.Admin+"/admin/oauth2/introspect", "application/x-www-form-urlencoded", url.Values{"token": {token}}.Encode(), "")
+			require.Equal(t, 200, status)
+			var claims map[string]any
+			require.NoError(t, common.Unmarshal(raw, &claims))
+			require.Equal(t, true, claims["active"])
+			return claims
+		}
+		for _, choice := range []bool{false, true} {
+			selected := []string{"openid", "profile", "offline_access"}
+			if choice {
+				selected = append(selected, "usage:read")
+			}
+			status, grant := c.exchange(c.code("openid profile offline_access usage:read", selected...))
+			require.Equal(t, 200, status)
+			claims := introspect(grant.Access)
+			scopes := strings.Fields(claims["scope"].(string))
+			assert.Equal(t, choice, slices.Contains(scopes, "usage:read"))
+			ext := claims["ext"].(map[string]any)
+			var stored model.OAuthGrant
+			require.NoError(t, f.db.Where("grant_id = ?", ext["newapi_grant_id"]).First(&stored).Error)
+			var persisted []string
+			require.NoError(t, common.UnmarshalJsonStr(stored.Scopes, &persisted))
+			assert.Equal(t, choice, slices.Contains(persisted, "usage:read"))
+			before := stored.Scopes
+			status, refreshed := c.refresh(grant)
+			require.Equal(t, 200, status)
+			assert.Equal(t, choice, slices.Contains(strings.Fields(introspect(refreshed.Access)["scope"].(string)), "usage:read"))
+			require.NoError(t, f.db.Where("grant_ref = ?", stored.GrantRef).First(&stored).Error)
+			assert.Equal(t, before, stored.Scopes, "refresh must not alter stored consent")
+		}
+		status, refreshed := c.refresh(freshNarrow)
+		require.Equal(t, 200, status)
+		assert.NotContains(t, strings.Fields(introspect(refreshed.Access)["scope"].(string)), "usage:read")
+		form := url.Values{"client_id": {c.clientID}, "grant_type": {"refresh_token"}, "refresh_token": {refreshed.Refresh}, "scope": {"usage:read"}}
+		status, _, _ = c.request("POST", input.Issuer+"oauth2/token", "application/x-www-form-urlencoded", form.Encode(), "")
+		assert.Equal(t, 400, status)
+		// Simulate a persisted preview bound to the prior public-v2 policy. The
+		// current policy must reject it even with the same actor/challenge/token.
+		challenge, _, _ := c.consent("openid profile offline_access balance:read")
+		data, err := common.Marshal(map[string]any{"challenge": challenge})
+		require.NoError(t, err)
+		status, _, raw = c.request("POST", input.Issuer+"api/oauth/provider/consent/preview", "application/json", string(data), f.bearer["owner"])
+		require.Equal(t, 200, status)
+		var preview service.OAuthProviderPreview
+		require.NoError(t, common.Unmarshal(raw, &preview))
+		c.secrets = append(c.secrets, challenge, preview.PreviewToken)
+		var flow model.AuthFlow
+		require.NoError(t, f.db.Where("purpose = ? AND user_id = ? AND intent = ?", model.AuthFlowPurposeOAuthProviderPreview, f.users["owner"].Id, "consent").Order("id DESC").First(&flow).Error)
+		var binding map[string]any
+		require.NoError(t, common.UnmarshalJsonStr(flow.Payload, &binding))
+		policy := binding["policy_hash"].(string)
+		require.Contains(t, policy, ":public-v3:")
+		legacyPolicy := strings.Split(policy, ":public-v3:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
+		legacyPolicyHash := fmt.Sprintf("%x", sha256.Sum256([]byte(legacyPolicy)))
+
+		// Reconstructed pre-upgrade local fixture: real Hydra issued this
+		// refresh chain, then the test replaces only its persisted policy hash
+		// with the exact v2 hash for the same bridge configuration. This is not
+		// evidence of running an old gateway deployment or a historical dump.
+		// No production policy switch or compatibility bypass is introduced.
+		legacyChain := c.grant("openid profile offline_access balance:read")
+		legacyClaims := introspect(legacyChain.Access)
+		legacyID := legacyClaims["ext"].(map[string]any)["newapi_grant_id"].(string)
+		var legacyStored model.OAuthGrant
+		require.NoError(t, f.db.Where("grant_ref = ?", model.OAuthGrantRef(input.Issuer, legacyID)).First(&legacyStored).Error)
+		require.NotEqual(t, legacyPolicyHash, legacyStored.PolicyHash)
+		require.NoError(t, f.db.Model(&legacyStored).UpdateColumn("policy_hash", legacyPolicyHash).Error)
+		require.NoError(t, f.db.Where("grant_ref = ?", legacyStored.GrantRef).First(&legacyStored).Error)
+		require.Equal(t, legacyPolicyHash, legacyStored.PolicyHash)
+		var legacyScopes []string
+		require.NoError(t, common.UnmarshalJsonStr(legacyStored.Scopes, &legacyScopes))
+		require.ElementsMatch(t, []string{"openid", "profile", "offline_access", "balance:read"}, legacyScopes)
+		legacyBefore := legacyStored
+		status, legacyRefreshed := c.refresh(legacyChain)
+		require.Equal(t, 200, status, "reconstructed v2-policy grant must remain refreshable")
+		actualScopes := strings.Fields(introspect(legacyRefreshed.Access)["scope"].(string))
+		assert.ElementsMatch(t, legacyScopes, actualScopes)
+		assert.NotContains(t, actualScopes, "usage:read")
+		require.NoError(t, f.db.Where("grant_ref = ?", legacyBefore.GrantRef).First(&legacyStored).Error)
+		assert.Equal(t, legacyBefore.Scopes, legacyStored.Scopes, "refresh cannot rewrite consented scopes")
+		assert.Equal(t, legacyBefore.PolicyHash, legacyStored.PolicyHash, "refresh cannot upgrade the persisted v2 policy")
+		assert.Equal(t, legacyBefore.ExpiresAt, legacyStored.ExpiresAt, "refresh cannot extend consent expiry")
+		assert.Equal(t, legacyBefore.Revision, legacyStored.Revision, "refresh cannot revise consent")
+		assert.Equal(t, legacyBefore.ConsentRef, legacyStored.ConsentRef)
+		assert.Equal(t, legacyBefore.ConsentRequestID, legacyStored.ConsentRequestID)
+		assert.Equal(t, legacyBefore.OriginSID, legacyStored.OriginSID)
+		assert.Equal(t, legacyBefore.SessionVersion, legacyStored.SessionVersion)
+		assert.Equal(t, legacyBefore.UserAuthVersion, legacyStored.UserAuthVersion)
+		assert.Equal(t, legacyBefore.GrantID, legacyStored.GrantID)
+		assert.Equal(t, legacyBefore.State, legacyStored.State)
+
+		binding["policy_hash"] = legacyPolicy
+		data, err = common.Marshal(binding)
+		require.NoError(t, err)
+		require.NoError(t, f.db.Model(&flow).UpdateColumn("payload", string(data)).Error)
+		data, err = common.Marshal(map[string]any{"challenge": challenge, "preview_token": preview.PreviewToken, "decision": "approve", "selected_scopes": []string{"openid", "profile", "offline_access"}})
+		require.NoError(t, err)
+		status, _, _ = c.request("POST", input.Issuer+"api/oauth/provider/consent", "application/json", string(data), f.bearer["owner"])
+		assert.Equal(t, 403, status)
+	})
 	t.Run("balance_explicit_consent_and_refresh", func(t *testing.T) {
 		c.t = t
 		grant := c.grant("openid profile email offline_access balance:read")

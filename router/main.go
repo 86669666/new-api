@@ -62,6 +62,7 @@ func SetRouter(router *gin.Engine, assets WebAssets) {
 		router.Any("/oauth/provider/"+page+"/*trailing", providerPage)
 	}
 	router.Use(middleware.OAuthBalanceBoundary)
+	router.Use(middleware.OAuthUsageBoundary)
 	router.Use(middleware.OrganizationSelectionBoundary())
 	SetApiRouter(router)
 	SetOAuthResourceRouter(router, service.CurrentOAuthUserInfoResource())

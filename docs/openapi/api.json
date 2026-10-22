@@ -24629,6 +24629,568 @@
         },
         "x-organization-selection": "personal-only; positive organization selection rejected before resource access"
       }
+    },
+    "/api/v1/oauth/usage/logs": {
+      "get": {
+        "operationId": "getOAuthUsageLogs",
+        "summary": "Read delegated account consumption history",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Requires a live public OAuth grant with separately and explicitly selected usage:read, unchecked on every new consent preview; profile remains mandatory. Only new explicit consent grants this scope; existing grants and refresh tokens never gain it. The trusted subject user identifies all its persisted consumption history across API tokens, including token-zero and deleted-token history; this is neither a personal wallet statement nor organization spending. There is no client, token, grant or caller-supplied user filter. Only this exact GET path is accepted. Any organization selector (including zero or empty), identity selector, query bearer, method override, body or noncanonical path returns invalid_request before fallback. Other unknown or duplicate query parameters fail strict parsing. A dashboard JWT, PAT, relay key, cookie, refresh token or bridge-only token cannot authenticate. After querying and JSON pre-encoding, uncached issuer introspection and current local user, grant revision, full scope set, source session, cleanup fence and expiry are rechecked; failure discards all prepared data. COUNT and page, main and log databases, and issuer/local state are request-level observations, not an atomic cross-system snapshot. Every returned integer, selected source-hour SUM and intermediate day addition must be an exact JavaScript-safe signed number; overflow or unsafe values fail instead of rounding, saturating or stringifying. Collection-disabled requests fail; successful sparse results always state data_complete:false and finite positive quota_per_unit. The reserved namespace never falls back to SPA/plugins or redirects, even when disabled. Privacy headers precede authentication and rate limiting; query and suffix data are removed from access logs. OAuth errors use flat error objects; query/collection errors use the management error envelope. status oauth.enabled and client_features.oauth remain false; no public enable is authorized.",
+        "security": [
+          {
+            "OAuthResourceBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "start_timestamp",
+            "in": "query",
+            "required": false,
+            "description": "Canonical nonnegative decimal Unix seconds within signed int64. Missing end uses now; future end is capped at now. Missing start uses max(0,end-configured MaxRangeSeconds). Start must not exceed the effective end and the span must fit the configured range.",
+            "schema": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "maxLength": 19
+            }
+          },
+          {
+            "name": "end_timestamp",
+            "in": "query",
+            "required": false,
+            "description": "Canonical nonnegative decimal Unix seconds within signed int64. Missing end uses now; future end is capped at now. Missing start uses max(0,end-configured MaxRangeSeconds). Start must not exceed the effective end and the span must fit the configured range.",
+            "schema": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "maxLength": 19
+            }
+          },
+          {
+            "name": "p",
+            "in": "query",
+            "required": false,
+            "description": "Canonical positive page, maximum 100001. Presence takes priority over page; page value is ignored, but duplicate page is still rejected. Default 1.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "description": "Fallback page when p is absent. Same positive bound as p; if p is present this value is ignored.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "description": "Canonical positive integer 1..100. Default configured ItemsPerPage clamped to 1..100. (page-1)*page_size must be <=100000.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "model_name",
+            "in": "query",
+            "required": false,
+            "description": "Exact model filter, at most 256 UTF-8 bytes; empty means no filter. Wildcards are literal.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "usage:read"
+        ],
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "x-organization-selection": "any selector presence rejected",
+        "responses": {
+          "200": {
+            "description": "Minimal persisted history with explicitly incomplete semantics.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthUsageLogsResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Root request rejection or authenticated strict query/range rejection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthResourceInvalidRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthUsageQueryError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TokenUsageRangeTooWideError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or expired access token, current user, local public grant or source session. Canonical disabled resource has the same error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"invalid_token\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInvalidToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing the exact delegated usage:read scope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"insufficient_scope\", scope=\"usage:read\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInsufficientScope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Global API limiter rejection; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Usage query, unsafe integer, aggregation or encoding failure returns USAGE_QUERY_FAILED without private diagnostics. A global API limiter storage failure has an empty body instead.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthUsageQueryFailedError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Collection disabled or issuer/local authority unavailable; no history or authentication fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthUsageUnavailableError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthResourceUnavailable"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/oauth/usage/stat": {
+      "get": {
+        "operationId": "getOAuthUsageStat",
+        "summary": "Read delegated account hourly or daily usage",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Requires a live public OAuth grant with separately and explicitly selected usage:read, unchecked on every new consent preview; profile remains mandatory. Only new explicit consent grants this scope; existing grants and refresh tokens never gain it. The trusted subject user identifies all its persisted consumption history across API tokens, including token-zero and deleted-token history; this is neither a personal wallet statement nor organization spending. There is no client, token, grant or caller-supplied user filter. Only this exact GET path is accepted. Any organization selector (including zero or empty), identity selector, query bearer, method override, body or noncanonical path returns invalid_request before fallback. Other unknown or duplicate query parameters fail strict parsing. A dashboard JWT, PAT, relay key, cookie, refresh token or bridge-only token cannot authenticate. After querying and JSON pre-encoding, uncached issuer introspection and current local user, grant revision, full scope set, source session, cleanup fence and expiry are rechecked; failure discards all prepared data. COUNT and page, main and log databases, and issuer/local state are request-level observations, not an atomic cross-system snapshot. Every returned integer, selected source-hour SUM and intermediate day addition must be an exact JavaScript-safe signed number; overflow or unsafe values fail instead of rounding, saturating or stringifying. Collection-disabled requests fail; successful sparse results always state data_complete:false and finite positive quota_per_unit. The reserved namespace never falls back to SPA/plugins or redirects, even when disabled. Privacy headers precede authentication and rate limiting; query and suffix data are removed from access logs. OAuth errors use flat error objects; query/collection errors use the management error envelope. status oauth.enabled and client_features.oauth remain false; no public enable is authorized.",
+        "security": [
+          {
+            "OAuthResourceBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "start_timestamp",
+            "in": "query",
+            "required": false,
+            "description": "Canonical nonnegative decimal Unix seconds within signed int64. Missing end uses now; future end is capped at now. Missing start uses max(0,end-configured MaxRangeSeconds). Start must not exceed the effective end and the span must fit the configured range.",
+            "schema": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "maxLength": 19
+            }
+          },
+          {
+            "name": "end_timestamp",
+            "in": "query",
+            "required": false,
+            "description": "Canonical nonnegative decimal Unix seconds within signed int64. Missing end uses now; future end is capped at now. Missing start uses max(0,end-configured MaxRangeSeconds). Start must not exceed the effective end and the span must fit the configured range.",
+            "schema": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "maxLength": 19
+            }
+          },
+          {
+            "name": "granularity",
+            "in": "query",
+            "required": false,
+            "description": "UTC bucket size. Includes whole stored source hours containing both inclusive endpoints; day folds only those selected hours into UTC midnight, without expanding to full days. Sparse ascending output; no fabricated zero buckets.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "hour",
+                "day"
+              ],
+              "default": "hour"
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "usage:read"
+        ],
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "x-organization-selection": "any selector presence rejected",
+        "responses": {
+          "200": {
+            "description": "Minimal persisted history with explicitly incomplete semantics.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthUsageStatResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Root request rejection or authenticated strict query/range rejection.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthResourceInvalidRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthUsageQueryError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TokenUsageRangeTooWideError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or expired access token, current user, local public grant or source session. Canonical disabled resource has the same error.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"invalid_token\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInvalidToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing the exact delegated usage:read scope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"insufficient_scope\", scope=\"usage:read\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInsufficientScope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Global API limiter rejection; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Usage query, unsafe integer, aggregation or encoding failure returns USAGE_QUERY_FAILED without private diagnostics. A global API limiter storage failure has an empty body instead.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthUsageQueryFailedError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Collection disabled or issuer/local authority unavailable; no history or authentication fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the root usage boundary before organization selection, authentication and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/OAuthUsageUnavailableError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OAuthResourceUnavailable"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -32599,7 +33161,7 @@
           },
           "selected_scopes": {
             "type": "array",
-            "maxItems": 5,
+            "maxItems": 6,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -32608,7 +33170,8 @@
                 "profile",
                 "email",
                 "offline_access",
-                "balance:read"
+                "balance:read",
+                "usage:read"
               ]
             }
           }
@@ -32629,7 +33192,8 @@
                       "openid",
                       "email",
                       "offline_access",
-                      "balance:read"
+                      "balance:read",
+                      "usage:read"
                     ]
                   }
                 }
@@ -32702,7 +33266,7 @@
           },
           "allowed_scopes": {
             "type": "array",
-            "maxItems": 5,
+            "maxItems": 6,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -32711,7 +33275,8 @@
                 "profile",
                 "email",
                 "offline_access",
-                "balance:read"
+                "balance:read",
+                "usage:read"
               ]
             },
             "minItems": 1
@@ -33731,8 +34296,8 @@
           },
           "scopes_supported": {
             "type": "array",
-            "minItems": 5,
-            "maxItems": 5,
+            "minItems": 6,
+            "maxItems": 6,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -33741,7 +34306,8 @@
                 "profile",
                 "email",
                 "offline_access",
-                "balance:read"
+                "balance:read",
+                "usage:read"
               ]
             }
           },
@@ -34839,6 +35405,319 @@
             }
           }
         }
+      },
+      "OAuthResourceInvalidRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "invalid_request"
+            ]
+          }
+        }
+      },
+      "OAuthUsageLog": {
+        "type": "object",
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "completion_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "quota": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "use_time": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "model_name": {
+            "type": "string"
+          },
+          "is_stream": {
+            "type": "boolean"
+          },
+          "group": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "created_at",
+          "prompt_tokens",
+          "completion_tokens",
+          "quota",
+          "use_time",
+          "model_name",
+          "is_stream",
+          "group"
+        ],
+        "additionalProperties": false,
+        "description": "Minimal recorded account-attributed consumption history across tokens, including token-zero and deleted-token rows. Not a personal wallet ledger or organization spending feed. Signed recorded integers are preserved and bounded to exact JavaScript-safe integers."
+      },
+      "OAuthUsageBucket": {
+        "type": "object",
+        "properties": {
+          "ts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "quota": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "ts",
+          "quota",
+          "requests",
+          "tokens"
+        ],
+        "additionalProperties": false,
+        "description": "Sparse ascending UTC bucket from persisted source hours; signed recorded quantities are preserved. Every source-hour aggregate and intermediate daily sum must be exact and JavaScript-safe, otherwise the request fails."
+      },
+      "OAuthUsageLogPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OAuthUsageLog"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100001
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "additionalProperties": false
+      },
+      "OAuthUsageLogsResult": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "quota_per_unit": {
+            "type": "number",
+            "minimum": 0,
+            "exclusiveMinimum": true
+          },
+          "data_complete": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/OAuthUsageLogPage"
+          }
+        },
+        "required": [
+          "success",
+          "message",
+          "quota_per_unit",
+          "data_complete",
+          "data"
+        ],
+        "additionalProperties": false,
+        "description": "Persisted account-attributed history only, with data_complete always false. Missing data is never a fabricated successful empty history. All integer fields are exact JavaScript-safe numbers; quota_per_unit is finite and strictly positive."
+      },
+      "OAuthUsageStatResult": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "quota_per_unit": {
+            "type": "number",
+            "minimum": 0,
+            "exclusiveMinimum": true
+          },
+          "data_complete": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OAuthUsageBucket"
+            }
+          },
+          "granularity": {
+            "type": "string",
+            "enum": [
+              "hour",
+              "day"
+            ]
+          }
+        },
+        "required": [
+          "success",
+          "message",
+          "quota_per_unit",
+          "data_complete",
+          "data",
+          "granularity"
+        ],
+        "additionalProperties": false,
+        "description": "Persisted account-attributed history only, with data_complete always false. Missing data is never a fabricated successful empty history. All integer fields are exact JavaScript-safe numbers; quota_per_unit is finite and strictly positive."
+      },
+      "OAuthUsageQueryError": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "USAGE_QUERY_INVALID",
+              "USAGE_RANGE_INVALID"
+            ]
+          }
+        },
+        "required": [
+          "success",
+          "message",
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "OAuthUsageQueryFailedError": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "USAGE_QUERY_FAILED"
+            ]
+          }
+        },
+        "required": [
+          "success",
+          "message",
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "OAuthUsageUnavailableError": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "USAGE_LOGS_DISABLED",
+              "USAGE_STAT_UNAVAILABLE"
+            ]
+          }
+        },
+        "required": [
+          "success",
+          "message",
+          "code"
+        ],
+        "additionalProperties": false
       }
     },
     "responses": {
@@ -35658,7 +36537,7 @@
       "OAuthResourceBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected."
+        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected. Account usage additionally requires public grant mode and the separately selected usage:read scope; existing profile/balance grants and their refreshes never acquire it."
       },
       "ClientEventsBearer": {
         "type": "http",

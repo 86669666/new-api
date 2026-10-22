@@ -25,21 +25,31 @@ type tokenUsageQuery struct {
 // parseTokenUsageQuery deliberately opts into strict parsing only for the new
 // API-key endpoints. Dashboard history retains its existing compatibility rules.
 func parseTokenUsageQuery(c *gin.Context, stat bool) (tokenUsageQuery, bool) {
+	return parseUsageQuery(c, stat, "TOKEN_USAGE")
+}
+
+// parseUsageQuery retains the established API-key parsing and error contract;
+// OAuth excludes the organization selector even when it is explicitly zero.
+func parseUsageQuery(c *gin.Context, stat bool, prefix string) (tokenUsageQuery, bool) {
+	queryKey, rangeKey := i18n.MsgTokenUsageQueryInvalid, i18n.MsgTokenUsageRangeInvalid
+	if prefix == "USAGE" {
+		queryKey, rangeKey = "usage.query_invalid", "usage.range_invalid"
+	}
 	query := tokenUsageQuery{page: 1, size: min(max(common.ItemsPerPage, 1), 100), granularity: "hour"}
 	values, err := url.ParseQuery(c.Request.URL.RawQuery)
 	if err != nil {
-		common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, i18n.MsgTokenUsageQueryInvalid)), gin.H{"code": "TOKEN_USAGE_QUERY_INVALID"})
+		common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, queryKey)), gin.H{"code": prefix + "_QUERY_INVALID"})
 		return query, false
 	}
 	for name, entries := range values {
-		allowed := name == "start_timestamp" || name == "end_timestamp" || name == "org_id"
+		allowed := name == "start_timestamp" || name == "end_timestamp" || name == "org_id" && prefix == "TOKEN_USAGE"
 		if stat {
 			allowed = allowed || name == "granularity"
 		} else {
 			allowed = allowed || name == "p" || name == "page" || name == "page_size" || name == "model_name"
 		}
 		if !allowed || len(entries) != 1 {
-			common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, i18n.MsgTokenUsageQueryInvalid)), gin.H{"code": "TOKEN_USAGE_QUERY_INVALID"})
+			common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, queryKey)), gin.H{"code": prefix + "_QUERY_INVALID"})
 			return query, false
 		}
 	}
@@ -50,7 +60,7 @@ func parseTokenUsageQuery(c *gin.Context, stat bool) (tokenUsageQuery, bool) {
 		}
 		number, valid := middleware.ParseOrganizationDecimal(values.Get(name))
 		if !valid || (name == "p" || name == "page" || name == "page_size") && (number == 0 || number > 100001) || name == "page_size" && number > 100 {
-			common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, i18n.MsgTokenUsageQueryInvalid)), gin.H{"code": "TOKEN_USAGE_QUERY_INVALID"})
+			common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, queryKey)), gin.H{"code": prefix + "_QUERY_INVALID"})
 			return query, false
 		}
 		switch name {
@@ -65,14 +75,14 @@ func parseTokenUsageQuery(c *gin.Context, stat bool) (tokenUsageQuery, bool) {
 		}
 	}
 	if (query.page-1)*query.size > 100000 || len(values.Get("model_name")) > 256 {
-		common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, i18n.MsgTokenUsageQueryInvalid)), gin.H{"code": "TOKEN_USAGE_QUERY_INVALID"})
+		common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, queryKey)), gin.H{"code": prefix + "_QUERY_INVALID"})
 		return query, false
 	}
 	query.modelName = values.Get("model_name")
 	if values.Has("granularity") {
 		query.granularity = values.Get("granularity")
 		if query.granularity != "hour" && query.granularity != "day" {
-			common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, i18n.MsgTokenUsageQueryInvalid)), gin.H{"code": "TOKEN_USAGE_QUERY_INVALID"})
+			common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, queryKey)), gin.H{"code": prefix + "_QUERY_INVALID"})
 			return query, false
 		}
 	}
@@ -81,7 +91,7 @@ func parseTokenUsageQuery(c *gin.Context, stat bool) (tokenUsageQuery, bool) {
 		query.start = max(0, query.end-maxRange)
 	}
 	if query.start > query.end {
-		common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, i18n.MsgTokenUsageRangeInvalid)), gin.H{"code": "TOKEN_USAGE_RANGE_INVALID"})
+		common.ApiErrorStatus(c, http.StatusBadRequest, errors.New(i18n.T(c, rangeKey)), gin.H{"code": prefix + "_RANGE_INVALID"})
 		return query, false
 	}
 	if query.end-query.start > maxRange {

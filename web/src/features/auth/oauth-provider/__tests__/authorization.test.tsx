@@ -38,9 +38,14 @@ import { Route as ConsentRoute } from '@/routes/oauth/provider/consent'
 import { Route as LoginRoute } from '@/routes/oauth/provider/login'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 
-import { providerHTTP, type AuthorizationPreview } from '../api'
+import {
+  providerHTTP,
+  requestAuthorization,
+  type AuthorizationPreview,
+} from '../api'
 import {
   createAuthorizationEntry,
+  currentAuthorizationIdentity,
   providerBrowser,
   type AuthorizationCeremony,
   type AuthorizationPhase,
@@ -1134,6 +1139,136 @@ describe('encrypted issuer challenge capture', () => {
       entry.capture()
       expect(entry.read()).toBeNull()
       expect(window.location.search).toBe('')
+    }
+  )
+})
+
+describe('explicit recorded-history consent', () => {
+  it.each(['unselected', 'selected', 'unticked', 'denied'])(
+    'usage choice %s grants only explicit requested history access',
+    async (choice) => {
+      const user = userEvent.setup()
+      providerHTTP.defaults.adapter = async (config) => {
+        requests.push(config)
+        const value = preview('consent')
+        value.requested_scopes = ['profile', 'usage:read']
+        value.allowed_scopes = [...value.requested_scopes]
+        return response(
+          config,
+          config.url?.endsWith('/preview')
+            ? value
+            : {
+                redirect_to:
+                  'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+              }
+        )
+      }
+      await mountPage('consent')
+      const usage = await screen.findByRole('checkbox', {
+        name: 'Recorded call history (optional)',
+      })
+      expect(usage).not.toBeChecked()
+      expect(usage).toHaveAccessibleDescription(/including deleted tokens/)
+      expect(usage).toHaveAccessibleDescription(/may be incomplete/)
+      expect(usage).toHaveAccessibleDescription(/not a wallet statement/)
+      expect(usage).toHaveAccessibleDescription(
+        /do not include organization usage/
+      )
+      if (choice !== 'unselected') {
+        usage.focus()
+        await user.keyboard(' ')
+        expect(usage).toBeChecked()
+      }
+      if (choice === 'unticked') await user.click(usage)
+      await user.click(
+        screen.getByRole('button', {
+          name: choice === 'denied' ? 'Deny' : 'Approve',
+        })
+      )
+      await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+      expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual(
+        choice === 'denied'
+          ? []
+          : ['profile', ...(choice === 'selected' ? ['usage:read'] : [])]
+      )
+      expect(requests).toHaveLength(2)
+    }
+  )
+
+  it('does not offer requested history when registration excludes it', async () => {
+    providerHTTP.defaults.adapter = async (config) => {
+      requests.push(config)
+      const value = preview('consent')
+      value.requested_scopes = ['profile', 'usage:read']
+      value.allowed_scopes = ['profile']
+      return response(
+        config,
+        config.url?.endsWith('/preview')
+          ? value
+          : {
+              redirect_to:
+                'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+            }
+      )
+    }
+    await mountPage('consent')
+    await screen.findByRole('button', { name: 'Approve' })
+    expect(
+      screen.queryByRole('checkbox', {
+        name: 'Recorded call history (optional)',
+      })
+    ).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+    expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual([
+      'profile',
+    ])
+  })
+
+  it('rejects a history allowance that was never requested', async () => {
+    providerHTTP.defaults.adapter = async (config) => {
+      requests.push(config)
+      const value = preview('consent')
+      value.allowed_scopes.push('usage:read')
+      return response(config, value)
+    }
+    await mountPage('consent')
+    await screen.findByText('Authorization could not be completed.')
+    expect(
+      screen.queryByRole('button', { name: 'Approve' })
+    ).not.toBeInTheDocument()
+    expect(requests).toHaveLength(1)
+  })
+
+  it.each(['requested', 'allowed'] as const)(
+    'a removed %s history scope cannot be sent by a stale checked decision',
+    async (removed) => {
+      window.history.replaceState(null, '', '/oauth/provider/consent')
+      const identity = currentAuthorizationIdentity()
+      expect(identity).not.toBeNull()
+      if (!identity) throw new Error('fixture_identity_missing')
+      const value = preview('consent')
+      value.requested_scopes =
+        removed === 'requested' ? ['profile'] : ['profile', 'usage:read']
+      value.allowed_scopes =
+        removed === 'allowed' ? ['profile'] : ['profile', 'usage:read']
+      await requestAuthorization(
+        identity,
+        'consent',
+        new AbortController().signal,
+        capability,
+        {
+          preview: value,
+          approve: true,
+          email: false,
+          offline: false,
+          balance: false,
+          usage: true,
+        }
+      )
+      expect(JSON.parse(String(requests[0].data)).selected_scopes).toEqual([
+        'profile',
+      ])
     }
   )
 })

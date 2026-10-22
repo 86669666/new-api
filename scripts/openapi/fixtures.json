@@ -14458,7 +14458,7 @@
     "valid": false
   },
   {
-    "name": "oauth balance discovery five scopes",
+    "name": "oauth public discovery six scopes",
     "document": "api",
     "schema": "#/components/schemas/OAuthPublicMetadata",
     "value": {
@@ -14473,7 +14473,8 @@
         "profile",
         "email",
         "offline_access",
-        "balance:read"
+        "balance:read",
+        "usage:read"
       ],
       "response_types_supported": [
         "code"
@@ -15559,5 +15560,858 @@
       "message_key": "Invalid parameters"
     },
     "valid": true
+  },
+  {
+    "name": "oauth usage signed logs",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "items": [
+          {
+            "created_at": 3600,
+            "model_name": "fixture",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "quota": -7,
+            "use_time": 0,
+            "is_stream": false,
+            "group": "default"
+          }
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 20
+      },
+      "quota_per_unit": 500000,
+      "data_complete": false
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage signed stat",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "ts": 0,
+          "quota": -7,
+          "requests": 1,
+          "tokens": 9007199254740991
+        }
+      ],
+      "granularity": "day",
+      "quota_per_unit": 500000,
+      "data_complete": false
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage logs missing data",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage logs missing data_complete",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "items": [
+          {
+            "created_at": 3600,
+            "model_name": "fixture",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "quota": -7,
+            "use_time": 0,
+            "is_stream": false,
+            "group": "default"
+          }
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 20
+      },
+      "quota_per_unit": 500000
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage logs null data",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": null,
+      "quota_per_unit": 500000,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage logs false completeness claim",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "items": [
+          {
+            "created_at": 3600,
+            "model_name": "fixture",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "quota": -7,
+            "use_time": 0,
+            "is_stream": false,
+            "group": "default"
+          }
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 20
+      },
+      "quota_per_unit": 500000,
+      "data_complete": true
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage logs invalid quota unit 0",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "items": [
+          {
+            "created_at": 3600,
+            "model_name": "fixture",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "quota": -7,
+            "use_time": 0,
+            "is_stream": false,
+            "group": "default"
+          }
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 20
+      },
+      "quota_per_unit": 0,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage logs invalid quota unit -1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "items": [
+          {
+            "created_at": 3600,
+            "model_name": "fixture",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "quota": -7,
+            "use_time": 0,
+            "is_stream": false,
+            "group": "default"
+          }
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 20
+      },
+      "quota_per_unit": -1,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage stat missing data",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "granularity": "day",
+      "quota_per_unit": 500000,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage stat missing data_complete",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "ts": 0,
+          "quota": -7,
+          "requests": 1,
+          "tokens": 9007199254740991
+        }
+      ],
+      "granularity": "day",
+      "quota_per_unit": 500000
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage stat null data",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": null,
+      "granularity": "day",
+      "quota_per_unit": 500000,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage stat false completeness claim",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "ts": 0,
+          "quota": -7,
+          "requests": 1,
+          "tokens": 9007199254740991
+        }
+      ],
+      "granularity": "day",
+      "quota_per_unit": 500000,
+      "data_complete": true
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage stat invalid quota unit 0",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "ts": 0,
+          "quota": -7,
+          "requests": 1,
+          "tokens": 9007199254740991
+        }
+      ],
+      "granularity": "day",
+      "quota_per_unit": 0,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage stat invalid quota unit -1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "ts": 0,
+          "quota": -7,
+          "requests": 1,
+          "tokens": 9007199254740991
+        }
+      ],
+      "granularity": "day",
+      "quota_per_unit": -1,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage quota 9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": 9007199254740991,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage quota -9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -9007199254740991,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage quota 9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": 9007199254740992,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage quota -9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -9007199254740992,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage quota 1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": "1",
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage prompt_tokens 9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 9007199254740991,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage prompt_tokens -9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": -9007199254740991,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage prompt_tokens 9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 9007199254740992,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage prompt_tokens -9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": -9007199254740992,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage prompt_tokens 1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": "1",
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage completion_tokens 9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 9007199254740991,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage completion_tokens -9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": -9007199254740991,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage completion_tokens 9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 9007199254740992,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage completion_tokens -9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": -9007199254740992,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage completion_tokens 1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": "1",
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage use_time 9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 9007199254740991,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage use_time -9007199254740991",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": -9007199254740991,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage use_time 9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 9007199254740992,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage use_time -9007199254740992",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": -9007199254740992,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage use_time 1",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": "1",
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage reject extra token_id",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default",
+      "token_id": "private"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage reject extra user_id",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default",
+      "user_id": "private"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage reject extra channel_id",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default",
+      "channel_id": "private"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage reject extra ip",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default",
+      "ip": "private"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage reject extra other",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default",
+      "other": "private"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage reject extra request_id",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default",
+      "request_id": "private"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage reject extra org_id",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -7,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default",
+      "org_id": "private"
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage unsafe bucket quota",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageBucket",
+    "value": {
+      "ts": 0,
+      "quota": 9007199254740992,
+      "requests": 1,
+      "tokens": 9007199254740991
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage unsafe bucket requests",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageBucket",
+    "value": {
+      "ts": 0,
+      "quota": -7,
+      "requests": 9007199254740992,
+      "tokens": 9007199254740991
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage unsafe bucket tokens",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageBucket",
+    "value": {
+      "ts": 0,
+      "quota": -7,
+      "requests": 1,
+      "tokens": 9007199254740992
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage query error",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageQueryError",
+    "value": {
+      "success": false,
+      "message": "Invalid query",
+      "code": "USAGE_QUERY_INVALID"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage query failure",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageQueryFailedError",
+    "value": {
+      "success": false,
+      "message": "Failed",
+      "code": "USAGE_QUERY_FAILED"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage disabled",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthUsageUnavailableError",
+    "value": {
+      "success": false,
+      "message": "Disabled",
+      "code": "USAGE_LOGS_DISABLED"
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage explicit requested scope",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "profile",
+        "usage:read"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "oauth usage profile remains required",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "usage:read"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "oauth usage duplicates",
+    "document": "api",
+    "schema": "#/components/schemas/OAuthProviderConsentDecision",
+    "value": {
+      "challenge": "synthetic",
+      "preview_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "approve",
+      "selected_scopes": [
+        "profile",
+        "usage:read",
+        "usage:read"
+      ]
+    },
+    "valid": false
   }
 ]

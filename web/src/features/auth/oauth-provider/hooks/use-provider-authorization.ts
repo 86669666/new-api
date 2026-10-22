@@ -48,6 +48,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
   const [email, setEmail] = useState(false)
   const [offline, setOffline] = useState(false)
   const [balance, setBalance] = useState(false)
+  const [usage, setUsage] = useState(false)
   const mounted = useRef(false)
   const invalidated = useRef(false)
   const submitted = useRef(false)
@@ -112,6 +113,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
         stop()
         return
       }
+      setUsage(false)
       setState({ kind: 'ready', preview })
       clearTimeout(expiry.current)
       const expires = waiting.current
@@ -264,6 +266,10 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
           email: email && preview.allowed_scopes.includes('email'),
           offline: offline && preview.allowed_scopes.includes('offline_access'),
           balance: balance && preview.allowed_scopes.includes('balance:read'),
+          usage:
+            usage &&
+            preview.requested_scopes.includes('usage:read') &&
+            preview.allowed_scopes.includes('usage:read'),
         }
       )
       if (
@@ -290,6 +296,8 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
     setOffline,
     balance,
     setBalance,
+    usage,
+    setUsage,
     decide,
     resume,
     cancel: stop,

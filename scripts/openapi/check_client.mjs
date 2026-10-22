@@ -88,6 +88,11 @@ const tokenSeriesServices = ['getTokenUsageLogs', 'getTokenUsageStat'].map(metho
   assert.equal(matches.length, 1, method);
   return { method, service: matches[0].name };
 });
+const oauthUsageServices = ['getOAuthUsageLogs', 'getOAuthUsageStat'].map(method => {
+  const matches = services.filter(service => service.source.includes(`    public static ${method}(`));
+  assert.equal(matches.length, 1, method);
+  return { method, service: matches[0].name };
+});
 const pricingServices = services.filter(service => service.source.includes('    public static getApiPricing('));
 assert.equal(pricingServices.length, 1, 'Exactly one generated pricing method is required');
 const pricingService = pricingServices[0].name;
@@ -433,6 +438,21 @@ export async function compileTokenUsageSeries() {
   // @ts-expect-error empty arrays are allowed, null data is not
   const invalid: client.TokenUsageStatResult = { success: true, message: '', quota_per_unit: 500000, data_complete: false, granularity: 'hour', data: null };
   return { complete, tokens, projected, invalid };
+}
+export async function compileDelegatedUsage() {
+  const logs = await client.${oauthUsageServices[0].service}.getOAuthUsageLogs({ pageSize: '10', modelName: 'fixture' });
+  const stat = await client.${oauthUsageServices[1].service}.getOAuthUsageStat({ granularity: 'day', startTimestamp: '0' });
+  const quota: number = stat.data[0].quota;
+  const count: number = logs.data.total;
+  // @ts-expect-error caller-supplied subject is not part of the delegated contract
+  client.${oauthUsageServices[0].service}.getOAuthUsageLogs({ userId: '1' });
+  // @ts-expect-error delegated history has no token selector
+  client.${oauthUsageServices[1].service}.getOAuthUsageStat({ tokenId: '1' });
+  // @ts-expect-error canonical decimal query values remain wire strings
+  client.${oauthUsageServices[0].service}.getOAuthUsageLogs({ pageSize: 10 });
+  // @ts-expect-error no channel or credential metadata is publicly projected
+  const privateChannel: number = logs.data.items[0].channel_id;
+  return { quota, count, privateChannel };
 }
 `);
 await writeFile(consumer, await readFile(consumer, 'utf8') + `
@@ -1280,6 +1300,51 @@ for (const [index, fixtureName, parameters, query] of [
   }
 }
 const tokenSeriesStubbedRequests = calls.length - beforeTokenSeriesRequests;
+const beforeOAuthUsageRequests = calls.length;
+api.OpenAPI.TOKEN = 'delegated-usage-fixture';
+api.OpenAPI.HEADERS = undefined;
+api.OpenAPI.WITH_CREDENTIALS = false;
+for (const [index, fixtureName, parameters] of [
+  [0, 'signed logs', { page: '2', pageSize: '10', modelName: 'a/b' }],
+  [1, 'signed stat', { granularity: 'day', startTimestamp: '0', endTimestamp: '7200' }],
+]) {
+  const { method, service } = oauthUsageServices[index];
+  responseStatus = 200;
+  responseBody = allFixtures.find(fixture => fixture.name === 'oauth usage ' + fixtureName).value;
+  assert.deepEqual(await api[service][method](parameters), responseBody);
+  const request = calls.at(-1);
+  const url = new URL(request.url);
+  assert.equal(url.pathname, '/api/v1/oauth/usage/' + (index === 0 ? 'logs' : 'stat'));
+  const expected = index === 0 ? 'page=2&page_size=10&model_name=a%2Fb' : 'granularity=day&start_timestamp=0&end_timestamp=7200';
+  assert.deepEqual([...url.searchParams].sort(), [...new URLSearchParams(expected)].sort());
+  assert.equal(request.init.method, 'GET');
+  assert.equal(request.init.body, undefined);
+  const headers = new Headers(request.init.headers);
+  assert.equal(headers.get('Authorization'), 'Bearer delegated-usage-fixture');
+  assert.equal(headers.has('X-Organization-Id'), false);
+  for (const [status, body] of [
+    [400, { error: 'invalid_request' }],
+    [400, { success: false, message: 'Invalid', code: 'USAGE_QUERY_INVALID' }],
+    [401, { error: 'invalid_token' }],
+    [403, { error: 'insufficient_scope' }],
+    [429, undefined],
+    [500, { success: false, message: 'Failed', code: 'USAGE_QUERY_FAILED' }],
+    [500, undefined],
+    [503, { success: false, message: 'Disabled', code: index === 0 ? 'USAGE_LOGS_DISABLED' : 'USAGE_STAT_UNAVAILABLE' }],
+    [503, { error: 'temporarily_unavailable' }],
+  ]) {
+    responseStatus = status;
+    responseBody = body;
+    const before = calls.length;
+    await assert.rejects(api[service][method](parameters), error => error.status === status && JSON.stringify(error.body) === JSON.stringify(body));
+    assert.equal(calls.length, before + 1, 'Delegated usage errors must not retry');
+  }
+}
+await writeFile(path.join(output, 'oauth-usage-client-results.json'), JSON.stringify({
+  requests: calls.length - beforeOAuthUsageRequests, live_http: false,
+  generated_client_response_validation: false, independent_scope_enforced_by_server: true,
+  no_automatic_retry: true,
+}, null, 2) + '\n');
 const beforeClientEventsRequests = calls.length;
 api.OpenAPI.TOKEN = 'sk-generated-events-fixture';
 api.OpenAPI.HEADERS = undefined;

@@ -60,6 +60,9 @@ func SetUpLogger(server *gin.Engine) {
 		// OAuth callbacks carry one-time codes and state in the query string.
 		// Redact the log value only; the handler still needs the original query.
 		resourcePath, _, _ := strings.Cut(path, "?")
+		if OAuthUsagePath(param.Request.URL.EscapedPath()) {
+			path = "/api/v1/oauth/usage/[resource]"
+		}
 		if OAuthPublicPath(param.Request.URL.Path) {
 			path = "/oauth2/[protocol]"
 		}

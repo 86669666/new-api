@@ -1,14 +1,26 @@
 package router
 
 import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
+	"github.com/QuantumNous/new-api/service"
+	"gorm.io/gorm"
 	"maps"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -384,4 +396,551 @@ func TestTokenUsageReadOnlyHTTP(t *testing.T) {
 	// Query parse failures and the public projection must never disclose seeded
 	// metadata; raw credentials are also absent from server logs.
 	assert.NotContains(t, f.logs.snapshot(), tokens["A"].Key)
+}
+
+// Pure numeric and transport regressions run without DB, issuer or socket I/O.
+func TestOAuthUsageNamespacePrivacy(t *testing.T) {
+	oldMaster := common.IsMasterNode
+	common.IsMasterNode = false
+	t.Cleanup(func() { common.IsMasterNode = oldMaster })
+	t.Setenv("FRONTEND_BASE_URL", "https://frontend.invalid")
+	require.Nil(t, service.CurrentOAuthUserInfoResource())
+	var logs bytes.Buffer
+	oldWriter := gin.DefaultWriter
+	gin.DefaultWriter = &logs
+	t.Cleanup(func() { gin.DefaultWriter = oldWriter })
+	engine := gin.New()
+	middleware.SetUpLogger(engine)
+	SetRouter(engine, WebAssets{})
+	for _, tc := range []struct {
+		method, path, body string
+		header             string
+		status             int
+	}{
+		{"GET", "/api/v1/oauth/usage/logs", "", "", 401},
+		{"GET", "/api/v1/oauth/usage/stat?granularity=day", "", "", 401},
+		{"GET", "/api/v1/oauth/usage/logs?access_token=USAGE_QUERY_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/usage/logs?ORG_ID=0", "", "", 400},
+		{"GET", "/api/v1/oauth/usage/stat?user_id=1", "", "", 400},
+		{"GET", "/api/v1/oauth/usage/logs?x=%ZZ", "", "", 400},
+		{"GET", "/api/v1/oauth/usage/logs/USAGE_PATH_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/usage/logs/", "", "", 400},
+		{"GET", "/api/v1/oauth/%75sage/logs", "", "", 400},
+		{"GET", "/api/v1/oauth/%2575sage/stat", "", "", 400},
+		{"GET", "/api/v1/oauth/%252575sage/logs?access_token=USAGE_QUERY_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/%25252575sage/stat?access_token=USAGE_QUERY_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/%2575sage/logs%25ZZ?access_token=USAGE_QUERY_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/%252575sage/stat%25?access_token=USAGE_QUERY_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/%25%37%35sage/logs%25ZZ?access_token=USAGE_QUERY_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/%252%35%37%35sage/logs?access_token=USAGE_QUERY_CANARY", "", "", 400},
+		{"GET", "/api//v1/oauth/usage/logs", "", "", 400},
+		{"GET", "/API/V1/OAUTH/USAGE/LOGS", "", "", 400},
+		{"GET", "/api/v1/oauth/usage", "", "", 400},
+		{"POST", "/api/v1/oauth/usage/logs", "", "", 400},
+		{"HEAD", "/api/v1/oauth/usage/stat", "", "", 400},
+		{"GET", "/api/v1/oauth/usage/logs", "x", "", 400},
+		{"GET", "/api/v1/oauth/usage/logs", "", "X-Organization-Id", 400},
+		{"GET", "/api/v1/oauth/usage/stat", "", "X-HTTP-Method-Override", 400},
+	} {
+		t.Run(tc.method+tc.path+tc.header+tc.body, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			if tc.header != "" {
+				req.Header[tc.header] = []string{""}
+			}
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			assert.Equal(t, tc.status, w.Code, w.Body.String())
+			assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+			assert.Equal(t, "no-referrer", w.Header().Get("Referrer-Policy"))
+			assert.Empty(t, w.Header().Get("Location"))
+			assert.NotContains(t, w.Body.String(), "USAGE_")
+		})
+	}
+	assert.NotContains(t, logs.String(), "USAGE_QUERY_CANARY")
+	assert.NotContains(t, logs.String(), "USAGE_PATH_CANARY")
+}
+
+func TestOAuthUsagePureContracts(t *testing.T) {
+	const safe = model.OAuthUsageMaxInteger
+	for _, tc := range []struct {
+		name        string
+		hours       []model.TokenUsageBucket
+		granularity string
+		want        []model.TokenUsageBucket
+		bad         bool
+	}{
+		{"empty", nil, "hour", []model.TokenUsageBucket{}, false},
+		{"signed", []model.TokenUsageBucket{{TS: 0, Quota: -7, Requests: 1, Tokens: 3}}, "hour", []model.TokenUsageBucket{{TS: 0, Quota: -7, Requests: 1, Tokens: 3}}, false},
+		{"utc_sparse", []model.TokenUsageBucket{{TS: 82800, Quota: 1}, {TS: 86400, Quota: 2}}, "day", []model.TokenUsageBucket{{TS: 0, Quota: 1}, {TS: 86400, Quota: 2}}, false},
+		{"safe_max", []model.TokenUsageBucket{{TS: 0, Quota: safe}}, "day", []model.TokenUsageBucket{{TS: 0, Quota: safe}}, false},
+		{"hour_unsafe", []model.TokenUsageBucket{{TS: 0, Tokens: safe + 1}}, "hour", nil, true},
+		{"day_unsafe", []model.TokenUsageBucket{{TS: 0, Quota: safe}, {TS: 3600, Quota: 1}}, "day", nil, true},
+		{"negative_unsafe", []model.TokenUsageBucket{{TS: 0, Requests: -safe}, {TS: 3600, Requests: -1}}, "day", nil, true},
+		{"int64_max", []model.TokenUsageBucket{{TS: 0, Quota: math.MaxInt64}}, "hour", nil, true},
+		{"int64_min", []model.TokenUsageBucket{{TS: 0, Quota: math.MinInt64}}, "hour", nil, true},
+		{"prefix_cannot_cancel", []model.TokenUsageBucket{{TS: 0, Quota: safe}, {TS: 3600, Quota: 1}, {TS: 7200, Quota: -1}}, "day", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := model.FoldOAuthUsageHours(tc.hours, tc.granularity)
+			if tc.bad {
+				require.ErrorIs(t, err, model.ErrOAuthUsageNumeric)
+				assert.Nil(t, got)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, got)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		method, path, body string
+		headers            map[string]string
+		status             int
+	}{
+		{"GET", "/api/v1/oauth/usage/logs?org_id=0", "", nil, 400},
+		{"GET", "/api/v1/oauth/usage/stat?user_id=1", "", nil, 400},
+		{"GET", "/api/v1/oauth/usage/logs?ACCESS_TOKEN=secret", "", nil, 400},
+		{"GET", "/api/v1/oauth/usage/logs", "", map[string]string{"X-Organization-Id": ""}, 400},
+		{"GET", "/api/v1/oauth/usage/logs", "", map[string]string{"X-HTTP-Method-Override": "POST"}, 400},
+		{"GET", "/api/v1/oauth/usage/logs", "x", nil, 400},
+		{"POST", "/api/v1/oauth/usage/logs", "", nil, 400},
+		{"GET", "/api/v1/oauth/usage/logs", "", nil, 401},
+	} {
+		engine := gin.New()
+		engine.Use(func(c *gin.Context) { c.Set("id", 1); c.Set("role", common.RoleRootUser); c.Next() })
+		engine.Any("/api/v1/oauth/usage/logs", controller.GetOAuthUsageLogs)
+		engine.Any("/api/v1/oauth/usage/stat", controller.GetOAuthUsageStat)
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		for k, v := range tc.headers {
+			req.Header[k] = []string{v}
+		}
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		assert.Equal(t, tc.status, w.Code, tc.path)
+		assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+		assert.Equal(t, "no-referrer", w.Header().Get("Referrer-Policy"))
+		assert.Empty(t, w.Header().Get("Location"))
+	}
+}
+
+// The resource is served through the formal OAuth router; only the issuer's TLS
+// introspection response is synthetic. Local authority and usage reads use DBs.
+func TestOAuthUsageConsumerHTTP(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	if model.LOG_DB == f.db {
+		logDB, _ := organizationTestDB(t, f.mainKind, os.Getenv("NEWAPI_S2_MAIN_DSN"))
+		require.NoError(t, logDB.AutoMigrate(&model.Log{}))
+		model.LOG_DB = logDB
+	}
+	require.NotSame(t, f.db, model.LOG_DB, "usage history must read its independently configured log database")
+	require.NoError(t, f.db.AutoMigrate(&model.QuotaData{}))
+	common.IsMasterNode = true
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	common.IsMasterNode = false
+	oldLog, oldExport, oldUnit := common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit
+	common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit = true, true, 500000
+	t.Cleanup(func() {
+		common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit = oldLog, oldExport, oldUnit
+	})
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	require.NoError(t, err)
+	const issuer = "https://gateway.example/"
+	grant := &model.OAuthGrant{GrantID: base64.RawURLEncoding.EncodeToString(b), Issuer: issuer, ClientID: "usage-client", Subject: strconv.Itoa(f.users["owner"].Id), UserID: f.users["owner"].Id, ConsentRequestID: "usage-consent", HydraLoginSessionID: "usage-login", OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile","usage:read"]`, PolicyHash: strings.Repeat("a", 64)}
+	require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+	require.NoError(t, model.ApproveOAuthGrant(t.Context(), grant))
+	_, err = model.AuthorizeOAuthGrant(t.Context(), model.OAuthGrantAuthorization{Issuer: issuer, GrantID: grant.GrantID, ClientID: grant.ClientID, Subject: grant.Subject, UserID: grant.UserID, AuthVersion: 1, GrantExpiresAt: grant.ExpiresAt, TokenExpiresAt: time.Now().Unix() + 600, Scopes: []string{"profile", "usage:read"}, Activate: true})
+	require.NoError(t, err)
+	var calls atomic.Int32
+	var change func()
+	scope := "profile usage:read"
+	expires := time.Now().Unix() + 600
+	var notBefore int64
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 2 && change != nil {
+			change()
+		}
+		data, e := common.Marshal(map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": issuer, "aud": []string{"userinfo"}, "client_id": grant.ClientID, "sub": grant.Subject, "exp": expires, "nbf": notBefore, "scope": scope, "ext": map[string]any{"newapi_auth_version": "1", "newapi_grant_id": grant.GrantID, "newapi_grant_expires_at": strconv.FormatInt(grant.ExpiresAt, 10)}})
+		if e != nil {
+			w.WriteHeader(500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(server.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: server.URL + "/admin/oauth2/introspect", Issuer: issuer, Audience: "userinfo", ClientIDs: []string{grant.ClientID}}, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: server.URL, AuthorizationURL: issuer + "oauth2/auth"}, resource)
+	require.NoError(t, err)
+	_, err = service.NewOAuthPublic(service.OAuthPublicConfig{Enabled: true, BaseURL: "https://hydra-private.example"}, bridge)
+	require.NoError(t, err)
+	engine := gin.New()
+	engine.Use(middleware.OAuthUsageBoundary)
+	SetOAuthResourceRouter(engine, resource)
+	base := time.Now().UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour).Unix()
+	for _, row := range []model.Log{{UserId: grant.UserID, TokenId: 0, CreatedAt: base, Type: model.LogTypeConsume, ModelName: "zero", Quota: 3}, {UserId: grant.UserID, TokenId: 987654, CreatedAt: base, Type: model.LogTypeConsume, ModelName: "deleted", Quota: 5}, {UserId: f.users["foreign"].Id, CreatedAt: base, Type: model.LogTypeConsume, ModelName: "foreign", Quota: 999}} {
+		row.Ip = "203.0.113.1"
+		row.Other = `{"secret":"private"}`
+		require.NoError(t, model.LOG_DB.Create(&row).Error)
+	}
+	request := func(path string) *httptest.ResponseRecorder {
+		calls.Store(0)
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Authorization", "Bearer synthetic-usage-token")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		return w
+	}
+	logs := fmt.Sprintf("/api/v1/oauth/usage/logs?start_timestamp=%d&end_timestamp=%d", base, base+7200)
+	stat := fmt.Sprintf("/api/v1/oauth/usage/stat?start_timestamp=%d&end_timestamp=%d&granularity=day", base, base+7200)
+	t.Run("subject_history_and_projection", func(t *testing.T) {
+		w := request(logs)
+		require.Equal(t, 200, w.Code, w.Body.String())
+		var body map[string]any
+		require.NoError(t, common.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, false, body["data_complete"])
+		data := body["data"].(map[string]any)
+		assert.Equal(t, float64(2), data["total"])
+		for _, item := range data["items"].([]any) {
+			assert.Len(t, item.(map[string]any), 8)
+		}
+		assert.NotContains(t, w.Body.String(), "foreign")
+		assert.NotContains(t, w.Body.String(), "private")
+		assert.NotContains(t, w.Body.String(), "203.0.113")
+	})
+	t.Run("missing_scope", func(t *testing.T) {
+		scope = "profile"
+		require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("scopes", `["profile"]`).Error)
+		defer func() {
+			scope = "profile usage:read"
+			require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("scopes", `["profile","usage:read"]`).Error)
+		}()
+		w := request(logs)
+		assert.Equal(t, 403, w.Code)
+		assert.Contains(t, w.Header().Get("WWW-Authenticate"), `scope="usage:read"`)
+	})
+	t.Run("expired", func(t *testing.T) {
+		expires = time.Now().Unix() - 1
+		defer func() { expires = time.Now().Unix() + 600 }()
+		assert.Equal(t, 401, request(logs).Code)
+	})
+	t.Run("final_guard", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			table     any
+			where     string
+			id        any
+			column    string
+			bad, good any
+		}{{"grant", &model.OAuthGrant{}, "grant_ref = ?", grant.GrantRef, "state", "revoked", "active"}, {"revision", &model.OAuthGrant{}, "grant_ref = ?", grant.GrantRef, "revision", 4, 3}, {"source_sid", &model.UserSession{}, "sid = ?", grant.OriginSID, "revoked_at", 1, 0}, {"auth_version", &model.User{}, "id = ?", grant.UserID, "auth_version", 2, 1}, {"scope_changed", &model.OAuthGrant{}, "grant_ref = ?", grant.GrantRef, "scopes", `["profile"]`, `["profile","usage:read"]`}, {"disabled", &model.User{}, "id = ?", grant.UserID, "status", 2, common.UserStatusEnabled}} {
+			t.Run(tc.name, func(t *testing.T) {
+				var mutationErr error
+				change = func() {
+					mutationErr = f.db.Model(tc.table).Where(tc.where, tc.id).UpdateColumn(tc.column, tc.bad).Error
+				}
+				for _, path := range []string{logs, stat} {
+					w := request(path)
+					require.NoError(t, mutationErr)
+					require.NoError(t, f.db.Model(tc.table).Where(tc.where, tc.id).UpdateColumn(tc.column, tc.good).Error)
+					assert.Equal(t, 401, w.Code)
+					assert.NotContains(t, w.Body.String(), `"data":`)
+				}
+				change = nil
+			})
+		}
+	})
+
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		t.Run("clickhouse_owned_storage_and_read_guard_schema", func(t *testing.T) {
+			// organizationTestDB created this random DB with collision-failing CREATE
+			// and registered DROP only after success. No existing business table is used.
+			dsn := os.Getenv("LOG_SQL_DSN")
+			require.NoError(t, organizationFixtureDSN("clickhouse", dsn, os.Getenv("NEWAPI_S2_CLICKHOUSE_PORT")))
+			parsed, err := url.Parse(dsn)
+			require.NoError(t, err)
+			var database string
+			require.NoError(t, model.LOG_DB.Raw("SELECT currentDatabase()").Scan(&database).Error)
+			require.Regexp(t, `^newapi_s2_[a-z0-9]+$`, database)
+			require.Equal(t, "/"+database, parsed.Path)
+			t.Logf("exclusive ClickHouse fixture verified: database=%s", database)
+			var columns []struct {
+				Name string
+				Type string
+			}
+			require.NoError(t, model.LOG_DB.Raw("SELECT name, type FROM system.columns WHERE database = currentDatabase() AND table = 'logs' AND name IN ('quota','prompt_tokens','completion_tokens','use_time') ORDER BY name").Scan(&columns).Error)
+			require.Len(t, columns, 4)
+			for _, column := range columns {
+				assert.Equal(t, "Int32", column.Type)
+				t.Logf("production-schema column=%s type=%s", column.Name, column.Type)
+			}
+			for _, value := range []int64{math.MaxInt32, math.MinInt32} {
+				row := model.Log{UserId: grant.UserID, CreatedAt: base + 1, Type: model.LogTypeConsume, ModelName: "ch-int32", Quota: int(value)}
+				require.NoError(t, model.LOG_DB.Create(&row).Error)
+				var stored int64
+				require.NoError(t, model.LOG_DB.Model(&model.Log{}).Select("quota").Where("model_name = ?", row.ModelName).Scan(&stored).Error)
+				assert.Equal(t, value, stored)
+				w := request(logs + "&model_name=ch-int32")
+				assert.Equal(t, 200, w.Code, w.Body.String())
+				assert.Contains(t, w.Body.String(), strconv.FormatInt(value, 10))
+				require.NoError(t, model.LOG_DB.Exec("ALTER TABLE logs DELETE WHERE model_name = ? SETTINGS mutations_sync = 2", row.ModelName).Error)
+			}
+			// Int32 cannot represent JS-unsafe integers. This test-only widening
+			// exercises the reader guard on retained Int64 values, not migrations.
+			for _, column := range []string{"quota", "prompt_tokens", "completion_tokens", "use_time"} {
+				sql := "ALTER TABLE logs MODIFY COLUMN " + column + " Int64"
+				t.Logf("private test-only schema SQL: %s", sql)
+				require.NoError(t, model.LOG_DB.Exec(sql).Error)
+			}
+		})
+	}
+	t.Run("log_overflow", func(t *testing.T) {
+		row := model.Log{UserId: grant.UserID, CreatedAt: base + 1, Type: model.LogTypeConsume, ModelName: "oauth-unsafe", Quota: int(model.OAuthUsageMaxInteger + 1)}
+		require.NoError(t, model.LOG_DB.Create(&row).Error)
+		var stored int64
+		require.NoError(t, model.LOG_DB.Model(&model.Log{}).Select("quota").Where("user_id = ? AND model_name = ?", grant.UserID, row.ModelName).Scan(&stored).Error)
+		require.Equal(t, int64(row.Quota), stored, "unsafe integer must survive storage before testing the read guard")
+		assert.Equal(t, 500, request(logs).Code)
+		if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+			require.NoError(t, model.LOG_DB.Exec("ALTER TABLE logs DELETE WHERE model_name = ? SETTINGS mutations_sync = 2", row.ModelName).Error)
+		} else {
+			require.NoError(t, model.LOG_DB.Where("user_id = ? AND model_name = ?", grant.UserID, row.ModelName).Delete(&model.Log{}).Error)
+		}
+	})
+	t.Run("hours_and_daily_overflow", func(t *testing.T) {
+		require.NoError(t, f.db.Create(&model.QuotaData{UserID: grant.UserID, CreatedAt: base, Quota: int(model.OAuthUsageMaxInteger), Count: 1}).Error)
+		require.NoError(t, f.db.Create(&model.QuotaData{UserID: grant.UserID, CreatedAt: base + 3600, Quota: 1, Count: 1}).Error)
+		assert.Equal(t, 500, request(stat).Code)
+		require.NoError(t, f.db.Where("user_id = ?", grant.UserID).Delete(&model.QuotaData{}).Error)
+	})
+	t.Run("collection_matrix", func(t *testing.T) {
+		for _, enabled := range []bool{false, true} {
+			for _, export := range []bool{false, true} {
+				common.LogConsumeEnabled, common.DataExportEnabled = enabled, export
+				for _, path := range []string{logs, stat} {
+					want, code := 200, ""
+					if !enabled {
+						want, code = 503, "USAGE_LOGS_DISABLED"
+					}
+					if path == stat && (!enabled || !export) {
+						want, code = 503, "USAGE_STAT_UNAVAILABLE"
+					}
+					w := request(path)
+					assert.Equal(t, want, w.Code, "consume=%v export=%v path=%s", enabled, export, path)
+					if code != "" {
+						assert.Contains(t, w.Body.String(), code)
+						assert.NotContains(t, w.Body.String(), `"data":`)
+					}
+				}
+			}
+		}
+		common.LogConsumeEnabled, common.DataExportEnabled = true, true
+	})
+	t.Run("subject_root_and_sparse_projection", func(t *testing.T) {
+		original := grant
+		defer func() { grant = original }()
+		for _, actor := range []string{"owner", "foreign", "root"} {
+			user := f.users[actor]
+			if actor != "owner" {
+				b := make([]byte, 32)
+				_, err := rand.Read(b)
+				require.NoError(t, err)
+				grant = &model.OAuthGrant{GrantID: base64.RawURLEncoding.EncodeToString(b), Issuer: issuer, ClientID: "usage-client", Subject: strconv.Itoa(user.Id), UserID: user.Id, ConsentRequestID: "usage-" + actor, HydraLoginSessionID: "usage-" + actor, OriginSID: f.sids[actor], SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile","usage:read"]`, PolicyHash: strings.Repeat("a", 64)}
+				require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+				require.NoError(t, model.ApproveOAuthGrant(t.Context(), grant))
+				_, err = model.AuthorizeOAuthGrant(t.Context(), model.OAuthGrantAuthorization{Issuer: issuer, GrantID: grant.GrantID, ClientID: grant.ClientID, Subject: grant.Subject, UserID: grant.UserID, AuthVersion: 1, GrantExpiresAt: grant.ExpiresAt, TokenExpiresAt: expires, Scopes: []string{"profile", "usage:read"}, Activate: true})
+				require.NoError(t, err)
+			}
+			w := request(logs)
+			require.Equal(t, 200, w.Code, w.Body.String())
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &body))
+			want := map[string]float64{"owner": 2, "foreign": 1, "root": 0}[actor]
+			assert.Equal(t, want, body["data"].(map[string]any)["total"], actor)
+			if actor == "root" {
+				assert.Equal(t, []any{}, body["data"].(map[string]any)["items"])
+			}
+			quota := map[string]int{"owner": -3, "foreign": 999, "root": 7}[actor]
+			require.NoError(t, f.db.Create(&model.QuotaData{UserID: user.Id, TokenID: 0, CreatedAt: base, Quota: quota, Count: 1, TokenUsed: 2}).Error)
+			require.NoError(t, f.db.Create(&model.QuotaData{UserID: user.Id, TokenID: 987654, CreatedAt: base, Quota: 5, Count: 2, TokenUsed: 3}).Error)
+			w = request(stat)
+			require.Equal(t, 200, w.Code, w.Body.String())
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &body))
+			buckets := body["data"].([]any)
+			require.Len(t, buckets, 1)
+			item := buckets[0].(map[string]any)
+			assert.ElementsMatch(t, []string{"ts", "quota", "requests", "tokens"}, slices.Collect(maps.Keys(item)))
+			assert.Equal(t, float64(quota+5), item["quota"])
+			assert.Equal(t, float64(3), item["requests"])
+			assert.Equal(t, float64(5), item["tokens"])
+			require.NoError(t, f.db.Where("user_id = ?", user.Id).Delete(&model.QuotaData{}).Error)
+			w = request(stat)
+			require.Equal(t, 200, w.Code)
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &body))
+			assert.Equal(t, []any{}, body["data"])
+		}
+	})
+	t.Run("numeric_sql_boundaries", func(t *testing.T) {
+		const safe = model.OAuthUsageMaxInteger
+		for _, tc := range []struct {
+			name                string
+			values              []int64
+			column, granularity string
+			want                int
+		}{
+			{"safe_max", []int64{safe}, "quota", "day", 200},
+			{"negative_safe", []int64{-safe}, "quota", "day", 200},
+			{"hour_max_plus_one", []int64{safe, 1}, "quota", "hour", 500},
+			{"sql_int64_sum_overflow", []int64{math.MaxInt64, 1}, "quota", "hour", 500},
+			{"sql_int64_sum_underflow", []int64{math.MinInt64, -1}, "quota", "hour", 500},
+			{"requests_max_plus_one", []int64{safe, 1}, "count", "hour", 500},
+			{"tokens_max_plus_one", []int64{safe, 1}, "token_used", "hour", 500},
+			{"daily_prefix_cannot_cancel", []int64{safe, 1, -1}, "quota", "day", 500},
+			{"negative_daily_prefix_cannot_cancel", []int64{-safe, -1, 1}, "quota", "day", 500},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				for i, value := range tc.values {
+					ts := base
+					if strings.Contains(tc.name, "daily_prefix") {
+						ts += int64(i) * 3600
+					}
+					row := model.QuotaData{UserID: grant.UserID, CreatedAt: ts, ModelName: fmt.Sprint(i)}
+					require.NoError(t, f.db.Create(&row).Error)
+					require.NoError(t, f.db.Model(&row).UpdateColumn(tc.column, value).Error)
+				}
+				w := request(strings.Replace(stat, "granularity=day", "granularity="+tc.granularity, 1))
+				assert.Equal(t, tc.want, w.Code, w.Body.String())
+				if tc.want == 500 {
+					assert.NotContains(t, w.Body.String(), `"data":`)
+				} else {
+					assert.Contains(t, w.Body.String(), strconv.FormatInt(tc.values[0], 10))
+				}
+				require.NoError(t, f.db.Where("user_id = ?", grant.UserID).Delete(&model.QuotaData{}).Error)
+			})
+		}
+		for _, value := range []int64{safe, -safe} {
+			row := model.Log{UserId: grant.UserID, CreatedAt: base + 1, Type: model.LogTypeConsume, ModelName: "oauth-safe", Quota: int(value)}
+			require.NoError(t, model.LOG_DB.Create(&row).Error)
+			w := request(logs)
+			assert.Equal(t, 200, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), strconv.FormatInt(value, 10))
+			if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+				require.NoError(t, model.LOG_DB.Exec("ALTER TABLE logs DELETE WHERE model_name = ? SETTINGS mutations_sync = 2", row.ModelName).Error)
+			} else {
+				require.NoError(t, model.LOG_DB.Where("user_id = ? AND model_name = ?", grant.UserID, row.ModelName).Delete(&model.Log{}).Error)
+			}
+		}
+	})
+	t.Run("final_fence_and_temporal_guards", func(t *testing.T) {
+		for _, path := range []string{logs, stat} {
+			for _, scenario := range []string{"cleanup_fence", "source_session_expiry", "token_expiry", "not_before", "full_scope_change"} {
+				t.Run(fmt.Sprintf("%s/%s", strings.Split(path, "?")[0], scenario), func(t *testing.T) {
+					var mutationErr error
+					change = func() {
+						switch scenario {
+						case "cleanup_fence":
+							mutationErr = f.db.Create(&model.OAuthCleanupJob{JobRef: strings.Repeat("b", 64), Issuer: issuer, UserID: grant.UserID, Subject: grant.Subject, Scope: "grant", Value: grant.GrantRef, Targets: "[]", Reason: "test", State: "pending"}).Error
+						case "source_session_expiry":
+							mutationErr = f.db.Model(&model.UserSession{}).Where("sid = ?", grant.OriginSID).UpdateColumn("expires_at", time.Now().Unix()-1).Error
+						case "token_expiry":
+							expires = time.Now().Unix() - 1
+						case "not_before":
+							notBefore = time.Now().Unix() + 3600
+						case "full_scope_change":
+							scope = "profile email usage:read"
+							mutationErr = f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("scopes", `["profile","email","usage:read"]`).Error
+						}
+					}
+					w := request(path)
+					change = nil
+					require.NoError(t, mutationErr)
+					want := 401
+					if scenario == "cleanup_fence" {
+						want = 503
+					}
+					assert.Equal(t, want, w.Code, w.Body.String())
+					assert.NotContains(t, w.Body.String(), `"data":`)
+					require.NoError(t, f.db.Where("job_ref = ?", strings.Repeat("b", 64)).Delete(&model.OAuthCleanupJob{}).Error)
+					require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", grant.OriginSID).UpdateColumn("expires_at", grant.ExpiresAt).Error)
+					expires, notBefore, scope = time.Now().Unix()+600, 0, "profile usage:read"
+					require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("scopes", `["profile","usage:read"]`).Error)
+				})
+			}
+		}
+	})
+	t.Run("query_completion_revocation", func(t *testing.T) {
+		for _, path := range []string{logs, stat} {
+			conn, table := model.LOG_DB, "logs"
+			if path == stat {
+				conn, table = f.db, "quota_data"
+			}
+			fired := false
+			var mutationErr error
+			name := "oauth_usage_query_completion"
+			require.NoError(t, conn.Callback().Row().After("gorm:row").Register(name, func(tx *gorm.DB) {
+				if !fired && tx.Statement.Table == table {
+					fired = true
+					mutationErr = f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("state", "revoked").Error
+				}
+			}))
+			w := request(path)
+			require.NoError(t, conn.Callback().Row().Remove(name))
+			require.True(t, fired, "real usage query barrier must execute")
+			require.NoError(t, mutationErr)
+			assert.Equal(t, 401, w.Code, w.Body.String())
+			assert.NotContains(t, w.Body.String(), `"data":`)
+			require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("state", "active").Error)
+		}
+	})
+	t.Run("real_commit_deadline", func(t *testing.T) {
+		var savedSession model.UserSession
+		require.NoError(t, f.db.Where("sid = ?", grant.OriginSID).First(&savedSession).Error)
+		var savedGrant model.OAuthGrant
+		require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).First(&savedGrant).Error)
+		sqlDB, err := f.db.DB()
+		require.NoError(t, err)
+		for _, deadline := range []string{"token", "grant", "session"} {
+			t.Run(deadline, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					now := time.Now().Unix()
+					tokenExpiry, grantExpiry, sessionExpiry := now+60, now+60, now+60
+					switch deadline {
+					case "token":
+						tokenExpiry = now + 1
+					case "grant":
+						grantExpiry = now + 1
+					case "session":
+						sessionExpiry = now + 1
+						grantExpiry = sessionExpiry
+					}
+					require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", grant.OriginSID).UpdateColumn("expires_at", sessionExpiry).Error)
+					require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("expires_at", grantExpiry).Error)
+					db := f.db.Session(&gorm.Session{NewDB: true}).WithContext(context.Background())
+					db.Statement.ConnPool = &oauthCommitDelayPool{DB: sqlDB}
+					model.DB = db
+					require.NoError(t, model.InitOAuthCleanupStore(true))
+					_, authorizeErr := model.AuthorizeOAuthGrant(context.Background(), model.OAuthGrantAuthorization{Issuer: issuer, GrantID: grant.GrantID, ClientID: grant.ClientID, Subject: grant.Subject, UserID: grant.UserID, AuthVersion: 1, GrantExpiresAt: grantExpiry, TokenExpiresAt: tokenExpiry, Scopes: []string{"profile", "usage:read"}})
+					model.DB = f.db
+					require.NoError(t, model.InitOAuthCleanupStore(true))
+					require.ErrorIs(t, authorizeErr, model.ErrOAuthGrantInvalid)
+				})
+			})
+		}
+		require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", grant.OriginSID).UpdateColumn("expires_at", savedSession.ExpiresAt).Error)
+		require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("expires_at", savedGrant.ExpiresAt).Error)
+	})
+	t.Run("read_failure", func(t *testing.T) {
+		name := "usage_read_fault"
+		require.NoError(t, model.LOG_DB.Callback().Row().Before("gorm:row").Register(name, func(tx *gorm.DB) {
+			if tx.Statement.Table == "logs" {
+				tx.AddError(fmt.Errorf("private diagnostic"))
+			}
+		}))
+		w := request(logs)
+		require.NoError(t, model.LOG_DB.Callback().Row().Remove(name))
+		assert.Equal(t, 500, w.Code)
+		assert.NotContains(t, w.Body.String(), "diagnostic")
+	})
 }

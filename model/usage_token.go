@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
 )
 
 // TokenUsageLog is the public projection shared with read-only API-key clients.
@@ -28,12 +29,17 @@ type TokenUsageBucket struct {
 }
 
 func GetTokenUsageLogs(ctx context.Context, userID, tokenID int, start, end int64, modelName string, offset, limit int) ([]TokenUsageLog, int64, error) {
-	items := make([]TokenUsageLog, 0)
 	if userID <= 0 || tokenID <= 0 {
 		return nil, 0, errors.New("invalid token usage owner")
 	}
-	query := LOG_DB.WithContext(ctx).Model(&Log{}).
-		Where("user_id = ? AND token_id = ? AND type = ? AND created_at >= ? AND created_at <= ?", userID, tokenID, LogTypeConsume, start, end)
+	return queryUsageLogs(LOG_DB.WithContext(ctx).Model(&Log{}).
+		Where("user_id = ? AND token_id = ? AND type = ? AND created_at >= ? AND created_at <= ?", userID, tokenID, LogTypeConsume, start, end), modelName, offset, limit)
+}
+
+// queryUsageLogs shares only the bounded public projection and ordering. Each
+// caller must first bind its positive owner and any required token predicate.
+func queryUsageLogs(query *gorm.DB, modelName string, offset, limit int) ([]TokenUsageLog, int64, error) {
+	items := make([]TokenUsageLog, 0)
 	if modelName != "" {
 		query = query.Where("model_name = ?", modelName)
 	}

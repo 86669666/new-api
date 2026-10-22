@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,6 +26,11 @@ func OAuthUserInfoAuth(resource *service.OAuthUserInfoResource) gin.HandlerFunc 
 
 func OAuthBalanceAuth(resource *service.OAuthUserInfoResource) gin.HandlerFunc {
 	return oauthResourceAuth(resource, "balance:read")
+}
+
+// OAuthUsageAuth requires a live public grant with the distinct delegated scope.
+func OAuthUsageAuth(resource *service.OAuthUserInfoResource) gin.HandlerFunc {
+	return oauthResourceAuth(resource, "usage:read")
 }
 
 func oauthResourceAuth(resource *service.OAuthUserInfoResource, scope string) gin.HandlerFunc {
@@ -77,6 +83,12 @@ func oauthResourceAuth(resource *service.OAuthUserInfoResource, scope string) gi
 				return
 			}
 		}
+		if scope == "usage:read" {
+			if err := access.RequireUsageScope(); err != nil {
+				WriteOAuthResourceError(c, err, scope)
+				return
+			}
+		}
 		c.Set(oauthUserInfoAccessKey, access)
 		c.Next()
 	}
@@ -96,8 +108,8 @@ func WriteOAuthResourceError(c *gin.Context, err error, requiredScope ...string)
 	} else if errors.Is(err, service.ErrOAuthInsufficientScope) {
 		status, code = http.StatusForbidden, "insufficient_scope"
 		scope := "profile"
-		if len(requiredScope) == 1 && requiredScope[0] == "balance:read" {
-			scope = "balance:read"
+		if len(requiredScope) == 1 && (requiredScope[0] == "balance:read" || requiredScope[0] == "usage:read") {
+			scope = requiredScope[0]
 		}
 		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+scope+`"`)
 	}
@@ -146,6 +158,78 @@ func OAuthBalanceBoundary(c *gin.Context) {
 		// Public mode may be off; the reserved resource still cannot fall back
 		// to frontend routing or a plugin handler.
 		WriteOAuthResourceError(c, service.ErrOAuthInvalidToken, "balance:read")
+		return
+	}
+	c.Next()
+}
+
+// OAuthUsagePath includes rejected spelling and escaped variants. It is used
+// before routing and by the logger, so neither fallback nor a log can disclose
+// credentials attached to the reserved namespace.
+func OAuthUsagePath(path string) bool {
+	// Fold valid escapes as bytes arrive, including newly formed nested escapes.
+	// Each fold removes two bytes, so work is linear in the original path length.
+	// Invalid suffixes stay literal and cannot hide an already decoded prefix.
+	// This recognizer never rewrites the actual routing or authentication URL.
+	decoded := make([]byte, 0, len(path))
+	for i := range len(path) {
+		decoded = append(decoded, path[i])
+		for len(decoded) >= 3 {
+			n := len(decoded)
+			if decoded[n-3] != '%' {
+				break
+			}
+			value, err := url.PathUnescape(string(decoded[n-3:]))
+			if err != nil {
+				break
+			}
+			decoded = append(decoded[:n-3], value[0])
+		}
+	}
+	collapsed := "/" + strings.Join(strings.FieldsFunc(string(decoded), func(r rune) bool { return r == '/' }), "/")
+	return strings.EqualFold(collapsed, "/api/v1/oauth/usage") || strings.HasPrefix(strings.ToLower(collapsed), "/api/v1/oauth/usage/")
+}
+
+// OAuthUsageBoundary reserves the namespace even when the resource is disabled.
+// It runs before organization selection, limits, authentication and fallback.
+func OAuthUsageBoundary(c *gin.Context) {
+	if !OAuthUsagePath(c.Request.URL.EscapedPath()) {
+		c.Next()
+		return
+	}
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("Referrer-Policy", "no-referrer")
+	path := c.Request.URL.EscapedPath()
+	invalid := c.Request.Method != http.MethodGet || path != "/api/v1/oauth/usage/logs" && path != "/api/v1/oauth/usage/stat"
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		invalid = true
+	}
+	for key := range query {
+		switch strings.ToLower(key) {
+		case "access_token", "org_id", "organization_id", "user_id", "username", "token_id", "token_name", "client_id", "grant_id":
+			invalid = true
+		}
+	}
+	for key := range c.Request.Header {
+		switch strings.ToLower(key) {
+		case "x-organization-id", "x-http-method-override", "x-method-override", "x-http-method":
+			invalid = true
+		}
+	}
+	if c.Request.Body != nil {
+		var one [1]byte
+		n, readErr := io.ReadFull(c.Request.Body, one[:])
+		if n != 0 || readErr != nil && readErr != io.EOF {
+			invalid = true
+		}
+	}
+	if invalid {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+	if c.FullPath() == "" {
+		WriteOAuthResourceError(c, service.ErrOAuthInvalidToken, "usage:read")
 		return
 	}
 	c.Next()

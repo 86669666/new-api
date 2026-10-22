@@ -188,6 +188,43 @@ export function ProviderAuthorizationPage(props: {
                 </div>
               </div>
             )}
+            {state.preview.allowed_scopes.includes('usage:read') && (
+              <div className='space-y-2'>
+                <div className='flex items-center gap-2'>
+                  <Checkbox
+                    id='provider-usage'
+                    checked={authorization.usage}
+                    aria-describedby='provider-usage-description'
+                    onCheckedChange={(checked) =>
+                      authorization.setUsage(checked === true)
+                    }
+                  />
+                  <Label htmlFor='provider-usage'>
+                    {t('Recorded call history (optional)')}
+                  </Label>
+                </div>
+                <div
+                  id='provider-usage-description'
+                  className='text-muted-foreground space-y-1 text-sm'
+                >
+                  <p>
+                    {t(
+                      'Allow this client to read this account’s stored call history across API tokens, including deleted tokens.'
+                    )}
+                  </p>
+                  <p>
+                    {t(
+                      'These records may be incomplete. They are not a wallet statement and do not include organization usage.'
+                    )}
+                  </p>
+                  <p>
+                    {t(
+                      'Access lasts up to seven days and ends when this sign-in session ends.'
+                    )}
+                  </p>
+                </div>
+              </div>
+            )}
           </fieldset>
         )}
         <div className='flex flex-wrap gap-3'>

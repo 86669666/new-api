@@ -61,6 +61,7 @@ export async function requestAuthorization(
     email: boolean
     offline: boolean
     balance: boolean
+    usage: boolean
   }
 ): Promise<AuthorizationPreview | string> {
   try {
@@ -87,6 +88,11 @@ export async function requestAuthorization(
               ...(decision.balance &&
               decision.preview.allowed_scopes.includes('balance:read')
                 ? ['balance:read']
+                : []),
+              ...(decision.usage &&
+              decision.preview.requested_scopes.includes('usage:read') &&
+              decision.preview.allowed_scopes.includes('usage:read')
+                ? ['usage:read']
                 : []),
             ]
           : []
@@ -149,6 +155,7 @@ export async function requestAuthorization(
             'email',
             'offline_access',
             'balance:read',
+            'usage:read',
           ].includes(scope) &&
           (record.requested_scopes as string[]).includes(scope)
       ) ||

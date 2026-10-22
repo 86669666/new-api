@@ -88,3 +88,9 @@ token_usage.stat_unavailable: "令牌用量統計暫不可用"
 token_usage.query_failed: "令牌用量查詢失敗"
 
 quota.user_insufficient_private: "使用者額度不足"
+
+usage.query_invalid: "無效的用量查詢。"
+usage.range_invalid: "無效的用量查詢時間範圍。"
+usage.logs_disabled: "用量日誌收集已關閉。"
+usage.stat_unavailable: "用量統計無法使用。"
+usage.query_failed: "查詢用量記錄失敗。"

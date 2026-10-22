@@ -87,3 +87,9 @@ token_usage.stat_unavailable: "Token usage statistics are unavailable."
 token_usage.query_failed: "Failed to query token usage."
 
 quota.user_insufficient_private: "Insufficient user quota"
+
+usage.query_invalid: "Invalid usage query."
+usage.range_invalid: "Invalid usage time range."
+usage.logs_disabled: "Usage log collection is disabled."
+usage.stat_unavailable: "Usage statistics are unavailable."
+usage.query_failed: "Failed to query usage records."

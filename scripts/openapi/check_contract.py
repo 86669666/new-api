@@ -185,8 +185,8 @@ def check_oauth_balance(api, source_root):
         assert response['headers']['Referrer-Policy']['schema']['enum'] == ['no-referrer']
     assert operation['responses']['403']['headers']['WWW-Authenticate']['schema']['enum'] == ['Bearer error="insufficient_scope", scope="balance:read"']
     supported = schemas['OAuthPublicMetadata']['properties']['scopes_supported']
-    assert supported['minItems'] == supported['maxItems'] == 5
-    assert supported['items']['enum'] == ['openid', 'profile', 'email', 'offline_access', 'balance:read']
+    assert supported['minItems'] == supported['maxItems'] == 6
+    assert supported['items']['enum'] == ['openid', 'profile', 'email', 'offline_access', 'balance:read', 'usage:read']
     routes = (source_root / 'router/oauth_resource_router.go').read_text()
     assert 'OAuthBalanceAuth(resource)' in routes and 'controller.GetOAuthBalance' in routes
     root_routes = (source_root / 'router/main.go').read_text()
@@ -194,6 +194,50 @@ def check_oauth_balance(api, source_root):
     assert 'OAuthBalancePath' in (source_root / 'middleware/logger.go').read_text()
     return {'route': path, 'success_envelope': True, 'public_grant_only': True,
             'safe_integer_quota': True, 'optional_display_only': True, 'live_http': False}
+
+
+def check_oauth_usage(api, source_root):
+    schemas = api['components']['schemas']
+    for kind in ('logs', 'stat'):
+        path = '/api/v1/oauth/usage/' + kind
+        assert set(api['paths'][path]) == {'get'}
+        operation = api['paths'][path]['get']
+        assert operation['operationId'] == 'getOAuthUsage' + kind.title()
+        assert operation['security'] == [{'OAuthResourceBearer': []}]
+        assert operation['x-required-scopes'] == ['usage:read']
+        assert operation['x-default-off'] is True and operation['x-automatic-retry'] is False
+        assert 'requestBody' not in operation
+        assert all(parameter['in'] == 'query' for parameter in operation['parameters'])
+        assert not {'org_id', 'token_id', 'user_id', 'access_token'} & {p['name'] for p in operation['parameters']}
+        responses = operation['responses']
+        assert set(responses) == {'200', '400', '401', '403', '429', '500', '503'}
+        assert 'content' not in responses['429'] and 'empty body' in responses['500']['description']
+        assert responses['403']['headers']['WWW-Authenticate']['schema']['enum'] == ['Bearer error="insufficient_scope", scope="usage:read"']
+        for response in responses.values():
+            assert 'private, no-store' in response['headers']['Cache-Control']['description']
+            assert response['headers']['Referrer-Policy']['schema']['enum'] == ['no-referrer']
+        result = schemas['OAuthUsage' + kind.title() + 'Result']
+        assert result['additionalProperties'] is False
+        assert result['properties']['data_complete'] == {'type': 'boolean', 'enum': [False]}
+        assert result['properties']['quota_per_unit']['exclusiveMinimum'] is True
+    for name, fields in (
+        ('OAuthUsageLog', {'created_at', 'model_name', 'prompt_tokens', 'completion_tokens', 'quota', 'use_time', 'is_stream', 'group'}),
+        ('OAuthUsageBucket', {'ts', 'quota', 'requests', 'tokens'}),
+    ):
+        schema = schemas[name]
+        assert schema['additionalProperties'] is False
+        assert set(schema['required']) == set(schema['properties']) == fields
+        for field, value in schema['properties'].items():
+            if value['type'] == 'integer':
+                assert value['maximum'] == 9007199254740991
+                assert value['minimum'] == (0 if field in ('created_at', 'ts') else -9007199254740991)
+    routes = (source_root / 'router/oauth_resource_router.go').read_text()
+    assert 'OAuthUsageAuth(resource)' in routes and 'controller.GetOAuthUsageLogs' in routes and 'controller.GetOAuthUsageStat' in routes
+    root_routes = (source_root / 'router/main.go').read_text()
+    assert root_routes.index('OAuthUsageBoundary') < root_routes.index('OrganizationSelectionBoundary')
+    assert 'OAuthUsagePath' in (source_root / 'middleware/logger.go').read_text()
+    return {'routes': 2, 'separate_scope': 'usage:read', 'safe_integers': True,
+            'minimal_fields': True, 'source_wiring_checked': True, 'live_http': False}
 
 
 def check_oauth_provider(api, source_root):
@@ -234,11 +278,11 @@ def check_oauth_provider(api, source_root):
     consent = schemas['OAuthProviderConsentDecision']
     assert consent['properties']['decision']['enum'] == ['approve', 'deny']
     assert consent['properties']['selected_scopes'] == {
-        'type': 'array', 'maxItems': 5, 'uniqueItems': True,
-        'items': {'type': 'string', 'enum': ['openid', 'profile', 'email', 'offline_access', 'balance:read']}}
+        'type': 'array', 'maxItems': 6, 'uniqueItems': True,
+        'items': {'type': 'string', 'enum': ['openid', 'profile', 'email', 'offline_access', 'balance:read', 'usage:read']}}
     assert consent['oneOf'] == [
         {'properties': {'decision': {'enum': ['approve']},
-                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': ['openid', 'email', 'offline_access', 'balance:read']}}}}},
+                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': ['openid', 'email', 'offline_access', 'balance:read', 'usage:read']}}}}},
         {'properties': {'decision': {'enum': ['deny']}, 'selected_scopes': {'maxItems': 0}}}]
     assert schemas['OAuthProviderError']['properties'] == {'error': {'type': 'string', 'enum': [
         'invalid_request', 'invalid_token', 'access_denied', 'invalid_grant', 'temporarily_unavailable']}}
@@ -1390,6 +1434,7 @@ def main():
     api, relay = documents['api'], documents['relay']
     results['no_available_channel_detail'] = check_no_available_channel_detail(relay)
     results['oauth_public'] = check_oauth_public(api)
+    results['oauth_usage'] = check_oauth_usage(api, source_root)
     results['native_search'] = check_native_search(relay)
     access = api['components']['schemas']['OrganizationAccess']['properties']['capabilities']
     context_access = api['components']['schemas']['RequestAccessContext']['properties']['organization']['properties']['capabilities']
