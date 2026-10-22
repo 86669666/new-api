@@ -214,7 +214,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver", "g19-tools-search"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver", "g19-tools-search", "g20-token-error-codes"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -523,6 +523,128 @@ func (tx *clientEventsUncertainTx) Commit() error {
 	return err
 }
 func (tx *clientEventsUncertainTx) Rollback() error { return tx.ConnPool.(gorm.TxCommitter).Rollback() }
+
+func TestRelayTokenErrorCodesHTTP(t *testing.T) {
+	require.Equal(t, "g20-token-error-codes", os.Getenv("NEWAPI_S2_OWNED"))
+	f := newOrganizationHTTPFixture(t)
+	now := time.Now().Unix()
+	for index, tc := range []struct {
+		name       string
+		status     int
+		expires    int64
+		quota      int
+		missing    bool
+		code       string
+		wantStatus int
+	}{
+		{"stored_expired", common.TokenStatusExpired, now + 3600, 10, false, "token_expired", http.StatusUnauthorized},
+		{"expired_timestamp", common.TokenStatusEnabled, now - 3600, 10, false, "token_expired", http.StatusUnauthorized},
+		{"stored_exhausted", common.TokenStatusExhausted, -1, 10, false, "token_exhausted", http.StatusUnauthorized},
+		{"exhausted_quota", common.TokenStatusEnabled, -1, 0, false, "token_exhausted", http.StatusUnauthorized},
+		{"disabled_precedes_expiry", common.TokenStatusDisabled, now - 3600, 0, false, "token_disabled", http.StatusUnauthorized},
+		{"unknown_status", 999, -1, 10, false, "token_invalid", http.StatusUnauthorized},
+		{"unknown_key", common.TokenStatusEnabled, -1, 10, true, "token_invalid", http.StatusUnauthorized},
+		{"valid", common.TokenStatusEnabled, -1, 10, false, "", http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := fmt.Sprintf("state%02d%s", index, strings.Repeat("x", 32))
+			if !tc.missing {
+				require.NoError(t, f.db.Create(&model.Token{UserId: f.users["owner"].Id, Key: key,
+					Status: tc.status, ExpiredTime: tc.expires, RemainQuota: tc.quota}).Error)
+			}
+			for _, language := range []string{"en", "zh-CN"} {
+				status, _, body := f.request(t, http.MethodGet, "/v1/models", "sk-"+key, "", http.Header{"Accept-Language": {language}})
+				assert.Equal(t, tc.wantStatus, status, language)
+				if tc.code == "" {
+					assert.NotContains(t, body, "error")
+					continue
+				}
+				errorBody, ok := body["error"].(map[string]any)
+				require.True(t, ok, language)
+				assert.Equal(t, tc.code, errorBody["code"], language)
+				assert.Equal(t, "new_api_error", errorBody["type"], language)
+				message, ok := errorBody["message"].(string)
+				require.True(t, ok)
+				assert.Contains(t, message, map[string]string{"en": "Invalid token", "zh-CN": "无效的令牌"}[language])
+				assert.NotContains(t, message, key)
+			}
+			assert.NotContains(t, f.logs.snapshot(), key)
+		})
+	}
+
+	t.Run("database_failure_is_not_a_token_state", func(t *testing.T) {
+		const callback = "test:relay-token-state-database-failure"
+		require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Table == "tokens" {
+				tx.AddError(errors.New("isolated token lookup failure"))
+			}
+		}))
+		defer f.db.Callback().Query().Remove(callback)
+		status, _, body := f.request(t, http.MethodGet, "/v1/models", "sk-databasefailure", "", nil)
+		assert.Equal(t, http.StatusInternalServerError, status)
+		errorBody, ok := body["error"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "", errorBody["code"])
+		assert.Equal(t, "new_api_error", errorBody["type"])
+	})
+}
+
+func TestRelayTokenCachedErrorCodesHTTP(t *testing.T) {
+	require.Equal(t, "g20-token-error-codes", os.Getenv("NEWAPI_S2_OWNED"))
+	f := newOrganizationHTTPFixture(t)
+	address := os.Getenv("NEWAPI_TOKEN_STATE_REDIS_ADDR")
+	host, port, err := net.SplitHostPort(address)
+	require.NoError(t, err, "an explicitly owned Redis endpoint is required")
+	require.Equal(t, "127.0.0.1", host)
+	require.Equal(t, os.Getenv("NEWAPI_TOKEN_STATE_REDIS_PORT"), port)
+	client := redis.NewClient(&redis.Options{Addr: address})
+	require.NoError(t, client.Ping(context.Background()).Err())
+	previousRedis, previousClient := common.RedisEnabled, common.RDB
+	common.RedisEnabled, common.RDB = true, client
+	defer func() {
+		common.RedisEnabled, common.RDB = previousRedis, previousClient
+		require.NoError(t, client.Close())
+	}()
+	for index, tc := range []struct {
+		name    string
+		status  int
+		expires int64
+		code    string
+	}{
+		{"live_quota_ahead_of_database", common.TokenStatusEnabled, -1, "token_exhausted"},
+		{"expired_without_database_status_write", common.TokenStatusEnabled, time.Now().Unix() - 3600, "token_expired"},
+		{"disabled_precedes_expiry_and_quota", common.TokenStatusDisabled, time.Now().Unix() - 3600, "token_disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := fmt.Sprintf("cachedstate%02d%s", index, common.NewRequestId())
+			token := &model.Token{UserId: f.users["owner"].Id, Key: key, Status: tc.status, ExpiredTime: tc.expires, RemainQuota: 50}
+			require.NoError(t, f.db.Create(token).Error)
+			_, err := model.GetTokenByKey(key, true)
+			require.NoError(t, err)
+			cacheKey := "token:" + common.GenerateHMAC(key)
+			require.NoError(t, client.HSet(context.Background(), cacheKey, "RemainQuota", 0).Err())
+			for _, language := range []string{"en", "zh-CN"} {
+				status, _, body := f.request(t, http.MethodGet, "/v1/models", "sk-"+key, "", http.Header{"Accept-Language": {language}})
+				assert.Equal(t, http.StatusUnauthorized, status)
+				errorBody, ok := body["error"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, tc.code, errorBody["code"], language)
+				status, _, _ = f.request(t, http.MethodGet, "/api/usage/token/", "sk-"+key, "", http.Header{"Accept-Language": {language}})
+				if tc.status == common.TokenStatusDisabled {
+					assert.Equal(t, http.StatusUnauthorized, status)
+				} else {
+					assert.Equal(t, http.StatusOK, status)
+				}
+			}
+			var stored model.Token
+			require.NoError(t, f.db.First(&stored, token.Id).Error)
+			assert.Equal(t, tc.status, stored.Status)
+			assert.Equal(t, 50, stored.RemainQuota, "classifying a cached rejection must not settle cached quota")
+			assert.NotContains(t, f.logs.snapshot(), key)
+			require.NoError(t, client.Del(context.Background(), cacheKey).Err())
+		})
+	}
+}
 
 func TestClientEventsReceiverHTTP(t *testing.T) {
 	t.Setenv("CLIENT_EVENTS_ENABLED", "false")

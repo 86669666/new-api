@@ -12870,5 +12870,108 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "host token authentication token_expired",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayTokenAuthenticationError",
+    "value": {
+      "error": {
+        "message": "Invalid token (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "token_expired"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "host token authentication token_exhausted",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayTokenAuthenticationError",
+    "value": {
+      "error": {
+        "message": "Invalid token (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "token_exhausted"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "host token authentication token_disabled",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayTokenAuthenticationError",
+    "value": {
+      "error": {
+        "message": "Invalid token (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "token_disabled"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "host token authentication token_invalid",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayTokenAuthenticationError",
+    "value": {
+      "error": {
+        "message": "Invalid token (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "token_invalid"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "host token authentication rejects unknown code",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayTokenAuthenticationError",
+    "value": {
+      "error": {
+        "message": "Invalid token (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "token_unknown"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "host token authentication rejects wrong error type",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayTokenAuthenticationError",
+    "value": {
+      "error": {
+        "message": "Invalid token (request id: fixture-request)",
+        "type": "upstream_error",
+        "code": "token_invalid"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "host token authentication rejects missing code",
+    "document": "relay",
+    "schema": "#/components/schemas/RelayTokenAuthenticationError",
+    "value": {
+      "error": {
+        "message": "Invalid token (request id: fixture-request)",
+        "type": "new_api_error"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "generic upstream 401 codes remain extensible",
+    "document": "relay",
+    "schema": "#/components/schemas/ErrorResponse",
+    "value": {
+      "error": {
+        "message": "Invalid token (request id: fixture-request)",
+        "type": "new_api_error",
+        "code": "vendor_authentication_failed"
+      }
+    },
+    "valid": true
   }
 ]

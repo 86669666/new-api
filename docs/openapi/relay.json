@@ -7261,7 +7261,8 @@
             "nullable": true
           },
           "code": {
-            "nullable": true
+            "nullable": true,
+            "description": "For host relay API-key authentication failures, HTTP 401 uses token_expired, token_exhausted, token_disabled or token_invalid. The code is language independent; the existing localized message, new_api_error type and request-id suffix are preserved. Other relay/provider error codes retain their existing semantics."
           },
           "code_detail": {
             "type": "string",
@@ -7322,6 +7323,19 @@
           "legacy": "HTTP503, model_not_found, new_api_error and localized message/request-id suffix unchanged",
           "group": "captured usingGroup; auto stays literal auto, never candidate or last-attempt groups",
           "model": "original distributor modelRequest.Model; no upstream mapping or plugin/channel diagnostics"
+        },
+        "x-token-authentication-contract": {
+          "scope": "Host TokenAuth API-key rejection before relay",
+          "status": 401,
+          "codes": [
+            "token_expired",
+            "token_exhausted",
+            "token_disabled",
+            "token_invalid"
+          ],
+          "legacy": "new_api_error type, localized generic invalid-token message and request-id suffix unchanged; database faults remain HTTP500",
+          "precedence": "Stored non-enabled state first; for an enabled token expiry precedes quota exhaustion",
+          "read_only": "Does not change read-only token access for expired or exhausted tokens"
         }
       },
       "ImageEditMultipartRequest": {
@@ -7777,6 +7791,47 @@
           }
         },
         "description": "Complete original HTTP200 JSON only. Nullable site/date fields and unknown extensions are preserved. Result URLs are data and are never fetched by the gateway."
+      },
+      "RelayTokenAuthenticationError": {
+        "description": "Host relay API-key authentication rejection only. Does not constrain arbitrary upstream or native vendor error codes. These discriminators require possession of a matching API key; unknown/missing keys and unknown stored states are token_invalid.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ErrorResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "error"
+            ],
+            "properties": {
+              "error": {
+                "type": "object",
+                "required": [
+                  "message",
+                  "type",
+                  "code"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "new_api_error"
+                    ]
+                  },
+                  "code": {
+                    "type": "string",
+                    "enum": [
+                      "token_expired",
+                      "token_exhausted",
+                      "token_disabled",
+                      "token_invalid"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ]
       }
     },
     "responses": {

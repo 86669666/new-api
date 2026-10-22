@@ -1,6 +1,9 @@
 package model
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Common errors
 var (
@@ -20,6 +23,9 @@ var (
 var (
 	ErrTokenNotProvided = errors.New("token not provided")
 	ErrTokenInvalid     = errors.New("token invalid")
+	ErrTokenExpired     = fmt.Errorf("%w: expired", ErrTokenInvalid)
+	ErrTokenExhausted   = fmt.Errorf("%w: exhausted", ErrTokenInvalid)
+	ErrTokenDisabled    = fmt.Errorf("%w: disabled", ErrTokenInvalid)
 )
 
 // Redemption errors

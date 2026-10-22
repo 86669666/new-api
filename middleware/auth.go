@@ -669,8 +669,17 @@ func TokenAuth() func(c *gin.Context) {
 				abortWithOpenAiMessage(c, http.StatusInternalServerError,
 					common.TranslateMessage(c, i18n.MsgDatabaseError))
 			} else {
+				code := types.ErrorCode("token_invalid")
+				switch {
+				case errors.Is(err, model.ErrTokenExpired):
+					code = "token_expired"
+				case errors.Is(err, model.ErrTokenExhausted):
+					code = "token_exhausted"
+				case errors.Is(err, model.ErrTokenDisabled):
+					code = "token_disabled"
+				}
 				abortWithOpenAiMessage(c, http.StatusUnauthorized,
-					common.TranslateMessage(c, i18n.MsgTokenInvalid))
+					common.TranslateMessage(c, i18n.MsgTokenInvalid), code)
 			}
 			return
 		}
