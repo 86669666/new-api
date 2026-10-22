@@ -1471,6 +1471,14 @@ func TestOAuthProviderBridgeHTTP(t *testing.T) {
 	require.NoError(t, service.InitOAuthUserInfoResource())
 	require.NoError(t, service.InitOAuthProviderBridge())
 	f := newOrganizationHTTPFixture(t)
+	// This test injects its own bridge/resource instances below. Register their
+	// reserved routes once, instead of reusing the fully configured fixture router.
+	f.engine = gin.New()
+	f.engine.Use(middleware.RequestId())
+	middleware.SetUpLogger(f.engine)
+	f.engine.NoRoute(func(c *gin.Context) { c.JSON(http.StatusNotFound, gin.H{"error": "not_found"}) })
+	SetApiRouter(f.engine)
+	f.server.Config.Handler = f.engine
 	require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}))
 	oldCritical, oldAddress := common.CriticalRateLimitEnable, system_setting.ServerAddress
 	common.CriticalRateLimitEnable, system_setting.ServerAddress = false, "https://console.example"
