@@ -642,6 +642,35 @@ def check_token_usage(api):
     return {'group': 'selected/inherited/auto', 'pricing': False, 'auto_groups': False}
 
 
+
+def check_token_usage_series(api):
+    schemas = api['components']['schemas']
+    for suffix, result, operation_id in [('logs', 'TokenUsageLogsResult', 'getTokenUsageLogs'),
+                                         ('stat', 'TokenUsageStatResult', 'getTokenUsageStat')]:
+        operation = api['paths']['/api/usage/token/' + suffix]['get']
+        assert operation['operationId'] == operation_id
+        assert operation['security'] == [{'RelayKey': []}]
+        assert operation['x-automatic-retry'] is False
+        assert set(operation['responses']) == {'200', '400', '401', '403', '500', '503'}
+        assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/' + result}
+        for response in operation['responses'].values():
+            assert response['headers']['Cache-Control']['schema'] == {'$ref': '#/components/schemas/OrganizationCacheControl'}
+        envelope = schemas[result]
+        assert envelope['properties']['data_complete'] == {'type': 'boolean', 'enum': [False]}
+        assert set(envelope['required']) == set(envelope['properties'])
+        assert envelope['additionalProperties'] is False
+        for status in ['401', '403', '500']:
+            assert {'$ref': '#/components/schemas/ManagementError'} in operation['responses'][status]['content']['application/json']['schema']['anyOf']
+    log = schemas['TokenUsageLog']
+    assert set(log['properties']) == set(log['required']) == {'created_at', 'model_name', 'prompt_tokens', 'completion_tokens', 'quota', 'use_time', 'is_stream', 'group'}
+    assert log['additionalProperties'] is False
+    bucket = schemas['TokenUsageBucket']
+    assert set(bucket['properties']) == set(bucket['required']) == {'ts', 'quota', 'requests', 'tokens'}
+    assert schemas['TokenUsageStatResult']['properties']['granularity']['enum'] == ['hour', 'day']
+    return {'api_key_only': True, 'utc_sparse': True, 'data_complete': False,
+            'legacy_management_errors_preserved': True, 'live_http': False}
+
+
 def check_organization_lifecycle(api, relay, fixtures, design_gate):
     check_organization_wallet(api, relay)
     contract = api['x-organization-lifecycle-contract']
@@ -1246,6 +1275,7 @@ def main():
 
     fixtures = json.loads((Path(__file__).with_name('fixtures.json')).read_text())
     results['token_usage'] = check_token_usage(api)
+    results['token_usage_series'] = check_token_usage_series(api)
     results['token_pricing'] = check_token_pricing(api)
     results['client_events'] = check_client_events(api, source_root)
     results['model_capability_metadata'] = check_model_capability_metadata(api, relay)

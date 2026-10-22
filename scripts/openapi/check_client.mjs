@@ -83,6 +83,11 @@ const statusService = statusServices[0].name;
 const usageServices = services.filter(service => service.source.includes('    public static getApiUsageTokenCollection('));
 assert.equal(usageServices.length, 1, 'Exactly one generated read-only usage method is required');
 const usageService = usageServices[0].name;
+const tokenSeriesServices = ['getTokenUsageLogs', 'getTokenUsageStat'].map(method => {
+  const matches = services.filter(service => service.source.includes(`    public static ${method}(`));
+  assert.equal(matches.length, 1, method);
+  return { method, service: matches[0].name };
+});
 const pricingServices = services.filter(service => service.source.includes('    public static getApiPricing('));
 assert.equal(pricingServices.length, 1, 'Exactly one generated pricing method is required');
 const pricingService = pricingServices[0].name;
@@ -380,6 +385,22 @@ export async function compileClientEvents() {
   // @ts-expect-error counters in an eligible typed event are numbers, not strings
   const wrongCounter: client.ClientEventUsageData = { provider: 'fixture', model: 'fixture', input_tokens: '1', output_tokens: 0 };
   return count;
+}
+`);
+await writeFile(consumer, await readFile(consumer, 'utf8') + `
+export async function compileTokenUsageSeries() {
+  const logs = await client.${tokenSeriesServices[0].service}.getTokenUsageLogs({ p: '1', pageSize: '10', startTimestamp: '0', modelName: 'fixture' });
+  const stat = await client.${tokenSeriesServices[1].service}.getTokenUsageStat({ granularity: 'day', endTimestamp: '3600' });
+  const complete: boolean = stat.data_complete;
+  const tokens: number = stat.data[0].tokens;
+  const projected: string = logs.data.items[0].model_name;
+  // @ts-expect-error unsupported granularity must be rejected by the typed call
+  client.${tokenSeriesServices[1].service}.getTokenUsageStat({ granularity: 'week' });
+  // @ts-expect-error canonical decimal query inputs retain their raw wire strings
+  client.${tokenSeriesServices[0].service}.getTokenUsageLogs({ p: 1 });
+  // @ts-expect-error empty arrays are allowed, null data is not
+  const invalid: client.TokenUsageStatResult = { success: true, message: '', quota_per_unit: 500000, data_complete: false, granularity: 'hour', data: null };
+  return { complete, tokens, projected, invalid };
 }
 `);
 execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'), '--strict', '--target', 'ES2020', '--module', 'commonjs', '--lib', 'ES2020,DOM', '--rootDir', path.join(output, 'generated'), '--outDir', path.join(output, 'compiled'), path.join(output, 'generated/api/index.ts'), path.join(output, 'generated/relay/index.ts'), consumer], { stdio: 'inherit' });
@@ -965,6 +986,34 @@ for (const [status, code] of [[400, 'invalid_request'], [401, 'invalid_client'],
 }
 const revocationStubbedRequests = calls.length - beforeRevocationRequests;
 Object.assign(api.OpenAPI, revokePublicConfig);
+const beforeTokenSeriesRequests = calls.length;
+api.OpenAPI.TOKEN = 'sk-token-series-fixture';
+api.OpenAPI.HEADERS = undefined;
+api.OpenAPI.WITH_CREDENTIALS = false;
+for (const [index, fixtureName, parameters, query] of [
+  [0, 'logs projected', { p: '2', page: 'ignored', pageSize: '10', modelName: 'a/b', startTimestamp: '0', endTimestamp: '7200' }, 'p=2&page=ignored&page_size=10&model_name=a%2Fb&start_timestamp=0&end_timestamp=7200'],
+  [1, 'day', { granularity: 'day', startTimestamp: '3601', endTimestamp: '7201' }, 'granularity=day&start_timestamp=3601&end_timestamp=7201'],
+]) {
+  const { method, service } = tokenSeriesServices[index];
+  responseStatus = 200;
+  responseBody = allFixtures.find(fixture => fixture.name === 'token series ' + fixtureName).value;
+  assert.deepEqual(await api[service][method](parameters), responseBody);
+  const request = calls.at(-1);
+  const url = new URL(request.url);
+  assert.equal(url.pathname, '/api/usage/token/' + (index === 0 ? 'logs' : 'stat'));
+  assert.deepEqual([...url.searchParams].sort(), [...new URLSearchParams(query)].sort());
+  assert.equal(request.init.method, 'GET');
+  assert.equal(new Headers(request.init.headers).get('Authorization'), 'Bearer sk-token-series-fixture');
+  assert.equal(request.init.body, undefined);
+  for (const [status, code] of [[400, 'TOKEN_USAGE_QUERY_INVALID'], [401, undefined], [403, undefined], [500, 'TOKEN_USAGE_QUERY_FAILED'], [503, index === 0 ? 'TOKEN_USAGE_LOGS_DISABLED' : 'TOKEN_USAGE_STAT_UNAVAILABLE']]) {
+    responseStatus = status;
+    responseBody = { success: false, message: 'Localized error', ...(code ? { code } : {}) };
+    const before = calls.length;
+    await assert.rejects(api[service][method](parameters), error => error.status === status && JSON.stringify(error.body) === JSON.stringify(responseBody));
+    assert.equal(calls.length, before + 1, 'usage errors must not cause automatic retries');
+  }
+}
+const tokenSeriesStubbedRequests = calls.length - beforeTokenSeriesRequests;
 const beforeClientEventsRequests = calls.length;
 api.OpenAPI.TOKEN = 'sk-generated-events-fixture';
 api.OpenAPI.HEADERS = undefined;
@@ -991,4 +1040,4 @@ for (const [status, code] of [[400, 'INVALID'], [401, 'UNAUTHORIZED'], [403, 'FO
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const clientEventsStubbedRequests = calls.length - beforeClientEventsRequests;
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_authentication_stubbed_requests: tokenAuthenticationStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, model_metadata_stubbed_requests: modelMetadataStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, personal_data_series_stubbed_requests: personalSeriesStubbedRequests, collection_status_stubbed_requests: collectionStatusStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_authentication_stubbed_requests: tokenAuthenticationStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_series_stubbed_requests: tokenSeriesStubbedRequests, token_pricing_stubbed_requests: pricingStubbedRequests, model_metadata_stubbed_requests: modelMetadataStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, personal_data_series_stubbed_requests: personalSeriesStubbedRequests, collection_status_stubbed_requests: collectionStatusStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));

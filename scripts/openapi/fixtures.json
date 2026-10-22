@@ -13327,5 +13327,313 @@
       "pricing_version": "fixture-version"
     },
     "valid": true
+  },
+  {
+    "name": "token series logs projected",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false,
+      "data": {
+        "items": [
+          {
+            "created_at": 3600,
+            "model_name": "fixture",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "quota": 3,
+            "use_time": 0,
+            "is_stream": false,
+            "group": "default"
+          }
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 10
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "token series logs empty",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false,
+      "data": {
+        "items": [],
+        "total": 0,
+        "page": 1,
+        "page_size": 10
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "token series hour",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false,
+      "granularity": "hour",
+      "data": [
+        {
+          "ts": 3600,
+          "quota": 3,
+          "requests": 1,
+          "tokens": 3
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "token series day",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false,
+      "granularity": "day",
+      "data": [
+        {
+          "ts": 0,
+          "quota": 3,
+          "requests": 1,
+          "tokens": 3
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "token series sparse empty",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false,
+      "granularity": "hour",
+      "data": []
+    },
+    "valid": true
+  },
+  {
+    "name": "token series false completeness required",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": true,
+      "granularity": "hour",
+      "data": [
+        {
+          "ts": 3600,
+          "quota": 3,
+          "requests": 1,
+          "tokens": 3
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "token series null data",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false,
+      "granularity": "hour",
+      "data": null
+    },
+    "valid": false
+  },
+  {
+    "name": "token series invalid granularity",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageStatResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false,
+      "granularity": "week",
+      "data": [
+        {
+          "ts": 3600,
+          "quota": 3,
+          "requests": 1,
+          "tokens": 3
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "token series private projection rejected",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data_complete": false,
+      "data": {
+        "items": [
+          {
+            "created_at": 3600,
+            "model_name": "fixture",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "quota": 3,
+            "use_time": 0,
+            "is_stream": false,
+            "group": "default",
+            "user_id": 1
+          }
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 10
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token series missing completeness rejected",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLogsResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "quota_per_unit": 500000,
+      "data": {
+        "items": [
+          {
+            "created_at": 3600,
+            "model_name": "fixture",
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "quota": 3,
+            "use_time": 0,
+            "is_stream": false,
+            "group": "default"
+          }
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 10
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "token series TOKEN_USAGE_QUERY_INVALID",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageQueryError",
+    "value": {
+      "success": false,
+      "message": "本地化错误",
+      "code": "TOKEN_USAGE_QUERY_INVALID"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series TOKEN_USAGE_RANGE_INVALID",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageQueryError",
+    "value": {
+      "success": false,
+      "message": "本地化错误",
+      "code": "TOKEN_USAGE_RANGE_INVALID"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series TOKEN_USAGE_AUTH_INVALID",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageAuthenticationError",
+    "value": {
+      "success": false,
+      "message": "本地化错误",
+      "code": "TOKEN_USAGE_AUTH_INVALID"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series TOKEN_USAGE_QUERY_FAILED",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageQueryFailedError",
+    "value": {
+      "success": false,
+      "message": "本地化错误",
+      "code": "TOKEN_USAGE_QUERY_FAILED"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series TOKEN_USAGE_LOGS_DISABLED",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageUnavailableError",
+    "value": {
+      "success": false,
+      "message": "本地化错误",
+      "code": "TOKEN_USAGE_LOGS_DISABLED"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series TOKEN_USAGE_STAT_UNAVAILABLE",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageUnavailableError",
+    "value": {
+      "success": false,
+      "message": "本地化错误",
+      "code": "TOKEN_USAGE_STAT_UNAVAILABLE"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series legacy auth without code",
+    "document": "api",
+    "schema": "#/components/schemas/ManagementError",
+    "value": {
+      "success": false,
+      "message": "Invalid token"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series range with structured params",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageRangeTooWideError",
+    "value": {
+      "success": false,
+      "message": "时间范围不能超过7天",
+      "code": "LOG_RANGE_TOO_WIDE",
+      "message_key": "The time range cannot exceed {{days}} days",
+      "message_params": {
+        "days": 7
+      }
+    },
+    "valid": true
   }
 ]
