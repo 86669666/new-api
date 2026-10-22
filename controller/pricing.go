@@ -40,7 +40,19 @@ func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string
 
 type pricingWithCapabilityMetadata struct {
 	model.Pricing
-	model.ModelCapabilityMetadata
+	// Declare the enrichment fields here because embedding both source structs
+	// makes their description tags conflict. An empty declaration clears the text.
+	ContextLength    *int64                               `json:"context_length,omitempty"`
+	MaxOutputTokens  *int64                               `json:"max_output_tokens,omitempty"`
+	Vision           *bool                                `json:"vision,omitempty"`
+	Reasoning        *bool                                `json:"reasoning,omitempty"`
+	ToolUse          *bool                                `json:"tool_use,omitempty"`
+	Capabilities     *[]string                            `json:"capabilities,omitempty"`
+	InputModalities  *[]string                            `json:"input_modalities,omitempty"`
+	OutputModalities *[]string                            `json:"output_modalities,omitempty"`
+	DisplayName      *string                              `json:"display_name,omitempty"`
+	Description      *string                              `json:"description,omitempty"`
+	Source           *model.ModelCapabilityMetadataSource `json:"metadata_source,omitempty"`
 }
 
 func projectPricingCapabilityMetadata(pricing []model.Pricing) []pricingWithCapabilityMetadata {
@@ -50,7 +62,25 @@ func projectPricingCapabilityMetadata(pricing []model.Pricing) []pricingWithCapa
 	metadata := model.ModelCapabilityMetadataSnapshot()
 	result := make([]pricingWithCapabilityMetadata, len(pricing))
 	for i, item := range pricing {
-		result[i] = pricingWithCapabilityMetadata{Pricing: item, ModelCapabilityMetadata: metadata[item.ModelName]}
+		declaration := metadata[item.ModelName]
+		description := declaration.Description
+		if description == nil && item.Description != "" {
+			description = &item.Description
+		}
+		result[i] = pricingWithCapabilityMetadata{
+			Pricing:          item,
+			ContextLength:    declaration.ContextLength,
+			MaxOutputTokens:  declaration.MaxOutputTokens,
+			Vision:           declaration.Vision,
+			Reasoning:        declaration.Reasoning,
+			ToolUse:          declaration.ToolUse,
+			Capabilities:     declaration.Capabilities,
+			InputModalities:  declaration.InputModalities,
+			OutputModalities: declaration.OutputModalities,
+			DisplayName:      declaration.DisplayName,
+			Description:      description,
+			Source:           declaration.Source,
+		}
 	}
 	return result
 }

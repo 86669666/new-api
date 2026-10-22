@@ -53,6 +53,9 @@ const searchServices = await Promise.all((await readdir(path.join(output, 'gener
 const nativeSearchServices = searchServices.filter(service => service.source.includes('    public static searchDeepSeekTools('));
 assert.equal(nativeSearchServices.length, 1, 'Exactly one native tools/search method is required');
 const nativeSearchService = nativeSearchServices[0].name;
+const modelListServices = searchServices.filter(service => service.source.includes('    public static listModels('));
+assert.equal(modelListServices.length, 1, 'Exactly one OpenAI model list method is required');
+const modelListService = modelListServices[0].name;
 const apiDocument = JSON.parse(await readFile(path.join(root, 'docs/openapi/api.json'), 'utf8'));
 const allFixtures = JSON.parse(await readFile(path.join(root, 'scripts/openapi/fixtures.json'), 'utf8'));
 const cacheFixtures = allFixtures.filter(fixture => fixture.kind === 'cache_control');
@@ -269,18 +272,34 @@ export async function compileTokenPricing() {
   const contextLength: number | undefined = result.data[0]?.context_length;
   const vision: boolean | undefined = result.data[0]?.vision;
   const declarant: 'administrator' | undefined = result.data[0]?.metadata_source?.kind;
-  const declaration: client.ModelCapabilityMetadataDeclaration = { reasoning: false, max_output_tokens: 4096 };
+  const declaration: client.ModelCapabilityMetadataDeclaration = { reasoning: false, max_output_tokens: 4096, capabilities: [], input_modalities: ['text'], output_modalities: [], display_name: 'Fixture', description: '' };
+  const capabilities: client.ModelCapabilityMetadataDeclaration['capabilities'] = result.data[0]?.capabilities;
+  const displayName: string | undefined = result.data[0]?.display_name;
   const option: client.ModelCapabilityMetadataOptionWrite = { key: 'ModelCapabilityMetadata', value: JSON.stringify({ fixture: declaration }) };
   // @ts-expect-error absence, not null, represents an unknown fact
   const unknownVision: client.ModelCapabilityMetadataDeclaration = { vision: null };
   // @ts-expect-error metadata is not supplied as an object through the existing option API
   const objectOption: client.ModelCapabilityMetadataOptionWrite = { key: 'ModelCapabilityMetadata', value: {} };
+  // @ts-expect-error complete capabilities use the documented vocabulary
+  const unknownCapability: client.ModelCapabilityMetadataDeclaration = { capabilities: ['unknown'] };
+  // @ts-expect-error modalities use the documented vocabulary
+  const unknownModality: client.ModelCapabilityMetadataDeclaration = { output_modalities: ['binary'] };
 
   // @ts-expect-error selected pricing requires its top-level group
   const missingGroup: client.TokenPricingResult = { success: true, data: [], vendors: [], group_ratio: {}, usable_group: {}, supported_endpoint: {}, auto_groups: [], pricing_version: 'fixture' };
   // @ts-expect-error selection is a string, not candidate array
   const invalidGroup: client.TokenPricingResult['group'] = ['auto'];
-  return { group, ratio, prices, contextLength, vision, declarant, option };
+  return { group, ratio, prices, contextLength, vision, declarant, option, capabilities, displayName };
+}
+`);
+await writeFile(consumer, await readFile(consumer, 'utf8') + `
+import * as relayClient from './relay';
+export async function compileModelListMetadata() {
+  const result = await relayClient.${modelListService}.listModels({});
+  const capabilities: client.ModelCapabilityMetadataDeclaration['capabilities'] = result.data?.[0]?.capabilities;
+  const description: string | undefined = result.data?.[0]?.description;
+  const declarant: 'administrator' | undefined = result.data?.[0]?.metadata_source?.kind;
+  return { capabilities, description, declarant };
 }
 `);
 await writeFile(consumer, await readFile(consumer, 'utf8') + `
@@ -401,6 +420,19 @@ await api.DefaultService.postApiUserAccessTokens({ requestBody: { name: 'Example
 assert.equal(new Headers(calls.at(-1).init.headers).get('Authorization'), 'Bearer fixture-only');
 assert.equal(new Headers(calls.at(-1).init.headers).get('X-Security-Proof'), 'fixture-proof');
 relay.OpenAPI.TOKEN = 'fixture-relay-key';
+const beforeModelMetadataRequests = calls.length;
+const previousModelMetadataResponse = responseBody;
+for (const suffix of ['declared', 'unknown omitted', 'explicit empty sets']) {
+  responseBody = { object: 'list', data: [allFixtures.find(fixture => fixture.name === 'OpenAI list metadata ' + suffix).value] };
+  const result = await relay[modelListService].listModels({});
+  assert.deepEqual(result, responseBody);
+  assert.equal(calls.at(-1).url, 'https://example.invalid/v1/models');
+  assert.equal(calls.at(-1).init.method, 'GET');
+  assert.equal(new Headers(calls.at(-1).init.headers).get('Authorization'), 'Bearer fixture-relay-key');
+  assert.equal(calls.at(-1).init.body, undefined);
+}
+responseBody = previousModelMetadataResponse;
+const modelMetadataStubbedRequests = calls.length - beforeModelMetadataRequests;
 const beforeNativeSearchRequests = calls.length;
 const previousNativeSearchResponse = responseBody;
 const nativeSearchBody = { query: 'owned search', count: 50, need_content: false, ori_question: null, localization: '', extension: null };
@@ -679,6 +711,10 @@ for (const [name, token] of [
   assert.equal(result.data[0].reasoning, false);
   assert.equal(result.data[0].context_length, 128000);
   assert.equal(result.data[0].metadata_source.kind, 'administrator');
+  assert.deepEqual(result.data[0].capabilities, ['structured_output', 'tools', 'vision', 'web_search']);
+  assert.deepEqual(result.data[0].input_modalities, ['image', 'text']);
+  assert.deepEqual(result.data[0].output_modalities, ['text']);
+  assert.equal(result.data[0].description, '');
   assert.match(result.data[0].metadata_source.version, /^sha256:[0-9a-f]{64}$/);
   assert.equal(new URL(calls.at(-1).url).pathname, '/api/pricing');
   assert.equal(calls.at(-1).init.method, 'GET');
@@ -955,4 +991,4 @@ for (const [status, code] of [[400, 'INVALID'], [401, 'UNAUTHORIZED'], [403, 'FO
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
 const clientEventsStubbedRequests = calls.length - beforeClientEventsRequests;
-console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_authentication_stubbed_requests: tokenAuthenticationStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, personal_data_series_stubbed_requests: personalSeriesStubbedRequests, collection_status_stubbed_requests: collectionStatusStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));
+console.log(JSON.stringify({ generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', documents: ['api.json', 'relay.json'], compile: 'PASS', adaptation, lifecycle_operations: invocationMap.length, lifecycle_type_negatives: lifecycleTypeNegatives, lifecycle_stubbed_requests: lifecycleStubbedRequests, typed_consumer_positive_calls: 16, typed_consumer_negative_calls: 12, organization_operations: organizationCalls.map(([method]) => method), inherited_stubbed_requests: inheritedStubbedRequests, organization_stubbed_requests: beforeLifecycleRequests - inheritedStubbedRequests, wallet_stubbed_requests: walletStubbedRequests, native_search_stubbed_requests: nativeSearchStubbedRequests, token_authentication_stubbed_requests: tokenAuthenticationStubbedRequests, token_usage_stubbed_requests: usageStubbedRequests, token_usage_typed_group: true, token_pricing_stubbed_requests: pricingStubbedRequests, model_metadata_stubbed_requests: modelMetadataStubbedRequests, token_pricing_typed_group: true, personal_log_pagination_stubbed_requests: logPaginationStubbedRequests, personal_log_range_stubbed_requests: logRangeStubbedRequests, personal_data_range_stubbed_requests: dataRangeStubbedRequests, personal_data_series_stubbed_requests: personalSeriesStubbedRequests, collection_status_stubbed_requests: collectionStatusStubbedRequests, site_description_stubbed_requests: statusStubbedRequests, oauth_userinfo_stubbed_requests: oauthUserInfoStubbedRequests, oauth_provider_stubbed_requests: oauthProviderStubbedRequests, oauth_revocation_stubbed_requests: revocationStubbedRequests, revocation_adaptation: revocationAdaptation, client_events_stubbed_requests: clientEventsStubbedRequests, stubbed_requests: calls.length, provider_io: false, live_http_consumer: false, limitations: ['Raw pinned generator emits incompatible FormData and selects a response header over revocation JSON errors; only the external harness method adapts form encoding, removes that selector and changes empty-success return to void. No shipped SDK compatibility claim.', 'Generator selects the first request media type: image edit JSON is generated; multipart requires an explicit transport adapter.', 'SSE and WebSocket require protocol-aware adapters; this fetch client only verifies HTTP request generation.', 'Configure WITH_CREDENTIALS/CREDENTIALS for refresh cookies; configure TOKEN and HEADERS for bearer/proof or alternate API key headers. Generated clients do not enforce role, PAT scope, proof or server authorization.', 'Error-body checks use replaced fetch responses. Schema acceptance is tested separately; this generator does not validate response schemas at runtime.', 'Raw generation is adapted before compilation. useUnionTypes emits string unions rather than enum objects, including the exact empty success message. The pinned generator still widens boolean enum literals; validate response schemas separately.', 'Organization path/query independence and per-call header isolation are client transport checks only; A03 must verify real server authorization and conflict rejection.'], image_edit_json_generated: imageClient.includes("mediaType: 'application/json'") }, null, 2));

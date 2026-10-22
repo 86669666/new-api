@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,12 +20,17 @@ const ModelCapabilityMetadataOptionKey = "ModelCapabilityMetadata"
 // ModelCapabilityMetadata contains declarations, not provider-verified limits
 // or request enforcement. Pointer fields distinguish unknown from false.
 type ModelCapabilityMetadata struct {
-	ContextLength   *int64                         `json:"context_length,omitempty"`
-	MaxOutputTokens *int64                         `json:"max_output_tokens,omitempty"`
-	Vision          *bool                          `json:"vision,omitempty"`
-	Reasoning       *bool                          `json:"reasoning,omitempty"`
-	ToolUse         *bool                          `json:"tool_use,omitempty"`
-	Source          *ModelCapabilityMetadataSource `json:"metadata_source,omitempty"`
+	ContextLength    *int64                         `json:"context_length,omitempty"`
+	MaxOutputTokens  *int64                         `json:"max_output_tokens,omitempty"`
+	Vision           *bool                          `json:"vision,omitempty"`
+	Reasoning        *bool                          `json:"reasoning,omitempty"`
+	ToolUse          *bool                          `json:"tool_use,omitempty"`
+	Capabilities     *[]string                      `json:"capabilities,omitempty"`
+	InputModalities  *[]string                      `json:"input_modalities,omitempty"`
+	OutputModalities *[]string                      `json:"output_modalities,omitempty"`
+	DisplayName      *string                        `json:"display_name,omitempty"`
+	Description      *string                        `json:"description,omitempty"`
+	Source           *ModelCapabilityMetadataSource `json:"metadata_source,omitempty"`
 }
 
 type ModelCapabilityMetadataSource struct {
@@ -48,20 +54,74 @@ func ParseModelCapabilityMetadata(value string) (map[string]ModelCapabilityMetad
 		if name == "" || len(name) > 255 || name != strings.TrimSpace(name) || strings.ContainsFunc(name, unicode.IsControl) {
 			return nil, invalid
 		}
-		if err := common.ValidateJSONObjectFields(raw, nil, []string{"context_length", "max_output_tokens", "vision", "reasoning", "tool_use"}); err != nil {
+		if err := common.ValidateJSONObjectFields(raw, nil, []string{"context_length", "max_output_tokens", "vision", "reasoning", "tool_use", "capabilities", "input_modalities", "output_modalities", "display_name", "description"}); err != nil {
 			return nil, invalid
 		}
 		var declaration ModelCapabilityMetadata
 		if err := common.UnmarshalStrictObject(raw, &declaration); err != nil {
 			return nil, invalid
 		}
-		if declaration.ContextLength == nil && declaration.MaxOutputTokens == nil && declaration.Vision == nil && declaration.Reasoning == nil && declaration.ToolUse == nil {
+		if declaration == (ModelCapabilityMetadata{}) {
 			return nil, invalid
 		}
 		for _, limit := range []*int64{declaration.ContextLength, declaration.MaxOutputTokens} {
 			if limit != nil && (*limit < 1 || *limit > 9007199254740991) {
 				return nil, invalid
 			}
+		}
+		if declaration.ContextLength != nil && declaration.MaxOutputTokens != nil && *declaration.MaxOutputTokens > *declaration.ContextLength {
+			return nil, invalid
+		}
+		// These are complete declared sets, not inferred tags. A pointer retains
+		// an explicitly empty set; omitted sets remain unknown. Sort only these
+		// unordered sets, never the recommended endpoint order.
+		for _, set := range []struct {
+			values  *[]string
+			allowed []string
+		}{
+			{declaration.Capabilities, []string{"vision", "tools", "reasoning", "web_search", "structured_output"}},
+			{declaration.InputModalities, []string{"text", "image", "audio", "video", "file"}},
+			{declaration.OutputModalities, []string{"text", "image", "audio", "video", "file"}},
+		} {
+			if set.values == nil {
+				continue
+			}
+			if len(*set.values) > len(set.allowed) {
+				return nil, invalid
+			}
+			slices.Sort(*set.values)
+			for i, value := range *set.values {
+				if !slices.Contains(set.allowed, value) || (i > 0 && (*set.values)[i-1] == value) {
+					return nil, invalid
+				}
+			}
+		}
+		if declaration.Capabilities != nil {
+			// A complete capability set also supplies the legacy boolean facts.
+			// Partial legacy declarations cannot establish a complete set.
+			for _, capability := range []struct {
+				name string
+				flag **bool
+			}{
+				{"vision", &declaration.Vision},
+				{"reasoning", &declaration.Reasoning},
+				{"tools", &declaration.ToolUse},
+			} {
+				present := slices.Contains(*declaration.Capabilities, capability.name)
+				if *capability.flag != nil && **capability.flag != present {
+					return nil, invalid
+				}
+				*capability.flag = &present
+			}
+		}
+		if declaration.DisplayName != nil {
+			value := *declaration.DisplayName
+			if value == "" || len(value) > 255 || value != strings.TrimSpace(value) || strings.ContainsFunc(value, unicode.IsControl) {
+				return nil, invalid
+			}
+		}
+		if declaration.Description != nil && (len(*declaration.Description) > 4096 || strings.ContainsFunc(*declaration.Description, func(r rune) bool { return unicode.IsControl(r) && r != '\n' && r != '\t' })) {
+			return nil, invalid
 		}
 		canonical, err := common.Marshal(struct {
 			Version int    `json:"version"`

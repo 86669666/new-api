@@ -486,11 +486,18 @@ def check_client_events(api, source_root):
     return {'route': 'POST /api/events', 'default_enabled': False, 'durable_count': True, 'event_limit': 10}
 
 
-def check_model_capability_metadata(api):
+def check_model_capability_metadata(api, relay):
     schemas = api['components']['schemas']
     facts = ['context_length', 'max_output_tokens', 'vision', 'reasoning', 'tool_use']
     properties = {name: {'type': 'integer', 'format': 'int64', 'minimum': 1, 'maximum': 9007199254740991}
                   if name in facts[:2] else {'type': 'boolean'} for name in facts}
+    capabilities = ['vision', 'tools', 'reasoning', 'web_search', 'structured_output']
+    modalities = ['text', 'image', 'audio', 'video', 'file']
+    for name, values in [('capabilities', capabilities), ('input_modalities', modalities), ('output_modalities', modalities)]:
+        properties[name] = {'type': 'array', 'maxItems': 5, 'uniqueItems': True, 'items': {'type': 'string', 'enum': values}}
+    properties['display_name'] = {'type': 'string', 'minLength': 1, 'maxLength': 255}
+    properties['description'] = {'type': 'string', 'maxLength': 4096}
+    facts = list(properties)
     declaration = schemas['ModelCapabilityMetadataDeclaration']
     assert {key: value for key, value in declaration.items() if key != 'description'} == {
         'type': 'object', 'properties': properties, 'minProperties': 1, 'additionalProperties': False,
@@ -517,10 +524,10 @@ def check_model_capability_metadata(api):
               'billing_usage_examples', 'billing_plugin_variants'}
     assert set(entry['properties']) == legacy | set(facts) | {'metadata_source'}
     for name, schema in properties.items():
-        assert entry['properties'][name] == schema
+        assert entry['properties'][name] == ({'type': 'string'} if name == 'description' else schema)
     assert entry['properties']['metadata_source'] == {'$ref': '#/components/schemas/ModelCapabilityMetadataSource'}
     assert entry['oneOf'] == [
-        {'not': {'anyOf': [{'required': [name]} for name in facts + ['metadata_source']]}},
+        {'not': {'anyOf': [{'required': [name]} for name in facts if name != 'description'] + [{'required': ['metadata_source']}]}},
         {'required': ['metadata_source'], 'anyOf': [{'required': [name]} for name in facts]},
     ]
     operation = api['paths']['/api/option/']['put']
@@ -544,9 +551,15 @@ def check_model_capability_metadata(api):
     assert contract['facts'] == facts and contract['bounds'] == {
         'bytes': 65536, 'models': 256, 'model_name_bytes': 255, 'positive_integer_maximum': 9007199254740991,
     }
-    assert contract['exclusions'] == ['v1/models', 'automatic catalog ingestion', 'price/auth/routing/billing changes', 'UI']
+    assert contract['exclusions'] == ['model retrieve and native Anthropic/Gemini list formats', 'automatic catalog ingestion', 'price/auth/routing/billing changes', 'UI']
     assert 'no linearizable multiwriter' in contract['consistency']
-    return {'authority': 'administrator', 'unknown_omitted': True, 'scope': '/api/pricing only'}
+    projection = relay['components']['schemas']['ModelWithCapabilityMetadata']
+    assert projection['allOf'][0] == {'$ref': '#/components/schemas/Model'}
+    assert projection['allOf'][1]['properties'] == properties | {'metadata_source': {'$ref': '#/components/schemas/ModelCapabilityMetadataSource'}}
+    assert relay['components']['schemas']['ModelsResponse']['properties']['data']['items'] == {'$ref': '#/components/schemas/ModelWithCapabilityMetadata'}
+    assert set(relay['components']['schemas']['Model']['properties']) == {'id', 'object', 'created', 'owned_by'}
+    return {'authority': 'administrator', 'unknown_omitted': True, 'explicit_empty_sets': True,
+            'scope': '/api/pricing and visible OpenAI-format /v1/models list'}
 
 
 def check_token_pricing(api):
@@ -1235,7 +1248,7 @@ def main():
     results['token_usage'] = check_token_usage(api)
     results['token_pricing'] = check_token_pricing(api)
     results['client_events'] = check_client_events(api, source_root)
-    results['model_capability_metadata'] = check_model_capability_metadata(api)
+    results['model_capability_metadata'] = check_model_capability_metadata(api, relay)
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['personal_log_range_error'] = check_personal_log_range_error(api)
     results['personal_quota_series'] = check_personal_quota_series(api)

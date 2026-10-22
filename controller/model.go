@@ -185,6 +185,13 @@ type modelListGroups struct {
 	ownerGroups []string
 }
 
+// The gateway catalog adds administrator declarations without extending the
+// independent relay protocol DTO or mutating the shared static model catalog.
+type openAIModelWithCapabilityMetadata struct {
+	dto.OpenAIModels
+	model.ModelCapabilityMetadata
+}
+
 func getModelListGroups(c *gin.Context) (modelListGroups, error) {
 	tokenGroup := common.GetContextKeyString(c, constant.ContextKeyTokenGroup)
 	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
@@ -307,9 +314,14 @@ func ListModels(c *gin.Context, modelType int) {
 			"nextPageToken": nil,
 		})
 	default:
+		metadata := model.ModelCapabilityMetadataSnapshot()
+		catalog := make([]openAIModelWithCapabilityMetadata, len(userOpenAiModels))
+		for i, item := range userOpenAiModels {
+			catalog[i] = openAIModelWithCapabilityMetadata{OpenAIModels: item, ModelCapabilityMetadata: metadata[item.Id]}
+		}
 		c.JSON(200, gin.H{
 			"success": true,
-			"data":    userOpenAiModels,
+			"data":    catalog,
 			"object":  "list",
 		})
 	}

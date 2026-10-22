@@ -78,7 +78,7 @@
       "get": {
         "summary": "获取模型列表",
         "deprecated": false,
-        "description": "获取当前可用的模型列表。\n\n根据请求头自动识别返回格式：\n- 包含 `x-api-key` 和 `anthropic-version` 头时返回 Anthropic 格式\n- 包含 `x-goog-api-key` 头或 `key` 查询参数时返回 Gemini 格式\n- 其他情况返回 OpenAI 格式\n",
+        "description": "获取当前可用的模型列表。\n\n根据请求头自动识别返回格式：\n- 包含 `x-api-key` 和 `anthropic-version` 头时返回 Anthropic 格式\n- 包含 `x-goog-api-key` 头或 `key` 查询参数时返回 Gemini 格式\n- 其他情况返回 OpenAI 格式\n\nOpenAI-format list rows may include exact-name administrator-declared model capability metadata after existing visibility filtering; see ModelWithCapabilityMetadata. Omitted facts are unknown. Retrieval and native Anthropic/Gemini formats do not use this projection.",
         "operationId": "listModels",
         "tags": [
           "获取模型列表"
@@ -4894,7 +4894,7 @@
           "data": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Model"
+              "$ref": "#/components/schemas/ModelWithCapabilityMetadata"
             }
           }
         }
@@ -7832,6 +7832,238 @@
             }
           }
         ]
+      },
+      "ModelCapabilityMetadataSource": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "administrator"
+            ]
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "kind",
+          "version"
+        ],
+        "additionalProperties": false,
+        "description": "Declarant and version-1 canonical per-model content digest. Neither provider verification, signature nor freshness guarantee; no global map fingerprint."
+      },
+      "ModelWithCapabilityMetadata": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Model"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "context_length": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "max_output_tokens": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "vision": {
+                "type": "boolean"
+              },
+              "reasoning": {
+                "type": "boolean"
+              },
+              "tool_use": {
+                "type": "boolean"
+              },
+              "capabilities": {
+                "type": "array",
+                "maxItems": 5,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "vision",
+                    "tools",
+                    "reasoning",
+                    "web_search",
+                    "structured_output"
+                  ]
+                }
+              },
+              "input_modalities": {
+                "type": "array",
+                "maxItems": 5,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "image",
+                    "audio",
+                    "video",
+                    "file"
+                  ]
+                }
+              },
+              "output_modalities": {
+                "type": "array",
+                "maxItems": 5,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "image",
+                    "audio",
+                    "video",
+                    "file"
+                  ]
+                }
+              },
+              "display_name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "metadata_source": {
+                "$ref": "#/components/schemas/ModelCapabilityMetadataSource"
+              }
+            },
+            "oneOf": [
+              {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "context_length"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "max_output_tokens"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "vision"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "reasoning"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "tool_use"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "capabilities"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "input_modalities"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "output_modalities"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "display_name"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "description"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "metadata_source"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "metadata_source"
+                ],
+                "anyOf": [
+                  {
+                    "required": [
+                      "context_length"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "max_output_tokens"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "vision"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "reasoning"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "tool_use"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "capabilities"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "input_modalities"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "output_modalities"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "display_name"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "description"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "description": "Visible OpenAI-format /v1/models list rows only; optional administrator facts share the ModelCapabilityMetadata declaration contract with /api/pricing. Unknown fields are omitted, false and [] are explicit; no model-name or endpoint inference. Model retrieve and native Anthropic/Gemini formats remain unchanged."
       }
     },
     "responses": {

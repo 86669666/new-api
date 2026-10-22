@@ -28299,6 +28299,56 @@
           },
           "metadata_source": {
             "$ref": "#/components/schemas/ModelCapabilityMetadataSource"
+          },
+          "capabilities": {
+            "type": "array",
+            "maxItems": 5,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "vision",
+                "tools",
+                "reasoning",
+                "web_search",
+                "structured_output"
+              ]
+            }
+          },
+          "input_modalities": {
+            "type": "array",
+            "maxItems": 5,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "text",
+                "image",
+                "audio",
+                "video",
+                "file"
+              ]
+            }
+          },
+          "output_modalities": {
+            "type": "array",
+            "maxItems": 5,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "text",
+                "image",
+                "audio",
+                "video",
+                "file"
+              ]
+            }
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
           }
         },
         "required": [
@@ -28312,7 +28362,7 @@
           "supported_endpoint_types"
         ],
         "additionalProperties": false,
-        "description": "Existing pricing fields and units are unchanged; billing metadata is passed through without calculating a new price. Optional facts are exact-name administrator declarations from ModelCapabilityMetadata; omitted fields are unknown and false is explicit. metadata_source is present only with declared facts. They never change pricing, groups, endpoints, routing or request limits.",
+        "description": "Existing pricing fields and units are unchanged. Optional facts are exact-name administrator declarations from ModelCapabilityMetadata, projected after row authorization and group filtering. Omitted fields are unknown; false and empty arrays are explicit. metadata_source describes declared facts only, and does not verify catalog fallback descriptions or provider execution. A declared description overrides the legacy catalog description, including an explicit empty string; absent declaration retains the catalog fallback. These facts never change price, groups, endpoint order, routing or request limits.",
         "oneOf": [
           {
             "not": {
@@ -28340,6 +28390,26 @@
                 {
                   "required": [
                     "tool_use"
+                  ]
+                },
+                {
+                  "required": [
+                    "capabilities"
+                  ]
+                },
+                {
+                  "required": [
+                    "input_modalities"
+                  ]
+                },
+                {
+                  "required": [
+                    "output_modalities"
+                  ]
+                },
+                {
+                  "required": [
+                    "display_name"
                   ]
                 },
                 {
@@ -28378,6 +28448,31 @@
               {
                 "required": [
                   "tool_use"
+                ]
+              },
+              {
+                "required": [
+                  "capabilities"
+                ]
+              },
+              {
+                "required": [
+                  "input_modalities"
+                ]
+              },
+              {
+                "required": [
+                  "output_modalities"
+                ]
+              },
+              {
+                "required": [
+                  "display_name"
+                ]
+              },
+              {
+                "required": [
+                  "description"
                 ]
               }
             ]
@@ -28608,11 +28703,65 @@
           },
           "tool_use": {
             "type": "boolean"
+          },
+          "capabilities": {
+            "type": "array",
+            "maxItems": 5,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "vision",
+                "tools",
+                "reasoning",
+                "web_search",
+                "structured_output"
+              ]
+            }
+          },
+          "input_modalities": {
+            "type": "array",
+            "maxItems": 5,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "text",
+                "image",
+                "audio",
+                "video",
+                "file"
+              ]
+            }
+          },
+          "output_modalities": {
+            "type": "array",
+            "maxItems": 5,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "text",
+                "image",
+                "audio",
+                "video",
+                "file"
+              ]
+            }
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 4096
           }
         },
         "minProperties": 1,
         "additionalProperties": false,
-        "description": "Administrator-declared diagnostic facts only. Every field is optional; absence means unknown and explicit false is a declared negative. Limits are positive JSON-safe integers, not request or billing enforcement. Null and case-aliased field names are invalid."
+        "description": "Exact-name administrator declarations only; every field is optional and omitted means unknown. Empty arrays declare complete empty sets; capabilities is the complete set and supplies vision/reasoning/tool_use booleans, rejecting contradictory explicit booleans. Partial booleans do not imply capabilities. Arrays are sorted sets; endpoint order is unchanged. Limits are positive JSON-safe integers and max_output_tokens must not exceed context_length. display_name is nonempty, trimmed, control-free and at most 255 UTF-8 bytes. description is at most 4096 UTF-8 bytes, allows newline/tab and explicit empty string clears the catalog description; other controls are rejected. Null and unknown/case-aliased fields are invalid. Cross-field, UTF-8 byte and control constraints are enforced at runtime. No request or billing enforcement."
       },
       "ModelCapabilityMetadataMap": {
         "type": "object",
@@ -31247,20 +31396,42 @@
       "max_output_tokens",
       "vision",
       "reasoning",
-      "tool_use"
+      "tool_use",
+      "capabilities",
+      "input_modalities",
+      "output_modalities",
+      "display_name",
+      "description"
     ],
-    "unknown": "omitted, never default false/0; null and empty declarations are rejected",
-    "identity": "exact final Pricing.ModelName; no case/prefix/alias/routing/tag/endpoint inference",
+    "unknown": "Omitted, never default false/0/[]; null and empty objects are rejected. Explicit [] is a complete declared empty set and description empty string clears the catalog description.",
+    "identity": "Exact final pricing model_name or visible OpenAI list model id; no case/prefix/alias/routing/tag/endpoint inference",
     "authority": "administrator; no upstream/provider verification or execution guarantee",
-    "version": "sha256 of version-1 canonical struct: version, exact model, present facts in declaration field order; metadata_source excluded",
-    "visibility": "project copies only after existing public/dashboard/sk pricing row filtering; original nil/empty data semantics preserved",
+    "version": "sha256 of version-1 canonical struct: version, exact model, present facts in declaration field order, sorted declared sets and normalized complete-set legacy booleans; metadata_source excluded",
+    "visibility": "Project copies only after existing public/dashboard/sk pricing row filtering or OpenAI-format /v1/models list visibility filtering. Native Anthropic/Gemini formats and model retrieve are unchanged.",
     "consistency": "one raw OptionMap snapshot decoded per response; successful sequential local writes visible next read; other nodes follow existing option sync; no linearizable multiwriter or global freshness guarantee",
     "failures": "invalid input and failed transactions publish nothing; missing/invalid loaded raw config emits no metadata",
     "exclusions": [
-      "v1/models",
+      "model retrieve and native Anthropic/Gemini list formats",
       "automatic catalog ingestion",
       "price/auth/routing/billing changes",
       "UI"
-    ]
+    ],
+    "complete_sets": {
+      "capabilities": [
+        "vision",
+        "tools",
+        "reasoning",
+        "web_search",
+        "structured_output"
+      ],
+      "modalities": [
+        "text",
+        "image",
+        "audio",
+        "video",
+        "file"
+      ],
+      "contradictions": "Complete capabilities normalize the three legacy booleans and reject contradictory explicit flags; partial booleans cannot establish capabilities."
+    }
   }
 }
