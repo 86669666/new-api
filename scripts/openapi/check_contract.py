@@ -740,7 +740,8 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
     ]
     conflict = schemas['OrganizationLifecycleError409']
     assert conflict['properties']['code']['enum'] == [
-        'ORG_STATE_CHANGED', 'ORG_NAME_TAKEN', 'ORG_DISABLED', 'ORG_REQUEST_RESOLVED',
+        'ORG_STATE_CHANGED', 'ORG_NAME_TAKEN', 'ORG_CREATED_LIMIT_REACHED', 'ORG_JOINED_LIMIT_REACHED',
+        'ORG_DISABLED', 'ORG_REQUEST_RESOLVED',
         'ORG_ALREADY_MEMBER', 'ORG_INVITATION_EXISTS', 'ORG_WALLET_REQUEST_CONFLICT',
         'ORG_WALLET_ALREADY_REVERSED', 'ORG_WALLET_INSUFFICIENT_AVAILABLE',
         'ORG_WALLET_LIMIT_EXCEEDED', 'ORG_WALLET_NOT_EMPTY',
@@ -768,9 +769,9 @@ def check_organization_lifecycle(api, relay, fixtures, design_gate):
     assert conflict['oneOf'] == [
         {'properties': {'code': {'enum': ['ORG_STATE_CHANGED']}}},
         {'properties': {'success': {'type': 'boolean', 'enum': [False]}, 'message': {'type': 'string'},
-                        'code': {'enum': ['ORG_NAME_TAKEN']}}, 'additionalProperties': False},
+                        'code': {'enum': ['ORG_NAME_TAKEN', 'ORG_CREATED_LIMIT_REACHED', 'ORG_JOINED_LIMIT_REACHED']}}, 'additionalProperties': False},
         {'properties': {'code': {'enum': [value for value in conflict['properties']['code']['enum']
-                                        if value not in ('ORG_STATE_CHANGED', 'ORG_NAME_TAKEN')]}},
+                                        if value not in ('ORG_STATE_CHANGED', 'ORG_NAME_TAKEN', 'ORG_CREATED_LIMIT_REACHED', 'ORG_JOINED_LIMIT_REACHED')]}},
          'not': {'required': ['data']}},
     ]
     for path in ['/api/organizations/{org_id}/invitations', '/api/organizations/{org_id}/invitations/{invitation_id}/reissue']:

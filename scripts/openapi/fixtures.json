@@ -13981,5 +13981,79 @@
       ]
     },
     "valid": false
+  },
+  {
+    "name": "ORG_CREATED_LIMIT_REACHED fixed error",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": true,
+    "value": {
+      "success": false,
+      "message": "The maximum number of owned organizations has been reached.",
+      "code": "ORG_CREATED_LIMIT_REACHED"
+    }
+  },
+  {
+    "name": "ORG_CREATED_LIMIT_REACHED does not expose revision",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": false,
+    "value": {
+      "success": false,
+      "message": "The maximum number of owned organizations has been reached.",
+      "code": "ORG_CREATED_LIMIT_REACHED",
+      "data": {
+        "revision": "1"
+      }
+    }
+  },
+  {
+    "name": "ORG_CREATED_LIMIT_REACHED does not expose counts",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": false,
+    "value": {
+      "success": false,
+      "message": "The maximum number of owned organizations has been reached.",
+      "code": "ORG_CREATED_LIMIT_REACHED",
+      "count": 3
+    }
+  },
+  {
+    "name": "ORG_JOINED_LIMIT_REACHED fixed error",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": true,
+    "value": {
+      "success": false,
+      "message": "The maximum number of joined organizations has been reached.",
+      "code": "ORG_JOINED_LIMIT_REACHED"
+    }
+  },
+  {
+    "name": "ORG_JOINED_LIMIT_REACHED does not expose revision",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": false,
+    "value": {
+      "success": false,
+      "message": "The maximum number of joined organizations has been reached.",
+      "code": "ORG_JOINED_LIMIT_REACHED",
+      "data": {
+        "revision": "1"
+      }
+    }
+  },
+  {
+    "name": "ORG_JOINED_LIMIT_REACHED does not expose counts",
+    "document": "api",
+    "schema": "#/components/schemas/OrganizationLifecycleError409",
+    "valid": false,
+    "value": {
+      "success": false,
+      "message": "The maximum number of joined organizations has been reached.",
+      "code": "ORG_JOINED_LIMIT_REACHED",
+      "count": 3
+    }
   }
 ]

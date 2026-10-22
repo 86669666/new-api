@@ -689,6 +689,19 @@ await assert.rejects(api[create.service][create.method](create.arguments), error
   return true;
 });
 assert.equal(calls.length, beforeCreateLimiterFailure + 1, 'No retry after an empty limiter failure');
+// Fixed capacity conflicts are ordinary failed attempts, never automatic retries.
+for (const [contractId, code] of [['W01', 'ORG_CREATED_LIMIT_REACHED'], ['W01', 'ORG_JOINED_LIMIT_REACHED'], ['W11', 'ORG_JOINED_LIMIT_REACHED'], ['W15', 'ORG_CREATED_LIMIT_REACHED'], ['A01', 'ORG_CREATED_LIMIT_REACHED']]) {
+  const operation = invocationMap.find(value => value.contract_id === contractId);
+  responseStatus = 409;
+  responseBody = { success: false, message: 'Fixture capacity limit', code };
+  const before = calls.length;
+  await assert.rejects(api[operation.service][operation.method](operation.arguments), error => {
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.body, responseBody);
+    return true;
+  });
+  assert.equal(calls.length, before + 1, 'No retry after a capacity conflict');
+}
 const lifecycleStubbedRequests = calls.length - beforeLifecycleRequests;
 await writeFile(path.join(output, 'lifecycle-client-results.json'), JSON.stringify({ operations: invocationMap.length, typed_positive_calls: invocationMap.length + 2, typed_negative_calls: lifecycleTypeNegatives, stubbed_requests: lifecycleStubbedRequests, network_failure_attempts: networkAttempts, live_http: false, server_authorization_verified: false }, null, 2) + '\n');
 const imageClient = await readFile(path.join(output, 'generated/relay/services/ImagesService.ts'), 'utf8');
