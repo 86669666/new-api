@@ -176,5 +176,12 @@ func oauthIssuedTokenName(clientID string) string {
 }
 
 func oauthIssuedConflict(err error) bool {
-	return err != nil && (errors.Is(err, gorm.ErrDuplicatedKey) || strings.Contains(err.Error(), "UNIQUE"))
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "unique") || strings.Contains(text, "duplicate")
 }

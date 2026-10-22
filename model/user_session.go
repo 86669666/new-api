@@ -743,6 +743,7 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 	}
 	now := time.Now().Unix()
 	var totalAffected int64
+	scheduled := false
 	for {
 		query := DB.Where("user_id = ? AND status = ? AND expires_at > ?", userID, UserSessionStatusActive, now)
 		if excludedSID != "" {
@@ -753,6 +754,14 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 			return totalAffected, err
 		}
 		if len(candidates) == 0 {
+			if !scheduled {
+				if err := DB.Transaction(func(tx *gorm.DB) error {
+					return ScheduleOAuthRevocation(tx, userID, "")
+				}); err != nil {
+					return totalAffected, err
+				}
+				WakeOAuthRevocation()
+			}
 			return totalAffected, nil
 		}
 		for i := range candidates {
@@ -768,6 +777,11 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 		var affected int64
 		var revoked []UserSession
 		err := DB.Transaction(func(tx *gorm.DB) error {
+			if !scheduled {
+				if err := ScheduleOAuthRevocation(tx, userID, ""); err != nil {
+					return err
+				}
+			}
 			if err := lockForUpdate(tx).Where("sid IN ? AND status = ?", sids, UserSessionStatusActive).Find(&revoked).Error; err != nil {
 				return err
 			}
@@ -783,11 +797,18 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 				"revoked_at":     now,
 				"revoked_reason": reason,
 			})
+			if result.Error != nil {
+				return result.Error
+			}
 			affected = result.RowsAffected
-			return result.Error
+			return nil
 		})
 		if err != nil {
 			return totalAffected, err
+		}
+		if !scheduled {
+			scheduled = true
+			WakeOAuthRevocation()
 		}
 		totalAffected += affected
 		for i := range revoked {

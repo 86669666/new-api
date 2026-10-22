@@ -93,7 +93,7 @@ An administrator lists, creates, edits, and deletes public clients. Create, upda
 
 Redirects must be canonical. `https` URLs are matched exactly. `http` is only `127.0.0.1` or `[::1]`. A registered loopback path matches any incoming port; a different path or a non-loopback host does not. Custom schemes are an exact match and cannot be `javascript`, `data`, `file`, `blob`, `filesystem`, `vbscript`, `about`, or `jar`. The preset `boxo` stores `http://127.0.0.1/oauth/callback`. The preset `cherry_studio` stores `http://127.0.0.1:29873/oauth/callback`. A preset replaces any redirects submitted with it. Scopes are the known catalog, and `profile` is required.
 
-The same user's authorized-apps list shows grants recorded after consent is accepted. Revoking one app uses the dashboard session and does not require another step-up proof. It disables only the relay keys that app created for that user. It does not by itself revoke Hydra login sessions; that linkage is separate.
+The same user's authorized-apps list shows grants recorded after consent is accepted. Revoking one app uses the dashboard session and does not require another step-up proof. In the same transaction it disables only the relay keys that app created for that user and queues a Hydra consent revoke for that client. It does not revoke the Hydra login session, so other apps stay signed in.
 
 Inbound custom OAuth provider slugs cannot be `login`, `consent`, `logout`, `admin`, or `provider`. The existing telegram reservation is unchanged.
 
@@ -120,7 +120,24 @@ Balance uses the console envelope. `data` contains `quota`, `used_quota`, `quota
 
 Usage follows `/api/log/self`: `p` is the page, and `page` is used only when `p` is absent. A non-positive or non-numeric page or page size is `400 invalid_request`.
 
-`GET /tokens` lists only relay keys this OAuth client created for this user. It does not create a key and does not return plaintext. Manually created keys are absent. `POST /tokens` creates one key when none exists, with `OAUTH_ISSUED_TOKEN_QUOTA` (default 0) and `OAUTH_ISSUED_TOKEN_EXPIRE_DAYS` (default 30). The first response is `{"data":[{"key":"sk-..."}]}`. A later POST does not return the key again. The association is the `oauth_issued_tokens` table and does not change the tokens table. The table is migrated only when userinfo is enabled. Dashboard logout disables that user's issued keys.
+`GET /tokens` lists only relay keys this OAuth client created for this user. It does not create a key and does not return plaintext. Manually created keys are absent. `POST /tokens` creates one key when none exists, with `OAUTH_ISSUED_TOKEN_QUOTA` (default 0) and `OAUTH_ISSUED_TOKEN_EXPIRE_DAYS` (default 30). The first response is `{"data":[{"key":"sk-..."}]}`. A later POST does not return the key again. The association is the `oauth_issued_tokens` table and does not change the tokens table. The table is migrated only when userinfo is enabled. Dashboard logout disables that user's issued keys and queues the same full Hydra revoke as a password change.
+
+## Consent and session revocation
+
+Public clients cannot skip consent. Hydra `skip` or `skip_consent` is rejected, and every accepted login or consent decision sends `remember=false`. A later authorization shows the consent page again. `tokens:read` and `tokens:write` are granted only when the user leaves them checked.
+
+Password change, administrator disable, account delete, email password reset, dashboard logout, and revoke-all-sessions do two things in the same database transaction: disable the relay keys this user obtained through OAuth, and insert one row in `oauth_revocation_jobs`. That table is created only when `OAUTH_USERINFO_ENABLED=true`. The row stores the user id and, for a single app, the client id. It does not store an access token or a refresh token.
+
+After commit, the process calls Hydra's admin API on `OAUTH_PROVIDER_ADMIN_BASE_URL`:
+
+- every client: `DELETE /admin/oauth2/auth/sessions/login?subject={user id}` and `DELETE /admin/oauth2/auth/sessions/consent?subject={user id}&all=true`
+- one app: `DELETE /admin/oauth2/auth/sessions/consent?subject={user id}&client={client id}`
+
+The subject is the numeric user id sent at login. Success is HTTP 204, or 404 when the session is already gone. HTTP 200 does not complete the job. `POST /oauth2/revoke` returning 200 is not proof that a token was invalidated. Confirm with introspection: after the admin deletes succeed, introspect returns `active: false`, and `/api/v1/oauth/balance` returns 401.
+
+A Hydra error is logged as `oauth session revocation failed for user {id}` with no token and no response body. The job stays, and the next attempt waits 15 seconds, then 30, 60, 120, 240, 480, and at most 15 minutes. The process also polls every 30 seconds, so a missed wake still runs. If the provider bridge is off, the keys are still disabled and the job is completed after a log line, because there is no admin API to call. No extra flag turns this loop on. It starts with the process and does nothing useful until userinfo and the bridge are enabled.
+
+The example compose file sets `TTL_LOGIN_CONSENT_REQUEST=30m`. That value is the Hydra v26.2.0 schema default plus the explicit setting. It was not measured on a running Hydra. Tests use a local TLS stub, not Hydra.
 
 ## Limits
 

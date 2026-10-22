@@ -23,7 +23,7 @@ func ChangeUserPassword(identity AuthSessionIdentity, update *User, firstPasswor
 	if err != nil {
 		return err
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
+	err = DB.Transaction(func(tx *gorm.DB) error {
 		if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
 			return err
 		}
@@ -55,6 +55,11 @@ func ChangeUserPassword(identity AuthSessionIdentity, update *User, firstPasswor
 		}
 		return tx.First(update, identity.UserID).Error
 	})
+	if err != nil {
+		return err
+	}
+	WakeOAuthRevocation()
+	return nil
 }
 
 // AccountLoginMethods is a snapshot of administrator-enabled login mechanisms.

@@ -195,6 +195,9 @@ func IncrementUserAuthVersionWithTx(tx *gorm.DB, userId int) (int64, error) {
 			return 0, result.Error
 		}
 		if result.RowsAffected == 1 {
+			if err := ScheduleOAuthRevocation(tx, userId, ""); err != nil {
+				return 0, err
+			}
 			return next, nil
 		}
 	}
@@ -215,6 +218,7 @@ func BumpUserAuthVersion(userId int) (int64, error) {
 	if err := PublishUserAuthCache(userId); err != nil {
 		return next, err
 	}
+	WakeOAuthRevocation()
 	return next, nil
 }
 

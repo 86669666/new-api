@@ -250,6 +250,27 @@ func (b *OAuthProviderBridge) RevokeToken(ctx context.Context, token, clientID s
 	return ErrOAuthResourceUnavailable
 }
 
+// RevokeSessions asks Hydra's admin API to invalidate this subject's sessions.
+// An empty clientID revokes the login session and every consent. A clientID
+// revokes only that client's consent. Success is 204 or 404. A 200 is not
+// accepted: the public revoke route can return 200 without invalidating anything.
+func (b *OAuthProviderBridge) RevokeSessions(ctx context.Context, userID int, clientID string) error {
+	if b == nil || b.admin == "" || b.resource == nil || b.resource.client == nil || userID <= 0 {
+		return ErrOAuthResourceUnavailable
+	}
+	subject := strconv.Itoa(userID)
+	if clientID == "" {
+		login := b.admin + "/admin/oauth2/auth/sessions/login?" + url.Values{"subject": {subject}}.Encode()
+		if err := b.oauthAdminJSON(ctx, http.MethodDelete, login, nil, http.StatusNoContent, http.StatusNotFound); err != nil {
+			return err
+		}
+		consent := b.admin + "/admin/oauth2/auth/sessions/consent?" + url.Values{"subject": {subject}, "all": {"true"}}.Encode()
+		return b.oauthAdminJSON(ctx, http.MethodDelete, consent, nil, http.StatusNoContent, http.StatusNotFound)
+	}
+	consent := b.admin + "/admin/oauth2/auth/sessions/consent?" + url.Values{"subject": {subject}, "client": {clientID}}.Encode()
+	return b.oauthAdminJSON(ctx, http.MethodDelete, consent, nil, http.StatusNoContent, http.StatusNotFound)
+}
+
 func (b *OAuthProviderBridge) Preview(ctx context.Context, actor AuthIdentity, phase, challenge string) (*OAuthProviderPreview, error) {
 	if phase != "login" && phase != "consent" || !validOAuthProviderCapability(challenge) {
 		return nil, ErrOAuthProviderRequest
