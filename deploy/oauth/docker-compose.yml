@@ -1,0 +1,68 @@
+# Example only. Do not commit secrets, private keys, or certificates.
+# Generate HYDRA_DB_PASSWORD, HYDRA_SYSTEM_SECRET, and HYDRA_COOKIE_SECRET
+# outside this repository (each secret at least 16 characters). Point
+# HYDRA_TLS_DIR at a directory outside the repository that contains
+# public.crt, public.key, admin.crt, and admin.key. Those certificates must
+# be valid for the DNS name "hydra" and must chain to a CA trusted by New API.
+# This file publishes no host ports. Hydra admin stays on the compose network.
+
+services:
+  hydra-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: ${HYDRA_DB_PASSWORD:?required}
+      POSTGRES_DB: hydra
+    volumes:
+      - hydra-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra -d hydra"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  hydra-migrate:
+    image: oryd/hydra:v26.2.0
+    restart: "no"
+    command: ["migrate", "sql", "--yes"]
+    environment:
+      DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?required}@hydra-db:5432/hydra?sslmode=disable
+    depends_on:
+      hydra-db:
+        condition: service_healthy
+
+  hydra:
+    image: oryd/hydra:v26.2.0
+    # Production serve. Do not add --dev.
+    command: ["serve", "all", "--sqa-opt-out"]
+    environment:
+      DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?required}@hydra-db:5432/hydra?sslmode=disable
+      SECRETS_SYSTEM: ${HYDRA_SYSTEM_SECRET:?required}
+      SECRETS_COOKIE: ${HYDRA_COOKIE_SECRET:?required}
+      # Exact issuer string. OAUTH_USERINFO_ISSUER must match it character for character.
+      URLS_SELF_ISSUER: ${OAUTH_PUBLIC_ISSUER:?required}
+      URLS_LOGIN: ${OAUTH_PUBLIC_ORIGIN:?required}/oauth/provider/login
+      URLS_CONSENT: ${OAUTH_PUBLIC_ORIGIN:?required}/oauth/provider/consent
+      OAUTH2_PKCE_ENFORCED_FOR_PUBLIC_CLIENTS: "true"
+      OAUTH2_EXPOSE_INTERNAL_ERRORS: "false"
+      STRATEGIES_ACCESS_TOKEN: opaque
+      TTL_ACCESS_TOKEN: 1h
+      TTL_REFRESH_TOKEN: 720h
+      # v26.2.0 schema default is already 30m. Set it so a later image cannot raise it silently.
+      TTL_LOGIN_CONSENT_REQUEST: 30m
+      SERVE_PUBLIC_PORT: "4444"
+      SERVE_ADMIN_PORT: "4445"
+      SERVE_PUBLIC_TLS_CERT_PATH: /etc/hydra/tls/public.crt
+      SERVE_PUBLIC_TLS_KEY_PATH: /etc/hydra/tls/public.key
+      SERVE_ADMIN_TLS_CERT_PATH: /etc/hydra/tls/admin.crt
+      SERVE_ADMIN_TLS_KEY_PATH: /etc/hydra/tls/admin.key
+    volumes:
+      - ${HYDRA_TLS_DIR:?required}:/etc/hydra/tls:ro
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  hydra-db:

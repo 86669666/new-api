@@ -34,8 +34,10 @@ var (
 type OAuthProviderConfig struct {
 	Enabled           bool
 	RevocationEnabled bool
+	PublicProxy       bool
 	AdminBaseURL      string
 	AuthorizationURL  string
+	UpstreamURL       string
 }
 
 type OAuthProviderBridge struct {
@@ -44,6 +46,7 @@ type OAuthProviderBridge struct {
 	authorize string
 	policy    string
 	revoke    string
+	upstream  string
 }
 
 type OAuthProviderPreview struct {
@@ -113,12 +116,14 @@ type oauthProviderRequest struct {
 func InitOAuthProviderBridge() error {
 	enabled := os.Getenv("OAUTH_PROVIDER_BRIDGE_ENABLED")
 	revocation := os.Getenv("OAUTH_PROVIDER_REVOCATION_ENABLED")
-	if enabled != "" && enabled != "false" && enabled != "true" || revocation != "" && revocation != "false" && revocation != "true" {
+	publicProxy := os.Getenv("OAUTH_PUBLIC_PROXY_ENABLED")
+	if !oauthProviderTriState(enabled) || !oauthProviderTriState(revocation) || !oauthProviderTriState(publicProxy) {
 		return ErrOAuthProviderConfiguration
 	}
 	bridge, err := NewOAuthProviderBridge(OAuthProviderConfig{
-		Enabled: enabled == "true", RevocationEnabled: revocation == "true", AdminBaseURL: os.Getenv("OAUTH_PROVIDER_ADMIN_BASE_URL"),
-		AuthorizationURL: os.Getenv("OAUTH_PROVIDER_AUTHORIZATION_URL"),
+		Enabled: enabled == "true", RevocationEnabled: revocation == "true", PublicProxy: publicProxy == "true",
+		AdminBaseURL: os.Getenv("OAUTH_PROVIDER_ADMIN_BASE_URL"), AuthorizationURL: os.Getenv("OAUTH_PROVIDER_AUTHORIZATION_URL"),
+		UpstreamURL: os.Getenv("OAUTH_PROVIDER_UPSTREAM_URL"),
 	}, CurrentOAuthUserInfoResource())
 	if err != nil {
 		return ErrOAuthProviderConfiguration
@@ -129,7 +134,14 @@ func InitOAuthProviderBridge() error {
 
 func CurrentOAuthProviderBridge() *OAuthProviderBridge { return currentOAuthProvider.Load() }
 
+func oauthProviderTriState(value string) bool {
+	return value == "" || value == "false" || value == "true"
+}
+
 func NewOAuthProviderBridge(config OAuthProviderConfig, resource *OAuthUserInfoResource) (*OAuthProviderBridge, error) {
+	if config.PublicProxy && (!config.Enabled || !config.RevocationEnabled || resource == nil) {
+		return nil, ErrOAuthProviderConfiguration
+	}
 	if config.RevocationEnabled && (!config.Enabled || resource == nil) {
 		return nil, ErrOAuthProviderConfiguration
 	}
@@ -164,8 +176,19 @@ func NewOAuthProviderBridge(config OAuthProviderConfig, resource *OAuthUserInfoR
 	if config.RevocationEnabled {
 		bridge.revoke = strings.TrimSuffix(config.AuthorizationURL, "/auth") + "/revoke"
 	}
+	if config.PublicProxy {
+		upstream, err := oauthProxyOrigin(config.UpstreamURL)
+		if err != nil || upstream == base || oauthProxyHost(upstream) == oauthProxyHost(config.AuthorizationURL) || authorize.Path != "/oauth2/auth" {
+			return nil, ErrOAuthProviderConfiguration
+		}
+		bridge.upstream = upstream
+		// Revocation must reach Hydra directly. The public URL is this process.
+		bridge.revoke = upstream + "/oauth2/revoke"
+	}
 	return bridge, nil
 }
+
+func (b *OAuthProviderBridge) PublicProxyEnabled() bool { return b != nil && b.upstream != "" }
 
 func (b *OAuthProviderBridge) RevocationEnabled() bool { return b != nil && b.revoke != "" }
 
@@ -315,13 +338,21 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 	if err := b.adminCall(ctx, http.MethodPut, phase, suffix, input.Challenge, body, &result); err != nil {
 		return nil, err
 	}
-	if !b.validResume(result.RedirectTo, phase, request.query) {
+	redirect := result.RedirectTo
+	if b.PublicProxyEnabled() {
+		rewritten, err := b.publicAuthorizeReference(result.RedirectTo)
+		if err != nil {
+			return nil, ErrOAuthResourceUnavailable
+		}
+		redirect = rewritten
+	}
+	if !b.validResume(redirect, phase, request.query) {
 		return nil, ErrOAuthResourceUnavailable
 	}
 	if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
 		return nil, err
 	}
-	return &OAuthProviderRedirect{RedirectTo: result.RedirectTo}, nil
+	return &OAuthProviderRedirect{RedirectTo: redirect}, nil
 }
 
 func currentOAuthProviderActor(ctx context.Context, actor AuthIdentity) (*model.User, *model.UserSession, error) {
@@ -357,7 +388,15 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 	if phase == "consent" && *value.Subject != strconv.Itoa(actor.UserID) || phase == "login" && *value.Subject != "" && *value.Subject != strconv.Itoa(actor.UserID) {
 		return nil, ErrOAuthProviderDenied
 	}
-	original, err := url.Parse(*value.RequestURL)
+	requestURL := *value.RequestURL
+	if b.PublicProxyEnabled() {
+		rewritten, rewriteErr := b.publicAuthorizeReference(requestURL)
+		if rewriteErr != nil {
+			return nil, ErrOAuthProviderDenied
+		}
+		requestURL = rewritten
+	}
+	original, err := url.Parse(requestURL)
 	if err != nil || original.User != nil || original.Fragment != "" || original.Opaque != "" {
 		return nil, ErrOAuthProviderDenied
 	}

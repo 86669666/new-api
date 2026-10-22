@@ -19,6 +19,24 @@ func OAuthRevocationPath(path string) bool {
 	return path == "/oauth2/revoke" || strings.HasPrefix(path, "/oauth2/revoke/") || err == nil && (decoded == "/oauth2/revoke" || strings.HasPrefix(decoded, "/oauth2/revoke/"))
 }
 
+// OAuthPublicSurface is the OAuth protocol prefix, including encoded variants.
+// Revocation stays on its own path so this does not replace that guard.
+func OAuthPublicSurface(path string) bool {
+	if OAuthRevocationPath(path) {
+		return false
+	}
+	candidates := []string{path}
+	if decoded, err := url.PathUnescape(path); err == nil && decoded != path {
+		candidates = append(candidates, decoded)
+	}
+	for _, candidate := range candidates {
+		if candidate == "/oauth2" || strings.HasPrefix(candidate, "/oauth2/") || candidate == "/.well-known" || strings.HasPrefix(candidate, "/.well-known/") {
+			return true
+		}
+	}
+	return false
+}
+
 func OAuthRevocationBoundary(c *gin.Context) {
 	if c.Request.URL.RawQuery != "" || c.Request.URL.ForceQuery {
 		WriteOAuthRevocationError(c, http.StatusBadRequest, "invalid_request")

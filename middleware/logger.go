@@ -63,7 +63,7 @@ func SetUpLogger(server *gin.Engine) {
 		if OAuthProviderPagePath(param.Request.URL.Path) {
 			path = "/oauth/provider/[authorization]"
 		}
-		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || OAuthRevocationPath(resourcePath) || strings.TrimSuffix(resourcePath, "/") == "/api/v1/oauth/userinfo" || strings.TrimRight(resourcePath, "/") == "/api/events" {
+		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || strings.HasPrefix(resourcePath, "/oauth2/") || strings.HasPrefix(resourcePath, "/.well-known/") || OAuthRevocationPath(resourcePath) || strings.TrimSuffix(resourcePath, "/") == "/api/v1/oauth/userinfo" || strings.TrimRight(resourcePath, "/") == "/api/events" {
 			path, _, _ = strings.Cut(path, "?")
 		}
 		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",

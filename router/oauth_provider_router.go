@@ -27,6 +27,23 @@ func SetOAuthProviderRouter(router *gin.Engine, bridge *service.OAuthProviderBri
 				return
 			}
 		}
+		if bridge.PublicProxyEnabled() && middleware.OAuthPublicSurface(c.Request.URL.Path) {
+			c.Header("Cache-Control", "private, no-store")
+			path := c.Request.URL.Path
+			if c.Request.URL.EscapedPath() != path {
+				middleware.WriteOAuthRevocationError(c, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			if controller.OAuthPublicKnownPath(path) {
+				if !controller.OAuthPublicMethodAllowed(c.Request.Method, path) {
+					middleware.WriteOAuthRevocationError(c, http.StatusMethodNotAllowed, "invalid_request")
+					return
+				}
+			} else {
+				middleware.WriteOAuthRevocationError(c, http.StatusNotFound, "not_found")
+				return
+			}
+		}
 		c.Next()
 	})
 	revocation := router.Group("/oauth2")
@@ -36,6 +53,14 @@ func SetOAuthProviderRouter(router *gin.Engine, bridge *service.OAuthProviderBri
 	revocation.Any("/revoke/*trailing", func(c *gin.Context) {
 		middleware.WriteOAuthRevocationError(c, http.StatusBadRequest, "invalid_request")
 	})
+	if bridge != nil && bridge.PublicProxyEnabled() {
+		public := []gin.HandlerFunc{middleware.RouteTag("api"), middleware.OAuthResourceNoStore, middleware.GlobalAPIRateLimit(), middleware.CriticalRateLimit()}
+		router.GET("/oauth2/auth", append(public, controller.ProxyOAuthAuthorization(bridge))...)
+		router.POST("/oauth2/token", append(public, controller.ProxyOAuthToken(bridge))...)
+		router.GET("/.well-known/openid-configuration", append(public, controller.ProxyOAuthDiscovery(bridge, "openid"))...)
+		router.GET("/.well-known/oauth-authorization-server", append(public, controller.ProxyOAuthDiscovery(bridge, "oauth"))...)
+		router.GET("/.well-known/jwks.json", append(public, controller.ProxyOAuthJWKS(bridge))...)
+	}
 	if bridge == nil {
 		return
 	}
