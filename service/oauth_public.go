@@ -17,9 +17,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/system_setting"
-	"gorm.io/gorm"
 )
 
 const OAuthPublicCapabilityLimit = 16384
@@ -476,6 +474,26 @@ func (p *OAuthPublic) Exchange(ctx context.Context, form url.Values) ([]byte, er
 	if !slices.Contains(p.bridge.resource.clients, form.Get("client_id")) {
 		return nil, &OAuthPublicError{401, "invalid_client"}
 	}
+	var previous OAuthResourceIdentity
+	var previousErr error
+	if form.Get("grant_type") == "refresh_token" {
+		previous, previousErr = p.bridge.resource.introspectPurpose(ctx, form.Get("refresh_token"), "refresh_token")
+		if previousErr == nil {
+			if previous.clientID != form.Get("client_id") {
+				return nil, &OAuthPublicError{400, "invalid_grant"}
+			}
+			if _, err := authorizeOAuthGrant(ctx, previous, false); err != nil {
+				if errors.Is(err, ErrOAuthInvalidToken) {
+					return nil, &OAuthPublicError{400, "invalid_grant"}
+				}
+				return nil, ErrOAuthResourceUnavailable
+			}
+		} else if !errors.Is(previousErr, ErrOAuthInvalidToken) {
+			return nil, ErrOAuthResourceUnavailable
+		}
+		// An inactive/replayed credential still reaches Hydra so its replay-family
+		// invalidation runs. It cannot authorize a successful response locally.
+	}
 	response, err := p.request(ctx, http.MethodPost, "/oauth2/token", form.Encode(), nil)
 	if err != nil {
 		return nil, err
@@ -489,12 +507,15 @@ func (p *OAuthPublic) Exchange(ctx context.Context, form url.Values) ([]byte, er
 	if common.Unmarshal(fields["access_token"], &access) != nil || access == "" || len(access) > 4096 || common.Unmarshal(fields["token_type"], &kind) != nil || !strings.EqualFold(kind, "bearer") || common.Unmarshal(fields["expires_in"], &expires) != nil || expires <= 0 || expires > 900 || common.Unmarshal(fields["scope"], &scope) != nil {
 		return nil, ErrOAuthResourceUnavailable
 	}
-	identity, _, err := p.bridge.resource.readCurrentIdentity(ctx, access)
+	identity, err := p.bridge.resource.introspect(ctx, access)
 	if err != nil {
 		if errors.Is(err, ErrOAuthInvalidToken) {
 			return nil, &OAuthPublicError{400, "invalid_grant"}
 		}
 		return nil, ErrOAuthResourceUnavailable
+	}
+	if form.Get("grant_type") == "refresh_token" && (previousErr != nil || previous.grantID != identity.grantID || previous.grantExpiresAt != identity.grantExpiresAt || previous.userID != identity.userID || previous.authVersion != identity.authVersion || previous.clientID != identity.clientID || !sameOAuthProviderSet(previous.scopes, identity.scopes)) {
+		return nil, &OAuthPublicError{400, "invalid_grant"}
 	}
 	actual, err := oauthProviderScopeSet(scope)
 	if err != nil || !sameOAuthProviderSet(actual, identity.scopes) || identity.clientID != form.Get("client_id") {
@@ -528,17 +549,14 @@ func (p *OAuthPublic) Exchange(ctx context.Context, form url.Values) ([]byte, er
 	}
 	// All issuer requests finish before the final local identity read. A logout,
 	// disable or version rotation during refresh introspection must win.
-	user, err := model.GetOAuthUserInfoByID(ctx, identity.userID)
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	_, err = authorizeOAuthGrant(ctx, identity, form.Get("grant_type") == "authorization_code")
+	if errors.Is(err, ErrOAuthInvalidToken) {
 		return nil, &OAuthPublicError{400, "invalid_grant"}
 	}
 	if err != nil {
 		return nil, ErrOAuthResourceUnavailable
 	}
 	now := time.Now().Unix()
-	if user.Status != common.UserStatusEnabled || user.AuthVersion != identity.authVersion || identity.expiresAt <= now || identity.notBefore > now || identity.grantExpiresAt <= now {
-		return nil, &OAuthPublicError{400, "invalid_grant"}
-	}
 	out["expires_in"] = min(expires, identity.expiresAt-now, identity.grantExpiresAt-now)
 	return common.Marshal(out)
 }

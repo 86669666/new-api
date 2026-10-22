@@ -82,13 +82,15 @@ type oauthProviderBinding struct {
 // Only security-relevant fields and plain client display text are decoded.
 // Unknown optional Hydra metadata, including null values, is deliberately ignored.
 type oauthProviderChallenge struct {
-	Challenge  string               `json:"challenge"`
-	Subject    *string              `json:"subject"`
-	Skip       *bool                `json:"skip"`
-	RequestURL *string              `json:"request_url"`
-	Scopes     *[]string            `json:"requested_scope"`
-	Audience   *[]string            `json:"requested_access_token_audience"`
-	Client     *oauthProviderClient `json:"client"`
+	Challenge        string               `json:"challenge"`
+	ConsentRequestID *string              `json:"consent_request_id"`
+	LoginSessionID   *string              `json:"login_session_id"`
+	Subject          *string              `json:"subject"`
+	Skip             *bool                `json:"skip"`
+	RequestURL       *string              `json:"request_url"`
+	Scopes           *[]string            `json:"requested_scope"`
+	Audience         *[]string            `json:"requested_access_token_audience"`
+	Client           *oauthProviderClient `json:"client"`
 }
 
 type oauthProviderClient struct {
@@ -105,12 +107,14 @@ type oauthProviderClient struct {
 }
 
 type oauthProviderRequest struct {
-	binding    oauthProviderBinding
-	clientID   string
-	clientName string
-	requested  []string
-	allowed    []string
-	query      url.Values
+	binding          oauthProviderBinding
+	clientID         string
+	clientName       string
+	requested        []string
+	allowed          []string
+	query            url.Values
+	consentRequestID string
+	loginSessionID   string
 }
 
 func InitOAuthProviderBridge() error {
@@ -273,6 +277,7 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 		return nil, err
 	}
 	var body any
+	var prepared *model.OAuthGrant
 	suffix := "accept"
 	if input.Decision == "deny" {
 		if len(input.SelectedScopes) != 0 {
@@ -302,7 +307,17 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 			if _, err := rand.Read(grant); err != nil {
 				return nil, ErrOAuthResourceUnavailable
 			}
-			body.(map[string]any)["session"] = map[string]any{"access_token": map[string]string{"newapi_auth_version": strconv.FormatInt(actor.UserAuthVersion, 10), "newapi_grant_id": base64.RawURLEncoding.EncodeToString(grant), "newapi_grant_expires_at": strconv.FormatInt(time.Now().Add(7*24*time.Hour).Unix(), 10)}}
+			scopes := slices.Clone(selected)
+			slices.Sort(scopes)
+			encoded, err := common.Marshal(scopes)
+			if err != nil {
+				return nil, ErrOAuthResourceUnavailable
+			}
+			prepared = &model.OAuthGrant{GrantID: base64.RawURLEncoding.EncodeToString(grant), Issuer: b.resource.issuer,
+				ClientID: request.clientID, Subject: strconv.Itoa(actor.UserID), UserID: actor.UserID,
+				ConsentRequestID: request.consentRequestID, HydraLoginSessionID: request.loginSessionID,
+				OriginSID: actor.SessionID, SessionVersion: actor.SessionVersion, UserAuthVersion: actor.UserAuthVersion,
+				Scopes: string(encoded), PolicyHash: fmt.Sprintf("%x", sha256.Sum256([]byte(b.policy)))}
 		}
 	} else {
 		return nil, ErrOAuthProviderRequest
@@ -315,14 +330,20 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 			return ErrOAuthProviderDenied
 		}
 		if err := model.ValidateAuthSessionWithTx(tx, actor); err != nil {
-			return ErrOAuthInvalidToken
+			return oauthGrantError(err)
 		}
 		// No HTTP runs while this transaction holds the flow/user/session locks.
 		// Existing cleanup retains this consumed claim for at least 24h. Real
 		// activation requires verified effective Hydra challenge TTL<=30m,
 		// including old outstanding requests; this is not permanent retention.
-		return model.ClaimExternalAuthAssertionWithTx(tx, model.AuthFlowPurposeOAuthProviderAttempt,
-			b.resource.issuer+"\n"+phase+"\n"+input.Challenge, flow.ExpiresAt)
+		if err := model.ClaimExternalAuthAssertionWithTx(tx, model.AuthFlowPurposeOAuthProviderAttempt,
+			b.resource.issuer+"\n"+phase+"\n"+input.Challenge, flow.ExpiresAt); err != nil {
+			return err
+		}
+		if prepared != nil {
+			return oauthGrantError(model.CreateOAuthGrantWithTx(tx, prepared))
+		}
+		return nil
 	})
 	if err != nil {
 		if errors.Is(err, ErrOAuthInvalidToken) || errors.Is(err, ErrOAuthProviderDenied) {
@@ -332,6 +353,11 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 			return nil, ErrOAuthProviderReplay
 		}
 		return nil, ErrOAuthResourceUnavailable
+	}
+	if prepared != nil {
+		body.(map[string]any)["session"] = map[string]any{"access_token": map[string]string{
+			"newapi_auth_version": strconv.FormatInt(prepared.UserAuthVersion, 10), "newapi_grant_id": prepared.GrantID,
+			"newapi_grant_expires_at": strconv.FormatInt(prepared.ExpiresAt, 10)}}
 	}
 	// Local consumption and the cross-preview claim have committed before PUT.
 	if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
@@ -346,7 +372,11 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 	if !b.validResume(result.RedirectTo, phase, request.query) {
 		return nil, ErrOAuthResourceUnavailable
 	}
-	if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
+	if prepared != nil {
+		if err := model.ApproveOAuthGrant(ctx, prepared); err != nil {
+			return nil, oauthGrantError(err)
+		}
+	} else if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
 		return nil, err
 	}
 	return &OAuthProviderRedirect{RedirectTo: result.RedirectTo}, nil
@@ -358,11 +388,11 @@ func currentOAuthProviderActor(ctx context.Context, actor AuthIdentity) (*model.
 	}
 	user, err := model.GetOAuthUserInfoByID(ctx, actor.UserID)
 	if err != nil {
-		return nil, nil, ErrOAuthInvalidToken
+		return nil, nil, oauthGrantError(err)
 	}
 	session, err := model.GetUserSessionBySIDWithContext(ctx, actor.SessionID)
 	if err != nil {
-		return nil, nil, ErrOAuthInvalidToken
+		return nil, nil, oauthGrantError(err)
 	}
 	if user.Status != common.UserStatusEnabled || user.AuthVersion != actor.UserAuthVersion || session.UserID != actor.UserID || session.Version != actor.SessionVersion || session.UserAuthVersion != actor.UserAuthVersion || session.Status != model.UserSessionStatusActive || session.RevokedAt != 0 || session.ExpiresAt <= time.Now().Unix() {
 		return nil, nil, ErrOAuthInvalidToken
@@ -384,6 +414,18 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 	}
 	if phase == "consent" && *value.Subject != strconv.Itoa(actor.UserID) || phase == "login" && *value.Subject != "" && *value.Subject != strconv.Itoa(actor.UserID) {
 		return nil, ErrOAuthProviderDenied
+	}
+	if b.public != nil && phase == "consent" {
+		for _, id := range []*string{value.ConsentRequestID, value.LoginSessionID} {
+			if id == nil || len(*id) == 0 || len(*id) > 256 {
+				return nil, ErrOAuthProviderDenied
+			}
+			for _, c := range *id {
+				if c < 0x21 || c > 0x7e {
+					return nil, ErrOAuthProviderDenied
+				}
+			}
+		}
 	}
 	original, err := url.Parse(*value.RequestURL)
 	if err != nil || original.User != nil || original.Fragment != "" || original.Opaque != "" {
@@ -448,11 +490,15 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 	if client.Name != nil {
 		name = *client.Name
 	}
-	return &oauthProviderRequest{
+	request := &oauthProviderRequest{
 		binding: oauthProviderBinding{Identity: actor, Phase: phase, PolicyHash: b.policy,
 			ChallengeHash: fmt.Sprintf("%x", sha256.Sum256([]byte(challenge))), RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded))},
 		clientID: client.ID, clientName: name, requested: requested, allowed: allowed, query: q,
-	}, nil
+	}
+	if b.public != nil && phase == "consent" {
+		request.consentRequestID, request.loginSessionID = *value.ConsentRequestID, *value.LoginSessionID
+	}
+	return request, nil
 }
 
 func (b *OAuthProviderBridge) adminCall(ctx context.Context, method, phase, action, challenge string, body, result any) error {

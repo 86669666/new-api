@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -128,7 +129,7 @@ func (c *oauthHydraClient) decision(phase, challenge string, scopes []string) st
 	require.NoError(c.t, common.Unmarshal(data, &result))
 	return result.RedirectTo
 }
-func (c *oauthHydraClient) code(scopes string, selected ...string) oauthHydraGrant {
+func (c *oauthHydraClient) consent(scopes string) (string, oauthHydraGrant, string) {
 	c.t.Helper()
 	random := make([]byte, 32)
 	_, err := rand.Read(random)
@@ -153,11 +154,18 @@ func (c *oauthHydraClient) code(scopes string, selected ...string) oauthHydraGra
 	consent, err := url.Parse(headers.Get("Location"))
 	require.NoError(c.t, err)
 	c.t.Logf("real encrypted consent challenge length=%d", len(consent.Query().Get("consent_challenge")))
+	c.secrets = append(c.secrets, verifier, state, nonce)
+	return consent.Query().Get("consent_challenge"), oauthHydraGrant{Verifier: verifier, Nonce: nonce}, state
+}
+
+func (c *oauthHydraClient) code(scopes string, selected ...string) oauthHydraGrant {
+	c.t.Helper()
+	challenge, grant, state := c.consent(scopes)
 	if len(selected) == 0 {
 		selected = strings.Split(scopes, " ")
 	}
-	resumed = c.decision("consent", consent.Query().Get("consent_challenge"), selected)
-	status, headers, _ = c.request("GET", resumed, "", "", "")
+	resumed := c.decision("consent", challenge, selected)
+	status, headers, _ := c.request("GET", resumed, "", "", "")
 	require.Equal(c.t, http.StatusSeeOther, status, "real consent verifier failed")
 	callback, err := url.Parse(headers.Get("Location"))
 	require.NoError(c.t, err)
@@ -167,8 +175,9 @@ func (c *oauthHydraClient) code(scopes string, selected ...string) oauthHydraGra
 	require.True(c.t, state == callback.Query().Get("state"), "callback state must match this transaction")
 	require.Equal(c.t, c.input.Issuer, callback.Query().Get("iss"))
 	require.True(c.t, callback.Query().Get("code") != "", "missing authorization code")
-	c.secrets = append(c.secrets, callback.Query().Get("code"), verifier, state, nonce)
-	return oauthHydraGrant{Code: callback.Query().Get("code"), Verifier: verifier, Nonce: nonce}
+	c.secrets = append(c.secrets, callback.Query().Get("code"))
+	grant.Code = callback.Query().Get("code")
+	return grant
 }
 func (c *oauthHydraClient) exchange(grant oauthHydraGrant) (int, oauthHydraGrant) {
 	c.t.Helper()
@@ -250,18 +259,105 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		require.NoError(t, service.InitOAuthUserInfoResource())
 		require.NoError(t, service.InitOAuthProviderBridge())
 	})
-	for key, value := range map[string]string{"OAUTH_USERINFO_ENABLED": "true", "OAUTH_USERINFO_ISSUER": input.Issuer, "OAUTH_USERINFO_INTROSPECTION_URL": input.Admin + "/admin/oauth2/introspect", "OAUTH_USERINFO_AUDIENCE": "newapi-userinfo", "OAUTH_USERINFO_CLIENT_IDS": "newapi-w01-desktop,newapi-w01-independent", "OAUTH_PROVIDER_BRIDGE_ENABLED": "true", "OAUTH_PROVIDER_REVOCATION_ENABLED": "true", "OAUTH_PROVIDER_ADMIN_BASE_URL": input.Admin, "OAUTH_PROVIDER_AUTHORIZATION_URL": input.Issuer + "oauth2/auth", "OAUTH_PROVIDER_PUBLIC_ENABLED": "true", "OAUTH_PROVIDER_PUBLIC_BASE_URL": input.Public} {
-		t.Setenv(key, value)
-	}
-	require.NoError(t, service.InitOAuthUserInfoResource())
-	require.NoError(t, service.InitOAuthProviderBridge())
-	require.NoError(t, service.ValidateOAuthPublicTopology(t.Context()))
+	// A transparent, certificate-verified proxy lets the test commit local
+	// revocation after a real issuer response and before the final local gate.
 	ca, err := os.ReadFile(input.CA)
 	require.NoError(t, err)
 	roots := x509.NewCertPool()
 	require.True(t, roots.AppendCertsFromPEM(ca))
 	cert, err := tls.LoadX509KeyPair(input.Certificate, input.Key)
 	require.NoError(t, err)
+	issuerHTTP := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}, Timeout: 5 * time.Second}
+	t.Cleanup(issuerHTTP.CloseIdleConnections)
+	var introspections atomic.Int64
+	var changeAt atomic.Int64
+	var consentFault atomic.Int32
+	var consentPuts atomic.Int64
+	var trustedConsentIDs sync.Map
+	mutations := make(chan func() error, 1)
+	adminProxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, input.Admin+r.URL.RequestURI(), r.Body)
+		if err != nil {
+			w.WriteHeader(503)
+			return
+		}
+		req.Header = r.Header.Clone()
+		req.GetBody = nil
+		response, err := issuerHTTP.Do(req)
+		if err != nil {
+			w.WriteHeader(503)
+			return
+		}
+		defer response.Body.Close()
+		data, err := io.ReadAll(io.LimitReader(response.Body, 65537))
+		if err != nil {
+			w.WriteHeader(503)
+			return
+		}
+		if r.URL.Path == "/admin/oauth2/introspect" && introspections.Add(1) == changeAt.Load() {
+			if err := (<-mutations)(); err != nil {
+				w.WriteHeader(503)
+				return
+			}
+		}
+		if r.URL.Path == "/admin/oauth2/auth/requests/consent" && r.Method == "GET" {
+			var trusted struct {
+				Consent string `json:"consent_request_id"`
+				Login   string `json:"login_session_id"`
+			}
+			if common.Unmarshal(data, &trusted) == nil && trusted.Consent != "" {
+				trustedConsentIDs.Store(trusted.Consent, trusted.Login)
+			}
+			if fault := consentFault.Load(); fault == 1 || fault == 2 {
+				var fields map[string]common.RawMessage
+				if common.Unmarshal(data, &fields) != nil {
+					w.WriteHeader(503)
+					return
+				}
+				if fault == 1 {
+					delete(fields, "consent_request_id")
+				} else {
+					fields["consent_request_id"] = common.RawMessage(`"different-trusted-id"`)
+				}
+				data, err = common.Marshal(fields)
+				if err != nil {
+					w.WriteHeader(503)
+					return
+				}
+				response.Header.Del("Content-Length")
+			}
+		}
+		if r.URL.Path == "/admin/oauth2/auth/requests/consent/accept" && r.Method == "PUT" {
+			consentPuts.Add(1)
+			switch consentFault.Load() {
+			case 3:
+				w.WriteHeader(503)
+				return // genuine issuer acceptance, response lost
+			case 4:
+				if err := f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).UpdateColumn("revoked_at", time.Now().Unix()).Error; err != nil {
+					w.WriteHeader(503)
+					return
+				}
+			}
+		}
+		for key, values := range response.Header {
+			w.Header()[key] = values
+		}
+		w.WriteHeader(response.StatusCode)
+		_, _ = w.Write(data)
+	}))
+	adminProxy.TLS = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
+	adminProxy.StartTLS()
+	t.Cleanup(adminProxy.Close)
+	for key, value := range map[string]string{"OAUTH_USERINFO_ENABLED": "true", "OAUTH_USERINFO_ISSUER": input.Issuer, "OAUTH_USERINFO_INTROSPECTION_URL": adminProxy.URL + "/admin/oauth2/introspect", "OAUTH_USERINFO_AUDIENCE": "newapi-userinfo", "OAUTH_USERINFO_CLIENT_IDS": "newapi-w01-desktop,newapi-w01-independent", "OAUTH_PROVIDER_BRIDGE_ENABLED": "true", "OAUTH_PROVIDER_REVOCATION_ENABLED": "true", "OAUTH_PROVIDER_ADMIN_BASE_URL": adminProxy.URL, "OAUTH_PROVIDER_AUTHORIZATION_URL": input.Issuer + "oauth2/auth", "OAUTH_PROVIDER_PUBLIC_ENABLED": "true", "OAUTH_PROVIDER_PUBLIC_BASE_URL": input.Public} {
+		t.Setenv(key, value)
+	}
+	require.NoError(t, service.InitOAuthUserInfoResource())
+	require.NoError(t, service.InitOAuthProviderBridge())
+	common.IsMasterNode = true
+	require.NoError(t, service.InitOAuthGrantStore())
+	common.IsMasterNode = false
+	require.NoError(t, service.ValidateOAuthPublicTopology(t.Context()))
 	engine := gin.New()
 	middleware.SetUpLogger(engine)
 	root, err := os.Getwd()
@@ -451,6 +547,140 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		assert.JSONEq(t, `{"error":"temporarily_unavailable"}`, string(data))
 		assert.True(t, c.active(grant.Access))
 	})
+	t.Run("persistent_grants_and_final_local_gate", func(t *testing.T) {
+		c.t = t
+		a := c.grant("openid profile offline_access")
+		b := c.grant("openid profile offline_access")
+		var rows []model.OAuthGrant
+		require.NoError(t, f.db.Where("user_id = ? AND state = ?", f.users["owner"].Id, "active").Order("created_at, grant_ref").Find(&rows).Error)
+		require.GreaterOrEqual(t, len(rows), 2)
+		for _, row := range rows {
+			require.NotEmpty(t, row.ConsentRequestID)
+			require.NotEmpty(t, row.HydraLoginSessionID)
+			login, ok := trustedConsentIDs.Load(row.ConsentRequestID)
+			require.True(t, ok, "consent ID must come from real Admin metadata")
+			assert.Equal(t, login, row.HydraLoginSessionID)
+			require.Equal(t, f.sids["owner"], row.OriginSID)
+			require.Equal(t, int64(1), row.SessionVersion)
+			require.Equal(t, int64(1), row.UserAuthVersion)
+		}
+		// Resolve A's binding through real introspection, then revoke precisely A.
+		status, _, data := c.request("POST", input.Admin+"/admin/oauth2/introspect", "application/x-www-form-urlencoded", url.Values{"token": {a.Access}}.Encode(), "")
+		require.Equal(t, 200, status)
+		var value struct {
+			Ext map[string]string `json:"ext"`
+		}
+		require.NoError(t, common.Unmarshal(data, &value))
+		ref := model.OAuthGrantRef(input.Issuer, value.Ext["newapi_grant_id"])
+		require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", ref).UpdateColumn("state", "revoked").Error)
+		require.Equal(t, 401, c.userinfo(a.Access))
+		require.Equal(t, 200, c.userinfo(b.Access))
+		status, _ = c.refresh(a)
+		require.Equal(t, 400, status)
+		status, _ = c.refresh(b)
+		require.Equal(t, 200, status)
+		for _, column := range []string{"revoked_at", "version", "user_auth_version", "expires_at"} {
+			t.Run("source_session_"+column, func(t *testing.T) {
+				c.t = t
+				token := c.grant("openid profile offline_access")
+				var before model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", f.sids["owner"]).First(&before).Error)
+				var changed any = int64(2)
+				if column == "expires_at" {
+					changed = time.Now().Unix() - 1
+				}
+				mutations <- func() error {
+					return f.db.Model(&model.UserSession{}).Where("sid = ?", before.SID).UpdateColumn(column, changed).Error
+				}
+				changeAt.Store(introspections.Load() + 3) // refresh input, issued access, issued refresh
+				status, _ := c.refresh(token)
+				assert.Equal(t, 400, status)
+				require.NoError(t, f.db.Save(&before).Error)
+			})
+		}
+		t.Run("auth_version_during_code_exchange", func(t *testing.T) {
+			c.t = t
+			code := c.code("openid profile offline_access")
+			mutations <- func() error {
+				return f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).UpdateColumn("auth_version", 2).Error
+			}
+			changeAt.Store(introspections.Load() + 2)
+			status, _ := c.exchange(code)
+			assert.Equal(t, 400, status)
+			require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).UpdateColumn("auth_version", 1).Error)
+		})
+		t.Run("database_unavailable_at_publication", func(t *testing.T) {
+			c.t = t
+			code := c.code("openid profile offline_access")
+			mutations <- func() error { return f.db.Migrator().RenameTable("oauth_grants", "oauth_grants_unavailable") }
+			changeAt.Store(introspections.Load() + 2)
+			status, _ := c.exchange(code)
+			require.NoError(t, f.db.Migrator().RenameTable("oauth_grants_unavailable", "oauth_grants"))
+			assert.Equal(t, 503, status)
+		})
+
+		t.Run("prepared_cannot_activate", func(t *testing.T) {
+			c.t = t
+			code := c.code("openid profile offline_access")
+			// All preceding grants are active/revoked or failed approved. Match the
+			// current pending consent via the latest approved row created by this flow.
+			var approved []model.OAuthGrant
+			require.NoError(t, f.db.Where("state = ?", "approved").Find(&approved).Error)
+			for _, row := range approved {
+				require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", row.GrantRef).UpdateColumn("state", "prepared").Error)
+			}
+			status, _ := c.exchange(code)
+			assert.Equal(t, 400, status)
+		})
+		c.t = t
+	})
+
+	t.Run("approval_binding_and_unknown_accept", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			fault    int32
+			expected int
+			prepared bool
+		}{
+			{"missing_trusted_id", 1, 403, false}, {"changed_trusted_id", 2, 403, false},
+			{"accepted_response_lost", 3, 503, true}, {"logout_during_accept", 4, 401, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				c.t = t
+				consentFault.Store(0)
+				challenge, _, _ := c.consent("profile")
+				body, err := common.Marshal(map[string]any{"challenge": challenge})
+				require.NoError(t, err)
+				status, _, data := c.request("POST", input.Issuer+"api/oauth/provider/consent/preview", "application/json", string(body), f.bearer["owner"])
+				require.Equal(t, 200, status)
+				var preview service.OAuthProviderPreview
+				require.NoError(t, common.Unmarshal(data, &preview))
+				c.secrets = append(c.secrets, challenge, preview.PreviewToken)
+				var before int64
+				require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("state = ?", "prepared").Count(&before).Error)
+				consentFault.Store(tc.fault)
+				body, err = common.Marshal(service.OAuthProviderDecision{Challenge: challenge, PreviewToken: preview.PreviewToken, Decision: "approve", SelectedScopes: []string{"profile"}})
+				require.NoError(t, err)
+				status, _, _ = c.request("POST", input.Issuer+"api/oauth/provider/consent", "application/json", string(body), f.bearer["owner"])
+				assert.Equal(t, tc.expected, status)
+				consentFault.Store(0)
+				require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).UpdateColumn("revoked_at", 0).Error)
+				var after int64
+				require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("state = ?", "prepared").Count(&after).Error)
+				if tc.prepared {
+					assert.Equal(t, before+1, after)
+					puts := consentPuts.Load()
+					status, _, _ = c.request("POST", input.Issuer+"api/oauth/provider/consent", "application/json", string(body), f.bearer["owner"])
+					assert.NotEqual(t, 200, status)
+					assert.Equal(t, puts, consentPuts.Load(), "unknown accept must not be replayed")
+				} else {
+					assert.Equal(t, before, after)
+				}
+			})
+		}
+		c.t = t
+	})
+
 	for _, kind := range []string{"access", "refresh"} {
 		t.Run("revoke_"+kind+"_preserves_independent_authorization", func(t *testing.T) {
 			c.t = t
@@ -743,4 +973,206 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			assert.NotContains(t, response.Header().Get("Location"), "UPSTREAM-PRIVATE-DIAGNOSTIC")
 		})
 	})
+}
+
+func TestOAuthGrantStore(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	oauthPublicDatabase(t, f)
+	require.NoError(t, model.InitOAuthGrantStore(false))
+	require.False(t, f.db.Migrator().HasTable(&model.OAuthGrant{}))
+	require.Error(t, model.InitOAuthGrantStore(true), "non-master must fail on missing schema")
+	common.IsMasterNode = true
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	grant := &model.OAuthGrant{GrantID: strings.Repeat("a", 43), Issuer: "https://issuer.example/", ClientID: "desktop", Subject: strconv.Itoa(f.users["owner"].Id), UserID: f.users["owner"].Id,
+		ConsentRequestID: "trusted-consent", HydraLoginSessionID: "trusted-login", OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("b", 64)}
+	require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+	var session model.UserSession
+	require.NoError(t, f.db.Where("sid = ?", grant.OriginSID).First(&session).Error)
+	require.Equal(t, session.ExpiresAt, grant.ExpiresAt, "absolute lifetime is capped by source session")
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	require.NoError(t, model.InitOAuthGrantStore(false))
+	var retained model.OAuthGrant
+	require.NoError(t, f.db.First(&retained, "grant_ref = ?", grant.GrantRef).Error)
+	assert.Equal(t, *grant, retained)
+	duplicate := *grant
+	duplicate.GrantRef = strings.Repeat("c", 64)
+	duplicate.GrantID = strings.Repeat("d", 43)
+	require.Error(t, f.db.Create(&duplicate).Error, "same trusted consent cannot create another grant")
+	duplicate = *grant
+	duplicate.ConsentRef = strings.Repeat("e", 64)
+	require.Error(t, f.db.Create(&duplicate).Error, "grant identity is unique")
+	// Digest identity preserves case distinctions even under MySQL's default
+	// case-insensitive text collation, and long-lived sessions cannot extend 7d.
+	require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", grant.OriginSID).UpdateColumn("expires_at", time.Now().Unix()+8*24*60*60).Error)
+	for i, id := range []string{"case-sensitive-consent", "CASE-SENSITIVE-CONSENT"} {
+		other := *grant
+		other.GrantID = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{byte(i + 1)}, 32))
+		other.ConsentRequestID = id
+		require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, &other) }))
+		assert.Equal(t, other.CreatedAt+7*24*60*60, other.ExpiresAt)
+	}
+
+	common.IsMasterNode = false
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	require.NoError(t, f.db.Migrator().DropIndex(&model.OAuthGrant{}, "idx_oauth_grants_consent"))
+	require.Error(t, model.InitOAuthGrantStore(true), "missing uniqueness must fail closed")
+}
+
+func TestOAuthGrantUserInfo(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	oauthPublicDatabase(t, f)
+	common.IsMasterNode = true
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	common.IsMasterNode = false
+	const issuer = "https://gateway.example/"
+	const clientID = "grant-client"
+	grantBytes := make([]byte, 32)
+	_, err := rand.Read(grantBytes)
+	require.NoError(t, err)
+	grant := &model.OAuthGrant{GrantID: base64.RawURLEncoding.EncodeToString(grantBytes), Issuer: issuer, ClientID: clientID, Subject: strconv.Itoa(f.users["owner"].Id), UserID: f.users["owner"].Id,
+		ConsentRequestID: "trusted-consent", HydraLoginSessionID: "trusted-login", OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("a", 64)}
+	require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+	var payload atomic.Pointer[map[string]any]
+	mutation := make(chan func() error, 1)
+	calls := atomic.Int64{}
+	mutateAt := atomic.Int64{}
+	admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == mutateAt.Load() {
+			change := <-mutation
+			if err := change(); err != nil {
+				w.WriteHeader(500)
+				return
+			}
+		}
+		data, err := common.Marshal(*payload.Load())
+		if err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(admin.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(admin.Certificate())
+	makeResource := func(public bool) *service.OAuthUserInfoResource {
+		resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: admin.URL + "/admin/oauth2/introspect", Issuer: issuer, Audience: "userinfo", ClientIDs: []string{clientID, "other-client"}}, roots)
+		require.NoError(t, err)
+		t.Cleanup(resource.CloseIdleConnections)
+		if public {
+			bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: admin.URL, AuthorizationURL: issuer + "oauth2/auth"}, resource)
+			require.NoError(t, err)
+			_, err = service.NewOAuthPublic(service.OAuthPublicConfig{Enabled: true, BaseURL: "https://hydra-private.example"}, bridge)
+			require.NoError(t, err)
+		}
+		return resource
+	}
+	public, legacy := gin.New(), gin.New()
+	SetOAuthResourceRouter(public, makeResource(true))
+	SetOAuthResourceRouter(legacy, makeResource(false))
+	setClaims := func(extra map[string]any) {
+		value := map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": issuer, "aud": []string{"userinfo"}, "client_id": clientID, "sub": grant.Subject, "exp": time.Now().Unix() + 600, "scope": "profile", "ext": extra}
+		payload.Store(&value)
+	}
+	extras := func() map[string]any {
+		return map[string]any{"newapi_auth_version": "1", "newapi_grant_id": grant.GrantID, "newapi_grant_expires_at": strconv.FormatInt(grant.ExpiresAt, 10)}
+	}
+	serve := func(engine *gin.Engine) int {
+		req := httptest.NewRequest("GET", "/api/v1/oauth/userinfo", nil)
+		req.Header.Set("Authorization", "Bearer synthetic-opaque-token")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+		return w.Code
+	}
+	setClaims(extras())
+	assert.Equal(t, 401, serve(public), "prepared cannot authorize userinfo")
+	require.NoError(t, model.ApproveOAuthGrant(t.Context(), grant))
+	assert.Equal(t, 401, serve(public), "approved cannot authorize userinfo")
+	claims := model.OAuthGrantAuthorization{Issuer: issuer, GrantID: grant.GrantID, ClientID: clientID, Subject: grant.Subject, UserID: grant.UserID, AuthVersion: 1, GrantExpiresAt: grant.ExpiresAt, TokenExpiresAt: time.Now().Unix() + 600, Scopes: []string{"profile"}, Activate: true}
+	_, err = model.AuthorizeOAuthGrant(t.Context(), claims)
+	require.NoError(t, err)
+	require.Equal(t, 200, serve(public))
+	assert.Equal(t, 401, serve(legacy), "public-off must reject the same valid issuer/client token")
+	for _, key := range []string{"newapi_grant_id", "newapi_grant_expires_at"} {
+		for _, value := range []any{"", nil, 42, []any{}, map[string]any{}, false} {
+			t.Run(key+"/"+fmt.Sprintf("%T", value), func(t *testing.T) {
+				setClaims(map[string]any{"newapi_auth_version": "1", key: value})
+				expected := 401
+				// The existing strict envelope rejects JSON null before typed claims.
+				if value == nil {
+					expected = 503
+				}
+				assert.Equal(t, expected, serve(legacy))
+				assert.Equal(t, expected, serve(public))
+			})
+		}
+	}
+	setClaims(map[string]any{"newapi_auth_version": "1"})
+	require.Equal(t, 200, serve(legacy), "pure legacy remains compatible")
+	require.Equal(t, 401, serve(public))
+	for _, tc := range []struct {
+		name   string
+		change func(map[string]any)
+	}{
+		{"unknown_grant", func(e map[string]any) { e["newapi_grant_id"] = base64.RawURLEncoding.EncodeToString(make([]byte, 32)) }},
+		{"expiry_mismatch", func(e map[string]any) { e["newapi_grant_expires_at"] = strconv.FormatInt(grant.ExpiresAt-1, 10) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) { e := extras(); tc.change(e); setClaims(e); assert.Equal(t, 401, serve(public)) })
+	}
+	for _, tc := range []struct {
+		name, key string
+		value     any
+	}{
+		{"foreign_user", "sub", strconv.Itoa(f.users["foreign"].Id)},
+		{"foreign_client", "client_id", "other-client"},
+		{"wider_scope", "scope", "profile email"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setClaims(extras())
+			value := *payload.Load()
+			value[tc.key] = tc.value
+			payload.Store(&value)
+			assert.Equal(t, 401, serve(public))
+		})
+	}
+
+	setClaims(extras())
+	for _, tc := range []struct {
+		name    string
+		table   any
+		where   string
+		value   any
+		column  string
+		restore any
+	}{
+		{"sid_logout", &model.UserSession{}, "sid = ?", grant.OriginSID, "revoked_at", int64(0)},
+		{"sid_version", &model.UserSession{}, "sid = ?", grant.OriginSID, "version", int64(1)},
+		{"auth_version", &model.User{}, "id = ?", grant.UserID, "auth_version", int64(1)},
+		{"user_disabled", &model.User{}, "id = ?", grant.UserID, "status", common.UserStatusEnabled},
+		{"grant_revoked", &model.OAuthGrant{}, "grant_ref = ?", grant.GrantRef, "state", "active"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var invalid any = int64(2)
+			if tc.column == "state" {
+				invalid = "revoked"
+			}
+			// The second issuer check is the final userinfo projection. Commit the
+			// revocation before returning that response, without timing sleeps.
+			mutation <- func() error {
+				return f.db.Model(tc.table).Where(tc.where, tc.value).UpdateColumn(tc.column, invalid).Error
+			}
+			mutateAt.Store(calls.Load() + 2)
+			assert.Equal(t, 401, serve(public))
+			assert.Equal(t, 401, serve(legacy))
+			require.NoError(t, f.db.Model(tc.table).Where(tc.where, tc.value).UpdateColumn(tc.column, tc.restore).Error)
+			require.Equal(t, 200, serve(public))
+		})
+	}
+	// A schema/connection failure is unavailable, never interpreted as missing
+	// authorization or used to fall back to legacy authorization.
+	require.NoError(t, f.db.Migrator().DropTable(&model.OAuthGrant{}))
+	require.Equal(t, 503, serve(public))
+	require.Equal(t, 401, serve(legacy))
 }

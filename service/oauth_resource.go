@@ -199,6 +199,10 @@ func (r *OAuthUserInfoResource) readCurrentIdentity(ctx context.Context, credent
 	if err != nil {
 		return identity, nil, err
 	}
+	if r.grantsRequired {
+		user, err := authorizeOAuthGrant(ctx, identity, false)
+		return identity, user, err
+	}
 	user, err := model.GetOAuthUserInfoByID(ctx, identity.userID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return identity, nil, ErrOAuthInvalidToken
@@ -298,6 +302,15 @@ func (r *OAuthUserInfoResource) introspectPurpose(ctx context.Context, credentia
 	}
 	if !scopes["profile"] {
 		return identity, ErrOAuthInsufficientScope
+	}
+	// Presence, not a nonempty decoded string, distinguishes public grants.
+	// Disabling public mode must never downgrade a malformed/old public token.
+	if !r.grantsRequired {
+		_, idPresent := extra["newapi_grant_id"]
+		_, expiryPresent := extra["newapi_grant_expires_at"]
+		if idPresent || expiryPresent {
+			return identity, ErrOAuthInvalidToken
+		}
 	}
 	var grantID, grantExpiry string
 	var grantExpires int64

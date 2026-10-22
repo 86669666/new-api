@@ -346,6 +346,9 @@ func InitResources() error {
 		}
 	}
 	model.InitOptionMap()
+	if err := service.InitOAuthGrantStore(); err != nil {
+		return err
+	}
 	if err := service.ValidateOAuthPublicTopology(context.Background()); err != nil {
 		return err
 	}
