@@ -337,10 +337,29 @@ func (p *OAuthPublic) Authorize(ctx context.Context, request *http.Request) (*OA
 	}
 	cookies := []*http.Cookie{}
 	names := map[string]bool{}
-	if len(request.Header.Get("Cookie")) > 16384 {
-		return nil, ErrOAuthProviderRequest
+	// Bound every Cookie field before parsing, including unrelated cookies and
+	// noncanonical map keys. Joining uses the same separator as a merged field.
+	var cookieHeader strings.Builder
+	seenCookieHeader := false
+	for key, values := range request.Header {
+		if !strings.EqualFold(key, "Cookie") {
+			continue
+		}
+		for _, value := range values {
+			separator := ""
+			if seenCookieHeader {
+				separator = "; "
+			}
+			if len(value) > 16384-cookieHeader.Len()-len(separator) {
+				return nil, ErrOAuthProviderRequest
+			}
+			cookieHeader.WriteString(separator)
+			cookieHeader.WriteString(value)
+			seenCookieHeader = true
+		}
 	}
-	for _, cookie := range request.Cookies() {
+	cookieRequest := &http.Request{Header: http.Header{"Cookie": {cookieHeader.String()}}}
+	for _, cookie := range cookieRequest.Cookies() {
 		if !oauthPublicCookieName.MatchString(cookie.Name) {
 			continue
 		}
@@ -424,7 +443,9 @@ func (p *OAuthPublic) Authorize(ctx context.Context, request *http.Request) (*OA
 		}
 		if valid {
 			for _, key := range []string{"error_description", "error_hint", "error_debug"} {
-				targetQuery.Del(key)
+				if !initial.Has(key) {
+					targetQuery.Del(key)
+				}
 			}
 			targetQuery.Set("iss", p.bridge.resource.issuer)
 			target.RawQuery = targetQuery.Encode()

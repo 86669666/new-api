@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -559,4 +560,187 @@ func TestOAuthPublicRateLimitHTTP(t *testing.T) {
 			assert.NotEmpty(t, response.Header().Get("Retry-After"))
 		}
 	}
+}
+
+func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
+	const issuer = "https://gateway.example/"
+	const callback = "https://client.example/cb"
+	diagnostics := []string{"error_description", "error_hint", "error_debug"}
+	redirects := []string{callback}
+	for _, key := range diagnostics {
+		redirects = append(redirects, callback+"?"+key+"=registered-context")
+	}
+	admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/clients/boundary-client" {
+			w.WriteHeader(404)
+			return
+		}
+		data, err := common.Marshal(map[string]any{
+			"client_id": "boundary-client", "token_endpoint_auth_method": "none", "subject_type": "public",
+			"grant_types": []string{"authorization_code", "refresh_token"}, "response_types": []string{"code"},
+			"scope": "openid profile email offline_access", "audience": []string{"boundary-userinfo"},
+			"redirect_uris": redirects, "skip_consent": false,
+		})
+		if err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(admin.Close)
+	var authCalls atomic.Int64
+	forwarded := make(chan http.Header, 1)
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			data, err := common.Marshal(map[string]any{"issuer": issuer, "authorization_endpoint": issuer + "oauth2/auth", "token_endpoint": issuer + "oauth2/token", "revocation_endpoint": issuer + "oauth2/revoke", "jwks_uri": issuer + ".well-known/jwks.json", "id_token_signing_alg_values_supported": []string{"RS256"}})
+			if err != nil {
+				w.WriteHeader(500)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(data)
+			return
+		}
+		if r.URL.Path != "/oauth2/auth" {
+			w.WriteHeader(404)
+			return
+		}
+		authCalls.Add(1)
+		forwarded <- r.Header.Clone()
+		query := r.URL.Query()
+		target, err := url.Parse(query.Get("redirect_uri"))
+		if err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		result := target.Query()
+		for _, key := range diagnostics {
+			switch query.Get("state") {
+			case "append-diagnostic":
+				result.Add(key, "UPSTREAM-PRIVATE-DIAGNOSTIC")
+			case "replace-diagnostic":
+				result.Set(key, "UPSTREAM-PRIVATE-DIAGNOSTIC")
+			}
+		}
+		result.Set("state", query.Get("state"))
+		result.Set("code", "synthetic-code")
+		target.RawQuery = result.Encode()
+		w.Header().Set("Location", target.String())
+		w.WriteHeader(http.StatusSeeOther)
+	}))
+	upstream.TLS = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: admin.TLS.Certificates}
+	upstream.StartTLS()
+	t.Cleanup(upstream.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(admin.Certificate())
+	resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: admin.URL + "/admin/oauth2/introspect", Issuer: issuer, Audience: "boundary-userinfo", ClientIDs: []string{"boundary-client"}}, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: admin.URL, AuthorizationURL: issuer + "oauth2/auth"}, resource)
+	require.NoError(t, err)
+	public, err := service.NewOAuthPublic(service.OAuthPublicConfig{Enabled: true, BaseURL: upstream.URL}, bridge)
+	require.NoError(t, err)
+	oldAddress, oldGlobal, oldCritical := system_setting.ServerAddress, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable
+	system_setting.ServerAddress, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = issuer, false, false
+	t.Setenv("FRONTEND_BASE_URL", "")
+	t.Cleanup(func() {
+		system_setting.ServerAddress, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = oldAddress, oldGlobal, oldCritical
+	})
+	require.NoError(t, public.ValidateTopology(t.Context()))
+	engine := gin.New()
+	SetOAuthProviderRouter(engine, bridge)
+	serve := func(t *testing.T, redirect, state string, headers http.Header) *httptest.ResponseRecorder {
+		t.Helper()
+		pkce := sha256.Sum256([]byte(strings.Repeat("v", 43)))
+		query := url.Values{"client_id": {"boundary-client"}, "response_type": {"code"}, "redirect_uri": {redirect}, "scope": {"profile"}, "state": {state}, "code_challenge": {base64.RawURLEncoding.EncodeToString(pkce[:])}, "code_challenge_method": {"S256"}}
+		request := httptest.NewRequest(http.MethodGet, "/oauth2/auth?"+query.Encode(), nil)
+		request.Header = headers
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+		assert.NotContains(t, response.Body.String(), "UPSTREAM-PRIVATE-DIAGNOSTIC")
+		return response
+	}
+	t.Run("cookie_headers", func(t *testing.T) {
+		allowed := "__Host-newapi_oauth_login_csrf_1=login"
+		second := "__Host-newapi_oauth_consent_csrf_2=consent"
+		big := []string{}
+		for i := range 5 {
+			big = append(big, fmt.Sprintf("__Host-newapi_oauth_login_csrf_%d=%s", i+1, strings.Repeat("x", 3500)))
+		}
+		for _, tc := range []struct {
+			name    string
+			headers http.Header
+			want    int
+			cookies int
+		}{
+			{"normal isolation", http.Header{"Cookie": {allowed + "; dashboard_refresh=PRIVATE-DASHBOARD; hydra_session=PRIVATE-SESSION; " + second}}, 303, 2},
+			{"multiple values", http.Header{"Cookie": {allowed, second}}, 303, 2},
+			{"case insensitive names", http.Header{"cOoKiE": {allowed}, "COOKIE": {second}}, 303, 2},
+			{"exact combined limit", http.Header{"Cookie": {allowed, "ignored=" + strings.Repeat("x", 16384-len(allowed)-2-len("ignored="))}}, 303, 1},
+			{"combined limit plus one", http.Header{"Cookie": {allowed, "ignored=" + strings.Repeat("x", 16385-len(allowed)-2-len("ignored="))}}, 400, 0},
+			{"allowlisted multiple header overflow", http.Header{"Cookie": big}, 400, 0},
+			{"mixed case overflow", http.Header{"Cookie": {allowed}, "cookie": {strings.Repeat("z", 16384)}}, 400, 0},
+			{"unallowed overflow", http.Header{"Cookie": {allowed, "ignored=" + strings.Repeat("x", 16384)}}, 400, 0},
+			{"merged overflow", http.Header{"Cookie": {strings.Join(big, "; ")}}, 400, 0},
+			{"excess empty fields", http.Header{"Cookie": make([]string, 8194)}, 400, 0},
+			{"repeated name", http.Header{"Cookie": {allowed, allowed}}, 400, 0},
+			{"repeated name across header casing", http.Header{"Cookie": {allowed}, "cOOkie": {allowed}}, 400, 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				before := authCalls.Load()
+				response := serve(t, callback, "cookie-check", tc.headers)
+				assert.Equal(t, tc.want, response.Code)
+				if authCalls.Load() == before {
+					assert.Equal(t, 400, tc.want)
+					assert.Empty(t, response.Header().Get("Location"))
+					return
+				}
+				headers := <-forwarded
+				require.Equal(t, 1, int(authCalls.Load()-before))
+				assert.Equal(t, 303, tc.want, "rejected input must not reach the issuer authorization endpoint")
+				cookies := (&http.Request{Header: headers}).Cookies()
+				assert.Len(t, cookies, tc.cookies)
+				for _, cookie := range cookies {
+					assert.Contains(t, []string{"__Host-newapi_oauth_login_csrf_1", "__Host-newapi_oauth_consent_csrf_2"}, cookie.Name)
+				}
+				assert.NotContains(t, headers.Get("Cookie"), "PRIVATE-DASHBOARD")
+				assert.NotContains(t, headers.Get("Cookie"), "PRIVATE-SESSION")
+			})
+		}
+	})
+	t.Run("callback_queries", func(t *testing.T) {
+		for _, key := range diagnostics {
+			for _, state := range []string{"registered-context", "append-diagnostic", "replace-diagnostic"} {
+				t.Run(key+"/"+state, func(t *testing.T) {
+					response := serve(t, callback+"?"+key+"=registered-context", state, nil)
+					<-forwarded
+					if state != "registered-context" {
+						assert.Equal(t, 503, response.Code)
+						assert.Empty(t, response.Header().Get("Location"))
+						return
+					}
+					require.Equal(t, 303, response.Code)
+					target, err := url.Parse(response.Header().Get("Location"))
+					require.NoError(t, err)
+					assert.Equal(t, []string{"registered-context"}, target.Query()[key])
+					assert.Equal(t, "synthetic-code", target.Query().Get("code"))
+					assert.Equal(t, state, target.Query().Get("state"))
+					assert.Equal(t, issuer, target.Query().Get("iss"))
+				})
+			}
+		}
+		t.Run("strip unregistered diagnostics", func(t *testing.T) {
+			response := serve(t, callback, "append-diagnostic", nil)
+			<-forwarded
+			require.Equal(t, 303, response.Code)
+			target, err := url.Parse(response.Header().Get("Location"))
+			require.NoError(t, err)
+			for _, key := range diagnostics {
+				assert.NotContains(t, target.Query(), key)
+			}
+			assert.NotContains(t, response.Header().Get("Location"), "UPSTREAM-PRIVATE-DIAGNOSTIC")
+		})
+	})
 }
