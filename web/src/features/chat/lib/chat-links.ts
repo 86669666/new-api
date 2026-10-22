@@ -47,14 +47,28 @@ export type ActiveApiKey = {
 
 export const CHERRY_V2_TEMPLATE =
   'cherrystudio://providers/api-keys?v=2&data={cherryConfigV2}'
+export const BOXO_V2_TEMPLATE =
+  'boxo://providers/api-keys?v=2&data={cherryConfigV2}'
 export const CHERRY_V2_ERROR =
   'Unable to prepare Cherry Studio v2 import. Check the site configuration and selected API key.'
+export const BOXO_V2_ERROR =
+  'Unable to prepare Boxo v2 import. Check the site configuration and selected API key.'
 export const CHERRY_V2_ORIGIN_WARNING =
   'Server address is not configured. Using this page’s origin; ask the administrator to configure the API address.'
 
+// Exact templates only. Any other scheme that mentions the v2 placeholder is
+// still detected as an attempt so the legacy resolver cannot send the key.
+export function v2ImportScheme(
+  template: string
+): 'cherrystudio' | 'boxo' | null {
+  if (template === CHERRY_V2_TEMPLATE) return 'cherrystudio'
+  if (template === BOXO_V2_TEMPLATE) return 'boxo'
+  return null
+}
+
 export function isCherryV2Attempt(template: string): boolean {
   // Recognize encoded/nested attempts for classification too. Only the exact
-  // unencoded canonical template is accepted by the explicit export path.
+  // unencoded canonical templates are accepted by the explicit export path.
   let decoded = template
   for (let depth = 0; depth < 3; depth++) {
     if (/cherryconfigv2/i.test(decoded)) return true
@@ -66,7 +80,39 @@ export function isCherryV2Attempt(template: string): boolean {
 }
 
 export function validateCherryV2Template(template: string): void {
-  if (template !== CHERRY_V2_TEMPLATE) throw new Error(CHERRY_V2_ERROR)
+  if (v2ImportScheme(template) == null) throw new Error(CHERRY_V2_ERROR)
+}
+
+// Adds the Boxo preset an administrator saves in chat settings. It does not
+// replace a different preset that already uses the name, and it does not
+// accept any other scheme.
+export function withBoxoV2Preset(raw: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw.trim() === '' ? '[]' : raw)
+  } catch {
+    throw new Error(BOXO_V2_ERROR)
+  }
+  if (!Array.isArray(parsed)) throw new Error(BOXO_V2_ERROR)
+  const names = new Set<string>()
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error(BOXO_V2_ERROR)
+    }
+    const entries = Object.entries(item)
+    if (entries.length !== 1 || typeof entries[0][1] !== 'string') {
+      throw new Error(BOXO_V2_ERROR)
+    }
+    if (entries[0][1] === BOXO_V2_TEMPLATE) return raw
+    names.add(entries[0][0])
+  }
+  let name = 'Boxo'
+  if (names.has(name)) {
+    let suffix = 2
+    while (names.has(`Boxo ${suffix}`)) suffix += 1
+    name = `Boxo ${suffix}`
+  }
+  return JSON.stringify([...parsed, { [name]: BOXO_V2_TEMPLATE }], null, 2)
 }
 
 export type CherryV2Site = {
@@ -149,8 +195,11 @@ export function buildCherryV2Url(
   site: CherryV2Site,
   apiKey: string,
   group: string,
-  origin: string
+  origin: string,
+  template: string = CHERRY_V2_TEMPLATE
 ): { url: string; usedOrigin: boolean } {
+  const scheme = v2ImportScheme(template)
+  if (scheme == null) throw new Error(CHERRY_V2_ERROR)
   const { baseUrl, usedOrigin } = validateCherryV2Site(site, origin)
   const key = normalizeApiKey(apiKey)
   if (!key || /\s|\p{Cc}/u.test(key) || !group.trim()) {
@@ -174,7 +223,7 @@ export function buildCherryV2Url(
     .replaceAll('/', '_')
     .replace(/=+$/, '')
   return {
-    url: `cherrystudio://providers/api-keys?v=2&data=${encoded}`,
+    url: `${scheme}://providers/api-keys?v=2&data=${encoded}`,
     usedOrigin,
   }
 }
