@@ -1,8 +1,11 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,16 +23,22 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 // Exercise the production SetRouter chain, with independent persisted sessions
@@ -599,4 +610,521 @@ func organizationCountRace(t *testing.T, c *organizationLifecycleClient, first, 
 	} else {
 		organizationError(t, other.status, other.h, other.body, 409, code)
 	}
+}
+
+func organizationKeyRequest(t *testing.T, c *organizationLifecycleClient, actor, name, key string) (int, http.Header, map[string]any) {
+	t.Helper()
+	raw, err := common.Marshal(map[string]string{"name": name})
+	require.NoError(t, err)
+	return c.request(t, "POST", "/api/organizations", actor, string(raw), http.Header{"Content-Type": {"application/json"}, "Idempotency-Key": {key}})
+}
+
+func TestOrganizationCreationIdempotency(t *testing.T) {
+	if mode := os.Getenv("NEWAPI_ORGANIZATION_CREATE_CHILD"); mode != "" {
+		organizationCreationProcess(t, mode)
+		return
+	}
+	t.Run("receipt_scope_and_capacity", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		organizationCountPolicy(t, c, "1", "1")
+		status, _, body := organizationKeyRequest(t, c, "empty", "durable create", "create-one")
+		require.Equal(t, 201, status, body)
+		before := organizationNamesSnapshot(t, c)
+		var auditsBefore int64
+		require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("user_id = ? AND action = ?", c.users["empty"].Id, "organization.create").Count(&auditsBefore).Error)
+		status, _, replay := organizationKeyRequest(t, c, "empty", "  durable create  ", "create-one")
+		require.Equal(t, 200, status, replay)
+		assert.Equal(t, body, replay)
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		var auditsAfter int64
+		require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("user_id = ? AND action = ?", c.users["empty"].Id, "organization.create").Count(&auditsAfter).Error)
+		assert.EqualValues(t, 1, auditsBefore)
+		assert.Equal(t, auditsBefore, auditsAfter)
+		status, h, b := organizationKeyRequest(t, c, "empty", "DURABLE CREATE", "create-one")
+		organizationError(t, status, h, b, 409, "ORG_IDEMPOTENCY_CONFLICT")
+		status, h, b = organizationKeyRequest(t, c, "empty", "different name", "create-two")
+		organizationError(t, status, h, b, 409, "ORG_CREATED_LIMIT_REACHED")
+		organizationCountPolicy(t, c, "0", "0")
+		status, h, b = organizationKeyRequest(t, c, "empty", "durable create", "different-key")
+		organizationError(t, status, h, b, 409, "ORG_NAME_TAKEN")
+		status, _, b = organizationKeyRequest(t, c, "admin", "durable create", "create-one")
+		require.Equal(t, 201, status, b)
+		assert.NotEqual(t, body["data"], b["data"])
+		var rows []model.OrganizationCreationRequest
+		require.NoError(t, c.db.Order("id").Find(&rows).Error)
+		require.Len(t, rows, 2)
+		digest := sha256.Sum256([]byte("create-one"))
+		assert.Equal(t, hex.EncodeToString(digest[:]), rows[0].KeyHash)
+		require.True(t, c.db.Migrator().HasIndex(&model.OrganizationCreationRequest{}, "uq_org_creation_user_key"))
+		duplicate := rows[0]
+		duplicate.ID = 0
+		require.Error(t, c.db.Create(&duplicate).Error)
+		var count int64
+		require.NoError(t, c.db.Model(&model.OrganizationCreationRequest{}).Count(&count).Error)
+		assert.EqualValues(t, 2, count)
+	})
+	t.Run("strict_header_and_route_boundary", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		before := organizationNamesSnapshot(t, c)
+		for _, key := range []string{"", "-prefix", "a,b", "with space", "é", strings.Repeat("a", 129)} {
+			status, h, b := organizationKeyRequest(t, c, "empty", "invalid", key)
+			organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+		}
+		for _, headers := range []http.Header{{"Idempotency-Key": {"one", "two"}}, {"Idempotency-Key": {"one"}, "idempotency-key": {"two"}}} {
+			headers.Set("Content-Type", "application/json")
+			status, h, b := c.request(t, "POST", "/api/organizations", "empty", `{"name":"duplicate headers"}`, headers)
+			organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+		}
+		for _, route := range []struct{ method, path, body string }{{"GET", "/api/organizations", ""}, {"PATCH", c.path() + "/name", `{"revision":"1","name":"rename"}`}, {"POST", c.path() + "/authorization-context", `{}`}, {"POST", "/api/verify", `{}`}} {
+			status, h, b := c.request(t, route.method, route.path, "owner", route.body, http.Header{"Content-Type": {"application/json"}, "Idempotency-Key": {"key"}})
+			organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+		}
+		status, h, b := c.request(t, "POST", "/api/organizations", "empty", `{"name":"x","name":"y"}`, http.Header{"Content-Type": {"application/json"}, "Idempotency-Key": {"key"}})
+		organizationError(t, status, h, b, 400, "ORG_REQUEST_INVALID")
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		for i, key := range []string{"A", strings.Repeat("z", 128), "a._:-9", "a"} {
+			status, _, b := organizationKeyRequest(t, c, "empty", fmt.Sprint("valid", i), key)
+			require.Equal(t, 201, status, b)
+		}
+	})
+	t.Run("current_access_and_historical_receipt", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		status, _, first := organizationKeyRequest(t, c, "empty", "original display", "history")
+		require.Equal(t, 201, status, first)
+		id, err := strconv.ParseInt(first["data"].(map[string]any)["organization_id"].(string), 10, 64)
+		require.NoError(t, err)
+		fixture := *c.organizationHTTPFixture
+		fixture.orgA = id
+		created := &organizationLifecycleClient{organizationHTTPFixture: &fixture, passwords: c.passwords, refresh: c.refresh}
+		created.mutate(t, "empty", "PATCH", created.path()+"/name", "rename", map[string]any{"revision": created.revision(t), "name": "renamed display"}, nil, false)
+		request := organizationNameTransfer(t, created, "empty", "admin", true)
+		status, _, b := created.json(t, request.method, request.path, request.actor, request.body, request.proof)
+		require.Equal(t, 200, status, b)
+		status, _, b = organizationKeyRequest(t, c, "empty", "original display", "history")
+		require.Equal(t, 200, status, b)
+		assert.Equal(t, first, b)
+		before := organizationNamesSnapshot(t, c)
+		for _, field := range []string{"self_disabled_at", "platform_disabled_at"} {
+			require.NoError(t, c.db.Model(&model.Organization{}).Where("id = ?", id).Update(field, time.Now().Unix()).Error)
+			status, h, b := organizationKeyRequest(t, c, "empty", "original display", "history")
+			organizationError(t, status, h, b, 409, "ORG_DISABLED")
+			require.NoError(t, c.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", id, c.users["empty"].Id).Update("removed_at", time.Now().Unix()).Error)
+			status, h, b = organizationKeyRequest(t, c, "empty", "original display", "history")
+			organizationError(t, status, h, b, 404, "ORG_NOT_FOUND")
+			require.NoError(t, c.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", id, c.users["empty"].Id).Update("removed_at", 0).Error)
+			require.NoError(t, c.db.Model(&model.Organization{}).Where("id = ?", id).Update(field, 0).Error)
+		}
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		created.mutate(t, "admin", "POST", created.path()+"/dissolve", "dissolve", map[string]any{"revision": created.revision(t)}, nil, true)
+		before = organizationNamesSnapshot(t, c)
+		status, h, b := organizationKeyRequest(t, c, "empty", "original display", "history")
+		organizationError(t, status, h, b, 404, "ORG_NOT_FOUND")
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		var count int64
+		require.NoError(t, c.db.Model(&model.OrganizationCreationRequest{}).Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+	})
+	t.Run("fresh_identity", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		status, _, first := organizationKeyRequest(t, c, "empty", "authenticated", "auth")
+		require.Equal(t, 201, status, first)
+		before := organizationNamesSnapshot(t, c)
+		var session model.UserSession
+		require.NoError(t, c.db.Where("sid = ?", c.sids["empty"]).First(&session).Error)
+		for _, change := range []map[string]any{{"expires_at": time.Now().Unix() - 1}, {"revoked_at": time.Now().Unix()}, {"version": session.Version + 1}} {
+			require.NoError(t, c.db.Model(&session).Updates(change).Error)
+			status, _, b := organizationKeyRequest(t, c, "empty", "authenticated", "auth")
+			require.Equal(t, 401, status, b)
+			require.NoError(t, c.db.Model(&session).Updates(map[string]any{"expires_at": time.Now().Unix() + 3600, "revoked_at": 0, "version": session.Version}).Error)
+		}
+		require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["empty"].Id).Update("status", common.UserStatusDisabled).Error)
+		status, _, b := organizationKeyRequest(t, c, "empty", "authenticated", "auth")
+		require.Contains(t, []int{401, 403}, status, b)
+		require.NoError(t, c.db.Model(&model.User{}).Where("id = ?", c.users["empty"].Id).Update("status", common.UserStatusEnabled).Error)
+		require.NoError(t, c.db.Where("id = ?", c.users["empty"].Id).Delete(&model.User{}).Error)
+		status, _, b = organizationKeyRequest(t, c, "empty", "authenticated", "auth")
+		require.Contains(t, []int{401, 403}, status, b)
+		require.NoError(t, c.db.Unscoped().Model(&model.User{}).Where("id = ?", c.users["empty"].Id).Update("deleted_at", nil).Error)
+		c.login(t, "empty")
+		status, _, b = organizationKeyRequest(t, c, "empty", "authenticated", "auth")
+		require.Equal(t, 200, status, b)
+		assert.Equal(t, first, b)
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+	})
+	t.Run("atomic_insert_failure", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		before := organizationNamesSnapshot(t, c)
+		require.NoError(t, c.db.Callback().Create().Before("gorm:create").Register("create_receipt_fault", func(tx *gorm.DB) {
+			if tx.Statement.Table == "organization_creation_requests" {
+				tx.AddError(errors.New("owned receipt insertion fault"))
+			}
+		}))
+		status, _, b := organizationKeyRequest(t, c, "empty", "rollback", "fault")
+		require.Equal(t, 500, status, b)
+		require.NoError(t, c.db.Callback().Create().Remove("create_receipt_fault"))
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		var count int64
+		require.NoError(t, c.db.Model(&model.OrganizationCreationRequest{}).Count(&count).Error)
+		assert.Zero(t, count)
+		status, _, b = organizationKeyRequest(t, c, "empty", "rollback", "fault")
+		require.Equal(t, 201, status, b)
+	})
+	for _, conflict := range []bool{false, true} {
+		t.Run(fmt.Sprintf("concurrent_sessions_conflict_%t", conflict), func(t *testing.T) {
+			c := newOrganizationLifecycleClient(t)
+			sid := "idem-" + common.NewRequestId()
+			user := c.users["empty"]
+			require.NoError(t, model.CreateUserSession(&model.UserSession{SID: sid, UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("d", 64), LoginMethod: "password", ExpiresAt: time.Now().Unix() + 3600}))
+			token, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: user.Id, SessionID: sid, UserAuthVersion: 1, SessionVersion: 1})
+			require.NoError(t, err)
+			c.bearer["second"] = token
+			before := organizationNamesSnapshot(t, c)
+			held, attempted, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var winner atomic.Bool
+			var once, attemptOnce sync.Once
+			var wg sync.WaitGroup
+			require.NoError(t, c.db.Callback().Create().Before("gorm:create").Register("idem_race", func(tx *gorm.DB) {
+				if tx.Statement.Table == "organization_creation_requests" && winner.CompareAndSwap(false, true) {
+					close(held)
+					select {
+					case <-release:
+					case <-tx.Statement.Context.Done():
+						tx.AddError(tx.Statement.Context.Err())
+					}
+				}
+			}))
+			require.NoError(t, c.db.Callback().Update().Before("gorm:update").Register("idem_race", func(tx *gorm.DB) {
+				if winner.Load() && tx.Statement.Table == "users" {
+					attemptOnce.Do(func() { close(attempted) })
+				}
+			}))
+			defer func() {
+				once.Do(func() { close(release) })
+				wg.Wait()
+				_ = c.db.Callback().Create().Remove("idem_race")
+				_ = c.db.Callback().Update().Remove("idem_race")
+			}()
+			type response struct {
+				status int
+				body   map[string]any
+			}
+			done := make(chan response, 2)
+			wg.Go(func() {
+				status, _, b := organizationKeyRequest(t, c, "empty", "one concurrent organization", "concurrent")
+				done <- response{status, b}
+			})
+			select {
+			case <-held:
+			case <-time.After(5 * time.Second):
+				t.Fatal("winner did not hold receipt transaction")
+			}
+			wg.Go(func() {
+				name := "one concurrent organization"
+				if conflict {
+					name = "different concurrent organization"
+				}
+				status, _, b := organizationKeyRequest(t, c, "second", name, "concurrent")
+				done <- response{status, b}
+			})
+			select {
+			case <-attempted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("second session did not enter user-lock transaction")
+			}
+			once.Do(func() { close(release) })
+			wg.Wait()
+			a, b := <-done, <-done
+			if conflict {
+				assert.ElementsMatch(t, []int{201, 409}, []int{a.status, b.status})
+				if a.status == 409 {
+					assert.Equal(t, "ORG_IDEMPOTENCY_CONFLICT", a.body["code"])
+				} else {
+					assert.Equal(t, "ORG_IDEMPOTENCY_CONFLICT", b.body["code"])
+				}
+			} else {
+				assert.ElementsMatch(t, []int{201, 200}, []int{a.status, b.status})
+				assert.Equal(t, a.body, b.body)
+			}
+			after := organizationNamesSnapshot(t, c)
+			assert.Len(t, after.Organizations, len(before.Organizations)+1)
+			assert.Len(t, after.Members, len(before.Members)+1)
+			assert.Len(t, after.Events, len(before.Events)+1)
+			var count int64
+			require.NoError(t, c.db.Model(&model.OrganizationCreationRequest{}).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+	t.Run("expiry_after_replay_locks", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		status, _, b := organizationKeyRequest(t, c, "empty", "expiry", "expires")
+		require.Equal(t, 201, status, b)
+		before := organizationNamesSnapshot(t, c)
+		deadline := time.Now().Add(3 * time.Second).Truncate(time.Second)
+		require.NoError(t, c.db.Model(&model.UserSession{}).Where("sid = ?", c.sids["empty"]).Update("expires_at", deadline.Unix()).Error)
+		reached, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		var blocked atomic.Bool
+		// Hold after the real member locking read, before final identity validation.
+		// This deterministic lock barrier models a wait extending past the deadline.
+		require.NoError(t, c.db.Callback().Query().After("gorm:query").Register("idem_expiry", func(tx *gorm.DB) {
+			if _, ok := tx.Statement.Dest.(*model.OrganizationMember); ok && blocked.CompareAndSwap(false, true) {
+				close(reached)
+				select {
+				case <-release:
+				case <-tx.Statement.Context.Done():
+					tx.AddError(tx.Statement.Context.Err())
+				}
+			}
+		}))
+		defer func() { once.Do(func() { close(release) }); _ = c.db.Callback().Query().Remove("idem_expiry") }()
+		done := make(chan int, 1)
+		go func() { status, _, _ := organizationKeyRequest(t, c, "empty", "expiry", "expires"); done <- status }()
+		select {
+		case <-reached:
+		case <-time.After(5 * time.Second):
+			t.Fatal("replay member lock barrier not reached")
+		}
+		timer := time.NewTimer(time.Until(deadline) + 10*time.Millisecond)
+		defer timer.Stop()
+		<-timer.C
+		once.Do(func() { close(release) })
+		select {
+		case status := <-done:
+			require.Equal(t, 401, status)
+		case <-time.After(5 * time.Second):
+			t.Fatal("bounded replay did not complete")
+		}
+		assert.Equal(t, before, organizationNamesSnapshot(t, c))
+		var count int64
+		require.NoError(t, c.db.Model(&model.OrganizationCreationRequest{}).Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+	})
+	if kind := os.Getenv("NEWAPI_S2_MAIN"); kind == "mysql" || kind == "postgres" {
+		t.Run("real_organization_lock_crosses_expiry", func(t *testing.T) {
+			c := newOrganizationLifecycleClient(t)
+			status, _, b := organizationKeyRequest(t, c, "empty", "locked expiry", "lock-expiry")
+			require.Equal(t, 201, status, b)
+			id, err := strconv.ParseInt(b["data"].(map[string]any)["organization_id"].(string), 10, 64)
+			require.NoError(t, err)
+			before := organizationNamesSnapshot(t, c)
+			deadline := time.Now().Add(3 * time.Second).Truncate(time.Second)
+			require.NoError(t, c.db.Model(&model.UserSession{}).Where("sid = ?", c.sids["empty"]).Update("expires_at", deadline.Unix()).Error)
+			holder := c.db.WithContext(t.Context()).Begin()
+			require.NoError(t, holder.Error)
+			defer holder.Rollback()
+			var org model.Organization
+			require.NoError(t, holder.Clauses(clause.Locking{Strength: "UPDATE"}).First(&org, id).Error)
+			attempted := make(chan struct{})
+			var once sync.Once
+			require.NoError(t, c.db.Callback().Query().Before("gorm:query").Register("idem_real_lock", func(tx *gorm.DB) {
+				if _, ok := tx.Statement.Dest.(*model.Organization); ok {
+					once.Do(func() { close(attempted) })
+				}
+			}))
+			defer c.db.Callback().Query().Remove("idem_real_lock")
+			done := make(chan int, 1)
+			go func() {
+				status, _, _ := organizationKeyRequest(t, c, "empty", "locked expiry", "lock-expiry")
+				done <- status
+			}()
+			select {
+			case <-attempted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("organization locking read not attempted")
+			}
+			timer := time.NewTimer(time.Until(deadline) + 10*time.Millisecond)
+			defer timer.Stop()
+			<-timer.C
+			require.NoError(t, holder.Commit().Error)
+			select {
+			case status := <-done:
+				require.Equal(t, 401, status)
+			case <-time.After(5 * time.Second):
+				t.Fatal("locked replay did not finish")
+			}
+			assert.Equal(t, before, organizationNamesSnapshot(t, c))
+			var count int64
+			require.NoError(t, c.db.Model(&model.OrganizationCreationRequest{}).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+	for _, backend := range []string{"memory", "redis"} {
+		t.Run("replay_rate_"+backend, func(t *testing.T) {
+			if backend == "redis" && os.Getenv("NEWAPI_CREATION_REDIS_ADDR") == "" {
+				t.Skip("explicit owned Redis endpoint required")
+			}
+			c := newOrganizationLifecycleClient(t)
+			n, err := rand.Int(rand.Reader, big.NewInt(1_000_000_000))
+			require.NoError(t, err)
+			id := 1_000_000_000 + int(n.Int64())
+			sid := "idem-rate-" + common.NewRequestId()
+			user := &model.User{Id: id, Username: "idem-" + common.NewRequestId(), Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: strconv.Itoa(id)}
+			require.NoError(t, c.db.Create(user).Error)
+			require.NoError(t, model.CreateUserSession(&model.UserSession{SID: sid, UserID: id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("e", 64), LoginMethod: "password", ExpiresAt: time.Now().Unix() + 3600}))
+			token, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: id, SessionID: sid, UserAuthVersion: 1, SessionVersion: 1})
+			require.NoError(t, err)
+			c.bearer["rate"] = token
+			oldEnabled, oldNum, oldDuration := common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration
+			t.Cleanup(func() {
+				common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration = oldEnabled, oldNum, oldDuration
+			})
+			common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration = true, 2, 1200
+			if backend == "redis" {
+				client := redis.NewClient(&redis.Options{Addr: os.Getenv("NEWAPI_CREATION_REDIS_ADDR"), DB: 15, MaxRetries: -1})
+				require.NoError(t, client.Ping(t.Context()).Err())
+				keys := []string{fmt.Sprintf("user:%d", id), fmt.Sprintf("auth:user:fence:%d", id), fmt.Sprintf("auth:user:version:%d", id), fmt.Sprintf("rateLimit:v2:user:UC:organization-create:%d", id), "auth:session:" + common.GenerateHMACWithKey([]byte("user-session-cache-v1:"+common.SessionSecret), sid)}
+				count, err := client.Exists(t.Context(), keys...).Result()
+				require.NoError(t, err)
+				require.Zero(t, count)
+				t.Cleanup(func() {
+					require.NoError(t, client.Del(context.Background(), keys...).Err())
+					require.NoError(t, client.Close())
+				})
+				common.RDB, common.RedisEnabled = client, true
+			}
+			engine := gin.New()
+			SetRouter(engine, WebAssets{IndexPage: []byte("idem-rate")})
+			server := httptest.NewServer(engine)
+			t.Cleanup(server.Close)
+			c.server, c.client = server, server.Client()
+			status, _, first := organizationKeyRequest(t, c, "rate", "rate replay", "rate-key")
+			require.Equal(t, 201, status, first)
+			status, _, second := organizationKeyRequest(t, c, "rate", "rate replay", "rate-key")
+			require.Equal(t, 200, status, second)
+			assert.Equal(t, first, second)
+			req, err := http.NewRequest("POST", server.URL+"/api/organizations", strings.NewReader(`{"name":"rate replay"}`))
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", "rate-key")
+			response, err := c.client.Do(req)
+			require.NoError(t, err)
+			defer response.Body.Close()
+			raw, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			assert.Equal(t, 429, response.StatusCode)
+			assert.Empty(t, raw)
+			assert.NotEmpty(t, response.Header.Get("Retry-After"))
+			assert.True(t, organizationPrivateNoStore(response.Header.Values("Cache-Control")))
+			var count int64
+			require.NoError(t, c.db.Model(&model.OrganizationCreationRequest{}).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+	t.Run("new_process_replays_discarded_response", func(t *testing.T) {
+		c := newOrganizationLifecycleClient(t)
+		before := organizationNamesSnapshot(t, c)
+		input := organizationBudgetProcessInput{Kind: c.mainKind, DSN: c.mainDSN, Port: os.Getenv("NEWAPI_S2_" + strings.ToUpper(c.mainKind) + "_PORT"), SQLiteRoot: filepath.Dir(c.mainDSN), SessionSecret: common.SessionSecret, Bearer: c.bearer["empty"]}
+		raw, err := common.Marshal(input)
+		require.NoError(t, err)
+		for _, mode := range []string{"commit", "replay"} {
+			inR, inW, err := os.Pipe()
+			require.NoError(t, err)
+			outR, outW, err := os.Pipe()
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOrganizationCreationIdempotency$", "-test.count=1")
+			cmd.Env = append(os.Environ(), "NEWAPI_ORGANIZATION_CREATE_CHILD="+mode)
+			cmd.ExtraFiles = []*os.File{inR, outW}
+			var output bytes.Buffer
+			cmd.Stdout = &output
+			cmd.Stderr = &output
+			require.NoError(t, cmd.Start())
+			inR.Close()
+			outW.Close()
+			_, err = inW.Write(raw)
+			require.NoError(t, err)
+			inW.Close()
+			var result struct {
+				Status int
+				Body   map[string]any
+			}
+			require.NoError(t, common.DecodeJson(outR, &result))
+			outR.Close()
+			err = cmd.Wait()
+			cancel()
+			require.NoError(t, err, output.String())
+			if mode == "commit" {
+				require.Equal(t, 201, result.Status)
+				require.Nil(t, result.Body)
+			} else {
+				require.Equal(t, 200, result.Status, result.Body)
+				var row model.OrganizationCreationRequest
+				require.NoError(t, c.db.First(&row).Error)
+				assert.Equal(t, strconv.FormatInt(row.OrganizationID, 10), result.Body["data"].(map[string]any)["organization_id"])
+				assert.Equal(t, strconv.FormatInt(row.EventID, 10), result.Body["data"].(map[string]any)["event_id"])
+			}
+		}
+		after := organizationNamesSnapshot(t, c)
+		assert.Len(t, after.Organizations, len(before.Organizations)+1)
+		assert.Len(t, after.Events, len(before.Events)+1)
+	})
+}
+
+func organizationCreationProcess(t *testing.T, mode string) {
+	require.Contains(t, []string{"commit", "replay"}, mode)
+	input, output := os.NewFile(3, "owned-input"), os.NewFile(4, "owned-output")
+	defer input.Close()
+	defer output.Close()
+	var config organizationBudgetProcessInput
+	require.NoError(t, common.DecodeJson(io.LimitReader(input, 65536), &config))
+	var dialector gorm.Dialector
+	switch config.Kind {
+	case "sqlite":
+		root, err := filepath.EvalSymlinks(config.SQLiteRoot)
+		require.NoError(t, err)
+		path, err := filepath.EvalSymlinks(config.DSN)
+		require.NoError(t, err)
+		require.Equal(t, root, filepath.Dir(path))
+		require.Equal(t, "organization.db", filepath.Base(path))
+		dialector = sqlite.Open(path + "?_pragma=busy_timeout(10000)&_txlock=immediate")
+	case "mysql", "postgres":
+		require.NoError(t, organizationFixtureDSN(config.Kind, config.DSN, config.Port))
+		require.Contains(t, config.DSN, "/newapi_s2_")
+		if config.Kind == "mysql" {
+			dialector = mysql.Open(config.DSN)
+		} else {
+			dialector = postgres.Open(config.DSN)
+		}
+	default:
+		t.Fatal("unsupported owned database")
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, err)
+	conn, err := db.DB()
+	require.NoError(t, err)
+	defer conn.Close()
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(common.DatabaseType(config.Kind), common.DatabaseType(config.Kind))
+	common.RedisEnabled, common.MemoryCacheEnabled, common.IsMasterNode, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = false, false, false, false, false
+	common.SessionSecret = config.SessionSecret
+	require.NoError(t, i18n.Init())
+	require.NoError(t, authz.Init(db))
+	gin.DefaultWriter, gin.DefaultErrorWriter = io.Discard, io.Discard
+	engine := gin.New()
+	SetRouter(engine, WebAssets{IndexPage: []byte("idempotency-child")})
+	server := httptest.NewServer(engine)
+	defer server.Close()
+	req, err := http.NewRequest("POST", server.URL+"/api/organizations", strings.NewReader(`{"name":"survives restart"}`))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+config.Bearer)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "process-restart")
+	response, err := server.Client().Do(req)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	var body map[string]any
+	if mode == "replay" {
+		require.NoError(t, common.DecodeJson(response.Body, &body))
+	} else {
+		_, err = io.Copy(io.Discard, response.Body)
+		require.NoError(t, err)
+	}
+	raw, err := common.Marshal(struct {
+		Status int
+		Body   map[string]any
+	}{response.StatusCode, body})
+	require.NoError(t, err)
+	_, err = output.Write(raw)
+	require.NoError(t, err)
 }

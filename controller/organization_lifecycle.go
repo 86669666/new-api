@@ -55,6 +55,8 @@ func writeOrganizationLifecycleError(c *gin.Context, err error) {
 		status, code, message = 409, "ORG_CREATED_LIMIT_REACHED", model.ErrOrganizationCreatedLimit.Error()
 	case errors.Is(err, model.ErrOrganizationJoinedLimit):
 		status, code, message = 409, "ORG_JOINED_LIMIT_REACHED", model.ErrOrganizationJoinedLimit.Error()
+	case errors.Is(err, model.ErrOrganizationIdempotencyConflict):
+		status, code, message = 409, "ORG_IDEMPOTENCY_CONFLICT", model.ErrOrganizationIdempotencyConflict.Error()
 	case errors.Is(err, model.ErrOrganizationNameTaken):
 		status, code, message = 409, "ORG_NAME_TAKEN", "Organization name is already in use."
 	case errors.Is(err, model.ErrOrganizationAlreadyMember):
@@ -117,7 +119,7 @@ func organizationRequest(c *gin.Context, allowProof, paged bool, bodyLimit int64
 	c.Header("Cache-Control", "private, no-store")
 	page := model.OrganizationPage{Limit: 20}
 	var identity service.AuthIdentity
-	for _, name := range []string{"Authorization", "X-Security-Proof", "Origin", "Referer", "Content-Type", "X-Organization-Id", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"} {
+	for _, name := range []string{"Authorization", "Idempotency-Key", "X-Security-Proof", "Origin", "Referer", "Content-Type", "X-Organization-Id", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"} {
 		count := 0
 		for key, values := range c.Request.Header {
 			if strings.EqualFold(key, name) {
@@ -128,8 +130,13 @@ func organizationRequest(c *gin.Context, allowProof, paged bool, bodyLimit int64
 			return identity, nil, page, model.ErrOrganizationInvalidInput
 		}
 	}
-	for key := range c.Request.Header {
-		if strings.EqualFold(key, "Idempotency-Key") || strings.EqualFold(key, "X-HTTP-Method-Override") || strings.EqualFold(key, "X-Method-Override") || strings.EqualFold(key, "X-HTTP-Method") || !allowProof && strings.EqualFold(key, "X-Security-Proof") {
+	for key, values := range c.Request.Header {
+		if strings.EqualFold(key, "Idempotency-Key") {
+			if c.Request.Method != http.MethodPost || c.FullPath() != "/api/organizations" || len(values) != 1 || model.ValidateOrganizationCreationKey(values[0]) != nil {
+				return identity, nil, page, model.ErrOrganizationInvalidInput
+			}
+		}
+		if strings.EqualFold(key, "X-HTTP-Method-Override") || strings.EqualFold(key, "X-Method-Override") || strings.EqualFold(key, "X-HTTP-Method") || !allowProof && strings.EqualFold(key, "X-Security-Proof") {
 			return identity, nil, page, model.ErrOrganizationInvalidInput
 		}
 	}
@@ -240,7 +247,12 @@ func OrganizationLifecycleHandler(action string) gin.HandlerFunc {
 			writeOrganizationLifecycleError(c, model.ErrOrganizationInvalidInput)
 			return
 		}
-		receipt, err := service.ExecuteOrganizationLifecycleWithContext(c.Request.Context(), identity, action, wire, cmd, c.GetHeader("X-Security-Proof"))
+		var receipt *model.OrganizationMutationReceipt
+		if action == "create" && c.GetHeader("Idempotency-Key") != "" {
+			receipt, err = service.CreateOrganizationWithKeyWithContext(c.Request.Context(), identity, cmd.Name, c.GetHeader("Idempotency-Key"))
+		} else {
+			receipt, err = service.ExecuteOrganizationLifecycleWithContext(c.Request.Context(), identity, action, wire, cmd, c.GetHeader("X-Security-Proof"))
+		}
 		if err != nil {
 			writeOrganizationLifecycleError(c, err)
 			return
@@ -265,10 +277,13 @@ func OrganizationLifecycleHandler(action string) gin.HandlerFunc {
 		}
 		result := gin.H{"organization_id": strconv.FormatInt(receipt.OrganizationID, 10), "revision": strconv.FormatInt(receipt.Revision, 10), "action": strings.Replace(receipt.Action, "invite_", "invitation_", 1), "event_id": strconv.FormatInt(receipt.EventID, 10), "object_kind": receipt.ObjectKind, "object_id": strconv.FormatInt(receipt.ObjectID, 10), "generation": generation, "status": status}
 		code := 200
-		if action == "create" {
+		if action == "create" && !receipt.Replayed {
 			code = 201
 		}
 		c.JSON(code, gin.H{"success": true, "message": "", "data": result})
+		if receipt.Replayed {
+			return
+		}
 		// Nil sink context prevents automatic request metadata/free-text capture.
 		model.RecordAuditLog(nil, model.AuditLog{UserId: identity.UserID, Category: model.AuditCategorySecurity, ActorRole: c.GetInt("role"), Action: "organization." + action, AuthMethod: "session", Method: c.Request.Method, Route: c.FullPath(), Status: code, Success: true, Other: model.AuditOther{Op: &model.AuditOperation{Action: action, Params: model.AuditFields{"org_id": strconv.FormatInt(receipt.OrganizationID, 10), "event_id": strconv.FormatInt(receipt.EventID, 10)}}}})
 	}

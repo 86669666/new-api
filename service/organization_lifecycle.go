@@ -703,3 +703,9 @@ func ExecuteOrganizationLifecycleWithContext(ctx context.Context, identity AuthI
 
 var ErrOrganizationProofRequired = errors.New("Security proof is required.")
 var ErrOrganizationEmailInviteUnsupported = errors.New("Email invitations are not supported. Use a user ID or username.")
+
+// CreateOrganizationWithKeyWithContext is deliberately separate from the proof
+// and command contracts used by all other lifecycle operations.
+func CreateOrganizationWithKeyWithContext(ctx context.Context, identity AuthIdentity, name, key string) (*model.OrganizationMutationReceipt, error) {
+	return model.CreateOrganizationWithKey(ctx, identity, name, key)
+}

@@ -251,7 +251,7 @@ func OrganizationSelectionBoundary() gin.HandlerFunc {
 				}
 			}
 			for key := range c.Request.Header {
-				if strings.EqualFold(key, "Idempotency-Key") || strings.EqualFold(key, "X-HTTP-Method-Override") || strings.EqualFold(key, "X-Method-Override") || strings.EqualFold(key, "X-HTTP-Method") {
+				if strings.EqualFold(key, "Idempotency-Key") && !(c.Request.Method == http.MethodPost && c.FullPath() == "/api/organizations") || strings.EqualFold(key, "X-HTTP-Method-Override") || strings.EqualFold(key, "X-Method-Override") || strings.EqualFold(key, "X-HTTP-Method") {
 					invalid = true
 				}
 			}

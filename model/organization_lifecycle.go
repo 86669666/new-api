@@ -197,12 +197,19 @@ func validateOrganizationCommand(action string, c OrganizationCommand) error {
 }
 
 func CreateOrganization(identity AuthSessionIdentity, name string) (*Organization, error) {
-	return createOrganizationWithReceipt(context.Background(), identity, name, nil)
+	return createOrganizationWithReceipt(context.Background(), identity, name, nil, "")
 }
-func createOrganizationWithReceipt(ctx context.Context, identity AuthSessionIdentity, name string, receipt *OrganizationMutationReceipt) (*Organization, error) {
+func createOrganizationWithReceipt(ctx context.Context, identity AuthSessionIdentity, name string, receipt *OrganizationMutationReceipt, key string) (*Organization, error) {
 	name, err := organizationName(name)
 	if err != nil {
 		return nil, err
+	}
+	var request *OrganizationCreationRequest
+	if key != "" {
+		request, err = newOrganizationCreationRequest(identity.UserID, name, key)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var org Organization
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -214,6 +221,24 @@ func createOrganizationWithReceipt(ctx context.Context, identity AuthSessionIden
 		now := organizationNow().Unix()
 		if _, err := validateOrganizationIdentity(tx, identity, now); err != nil {
 			return err
+		}
+		if request != nil {
+			var previous OrganizationCreationRequest
+			err := tx.Where("user_id = ? AND key_hash = ?", identity.UserID, request.KeyHash).First(&previous).Error
+			if err == nil {
+				if previous.RequestHash != request.RequestHash {
+					return ErrOrganizationIdempotencyConflict
+				}
+				replay, err := replayOrganizationCreation(tx, identity, &previous, receipt)
+				if err != nil {
+					return err
+				}
+				org = *replay
+				return nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
 		}
 		if err := requireOrganizationNameAvailable(tx, identity.UserID, 0, name); err != nil {
 			return err
@@ -233,7 +258,16 @@ func createOrganizationWithReceipt(ctx context.Context, identity AuthSessionIden
 			return err
 		}
 		s := organizationState{tx: tx, identity: identity, org: org, now: now, execution: &organizationExecution{action: "create", receipt: receipt}}
-		return s.event("organization.created", identity.UserID, "organization", org.ID, 0, "", "active", "", "", 0)
+		if err := s.event("organization.created", identity.UserID, "organization", org.ID, 0, "", "active", "", "", 0); err != nil {
+			return err
+		}
+		if request != nil {
+			request.OrganizationID, request.EventID, request.CreatedAt = org.ID, receipt.EventID, now
+			// Any insert/unique failure aborts the entire transaction. Never
+			// attempt a read-back inside an aborted PostgreSQL transaction.
+			return tx.Create(request).Error
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -929,6 +963,7 @@ func resolveOrganizationTransfer(i AuthSessionIdentity, c OrganizationCommand, s
 // OrganizationMutationReceipt is captured alongside the primary event, never
 // reconstructed from a later query or an independently visible organization.
 type OrganizationMutationReceipt struct {
+	Replayed       bool // Internal only: replay is not a new mutation or creation audit.
 	OrganizationID int64
 	Revision       int64
 	Action         string
@@ -979,7 +1014,7 @@ func organizationPrimaryEvent(action string) string {
 func executeOrganizationCommand(i AuthSessionIdentity, c OrganizationCommand, op *organizationExecution) error {
 	switch op.action {
 	case "create":
-		_, err := createOrganizationWithReceipt(op.ctx, i, c.Name, op.receipt)
+		_, err := createOrganizationWithReceipt(op.ctx, i, c.Name, op.receipt, "")
 		return err
 	case "rename", "self_disable", "platform_disable", "dissolve", "change_role", "remove", "leave":
 		return mutateOrganization(i, c, op.action, op)
