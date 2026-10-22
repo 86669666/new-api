@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/service"
@@ -74,13 +75,26 @@ func GetOAuthUserInfoAccess(c *gin.Context) (*service.OAuthUserInfoAccess, bool)
 }
 
 func WriteOAuthResourceError(c *gin.Context, err error) {
+	writeOAuthResourceError(c, err, "profile")
+}
+
+func WriteOAuthResourceScopeError(c *gin.Context, err error, scope string) {
+	writeOAuthResourceError(c, err, scope)
+}
+
+func writeOAuthResourceError(c *gin.Context, err error, scope string) {
 	status, code := http.StatusServiceUnavailable, "temporarily_unavailable"
 	if errors.Is(err, service.ErrOAuthInvalidToken) {
 		status, code = http.StatusUnauthorized, "invalid_token"
 		c.Header("WWW-Authenticate", `Bearer error="invalid_token"`)
+	} else if errors.Is(err, service.ErrOAuthResourceRequest) {
+		status, code = http.StatusBadRequest, "invalid_request"
 	} else if errors.Is(err, service.ErrOAuthInsufficientScope) {
 		status, code = http.StatusForbidden, "insufficient_scope"
-		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope", scope="profile"`)
+		if !slices.Contains([]string{"profile", "email", "balance:read", "usage:read", "tokens:read", "tokens:write"}, scope) {
+			scope = "profile"
+		}
+		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+scope+`"`)
 	}
 	c.Header("Cache-Control", "private, no-store")
 	c.AbortWithStatusJSON(status, gin.H{"error": code})

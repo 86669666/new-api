@@ -64,6 +64,10 @@ func AuthLogout(c *gin.Context) {
 				writeAuthSessionError(c, err)
 				return
 			}
+			if err := model.DisableOAuthIssuedTokensForUser(identity.UserID); err != nil {
+				writeAuthSessionError(c, err)
+				return
+			}
 			cookieCleared := false
 			if cookieErr == nil && hasCookieSID && cookieSID == identity.SessionID {
 				if err := service.RevokeByRefreshToken(rawRefreshToken, identity.SessionID, "logout"); err != nil {
@@ -89,6 +93,14 @@ func AuthLogout(c *gin.Context) {
 	if err := service.RevokeByRefreshToken(rawRefreshToken, expectedSID, "logout"); err != nil {
 		writeAuthSessionError(c, err)
 		return
+	}
+	if sid, ok := service.RefreshTokenSID(rawRefreshToken); ok {
+		if session, err := model.GetUserSessionBySID(sid); err == nil {
+			if err := model.DisableOAuthIssuedTokensForUser(session.UserID); err != nil {
+				writeAuthSessionError(c, err)
+				return
+			}
+		}
 	}
 	service.ClearRefreshCookie(c)
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})

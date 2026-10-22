@@ -27,26 +27,36 @@ var (
 	ErrOAuthInvalidToken          = errors.New("invalid_token")
 	ErrOAuthInsufficientScope     = errors.New("insufficient_scope")
 	ErrOAuthResourceUnavailable   = errors.New("temporarily_unavailable")
+	ErrOAuthResourceRequest       = errors.New("invalid_request")
 	currentOAuthUserInfo          atomic.Pointer[OAuthUserInfoResource]
 )
+
+// oauthResourceScopes are checked on resource routes. They are not added to
+// the public authorization client, whose catalog stays openid, profile, email,
+// and offline_access.
+var oauthResourceScopes = []string{"profile", "email", "balance:read", "usage:read", "tokens:read", "tokens:write"}
 
 // OAuthUserInfoConfig is startup-only resource-server configuration. It does not
 // enable an authorization server, login flow, consent or token issuance.
 type OAuthUserInfoConfig struct {
-	Enabled          bool
-	IntrospectionURL string
-	Issuer           string
-	Audience         string
-	ClientIDs        []string
+	Enabled               bool
+	IntrospectionURL      string
+	Issuer                string
+	Audience              string
+	ClientIDs             []string
+	IssuedTokenQuota      int
+	IssuedTokenExpireDays int
 }
 
 type OAuthUserInfoResource struct {
-	endpoint       string
-	issuer         string
-	audience       string
-	clients        []string
-	client         *http.Client
-	grantsRequired bool
+	endpoint         string
+	issuer           string
+	audience         string
+	clients          []string
+	client           *http.Client
+	grantsRequired   bool
+	issuedQuota      int
+	issuedExpireDays int
 }
 
 // OAuthResourceIdentity is deliberately separate from AuthIdentity. It cannot
@@ -86,11 +96,19 @@ func InitOAuthUserInfoResource() error {
 	if enabled != "" && enabled != "false" && enabled != "true" {
 		return ErrOAuthResourceConfiguration
 	}
-	resource, err := NewOAuthUserInfoResource(OAuthUserInfoConfig{
+	config := OAuthUserInfoConfig{
 		Enabled: enabled == "true", IntrospectionURL: os.Getenv("OAUTH_USERINFO_INTROSPECTION_URL"),
 		Issuer: os.Getenv("OAUTH_USERINFO_ISSUER"), Audience: os.Getenv("OAUTH_USERINFO_AUDIENCE"),
 		ClientIDs: strings.Split(os.Getenv("OAUTH_USERINFO_CLIENT_IDS"), ","),
-	}, nil)
+	}
+	if config.Enabled {
+		quota, days, policyErr := oauthIssuedTokenPolicy()
+		if policyErr != nil {
+			return policyErr
+		}
+		config.IssuedTokenQuota, config.IssuedTokenExpireDays = quota, days
+	}
+	resource, err := NewOAuthUserInfoResource(config, nil)
 	if err != nil {
 		return ErrOAuthResourceConfiguration
 	}
@@ -120,6 +138,13 @@ func NewOAuthUserInfoResource(config OAuthUserInfoConfig, roots *x509.CertPool) 
 				return nil, ErrOAuthResourceConfiguration
 			}
 		}
+	}
+	if config.IssuedTokenQuota < 0 || config.IssuedTokenExpireDays < 0 || config.IssuedTokenExpireDays > 3650 {
+		return nil, ErrOAuthResourceConfiguration
+	}
+	expireDays := config.IssuedTokenExpireDays
+	if expireDays == 0 {
+		expireDays = 30
 	}
 	if config.Audience == "" || len(config.ClientIDs) == 0 {
 		return nil, ErrOAuthResourceConfiguration
@@ -151,10 +176,42 @@ func NewOAuthUserInfoResource(config OAuthUserInfoConfig, roots *x509.CertPool) 
 	}
 	return &OAuthUserInfoResource{
 		endpoint: config.IntrospectionURL, issuer: config.Issuer, audience: config.Audience, clients: clients,
+		issuedQuota: config.IssuedTokenQuota, issuedExpireDays: expireDays,
 		client: &http.Client{Transport: transport, Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		}},
 	}, nil
+}
+
+func oauthIssuedTokenPolicy() (int, int, error) {
+	quotaText := os.Getenv("OAUTH_ISSUED_TOKEN_QUOTA")
+	if quotaText == "" {
+		quotaText = "0"
+	}
+	daysText := os.Getenv("OAUTH_ISSUED_TOKEN_EXPIRE_DAYS")
+	if daysText == "" {
+		daysText = "30"
+	}
+	quota, err := strconv.Atoi(quotaText)
+	days, daysErr := strconv.Atoi(daysText)
+	if err != nil || daysErr != nil || quota < 0 || days < 1 || days > 3650 {
+		return 0, 0, ErrOAuthResourceConfiguration
+	}
+	return quota, days, nil
+}
+
+func (r *OAuthUserInfoResource) IssuedTokenQuota() int {
+	if r == nil {
+		return 0
+	}
+	return r.issuedQuota
+}
+
+func (r *OAuthUserInfoResource) IssuedTokenExpireDays() int {
+	if r == nil || r.issuedExpireDays < 1 {
+		return 30
+	}
+	return r.issuedExpireDays
 }
 
 func (r *OAuthUserInfoResource) CloseIdleConnections() {
@@ -169,6 +226,39 @@ func (r *OAuthUserInfoResource) Authorize(ctx context.Context, credential string
 		return nil, err
 	}
 	return &OAuthUserInfoAccess{resource: r, credential: credential, identity: identity}, nil
+}
+
+// RequireFresh repeats introspection and the local user check, then requires
+// the exact resource scope. It does not use a positive cache.
+func (a *OAuthUserInfoAccess) RequireFresh(ctx context.Context, scope string) (int, string, error) {
+	if a == nil || a.resource == nil || a.credential == "" {
+		return 0, "", ErrOAuthInvalidToken
+	}
+	identity, _, err := a.resource.readCurrentIdentity(ctx, a.credential)
+	if err != nil {
+		return 0, "", err
+	}
+	if identity.userID != a.identity.userID || identity.clientID != a.identity.clientID || identity.authVersion != a.identity.authVersion || identity.grantID != a.identity.grantID || identity.grantExpiresAt != a.identity.grantExpiresAt {
+		return 0, "", ErrOAuthInvalidToken
+	}
+	if err := identity.Require(scope); err != nil {
+		return 0, "", err
+	}
+	return identity.userID, identity.clientID, nil
+}
+
+func (a *OAuthUserInfoAccess) IssuedTokenQuota() int {
+	if a == nil || a.resource == nil {
+		return 0
+	}
+	return a.resource.IssuedTokenQuota()
+}
+
+func (a *OAuthUserInfoAccess) IssuedTokenExpireDays() int {
+	if a == nil || a.resource == nil {
+		return 30
+	}
+	return a.resource.IssuedTokenExpireDays()
 }
 
 // Read performs the final uncached issuer and local-state checks. The returned
@@ -329,4 +419,11 @@ func (r *OAuthUserInfoResource) introspectPurpose(ctx context.Context, credentia
 		}
 	}
 	return OAuthResourceIdentity{userID: int(id), authVersion: authVersion, issuer: issuer, clientID: clientID, expiresAt: expires, notBefore: notBefore, email: scopes["email"], scopes: strings.Split(scope, " "), grantID: grantID, grantExpiresAt: grantExpires}, nil
+}
+
+func (id OAuthResourceIdentity) Require(scope string) error {
+	if scope == "" || !slices.Contains(oauthResourceScopes, scope) || !slices.Contains(id.scopes, scope) {
+		return ErrOAuthInsufficientScope
+	}
+	return nil
 }
