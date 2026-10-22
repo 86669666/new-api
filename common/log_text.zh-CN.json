@@ -851,5 +851,8 @@
   "zhipu_image_get_b64_failed: %s": "智谱图片转 b64 失败: %s",
   "zhipu_image_missing_url": "智谱图片接口没有返回 URL",
   "¥%.6f quota": "¥%.6f 额度",
-  "＄%.6f quota": "＄%.6f 额度"
+  "＄%.6f quota": "＄%.6f 额度",
+  "OAuth cleanup task result could not be persisted": "无法持久化 OAuth 清理任务结果",
+  "OAuth cleanup deferred: event=%s state=%s attempt=%d": "OAuth 清理已延后：事件=%s 状态=%s 尝试=%d",
+  "OAuth uncertain operation could not be reconciled": "无法记录 OAuth 未确定操作的清理状态"
 }

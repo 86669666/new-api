@@ -722,6 +722,80 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		c.t = t
 	})
 
+	for _, scope := range []string{"grant", "client", "sid", "others", "user"} {
+		t.Run("durable_cleanup_"+scope, func(t *testing.T) {
+			c.t = t
+			c.clientID = "newapi-w01-desktop"
+			a := c.grant("openid profile offline_access")
+			status, rotated := c.refresh(a)
+			require.Equal(t, 200, status)
+			b := c.grant("openid profile offline_access")
+			c.clientID = "newapi-w01-independent"
+			otherClient := c.grant("openid profile offline_access")
+			c.clientID = "newapi-w01-desktop"
+			originalSID, originalBearer := f.sids["owner"], f.bearer["owner"]
+			var source model.UserSession
+			require.NoError(t, f.db.Where("sid = ?", originalSID).First(&source).Error)
+			source.SID = "g3-other-" + scope
+			require.NoError(t, model.CreateUserSession(&source))
+			bearer, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: source.UserID, SessionID: source.SID, UserAuthVersion: 1, SessionVersion: 1})
+			require.NoError(t, err)
+			f.sids["owner"], f.bearer["owner"] = source.SID, bearer
+			otherSID := c.grant("openid profile offline_access")
+			f.sids["owner"], f.bearer["owner"] = originalSID, originalBearer
+			_, origin, err := model.FindOAuthArtifact(t.Context(), input.Issuer, "access_token", rotated.Access)
+			require.NoError(t, err)
+			value := ""
+			switch scope {
+			case "grant":
+				value = origin.GrantRef
+			case "client":
+				value = "newapi-w01-desktop"
+			case "sid", "others":
+				value = originalSID
+			}
+			require.NoError(t, model.RevokeOAuth(t.Context(), source.UserID, scope, value))
+			for _, tc := range []struct {
+				token   oauthHydraGrant
+				revoked bool
+			}{
+				{rotated, scope != "others"},
+				{b, scope == "client" || scope == "sid" || scope == "user"},
+				{otherClient, scope == "sid" || scope == "user"},
+				{otherSID, scope == "client" || scope == "others" || scope == "user"},
+			} {
+				want := 200
+				if tc.revoked {
+					want = 401
+				}
+				assert.Equal(t, want, c.userinfo(tc.token.Access), "local denial precedes remote cleanup")
+			}
+			for range 5 {
+				processed, err := service.RunOAuthCleanup(t.Context(), service.CurrentOAuthProviderBridge(), "g3-real-worker")
+				require.NoError(t, err)
+				if processed == 0 {
+					break
+				}
+			}
+			for _, tc := range []struct {
+				token   oauthHydraGrant
+				revoked bool
+			}{
+				{rotated, scope != "others"},
+				{b, scope == "client" || scope == "sid" || scope == "user"},
+				{otherClient, scope == "sid" || scope == "user"},
+				{otherSID, scope == "client" || scope == "others" || scope == "user"},
+			} {
+				assert.Equal(t, !tc.revoked, c.active(tc.token.Access), "issuer access state follows exact cleanup scope")
+				assert.Equal(t, !tc.revoked, c.active(tc.token.Refresh), "issuer refresh state follows exact cleanup scope")
+			}
+			if scope != "others" {
+				assert.False(t, c.active(a.Access))
+				assert.False(t, c.active(a.Refresh))
+			}
+		})
+	}
+
 	t.Run("approval_binding_and_unknown_accept", func(t *testing.T) {
 		for _, tc := range []struct {
 			name     string
@@ -744,7 +818,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 				require.NoError(t, common.Unmarshal(data, &preview))
 				c.secrets = append(c.secrets, challenge, preview.PreviewToken)
 				var before int64
-				require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("state = ?", "prepared").Count(&before).Error)
+				require.NoError(t, f.db.Model(&model.OAuthGrant{}).Count(&before).Error)
 				consentFault.Store(tc.fault)
 				body, err = common.Marshal(service.OAuthProviderDecision{Challenge: challenge, PreviewToken: preview.PreviewToken, Decision: "approve", SelectedScopes: []string{"profile"}})
 				require.NoError(t, err)
@@ -753,9 +827,12 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 				consentFault.Store(0)
 				require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).UpdateColumn("revoked_at", 0).Error)
 				var after int64
-				require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("state = ?", "prepared").Count(&after).Error)
+				require.NoError(t, f.db.Model(&model.OAuthGrant{}).Count(&after).Error)
 				if tc.prepared {
 					assert.Equal(t, before+1, after)
+					var revoked int64
+					require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("state = ? AND revoked_reason = ?", "revoked", "issuer_unknown").Count(&revoked).Error)
+					assert.Positive(t, revoked)
 					puts := consentPuts.Load()
 					status, _, _ = c.request("POST", input.Issuer+"api/oauth/provider/consent", "application/json", string(body), f.bearer["owner"])
 					assert.NotEqual(t, 200, status)
@@ -794,6 +871,68 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 			assert.Equal(t, 200, status)
 		})
 	}
+	t.Run("unknown_hold_and_issuer_late_insert_constraint", func(t *testing.T) {
+		c.t = t
+		source := os.Getenv("NEWAPI_W01_HYDRA_FAULT_DSN")
+		require.NotEmpty(t, source, "owned real Hydra storage required")
+		parsed, err := url.Parse(source)
+		require.NoError(t, err)
+		require.Equal(t, "127.0.0.1", parsed.Hostname())
+		require.Equal(t, "/hydra_w01", parsed.Path)
+		database, err := gorm.Open(postgres.New(postgres.Config{DSN: source, PreferSimpleProtocol: true}), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+		require.NoError(t, err)
+		pool, err := database.DB()
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, pool.Close()) })
+		token := c.grant("openid profile offline_access")
+		_, origin, err := model.FindOAuthArtifact(t.Context(), input.Issuer, "access_token", token.Access)
+		require.NoError(t, err)
+		var grant model.OAuthGrant
+		require.NoError(t, f.db.Where("grant_ref = ?", origin.GrantRef).First(&grant).Error)
+		op := &model.OAuthOperation{Issuer: grant.Issuer, UserID: grant.UserID, ClientID: grant.ClientID, OriginSID: grant.OriginSID, GrantRef: grant.GrantRef, AuthVersion: 1, SessionVersion: 1, Kind: "refresh_token_exchange"}
+		require.NoError(t, model.ReserveOAuthOperation(t.Context(), op))
+		require.NoError(t, model.SendOAuthOperation(t.Context(), op))
+		require.NoError(t, model.RevokeOAuth(t.Context(), grant.UserID, "grant", grant.GrantRef))
+		_, err = service.RunOAuthCleanup(t.Context(), service.CurrentOAuthProviderBridge(), "unknown-worker")
+		require.NoError(t, err)
+		var job model.OAuthCleanupJob
+		require.NoError(t, f.db.Where("value = ? AND scope = ?", grant.GrantRef, "grant").First(&job).Error)
+		require.Equal(t, "blocked", job.State)
+		require.True(t, c.active(token.Access), "unknown hold must not delete the issuer flow")
+		// Inject the precise storage interleaving into an owned Hydra database:
+		// a request's already-produced token row arrives after flow deletion.
+		// Observe actual FK behavior rather than presuming that the insert succeeds.
+		// This does not prove every issuer operation has terminated.
+		for _, kind := range []string{"access", "refresh"} {
+			table := "newapi_cherry_w01_late_" + kind
+			require.NoError(t, database.Exec("CREATE TABLE "+table+" AS SELECT * FROM hydra_oauth2_"+kind+" WHERE request_id = ?", grant.ConsentRequestID).Error)
+			t.Cleanup(func() { require.NoError(t, database.Exec("DROP TABLE "+table).Error) })
+			var count int64
+			require.NoError(t, database.Table(table).Count(&count).Error)
+			require.Positive(t, count)
+		}
+		endpoint := input.Admin + "/admin/oauth2/auth/sessions/consent?" + url.Values{"consent_request_id": {grant.ConsentRequestID}}.Encode()
+		status, _, _ := c.request(http.MethodDelete, endpoint, "", "", "")
+		require.Equal(t, 204, status)
+		require.False(t, c.active(token.Access))
+		for _, kind := range []string{"access", "refresh"} {
+			err := database.Exec("INSERT INTO hydra_oauth2_" + kind + " SELECT * FROM newapi_cherry_w01_late_" + kind).Error
+			require.Error(t, err, "pinned Hydra PostgreSQL schema rejects the late insert")
+			assert.Contains(t, err.Error(), "23503")
+		}
+		status, _, _ = c.request(http.MethodDelete, endpoint, "", "", "")
+		require.Equal(t, 204, status)
+		assert.False(t, c.active(token.Access))
+		assert.False(t, c.active(token.Refresh))
+		t.Log("Hydra26.2/PostgreSQL foreign keys reject late access/refresh INSERT after flow deletion; this bounded storage result does not establish a general unknown-operation recovery protocol")
+		require.NoError(t, f.db.Model(&job).Update("next_attempt_at", time.Now().Unix()).Error)
+		_, err = service.RunOAuthCleanup(t.Context(), service.CurrentOAuthProviderBridge(), "replacement-worker")
+		require.NoError(t, err)
+		require.NoError(t, f.db.First(&job, "job_ref = ?", job.JobRef).Error)
+		assert.Equal(t, "blocked", job.State)
+		assert.Equal(t, 401, c.userinfo(token.Access), "local revocation never republishes a late issuer credential")
+	})
+
 }
 
 // Reuse signed-session fixtures, but keep external databases in this suite's
@@ -1531,8 +1670,10 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 						db := f.db.Session(&gorm.Session{NewDB: true}).WithContext(context.Background())
 						db.Statement.ConnPool = &oauthCommitDelayPool{DB: sqlDB}
 						model.DB = db
+						require.NoError(t, model.InitOAuthCleanupStore(true))
 						_, err := model.AuthorizeOAuthGrant(context.Background(), model.OAuthGrantAuthorization{Issuer: issuer, GrantID: grant.GrantID, ClientID: clientID, Subject: grant.Subject, UserID: grant.UserID, AuthVersion: 1, GrantExpiresAt: grantExpiry, TokenExpiresAt: tokenExpiry, Scopes: []string{"profile", "balance:read"}})
 						model.DB = f.db
+						require.NoError(t, model.InitOAuthCleanupStore(true))
 						require.ErrorIs(t, err, model.ErrOAuthGrantInvalid)
 					})
 				})
@@ -1594,4 +1735,397 @@ func oauthBalanceResponseData(t *testing.T, body []byte) map[string]any {
 		require.NotEmpty(t, display)
 	}
 	return data
+}
+
+// These cases use the production transaction and operation APIs. The paused
+// send boundary is the durable reserved/sent transition, before any issuer IO.
+func TestOAuthCleanupJournal(t *testing.T) {
+	for _, scenario := range []string{"reserved", "sent", "rollback", "lease", "hard_deleted", "cookie_logout", "sid_logout", "other_sessions", "all_sessions", "auth_version"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newOrganizationHTTPFixture(t)
+			oauthPublicDatabase(t, f)
+			common.IsMasterNode = true
+			require.NoError(t, model.InitOAuthGrantStore(true))
+			common.IsMasterNode = false
+			userID := f.users["owner"].Id
+			grant := &model.OAuthGrant{GrantID: strings.Repeat("a", 43), Issuer: "https://cleanup.example/", ClientID: "desktop", Subject: strconv.Itoa(userID), UserID: userID, ConsentRequestID: "cleanup-consent", HydraLoginSessionID: "cleanup-login", OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("b", 64)}
+			require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+			op := &model.OAuthOperation{Issuer: grant.Issuer, UserID: userID, ClientID: grant.ClientID, OriginSID: grant.OriginSID, AuthVersion: 1, SessionVersion: 1, GrantRef: grant.GrantRef, Kind: "code_exchange"}
+			require.NoError(t, model.ReserveOAuthOperation(t.Context(), op))
+			if scenario == "sent" || scenario == "hard_deleted" {
+				require.NoError(t, model.SendOAuthOperation(t.Context(), op))
+				// The fresh admission gate rejects a sent row even before a crash
+				// recovery has had the opportunity to create an outbox job.
+				require.ErrorIs(t, model.ValidateOAuthOperationPublication(t.Context(), op), model.ErrOAuthCleanupHeld)
+			}
+			switch scenario {
+			case "rollback":
+				rollback := errors.New("intentional rollback")
+				err := f.db.Transaction(func(tx *gorm.DB) error {
+					if err := model.LockOAuthUser(tx, userID); err != nil {
+						return err
+					}
+					if err := model.RevokeOAuthWithTx(tx, userID, "user", "", "security_changed"); err != nil {
+						return err
+					}
+					return rollback
+				})
+				require.ErrorIs(t, err, rollback)
+				var count int64
+				require.NoError(t, f.db.Model(&model.OAuthCleanupJob{}).Count(&count).Error)
+				assert.Zero(t, count)
+				require.NoError(t, model.SendOAuthOperation(t.Context(), op))
+				return
+			case "cookie_logout":
+				var source model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", grant.OriginSID).First(&source).Error)
+				ok, err := model.RevokeUserSessionByRefreshHash(source.SID, "unrecognized", "logout")
+				require.NoError(t, err)
+				require.False(t, ok)
+				var count int64
+				require.NoError(t, f.db.Model(&model.OAuthCleanupJob{}).Count(&count).Error)
+				assert.Zero(t, count)
+				ok, err = model.RevokeUserSessionByRefreshHash(source.SID, source.RefreshHash, "logout")
+				require.NoError(t, err)
+				require.True(t, ok)
+			case "sid_logout":
+				ok, err := model.RevokeUserSession(userID, grant.OriginSID, "logout")
+				require.NoError(t, err)
+				require.True(t, ok)
+			case "other_sessions":
+				_, err := model.RevokeOtherUserSessions(userID, grant.OriginSID, "logout_others")
+				require.NoError(t, err)
+				require.NoError(t, model.SendOAuthOperation(t.Context(), op), "excluded current SID remains usable")
+				return
+			case "all_sessions":
+				_, err := model.RevokeAllUserSessions(userID, "logout_all")
+				require.NoError(t, err)
+			case "auth_version":
+				_, err := model.BumpUserAuthVersion(userID)
+				require.NoError(t, err)
+			default:
+				require.NoError(t, model.RevokeOAuth(t.Context(), userID, "grant", grant.GrantRef))
+			}
+			var jobs []model.OAuthCleanupJob
+			require.NoError(t, f.db.Find(&jobs).Error)
+			require.NotEmpty(t, jobs)
+			var revoked model.OAuthGrant
+			require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).First(&revoked).Error)
+			assert.NotZero(t, revoked.RevokedAt)
+			require.Error(t, model.SendOAuthOperation(t.Context(), op), "revocation wins after reservation")
+			job := jobs[0]
+			if scenario == "hard_deleted" {
+				// The worker must not depend on the source rows surviving. The
+				// actual HardDelete entry point is covered by the security matrix.
+				require.NoError(t, f.db.Where("user_id = ?", userID).Delete(&model.UserSession{}).Error)
+				require.NoError(t, f.db.Unscoped().Delete(&model.User{}, userID).Error)
+			}
+			now := time.Now().Unix()
+			claimed, err := model.ClaimOAuthCleanup(t.Context(), job.JobRef, "worker-a", now)
+			require.NoError(t, err)
+			if scenario == "sent" || scenario == "hard_deleted" {
+				require.Nil(t, claimed)
+				require.NoError(t, f.db.Where("job_ref = ?", job.JobRef).First(&job).Error)
+				assert.Equal(t, "blocked", job.State)
+				assert.Equal(t, "issuer_unknown", job.ErrorCode)
+				claimed, err = model.ClaimOAuthCleanup(t.Context(), job.JobRef, "worker-b", now+86400)
+				require.NoError(t, err)
+				require.Nil(t, claimed, "time cannot prove remote quiescence")
+				require.NoError(t, model.ObserveOAuthOperation(t.Context(), op, nil), "late response can be reconciled without a user")
+				require.Error(t, model.ValidateOAuthOperationPublication(t.Context(), op), "late response never republishes")
+				require.NoError(t, f.db.Model(&job).Update("next_attempt_at", now).Error)
+				claimed, err = model.ClaimOAuthCleanup(t.Context(), job.JobRef, "worker-b", now)
+				require.NoError(t, err)
+			}
+			require.NotNil(t, claimed)
+			if scenario == "lease" {
+				other, err := model.ClaimOAuthCleanup(t.Context(), job.JobRef, "worker-b", now)
+				require.NoError(t, err)
+				require.Nil(t, other)
+				require.NoError(t, f.db.Model(&job).Update("lease_until", now-1).Error)
+				other, err = model.ClaimOAuthCleanup(t.Context(), job.JobRef, "worker-b", now)
+				require.NoError(t, err)
+				require.NotNil(t, other)
+				require.ErrorIs(t, model.FinishOAuthCleanup(t.Context(), claimed, "", 0), model.ErrOAuthCleanupHeld)
+				claimed = other
+			}
+			require.NoError(t, model.FinishOAuthCleanup(t.Context(), claimed, "", 0))
+			require.Error(t, model.SendOAuthOperation(t.Context(), op), "completion cannot revive an old reservation")
+		})
+	}
+}
+
+func TestOAuthCleanupSecurityEvents(t *testing.T) {
+	for _, event := range []string{"password_change", "password_reset", "disable_enable", "soft_delete", "hard_delete", "http_sid", "http_logout", "expiry"} {
+		t.Run(event, func(t *testing.T) {
+			f := newOrganizationHTTPFixture(t)
+			oauthPublicDatabase(t, f)
+			require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Organization{}, &model.OrganizationMember{}, &model.UserAccessToken{}, &model.ExternalIdentityClaim{}, &model.TwoFABackupCode{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.Token{}, &model.UserOAuthBinding{}))
+			common.IsMasterNode = true
+			require.NoError(t, model.InitOAuthGrantStore(true))
+			common.IsMasterNode = false
+			user := *f.users["empty"]
+			sid := f.sids["empty"]
+			grant := &model.OAuthGrant{GrantID: strings.Repeat("s", 43), Issuer: "https://security.example/", ClientID: "desktop", Subject: strconv.Itoa(user.Id), UserID: user.Id, ConsentRequestID: "security-consent", HydraLoginSessionID: "security-login", OriginSID: sid, SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("b", 64)}
+			require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+			switch event {
+			case "password_change":
+				hash, err := common.HashAccountPassword("Old-password-123!")
+				require.NoError(t, err)
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", user.Id).UpdateColumn("password", hash).Error)
+				update := model.User{Password: "New-password-123!", OriginalPassword: "Old-password-123!"}
+				require.NoError(t, model.ChangeUserPassword(model.AuthSessionIdentity{UserID: user.Id, SessionID: sid, UserAuthVersion: 1, SessionVersion: 1}, &update, false))
+			case "password_reset":
+				email := fmt.Sprintf("g3-%d@example.test", user.Id)
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", user.Id).UpdateColumn("email", email).Error)
+				require.NoError(t, model.ResetUserPasswordByEmail(email, "Reset-password-123!"))
+			case "disable_enable":
+				user.Status = common.UserStatusDisabled
+				require.NoError(t, user.Update(false))
+				user.Status = common.UserStatusEnabled
+				require.NoError(t, user.Update(false))
+			case "soft_delete":
+				_, err := user.Delete()
+				require.NoError(t, err)
+			case "hard_delete":
+				_, err := user.HardDelete()
+				require.NoError(t, err)
+			case "http_sid", "http_logout":
+				method, path := http.MethodDelete, "/api/user/sessions/"+sid
+				if event == "http_logout" {
+					method, path = http.MethodPost, "/api/user/auth/logout"
+				}
+				status, _, body := f.request(t, method, path, "empty", "", nil)
+				require.Equal(t, 200, status)
+				require.Equal(t, true, body["success"])
+			case "expiry":
+				require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", sid).Updates(map[string]any{"expires_at": time.Now().Unix() - 1, "created_at": time.Now().Unix() - 86400}).Error)
+				require.NoError(t, model.DeleteExpiredUserSessions(time.Now().Unix()))
+			}
+			var current model.OAuthGrant
+			require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).First(&current).Error)
+			require.NotZero(t, current.RevokedAt)
+			var jobs []model.OAuthCleanupJob
+			require.NoError(t, f.db.Where("user_id = ?", user.Id).Find(&jobs).Error)
+			require.NotEmpty(t, jobs)
+			for _, job := range jobs {
+				assert.Equal(t, strconv.Itoa(user.Id), job.Subject)
+				assert.Contains(t, job.Targets, "security-consent")
+			}
+			if event == "hard_delete" {
+				claimed, err := model.ClaimOAuthCleanup(t.Context(), jobs[0].JobRef, "after-delete", time.Now().Unix())
+				require.NoError(t, err)
+				require.NotNil(t, claimed)
+			}
+		})
+	}
+}
+
+func TestOAuthCleanupRetry(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	oauthPublicDatabase(t, f)
+	common.IsMasterNode = true
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	common.IsMasterNode = false
+	var status atomic.Int64
+	status.Store(429)
+	var calls atomic.Int64
+	admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		assert.Equal(t, http.MethodDelete, r.Method)
+		assert.Empty(t, r.Header.Get("Authorization"))
+		assert.Empty(t, r.Header.Get("Cookie"))
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(int(status.Load()))
+	}))
+	defer admin.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(admin.Certificate())
+	resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{Enabled: true, Issuer: "https://retry.example/", IntrospectionURL: admin.URL + "/admin/oauth2/introspect", Audience: "newapi-userinfo", ClientIDs: []string{"desktop"}}, roots)
+	require.NoError(t, err)
+	bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{Enabled: true, AdminBaseURL: admin.URL, AuthorizationURL: "https://retry.example/oauth2/auth"}, resource)
+	require.NoError(t, err)
+	job := model.OAuthCleanupJob{JobRef: strings.Repeat("f", 64), Issuer: "https://retry.example/", UserID: f.users["owner"].Id, Subject: strconv.Itoa(f.users["owner"].Id), Scope: "user", Targets: "[]", State: "pending", NextAttemptAt: time.Now().Unix()}
+	require.NoError(t, f.db.Create(&job).Error)
+	for _, tc := range []struct {
+		status      int64
+		state, code string
+	}{{429, "pending", "rate_limited"}, {503, "pending", "unavailable"}, {403, "blocked", "configuration"}, {204, "complete", ""}} {
+		status.Store(tc.status)
+		require.NoError(t, f.db.Model(&job).Update("next_attempt_at", time.Now().Unix()).Error)
+		count, err := service.RunOAuthCleanup(t.Context(), bridge, "retry-worker")
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+		require.NoError(t, f.db.First(&job, "job_ref = ?", job.JobRef).Error)
+		assert.Equal(t, tc.state, job.State)
+		assert.Equal(t, tc.code, job.ErrorCode)
+		if tc.status == 429 {
+			assert.GreaterOrEqual(t, job.NextAttemptAt, time.Now().Unix()+119)
+		}
+		before := calls.Load()
+		_, err = service.RunOAuthCleanup(t.Context(), bridge, "other-worker")
+		require.NoError(t, err)
+		assert.Equal(t, before, calls.Load(), "persisted backoff/completion survives another runner")
+	}
+	job.JobRef = strings.Repeat("e", 64)
+	job.State = "pending"
+	job.NextAttemptAt = time.Now().Unix()
+	job.CompletedAt = 0
+	require.NoError(t, f.db.Create(&job).Error)
+	_, err = service.RunOAuthCleanup(t.Context(), nil, "bridge-disabled")
+	require.NoError(t, err)
+	require.NoError(t, f.db.First(&job, "job_ref = ?", job.JobRef).Error)
+	assert.Equal(t, "blocked", job.State)
+	assert.Equal(t, "configuration", job.ErrorCode, "disabled issuer never discards durable cleanup")
+}
+
+func TestOAuthCleanupFlowDeletionOrder(t *testing.T) {
+	for _, purpose := range []string{model.AuthFlowPurposeOAuthProviderPreview, model.AuthFlowPurposePasskeyRegister, model.AuthFlowPurposeSecurityProof} {
+		t.Run(purpose, func(t *testing.T) {
+			f := newOrganizationHTTPFixture(t)
+			oauthPublicDatabase(t, f)
+			require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Organization{}, &model.OrganizationMember{}, &model.UserAccessToken{}, &model.ExternalIdentityClaim{}, &model.TwoFABackupCode{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.Token{}, &model.UserOAuthBinding{}))
+			user := *f.users["empty"]
+			token, _, err := model.CreateAuthFlow(model.AuthFlowCreate{Purpose: purpose, UserId: user.Id, SessionId: f.sids["empty"], ExpiresAt: time.Now().Add(time.Minute)})
+			require.NoError(t, err)
+			locked, release := make(chan struct{}), make(chan struct{})
+			attempt := make(chan string, 1)
+			var holding atomic.Bool
+			require.NoError(t, f.db.Callback().Update().After("gorm:update").Register("g3:delete-user-held", func(tx *gorm.DB) {
+				if tx.Statement.Table == "users" && holding.CompareAndSwap(false, true) {
+					close(locked)
+					<-release
+				}
+			}))
+			t.Cleanup(func() { _ = f.db.Callback().Update().Remove("g3:delete-user-held") })
+			probe := func(tx *gorm.DB) {
+				if !holding.Load() {
+					return
+				}
+				kind := ""
+				if tx.Statement.Table == "users" {
+					kind = "user"
+				}
+				if tx.Statement.Table == "auth_flows" {
+					kind = "flow"
+				}
+				if kind != "" {
+					select {
+					case attempt <- kind:
+					default:
+					}
+				}
+			}
+			require.NoError(t, f.db.Callback().Update().Before("gorm:update").Register("g3:consume-attempt", probe))
+			require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register("g3:consume-attempt", probe))
+			t.Cleanup(func() {
+				_ = f.db.Callback().Update().Remove("g3:consume-attempt")
+				_ = f.db.Callback().Query().Remove("g3:consume-attempt")
+			})
+			deleted := make(chan error, 1)
+			go func() { _, err := user.HardDelete(); deleted <- err }()
+			select {
+			case <-locked:
+			case err := <-deleted:
+				require.NoError(t, err)
+				t.Fatal("deletion did not reach locked boundary")
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			consumed := make(chan error, 1)
+			go func() {
+				_, err := model.ConsumeAuthFlowWithActionWithContext(ctx, token, model.AuthFlowMatch{Purpose: purpose, UserId: user.Id, SessionId: f.sids["empty"]}, func(tx *gorm.DB, _ *model.AuthFlow) error {
+					return model.ValidateAuthSessionWithTx(tx, model.AuthSessionIdentity{UserID: user.Id, SessionID: f.sids["empty"], UserAuthVersion: 1, SessionVersion: 1})
+				})
+				consumed <- err
+			}()
+			select {
+			case first := <-attempt:
+				assert.Equal(t, "user", first, "consumer must wait on user before writing the flow")
+			case <-ctx.Done():
+				t.Error("consumer did not reach lock boundary")
+			}
+			close(release)
+			require.NoError(t, <-deleted)
+			require.ErrorIs(t, <-consumed, model.ErrAuthFlowInvalid, "hard deletion wins without a lock cycle")
+		})
+	}
+}
+
+func TestOAuthCleanupFailureFences(t *testing.T) {
+	for _, fault := range []string{"outbox_write", "redis_fence", "bulk_interruption", "orphan_sent"} {
+		t.Run(fault, func(t *testing.T) {
+			f := newOrganizationHTTPFixture(t)
+			oauthPublicDatabase(t, f)
+			common.IsMasterNode = true
+			require.NoError(t, model.InitOAuthGrantStore(true))
+			common.IsMasterNode = false
+			userID, sid := f.users["empty"].Id, f.sids["empty"]
+			grant := &model.OAuthGrant{GrantID: strings.Repeat("x", 43), Issuer: "https://failure.example/", ClientID: "desktop", Subject: strconv.Itoa(userID), UserID: userID, ConsentRequestID: "failure-consent", HydraLoginSessionID: "failure-login", OriginSID: sid, SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("b", 64)}
+			require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+			switch fault {
+			case "outbox_write":
+				forced := errors.New("synthetic outbox failure")
+				require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register("g3:fail-outbox", func(tx *gorm.DB) {
+					if _, ok := tx.Statement.Dest.(*model.OAuthCleanupJob); ok {
+						tx.AddError(forced)
+					}
+				}))
+				t.Cleanup(func() { _ = f.db.Callback().Create().Remove("g3:fail-outbox") })
+				_, err := model.RevokeUserSession(userID, sid, "logout")
+				require.ErrorIs(t, err, forced)
+				var session model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", sid).First(&session).Error)
+				assert.Equal(t, model.UserSessionStatusActive, session.Status)
+				var current model.OAuthGrant
+				require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).First(&current).Error)
+				assert.Zero(t, current.RevokedAt)
+			case "redis_fence":
+				oldEnabled, oldClient := common.RedisEnabled, common.RDB
+				client := redis.NewClient(&redis.Options{Addr: os.Getenv("NEWAPI_W01_REDIS_ADDR")})
+				require.NoError(t, client.Close())
+				common.RedisEnabled, common.RDB = true, client
+				_, err := model.BumpUserAuthVersion(userID)
+				common.RedisEnabled, common.RDB = oldEnabled, oldClient
+				require.Error(t, err)
+				var user model.User
+				require.NoError(t, f.db.First(&user, userID).Error)
+				assert.Equal(t, int64(1), user.AuthVersion)
+				var count int64
+				require.NoError(t, f.db.Model(&model.OAuthCleanupJob{}).Count(&count).Error)
+				assert.Zero(t, count)
+			case "bulk_interruption":
+				// The starting range fence is durable even if the process stops
+				// before its first session batch. An ordinary retry finishes it.
+				require.NoError(t, model.BeginOAuthSessionRevocation(userID, ""))
+				newGrant := *grant
+				newGrant.GrantID = strings.Repeat("y", 43)
+				newGrant.ConsentRequestID = "new-consent"
+				require.ErrorIs(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, &newGrant) }), model.ErrOAuthCleanupHeld)
+				var job model.OAuthCleanupJob
+				require.NoError(t, f.db.First(&job).Error)
+				claimed, err := model.ClaimOAuthCleanup(t.Context(), job.JobRef, "after-restart", time.Now().Unix())
+				require.NoError(t, err)
+				require.Nil(t, claimed)
+				_, err = model.RevokeAllUserSessions(userID, "retry")
+				require.NoError(t, err)
+				var remaining int64
+				require.NoError(t, f.db.Model(&model.OAuthOperation{}).Where("state = ?", "local_pending").Count(&remaining).Error)
+				assert.Zero(t, remaining)
+			case "orphan_sent":
+				op := &model.OAuthOperation{Issuer: grant.Issuer, UserID: userID, ClientID: grant.ClientID, OriginSID: sid, GrantRef: grant.GrantRef, AuthVersion: 1, SessionVersion: 1, Kind: "code_exchange"}
+				require.NoError(t, model.ReserveOAuthOperation(t.Context(), op))
+				require.NoError(t, model.SendOAuthOperation(t.Context(), op))
+				require.NoError(t, f.db.Model(op).Update("created_at", time.Now().Unix()-120).Error)
+				_, err := service.RunOAuthCleanup(t.Context(), nil, "restart")
+				require.NoError(t, err)
+				var job model.OAuthCleanupJob
+				require.NoError(t, f.db.First(&job).Error)
+				assert.Equal(t, "blocked", job.State)
+				assert.Equal(t, "issuer_unknown", job.ErrorCode)
+				require.NoError(t, f.db.Where("operation_ref = ?", op.OperationRef).First(op).Error)
+				assert.Equal(t, "unknown", op.State)
+			}
+		})
+	}
 }

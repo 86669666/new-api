@@ -96,12 +96,18 @@ func InitOAuthGrantStore(enabled bool) error {
 	if !grantUnique || !consentUnique {
 		return errors.New("OAuth grant uniqueness unavailable")
 	}
-	return nil
+	return InitOAuthCleanupStore(true)
 }
 
 // CreateOAuthGrantWithTx joins preview consumption and the issuer attempt claim.
 // The caller must never perform HTTP while this transaction remains open.
 func CreateOAuthGrantWithTx(tx *gorm.DB, grant *OAuthGrant) error {
+	if err := LockOAuthUser(tx, grant.UserID); err != nil {
+		return err
+	}
+	if err := CheckOAuthCleanupWithTx(tx, grant.Issuer, grant.UserID, grant.ClientID, grant.OriginSID, grant.GrantRef, grant.HydraLoginSessionID); err != nil {
+		return err
+	}
 	actor := AuthSessionIdentity{UserID: grant.UserID, SessionID: grant.OriginSID, SessionVersion: grant.SessionVersion, UserAuthVersion: grant.UserAuthVersion}
 	if err := ValidateAuthSessionWithTx(tx, actor); err != nil {
 		return err
@@ -157,6 +163,9 @@ func withCurrentOAuthGrant(ctx context.Context, ref string, userID int, action f
 		now := time.Now().Unix()
 		if grant.UserID != userID || grant.OriginSID != session.SID || grant.UserAuthVersion != user.AuthVersion || grant.SessionVersion != session.Version || session.UserAuthVersion != user.AuthVersion || user.Status != common.UserStatusEnabled || session.Status != UserSessionStatusActive || session.RevokedAt != 0 || session.ExpiresAt <= now || grant.ExpiresAt <= now || grant.ExpiresAt > session.ExpiresAt || grant.RevokedAt != 0 {
 			return ErrOAuthGrantInvalid
+		}
+		if err := CheckOAuthCleanupWithTx(tx, grant.Issuer, userID, grant.ClientID, grant.OriginSID, grant.GrantRef, grant.HydraLoginSessionID); err != nil {
+			return err
 		}
 		return action(tx, &user, &session, &grant)
 	})

@@ -14,7 +14,11 @@ import (
 // grant schema because it rejects tokens bearing either public grant marker.
 func InitOAuthGrantStore() error {
 	bridge := CurrentOAuthProviderBridge()
-	return model.InitOAuthGrantStore(bridge != nil && bridge.public != nil)
+	enabled := bridge != nil && bridge.public != nil
+	if model.DB != nil && model.DB.Migrator().HasTable(&model.OAuthGrant{}) {
+		enabled = true
+	}
+	return model.InitOAuthGrantStore(enabled)
 }
 
 func oauthGrantError(err error) error {

@@ -268,6 +268,13 @@ func ConsumeAuthFlowWithActionWithContext(ctx context.Context, token string, mat
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Bound flows share the user-first order with hard deletion. SQLite
+		// reserves the writer before reading; anonymous flows retain their first write.
+		if match.UserId > 0 {
+			if err := LockOAuthUser(tx, match.UserId); err != nil {
+				return err
+			}
+		}
 		// Claim with the first write, rather than upgrading a prior read lock.
 		// SQLite cannot reliably upgrade two concurrent deferred read transactions.
 		now := time.Now()

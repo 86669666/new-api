@@ -540,20 +540,28 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 		if err := writeUserSessionDenyFence(&session, UserSessionStatusRevoking, now, "refresh_reuse"); err != nil {
 			return nil, err
 		}
-		result := DB.Model(&UserSession{}).
-			Where("sid = ? AND user_id = ? AND status = ? AND revoked_at = ? AND expires_at > ?",
-				sid, userID, UserSessionStatusActive, 0, now).
-			Updates(map[string]any{
-				"status":         UserSessionStatusRevoked,
-				"revoked_at":     now,
-				"revoked_reason": "refresh_reuse",
-			})
-		if result.Error != nil {
-			return nil, result.Error
+		var affected int64
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			if err := LockOAuthUser(tx, userID); err != nil {
+				return err
+			}
+			result := tx.Model(&UserSession{}).Where("sid = ? AND user_id = ? AND status = ? AND revoked_at = ? AND expires_at > ?", sid, userID, UserSessionStatusActive, 0, now).Updates(map[string]any{"status": UserSessionStatusRevoked, "revoked_at": now, "revoked_reason": "refresh_reuse"})
+			if result.Error != nil {
+				return result.Error
+			}
+			affected = result.RowsAffected
+			if affected == 0 {
+				return nil
+			}
+			return RevokeOAuthWithTx(tx, userID, "sid", sid, "session_revoked")
+		})
+		if err != nil {
+			return nil, err
 		}
-		if result.RowsAffected == 0 {
+		if affected == 0 {
 			return nil, ErrUserSessionInactive
 		}
+
 		session.Status = UserSessionStatusRevoked
 		session.RevokedAt = now
 		session.RevokedReason = "refresh_reuse"
@@ -590,6 +598,9 @@ func RevokeUserSessionWithContext(ctx context.Context, userID int, sid, reason s
 
 	var revoked bool
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userID); err != nil {
+			return err
+		}
 		var current UserSession
 		if err := lockForUpdate(tx).Where("sid = ? AND user_id = ?", sid, userID).First(&current).Error; err != nil {
 			return err
@@ -604,6 +615,11 @@ func RevokeUserSessionWithContext(ctx context.Context, userID int, sid, reason s
 		})
 		if result.Error != nil {
 			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			if err := RevokeOAuthWithTx(tx, userID, "sid", sid, "session_revoked"); err != nil {
+				return err
+			}
 		}
 		revoked = result.RowsAffected == 1
 		return nil
@@ -631,8 +647,18 @@ func RevokeUserSessionByRefreshHash(sid, presentedHash, reason string) (bool, er
 	}
 	now := time.Now().Unix()
 	var session UserSession
+	var seed UserSession
+	if err := DB.Select("user_id").Where("sid = ?", sid).First(&seed).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
 	var revoked bool
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, seed.UserID); err != nil {
+			return err
+		}
 		if err := lockForUpdate(tx).Where("sid = ?", sid).First(&session).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
@@ -658,6 +684,11 @@ func RevokeUserSessionByRefreshHash(sid, presentedHash, reason string) (bool, er
 		})
 		if result.Error != nil {
 			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			if err := RevokeOAuthWithTx(tx, session.UserID, "sid", sid, "session_revoked"); err != nil {
+				return err
+			}
 		}
 		revoked = result.RowsAffected == 1
 		if revoked {
@@ -689,6 +720,9 @@ func AdvanceUserSessionAuthVersion(userID int, sid string, expectedSessionVersio
 	now := time.Now().Unix()
 	var session UserSession
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userID); err != nil {
+			return err
+		}
 		if err := lockForUpdate(tx).Where("sid = ? AND user_id = ?", sid, userID).First(&session).Error; err != nil {
 			return err
 		}
@@ -741,6 +775,9 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 	if userID <= 0 {
 		return 0, ErrUserSessionInvalid
 	}
+	if err := BeginOAuthSessionRevocation(userID, excludedSID); err != nil {
+		return 0, err
+	}
 	now := time.Now().Unix()
 	var totalAffected int64
 	for {
@@ -753,7 +790,7 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 			return totalAffected, err
 		}
 		if len(candidates) == 0 {
-			return totalAffected, nil
+			return totalAffected, CompleteOAuthSessionRevocation(userID, excludedSID)
 		}
 		for i := range candidates {
 			if err := writeUserSessionDenyFence(&candidates[i], UserSessionStatusRevoking, now, reason); err != nil {
@@ -768,6 +805,9 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 		var affected int64
 		var revoked []UserSession
 		err := DB.Transaction(func(tx *gorm.DB) error {
+			if err := LockOAuthUser(tx, userID); err != nil {
+				return err
+			}
 			if err := lockForUpdate(tx).Where("sid IN ? AND status = ?", sids, UserSessionStatusActive).Find(&revoked).Error; err != nil {
 				return err
 			}
@@ -844,6 +884,12 @@ func deleteExpiredUserSessionsBefore(expiredBefore, issuanceCutoff, revokedBefor
 		}
 		for start := 0; start < len(sids); start += userSessionCleanupBatchSize {
 			end := min(start+userSessionCleanupBatchSize, len(sids))
+			if OAuthCleanupReady() {
+				if err := DeleteExpiredOAuthSessions(sids[start:end], expiredBefore, issuanceCutoff, revokedBefore); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := DB.Where("sid IN ?", sids[start:end]).
 				Where(
 					"expires_at < ? AND created_at <= ? AND (status <> ? OR revoked_at <= 0 OR revoked_at < ?)",
@@ -927,6 +973,9 @@ func RotateOrganizationSessionWithContext(ctx context.Context, identity AuthSess
 			return err
 		}
 		if err := tx.Model(&UserSession{}).Where("sid = ? AND version = ? AND status = ?", old.SID, identity.SessionVersion, UserSessionStatusActive).Updates(map[string]any{"status": UserSessionStatusRevoked, "revoked_at": now, "revoked_reason": "organization_verification", "previous_refresh_hash": "", "previous_valid_until": 0, "refresh_hash": ""}).Error; err != nil {
+			return err
+		}
+		if err := RevokeOAuthWithTx(tx, identity.UserID, "sid", old.SID, "session_revoked"); err != nil {
 			return err
 		}
 		next.ExpiresAt = old.ExpiresAt

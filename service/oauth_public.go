@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 )
 
@@ -367,6 +369,30 @@ func (p *OAuthPublic) Authorize(ctx context.Context, request *http.Request) (*OA
 		names[cookie.Name] = true
 		cookies = append(cookies, &http.Cookie{Name: cookie.Name, Value: cookie.Value})
 	}
+	var operation *model.OAuthOperation
+	published := false
+	for _, kind := range []string{"login_verifier", "consent_verifier"} {
+		if credential := q.Get(kind); credential != "" {
+			artifact, origin, err := model.FindOAuthArtifact(ctx, p.bridge.resource.issuer, kind, credential)
+			if err != nil {
+				if errors.Is(oauthGrantError(err), ErrOAuthInvalidToken) {
+					return nil, ErrOAuthProviderReplay
+				}
+				return nil, ErrOAuthResourceUnavailable
+			}
+			if origin.ClientID != client.ID || artifact.ExpiresAt <= time.Now().Unix() || artifact.PKCE != q.Get("code_challenge") || artifact.RedirectHash != model.OAuthArtifactRef(p.bridge.resource.issuer, "redirect", q.Get("redirect_uri")) {
+				return nil, ErrOAuthProviderReplay
+			}
+			operation = &model.OAuthOperation{Issuer: origin.Issuer, UserID: origin.UserID, ClientID: origin.ClientID, OriginSID: origin.OriginSID, AuthVersion: origin.AuthVersion, SessionVersion: origin.SessionVersion, GrantRef: origin.GrantRef, Kind: kind + "_resume"}
+			if err := model.ReserveOAuthOperation(ctx, operation); err != nil {
+				return nil, oauthGrantError(err)
+			}
+			if err := model.SendOAuthOperation(ctx, operation); err != nil {
+				return nil, oauthGrantError(err)
+			}
+			defer finishOAuthAttempt(operation, &published)
+		}
+	}
 	response, err := p.request(ctx, http.MethodGet, "/oauth2/auth?"+q.Encode(), "", cookies)
 	if err != nil {
 		return nil, err
@@ -454,6 +480,22 @@ func (p *OAuthPublic) Authorize(ctx context.Context, request *http.Request) (*OA
 	if !allowed {
 		return nil, ErrOAuthResourceUnavailable
 	}
+	if operation != nil {
+		var artifacts []model.OAuthArtifact
+		if code := targetQuery.Get("code"); code != "" {
+			if operation.GrantRef == "" {
+				return nil, ErrOAuthResourceUnavailable
+			}
+			artifacts = append(artifacts, model.OAuthArtifact{ArtifactRef: model.OAuthArtifactRef(operation.Issuer, "code", code), Kind: "code", PKCE: q.Get("code_challenge"), RedirectHash: model.OAuthArtifactRef(operation.Issuer, "redirect", q.Get("redirect_uri")), ExpiresAt: time.Now().Add(10 * time.Minute).Unix()})
+		}
+		if err := model.ObserveOAuthOperation(ctx, operation, artifacts); err != nil {
+			return nil, ErrOAuthResourceUnavailable
+		}
+		// A late valid response is recorded, but revocation still wins publication.
+		if err := model.ValidateOAuthOperationPublication(ctx, operation); err != nil {
+			return nil, oauthGrantError(err)
+		}
+	}
 	output := &OAuthPublicResponse{Status: response.StatusCode, Location: location}
 	for _, cookie := range response.Cookies() {
 		if !oauthPublicCookieName.MatchString(cookie.Name) {
@@ -464,6 +506,7 @@ func (p *OAuthPublic) Authorize(ctx context.Context, request *http.Request) (*OA
 		}
 		output.Cookies = append(output.Cookies, cookie)
 	}
+	published = true
 	return output, nil
 }
 
@@ -474,6 +517,28 @@ func (p *OAuthPublic) Exchange(ctx context.Context, form url.Values) ([]byte, er
 	if !slices.Contains(p.bridge.resource.clients, form.Get("client_id")) {
 		return nil, &OAuthPublicError{401, "invalid_client"}
 	}
+	kind := "code"
+	credential := form.Get("code")
+	if form.Get("grant_type") == "refresh_token" {
+		kind, credential = "refresh_token", form.Get("refresh_token")
+	}
+	artifact, origin, lookupErr := model.FindOAuthArtifact(ctx, p.bridge.resource.issuer, kind, credential)
+	if lookupErr != nil {
+		if errors.Is(oauthGrantError(lookupErr), ErrOAuthInvalidToken) {
+			return nil, &OAuthPublicError{400, "invalid_grant"}
+		}
+		return nil, ErrOAuthResourceUnavailable
+	}
+	if origin.ClientID != form.Get("client_id") || origin.GrantRef == "" {
+		return nil, &OAuthPublicError{400, "invalid_grant"}
+	}
+	if kind == "code" {
+		hash := sha256.Sum256([]byte(form.Get("code_verifier")))
+		if artifact.PKCE != base64.RawURLEncoding.EncodeToString(hash[:]) || artifact.RedirectHash != model.OAuthArtifactRef(origin.Issuer, "redirect", form.Get("redirect_uri")) {
+			return nil, &OAuthPublicError{400, "invalid_grant"}
+		}
+	}
+	operation := &model.OAuthOperation{Issuer: origin.Issuer, UserID: origin.UserID, ClientID: origin.ClientID, OriginSID: origin.OriginSID, AuthVersion: origin.AuthVersion, SessionVersion: origin.SessionVersion, GrantRef: origin.GrantRef, Kind: kind + "_exchange"}
 	var previous OAuthResourceIdentity
 	var previousErr error
 	if form.Get("grant_type") == "refresh_token" {
@@ -494,17 +559,31 @@ func (p *OAuthPublic) Exchange(ctx context.Context, form url.Values) ([]byte, er
 		// An inactive/replayed credential still reaches Hydra so its replay-family
 		// invalidation runs. It cannot authorize a successful response locally.
 	}
+	if err := model.ReserveOAuthOperation(ctx, operation); err != nil {
+		return nil, oauthGrantError(err)
+	}
+	if err := model.SendOAuthOperation(ctx, operation); err != nil {
+		return nil, oauthGrantError(err)
+	}
+	published := false
+	defer finishOAuthAttempt(operation, &published)
 	response, err := p.request(ctx, http.MethodPost, "/oauth2/token", form.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
 	fields, err := oauthPublicJSON(response)
 	if err != nil {
+		var protocolError *OAuthPublicError
+		if errors.As(err, &protocolError) && protocolError.Status < 500 {
+			if observeErr := model.ObserveOAuthOperation(ctx, operation, nil); observeErr != nil {
+				return nil, ErrOAuthResourceUnavailable
+			}
+		}
 		return nil, err
 	}
-	var access, kind, scope, refresh, idToken string
+	var access, tokenKind, scope, refresh, idToken string
 	var expires int64
-	if common.Unmarshal(fields["access_token"], &access) != nil || access == "" || len(access) > 4096 || common.Unmarshal(fields["token_type"], &kind) != nil || !strings.EqualFold(kind, "bearer") || common.Unmarshal(fields["expires_in"], &expires) != nil || expires <= 0 || expires > 900 || common.Unmarshal(fields["scope"], &scope) != nil {
+	if common.Unmarshal(fields["access_token"], &access) != nil || access == "" || len(access) > 4096 || common.Unmarshal(fields["token_type"], &tokenKind) != nil || !strings.EqualFold(tokenKind, "bearer") || common.Unmarshal(fields["expires_in"], &expires) != nil || expires <= 0 || expires > 900 || common.Unmarshal(fields["scope"], &scope) != nil {
 		return nil, ErrOAuthResourceUnavailable
 	}
 	identity, err := p.bridge.resource.introspect(ctx, access)
@@ -547,6 +626,16 @@ func (p *OAuthPublic) Exchange(ctx context.Context, form url.Values) ([]byte, er
 	} else if form.Get("grant_type") == "authorization_code" && slices.Contains(actual, "openid") {
 		return nil, ErrOAuthResourceUnavailable
 	}
+	if model.OAuthGrantRef(identity.issuer, identity.grantID) != operation.GrantRef {
+		return nil, ErrOAuthResourceUnavailable
+	}
+	artifacts := []model.OAuthArtifact{{ArtifactRef: model.OAuthArtifactRef(operation.Issuer, "access_token", access), Kind: "access_token", ExpiresAt: identity.expiresAt}}
+	if refresh != "" {
+		artifacts = append(artifacts, model.OAuthArtifact{ArtifactRef: model.OAuthArtifactRef(operation.Issuer, "refresh_token", refresh), Kind: "refresh_token", ExpiresAt: identity.grantExpiresAt})
+	}
+	if err := model.ObserveOAuthOperation(ctx, operation, artifacts); err != nil {
+		return nil, ErrOAuthResourceUnavailable
+	}
 	// All issuer requests finish before the final local identity read. A logout,
 	// disable or version rotation during refresh introspection must win.
 	_, err = authorizeOAuthGrant(ctx, identity, form.Get("grant_type") == "authorization_code")
@@ -558,7 +647,12 @@ func (p *OAuthPublic) Exchange(ctx context.Context, form url.Values) ([]byte, er
 	}
 	now := time.Now().Unix()
 	out["expires_in"] = min(expires, identity.expiresAt-now, identity.grantExpiresAt-now)
-	return common.Marshal(out)
+	encoded, err := common.Marshal(out)
+	if err != nil {
+		return nil, err
+	}
+	published = true
+	return encoded, nil
 }
 
 func validOAuthHydraCapability(value string) bool {

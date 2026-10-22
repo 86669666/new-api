@@ -363,6 +363,22 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 	if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
 		return nil, err
 	}
+	var operation *model.OAuthOperation
+	published := false
+	if b.public != nil && suffix == "accept" {
+		ref := ""
+		if prepared != nil {
+			ref = prepared.GrantRef
+		}
+		operation = oauthOperationFromActor(b.resource.issuer, request.clientID, phase+"_accept", ref, actor)
+		if err := model.ReserveOAuthOperation(ctx, operation); err != nil {
+			return nil, oauthGrantError(err)
+		}
+		if err := model.SendOAuthOperation(ctx, operation); err != nil {
+			return nil, oauthGrantError(err)
+		}
+		defer finishOAuthAttempt(operation, &published)
+	}
 	var result struct {
 		RedirectTo string `json:"redirect_to"`
 	}
@@ -372,6 +388,17 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 	if !b.validResume(result.RedirectTo, phase, request.query) {
 		return nil, ErrOAuthResourceUnavailable
 	}
+	if operation != nil {
+		resume, _ := url.Parse(result.RedirectTo)
+		credential := resume.Query().Get(phase + "_verifier")
+		if credential == "" {
+			return nil, ErrOAuthResourceUnavailable
+		}
+		artifacts := []model.OAuthArtifact{{ArtifactRef: model.OAuthArtifactRef(b.resource.issuer, phase+"_verifier", credential), Kind: phase + "_verifier", PKCE: request.query.Get("code_challenge"), RedirectHash: model.OAuthArtifactRef(b.resource.issuer, "redirect", request.query.Get("redirect_uri")), ExpiresAt: time.Now().Add(30 * time.Minute).Unix()}}
+		if err := model.ObserveOAuthOperation(ctx, operation, artifacts); err != nil {
+			return nil, ErrOAuthResourceUnavailable
+		}
+	}
 	if prepared != nil {
 		if err := model.ApproveOAuthGrant(ctx, prepared); err != nil {
 			return nil, oauthGrantError(err)
@@ -379,6 +406,12 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 	} else if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
 		return nil, err
 	}
+	if operation != nil && prepared == nil {
+		if err := model.ValidateOAuthOperationPublication(ctx, operation); err != nil {
+			return nil, oauthGrantError(err)
+		}
+	}
+	published = true
 	return &OAuthProviderRedirect{RedirectTo: result.RedirectTo}, nil
 }
 

@@ -195,6 +195,9 @@ func IncrementUserAuthVersionWithTx(tx *gorm.DB, userId int) (int64, error) {
 			return 0, result.Error
 		}
 		if result.RowsAffected == 1 {
+			if err := RevokeOAuthWithTx(tx, userId, "user", "", "security_changed"); err != nil {
+				return 0, err
+			}
 			return next, nil
 		}
 	}
