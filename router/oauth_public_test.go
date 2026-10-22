@@ -498,14 +498,16 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		require.Equal(t, 200, status)
 		assert.Equal(t, "no-referrer", headers.Get("Referrer-Policy"))
 		assert.Contains(t, headers.Get("Cache-Control"), "no-store")
-		var balance service.OAuthBalance
-		require.NoError(t, common.Unmarshal(data, &balance))
-		assert.Equal(t, -1, balance.Quota)
-		assert.Equal(t, 123, balance.UsedQuota)
+		balance := oauthBalanceResponseData(t, data)
+		assert.Equal(t, float64(-1), balance["quota"])
+		assert.Equal(t, float64(123), balance["used_quota"])
 		status, next := c.refresh(grant)
 		require.Equal(t, 200, status)
-		status, _, _ = c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", next.Access)
-		assert.Equal(t, 200, status)
+		status, _, data = c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", next.Access)
+		require.Equal(t, 200, status)
+		balance = oauthBalanceResponseData(t, data)
+		assert.Equal(t, float64(-1), balance["quota"])
+		assert.Equal(t, float64(123), balance["used_quota"])
 		for _, token := range []string{next.Refresh, grant.ID, f.bearer["owner"]} {
 			status, _, _ = c.request("GET", input.Issuer+"api/v1/oauth/balance", "", "", token)
 			assert.Equal(t, 401, status)
@@ -1289,6 +1291,14 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 			public.ServeHTTP(w, req)
 			assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
 			assert.Equal(t, "no-referrer", w.Header().Get("Referrer-Policy"))
+			if w.Code != http.StatusOK {
+				var failure map[string]any
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &failure))
+				require.Len(t, failure, 1)
+				require.Contains(t, failure, "error")
+				assert.NotContains(t, failure, "success")
+				assert.NotContains(t, failure, "data")
+			}
 			return w
 		}
 		setClaims(extras())
@@ -1314,6 +1324,7 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 				var data map[string]any
 				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
 				if tc.status == 200 {
+					data = oauthBalanceResponseData(t, w.Body.Bytes())
 					assert.Len(t, data, 5)
 					assert.Equal(t, float64(tc.quota), data["quota"])
 					assert.Equal(t, float64(tc.used), data["used_quota"])
@@ -1345,8 +1356,7 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 				operation_setting.USDExchangeRate = tc.rate
 				w := balance()
 				require.Equal(t, 200, w.Code)
-				var data map[string]any
-				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
+				data := oauthBalanceResponseData(t, w.Body.Bytes())
 				if tc.want == "" {
 					assert.NotContains(t, data, "display_amount")
 				} else {
@@ -1370,7 +1380,7 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 			operation_setting.GetGeneralSetting().QuotaDisplayType = "USD"
 			require.Equal(t, 200, w.Code)
 			assert.Equal(t, int32(2), reads.Load())
-			assert.JSONEq(t, `{"quota":100,"used_quota":17,"quota_per_unit":500000,"display_amount":"$0.0002","display_locale":"en-US"}`, w.Body.String())
+			assert.JSONEq(t, `{"success":true,"message":"","data":{"quota":100,"used_quota":17,"quota_per_unit":500000,"display_amount":"$0.0002","display_locale":"en-US"}}`, w.Body.String())
 		})
 		t.Run("final_gate_changes", func(t *testing.T) {
 			for _, tc := range []struct {
@@ -1439,18 +1449,17 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 			payload.Store(&value)
 			w := balance()
 			require.Equal(t, 200, w.Code)
-			var data service.OAuthBalance
-			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
-			assert.Equal(t, 456, data.Quota)
-			assert.Equal(t, 789, data.UsedQuota)
+			data := oauthBalanceResponseData(t, w.Body.Bytes())
+			assert.Equal(t, float64(456), data["quota"])
+			assert.Equal(t, float64(789), data["used_quota"])
 			require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", other.GrantRef).UpdateColumn("state", "revoked").Error)
 			assert.Equal(t, 401, balance().Code)
 			setClaims(extras())
 			w = balance()
 			require.Equal(t, 200, w.Code)
-			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
-			assert.Equal(t, 100, data.Quota)
-			assert.Equal(t, 17, data.UsedQuota)
+			data = oauthBalanceResponseData(t, w.Body.Bytes())
+			assert.Equal(t, float64(100), data["quota"])
+			assert.Equal(t, float64(17), data["used_quota"])
 		})
 		t.Run("batch_and_redis_are_not_balance_sources", func(t *testing.T) {
 			endpoint := os.Getenv("NEWAPI_W01_REDIS_ADDR")
@@ -1485,10 +1494,9 @@ func TestOAuthGrantUserInfo(t *testing.T) {
 						}
 						w := balance()
 						require.Equal(t, 200, w.Code)
-						var data service.OAuthBalance
-						require.NoError(t, common.Unmarshal(w.Body.Bytes(), &data))
-						assert.Equal(t, 100, data.Quota)
-						assert.Equal(t, expected, data.UsedQuota)
+						data := oauthBalanceResponseData(t, w.Body.Bytes())
+						assert.Equal(t, float64(100), data["quota"])
+						assert.Equal(t, float64(expected), data["used_quota"])
 					}
 					if batch {
 						model.UpdateUserUsedQuota(grant.UserID, -9)
@@ -1560,4 +1568,30 @@ func (t *oauthCommitDelayTx) Commit() error {
 		time.Sleep(2 * time.Second)
 	}
 	return err
+}
+
+// oauthBalanceResponseData validates the public success envelope and field
+// allowlist for both synthetic issuer and real Hydra HTTP responses.
+func oauthBalanceResponseData(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	var response map[string]any
+	require.NoError(t, common.Unmarshal(body, &response))
+	require.Len(t, response, 3)
+	require.Equal(t, true, response["success"])
+	require.Equal(t, "", response["message"])
+	data, ok := response["data"].(map[string]any)
+	require.True(t, ok, "balance data must be an object")
+	for _, key := range []string{"quota", "used_quota", "quota_per_unit"} {
+		require.Contains(t, data, key)
+		require.IsType(t, float64(0), data[key])
+	}
+	require.Equal(t, "en-US", data["display_locale"])
+	for key := range data {
+		require.Contains(t, []string{"quota", "used_quota", "quota_per_unit", "display_locale", "display_amount"}, key)
+	}
+	if display, exists := data["display_amount"]; exists {
+		require.IsType(t, "", display)
+		require.NotEmpty(t, display)
+	}
+	return data
 }

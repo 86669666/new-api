@@ -39,7 +39,7 @@ func GetOAuthBalance(c *gin.Context) {
 		middleware.WriteOAuthResourceError(c, err, "balance:read")
 		return
 	}
-	data, err := common.Marshal(balance)
+	data, err := common.Marshal(gin.H{"success": true, "message": "", "data": balance})
 	if err != nil {
 		middleware.WriteOAuthResourceError(c, service.ErrOAuthResourceUnavailable, "balance:read")
 		return
