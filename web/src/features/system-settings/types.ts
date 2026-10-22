@@ -358,6 +358,7 @@ export type BillingSettings = {
 }
 
 export type OperationsSettings = {
+  ClientEventsConfig: string
   DefaultCollapseSidebar: boolean
   DemoSiteEnabled: boolean
   SelfUseModeEnabled: boolean

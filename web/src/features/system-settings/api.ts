@@ -35,7 +35,11 @@ import type {
 } from './types'
 
 export async function getSystemOptions() {
-  const res = await api.get<SystemOptionsResponse>('/api/option/')
+  // React Query owns sharing and cancellation. HTTP-level deduplication can
+  // reattach a pre-save request after the query has confirmed newer settings.
+  const res = await api.get<SystemOptionsResponse>('/api/option/', {
+    disableDuplicate: true,
+  })
   return res.data
 }
 

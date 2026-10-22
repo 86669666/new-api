@@ -15021,5 +15021,543 @@
       "max_organizations_joined": "0"
     },
     "valid": false
+  },
+  {
+    "name": "client-stats Usage empty result",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": []
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats Usage invalid data_complete",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": true,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": []
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats Usage invalid result_version",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "old",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": []
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats Usage invalid retention_days",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 7,
+        "items": []
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats Clients empty result",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventClientsResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": [],
+        "activity_basis": "app_launch",
+        "identity_basis": "user_channel_client",
+        "groups_additive": false
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats Clients invalid data_complete",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventClientsResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": true,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": [],
+        "activity_basis": "app_launch",
+        "identity_basis": "user_channel_client",
+        "groups_additive": false
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats Clients invalid result_version",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventClientsResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "old",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": [],
+        "activity_basis": "app_launch",
+        "identity_basis": "user_channel_client",
+        "groups_additive": false
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats Clients invalid retention_days",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventClientsResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 7,
+        "items": [],
+        "activity_basis": "app_launch",
+        "identity_basis": "user_channel_client",
+        "groups_additive": false
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats decimal sum and unknown counter",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageGroup",
+    "value": {
+      "day": "2026-10-22",
+      "model": "fixture",
+      "provider": "fixture",
+      "source": "chat",
+      "events": 2,
+      "input_tokens": "18014398509481982",
+      "output_tokens": null,
+      "input_missing_events": 0,
+      "output_missing_events": 2,
+      "counter_data_complete": false
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats known zero counter",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageGroup",
+    "value": {
+      "day": "2026-10-22",
+      "model": "fixture",
+      "provider": "fixture",
+      "source": "chat",
+      "events": 2,
+      "input_tokens": "0",
+      "output_tokens": null,
+      "input_missing_events": 0,
+      "output_missing_events": 2,
+      "counter_data_complete": false
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats numeric aggregate rejected",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageGroup",
+    "value": {
+      "day": "2026-10-22",
+      "model": "fixture",
+      "provider": "fixture",
+      "source": "chat",
+      "events": 2,
+      "input_tokens": 3,
+      "output_tokens": null,
+      "input_missing_events": 0,
+      "output_missing_events": 2,
+      "counter_data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats config complete",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigValue",
+    "value": {
+      "enabled": false,
+      "retention_days": 30,
+      "rate_limit": 60
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats config invalid enabled",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigValue",
+    "value": {
+      "enabled": "true",
+      "retention_days": 30,
+      "rate_limit": 60
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats config invalid retention_days",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigValue",
+    "value": {
+      "enabled": false,
+      "retention_days": 7,
+      "rate_limit": 60
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats config invalid rate_limit",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigValue",
+    "value": {
+      "enabled": false,
+      "retention_days": 30,
+      "rate_limit": 601
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats config invalid source",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigValue",
+    "value": {
+      "enabled": false,
+      "retention_days": 30,
+      "rate_limit": 60,
+      "source": "option"
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats option value must be string",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigOptionWrite",
+    "value": {
+      "key": "ClientEventsConfig",
+      "value": {}
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats option encoded config",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigOptionWrite",
+    "value": {
+      "key": "ClientEventsConfig",
+      "value": "{\"enabled\":false,\"retention_days\":30,\"rate_limit\":60}"
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats error INVALID",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryError",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_INVALID",
+      "message": "Invalid request",
+      "message_key": "Invalid request"
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats error UNAUTHORIZED",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryError",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_UNAUTHORIZED",
+      "message": "Invalid request",
+      "message_key": "Invalid request"
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats error FORBIDDEN",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryError",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_FORBIDDEN",
+      "message": "Invalid request",
+      "message_key": "Invalid request"
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats error CHANGED",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryError",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_CHANGED",
+      "message": "Invalid request",
+      "message_key": "Invalid request"
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats error TOO_LARGE",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryError",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_TOO_LARGE",
+      "message": "Invalid request",
+      "message_key": "Invalid request",
+      "max_candidate_rows": 50000,
+      "max_groups": 2000
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats error UNAVAILABLE",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryError",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_UNAVAILABLE",
+      "message": "Invalid request",
+      "message_key": "Invalid request"
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats exact query limit error",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryTooLarge",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_TOO_LARGE",
+      "message": "Invalid request",
+      "message_key": "Invalid request",
+      "max_candidate_rows": 50000,
+      "max_groups": 2000
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats limit error missing max_groups",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryTooLarge",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_TOO_LARGE",
+      "message": "Invalid request",
+      "message_key": "Invalid request",
+      "max_candidate_rows": 50000
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats limit error missing max_candidate_rows",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryTooLarge",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_TOO_LARGE",
+      "message": "Invalid request",
+      "message_key": "Invalid request",
+      "max_groups": 2000
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats query error no partial data",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryTooLarge",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_TOO_LARGE",
+      "message": "Invalid request",
+      "message_key": "Invalid request",
+      "max_candidate_rows": 50000,
+      "max_groups": 2000,
+      "data": []
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats query error exact status code",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventQueryTooLarge",
+    "value": {
+      "success": false,
+      "code": "CLIENT_EVENTS_QUERY_INVALID",
+      "message": "Invalid request",
+      "message_key": "Invalid request",
+      "max_candidate_rows": 50000,
+      "max_groups": 2000
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats invalid authority snapshot remains explicit",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigSnapshot",
+    "value": {
+      "enabled": false,
+      "retention_days": 30,
+      "rate_limit": 60,
+      "source": "option",
+      "valid": false
+    },
+    "valid": true
+  },
+  {
+    "name": "client-stats snapshot source cannot be anonymous",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigSnapshot",
+    "value": {
+      "enabled": false,
+      "retention_days": 30,
+      "rate_limit": 60,
+      "source": "anonymous",
+      "valid": false
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats result version trailing newline rejected",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        "provenance": "client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": []
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "client-stats invalid config HTTP400 without code",
+    "document": "api",
+    "schema": "#/paths/~1api~1option~1/put/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Invalid parameters",
+      "message_key": "Invalid parameters"
+    },
+    "valid": true
   }
 ]

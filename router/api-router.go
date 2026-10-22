@@ -24,6 +24,8 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter.Use(middleware.AccessTokenAudit())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
+	apiRouter.GET("/events/usage", middleware.DisableCache(), middleware.AdminAuth(), middleware.SearchRateLimit(), controller.GetClientEventUsage)
+	apiRouter.GET("/events/clients", middleware.DisableCache(), middleware.AdminAuth(), middleware.SearchRateLimit(), controller.GetClientEventClients)
 	anonymousRequestBodyLimit := middleware.AnonymousRequestBodyLimit()
 	{
 		apiRouter.GET("/organizations/limits", middleware.UserAuth(), controller.OrganizationLimitsHandler(false))

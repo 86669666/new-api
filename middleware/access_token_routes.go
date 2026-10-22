@@ -53,6 +53,8 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/platform/organizations/:org_id/wallet":                                     accessTokenSessionRule,
 	"POST /api/platform/organizations/:org_id/wallet/credits":                            accessTokenSessionRule,
 	"POST /api/platform/organizations/:org_id/wallet/credits/:credit_id/reverse":         accessTokenSessionRule,
+	"GET /api/events/usage":                                                              accessTokenScopeRule("log:read"),
+	"GET /api/events/clients":                                                            accessTokenScopeRule("log:read"),
 	"GET /api/organizations":                                                             accessTokenSessionRule,
 	"GET /api/organization-context":                                                      accessTokenSessionRule,
 	"GET /api/organizations/:org_id":                                                     accessTokenSessionRule,

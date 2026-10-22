@@ -565,6 +565,37 @@ def check_client_events(api, source_root):
     return {'route': 'POST /api/events', 'default_enabled': False, 'durable_count': True, 'event_limit': 10}
 
 
+def check_client_event_stats(api, source_root):
+    schemas = api['components']['schemas']
+    for suffix in ('Usage', 'Clients'):
+        op = api['paths']['/api/events/' + suffix.lower()]['get']
+        assert op['operationId'] == 'getClientEvent' + suffix
+        assert op['security'] == [{'DashboardJWT': []}, {'PersonalAccessToken': []}]
+        assert op['x-pat-scope'] == 'log:read' and 'requestBody' not in op
+        assert {'200','400','401','403','409','422','503'} <= set(op['responses'])
+        assert schemas['ClientEvent' + suffix + 'Page']['properties']['data_complete']['enum'] == [False]
+    assert schemas['ClientEventUsageGroup']['properties']['input_tokens']['type'] == 'string'
+    assert schemas['ClientEventUsageGroup']['properties']['input_tokens']['nullable'] is True
+    assert schemas['ClientEventClientsPage']['properties']['groups_additive']['enum'] == [False]
+    assert schemas['ClientEventsConfigValue']['additionalProperties'] is False
+    assert schemas['ClientEventsConfigOptionWrite']['properties']['value']['type'] == 'string'
+    handler = (source_root / 'controller/client_events.go').read_text()
+    parser = go_function(handler, 'parseClientEventStatsQuery')
+    for phrase in ('len(raw) > 4096', 'query.EndTime-query.StartTime > 31*86400', '(page-1)*size > 2000', 'page > 1'):
+        assert phrase in parser, ('client query parser drift', phrase)
+    router = (source_root / 'router/api-router.go').read_text()
+    for suffix, method in [('usage', 'GetClientEventUsage'), ('clients', 'GetClientEventClients')]:
+        assert f'apiRouter.GET("/events/{suffix}", middleware.DisableCache(), middleware.AdminAuth(), middleware.SearchRateLimit(), controller.{method})' in router
+    rules = (source_root / 'middleware/access_token_routes.go').read_text()
+    for path in ('usage', 'clients'):
+        assert re.search(r'"GET /api/events/' + path + r'"\s*:\s*accessTokenScopeRule\("log:read"\)', rules)
+    option = (source_root / 'controller/option.go').read_text()
+    assert 'model.UpdateClientEventsConfigOption(value)' in option
+    config = (source_root / 'setting/operation_setting/client_events_setting.go').read_text()
+    assert 'len(fields) != 3' in config
+    return {'authenticated_admin': True, 'pat_scope': 'log:read', 'anonymous': False, 'live_http': False}
+
+
 def check_model_capability_metadata(api, relay):
     schemas = api['components']['schemas']
     facts = ['context_length', 'max_output_tokens', 'vision', 'reasoning', 'tool_use']
@@ -614,8 +645,9 @@ def check_model_capability_metadata(api, relay):
     assert branches == [
         {'$ref': '#/components/schemas/ModelCapabilityMetadataOptionWrite'},
         {'type': 'object', 'properties': {
-            'key': {'type': 'string', 'not': {'enum': ['ModelCapabilityMetadata']}}, 'value': {},
+            'key': {'type': 'string', 'not': {'enum': ['ModelCapabilityMetadata', 'ClientEventsConfig']}}, 'value': {},
         }, 'required': ['key', 'value'], 'additionalProperties': True},
+        {'$ref': '#/components/schemas/ClientEventsConfigOptionWrite'},
     ]
     write = schemas['ModelCapabilityMetadataOptionWrite']
     assert write['properties']['key'] == {'type': 'string', 'enum': ['ModelCapabilityMetadata']}
@@ -1436,6 +1468,7 @@ def main():
     results['token_usage_series'] = check_token_usage_series(api)
     results['token_pricing'] = check_token_pricing(api)
     results['client_events'] = check_client_events(api, source_root)
+    results['client_event_stats'] = check_client_event_stats(api, source_root)
     results['model_capability_metadata'] = check_model_capability_metadata(api, relay)
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['personal_log_range_error'] = check_personal_log_range_error(api)

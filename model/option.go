@@ -1,11 +1,13 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -237,6 +239,9 @@ func InitOptionMap() {
 }
 
 func loadOptionsFromDatabase() {
+	if err := ReloadClientEventsConfig(); err != nil {
+		common.SysError(common.LogText("client events configuration reload failed (%T)", err))
+	}
 	requestPolicyOptionMutex.Lock()
 	defer requestPolicyOptionMutex.Unlock()
 	defer func() {
@@ -249,6 +254,9 @@ func loadOptionsFromDatabase() {
 	options, _ := AllOption()
 	passkeyOptions := make(map[string]string)
 	for _, option := range options {
+		if operation_setting.IsClientEventsConfigKey(option.Key) {
+			continue
+		}
 		if IsPasskeyDomainOption(option.Key) {
 			passkeyOptions[option.Key] = option.Value
 			continue
@@ -316,6 +324,12 @@ func validateOrganizationLimitIdentity(requested, stored, value string) error {
 }
 
 func UpdateOption(key string, value string) error {
+	if operation_setting.IsClientEventsConfigKey(key) {
+		if key != operation_setting.ClientEventsConfigKey {
+			return operation_setting.ErrClientEventsConfig
+		}
+		return UpdateClientEventsConfigOption(value)
+	}
 	if key == siteInstanceIDKey {
 		return common.NewMessage("Invalid parameters")
 	}
@@ -349,32 +363,32 @@ func UpdateOption(key string, value string) error {
 		}
 		return updateOptionMap(key, value)
 	}
-	// Save to database first
-	option := Option{
-		Key: key,
-	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	if err := DB.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+	// An alias may resolve to the protected row under the database collation.
+	clientEventsOptionMutex.Lock()
+	defer clientEventsOptionMutex.Unlock()
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		option := Option{Key: key}
+		if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+			return err
+		}
+		if err := guardClientEventsOptionAlias(tx, option.Key); err != nil {
+			return err
+		}
+		if option.Key == siteInstanceIDKey {
+			return common.NewMessage("Invalid parameters")
+		}
+		if err := validateOrganizationLimitIdentity(key, option.Key, value); err != nil {
+			return err
+		}
+		if err := validateModelCapabilityOptionIdentity(key, option.Key, value); err != nil {
+			return err
+		}
+		option.Value = value
+		return tx.Save(&option).Error
+	})
+	if err != nil {
 		return err
 	}
-	// Check the stored spelling: MySQL may resolve case/accent/space aliases.
-	if option.Key == siteInstanceIDKey {
-		return common.NewMessage("Invalid parameters")
-	}
-	if err := validateOrganizationLimitIdentity(key, option.Key, value); err != nil {
-		return err
-	}
-	if err := validateModelCapabilityOptionIdentity(key, option.Key, value); err != nil {
-		return err
-	}
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	if err := DB.Save(&option).Error; err != nil {
-		return err
-	}
-	// Update OptionMap
 	return updateOptionMap(key, value)
 }
 
@@ -384,6 +398,11 @@ func UpdateOption(key string, value string) error {
 // is touched — safe for callers that must commit a set of related options
 // atomically (e.g. payment gateway binding).
 func UpdateOptionsBulk(values map[string]string) error {
+	for key := range values {
+		if operation_setting.IsClientEventsConfigKey(key) {
+			return operation_setting.ErrClientEventsConfig
+		}
+	}
 	if len(values) == 0 {
 		return nil
 	}
@@ -446,6 +465,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
 				return err
 			}
+			if err := guardClientEventsOptionAlias(tx, option.Key); err != nil {
+				return err
+			}
 			if option.Key == siteInstanceIDKey {
 				return common.NewMessage("Invalid parameters")
 			}
@@ -477,6 +499,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if operation_setting.IsClientEventsConfigKey(key) {
+		return nil
+	}
 	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey || key == siteInstanceIDKey {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)
@@ -851,4 +876,81 @@ func handleConfigUpdate(key, value string) bool {
 	}
 
 	return true // 已处理
+}
+
+// This domain lock covers storage observation through publication, preventing a
+// stale local reload from overwriting a completed local save. Other processes
+// converge through the existing SyncOptions poll; this is not a cluster lock.
+var clientEventsOptionMutex sync.Mutex
+
+func ReloadClientEventsConfig() error {
+	clientEventsOptionMutex.Lock()
+	defer clientEventsOptionMutex.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var options []Option
+	// LOWER/TRIM also detect corrupt case/space spellings on case-sensitive stores.
+	err := DB.WithContext(ctx).Where("LOWER(TRIM("+commonKeyCol+")) = LOWER(?)", operation_setting.ClientEventsConfigKey).Find(&options).Error
+	if err != nil {
+		return operation_setting.ApplyClientEventsOption(nil, err)
+	}
+	if len(options) == 0 {
+		return operation_setting.ApplyClientEventsOption(nil, nil)
+	}
+	if len(options) != 1 || options[0].Key != operation_setting.ClientEventsConfigKey {
+		invalid := "null"
+		return operation_setting.ApplyClientEventsOption(&invalid, nil)
+	}
+	return operation_setting.ApplyClientEventsOption(&options[0].Value, nil)
+}
+
+func UpdateClientEventsConfigOption(value string) error {
+	if _, err := operation_setting.ParseClientEventsConfig(value); err != nil {
+		return err
+	}
+	clientEventsOptionMutex.Lock()
+	defer clientEventsOptionMutex.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var matches []Option
+		if err := tx.Where("LOWER(TRIM("+commonKeyCol+")) = LOWER(?)", operation_setting.ClientEventsConfigKey).Find(&matches).Error; err != nil {
+			return err
+		}
+		if len(matches) > 1 || len(matches) == 1 && matches[0].Key != operation_setting.ClientEventsConfigKey {
+			return operation_setting.ErrClientEventsConfig
+		}
+		option := Option{Key: operation_setting.ClientEventsConfigKey}
+		if err := tx.FirstOrCreate(&option, Option{Key: option.Key}).Error; err != nil {
+			return err
+		}
+		if option.Key != operation_setting.ClientEventsConfigKey {
+			return operation_setting.ErrClientEventsConfig
+		}
+		option.Value = value
+		return tx.Save(&option).Error
+	})
+	if err != nil {
+		return err
+	}
+	return operation_setting.ApplyClientEventsOption(&value, nil)
+}
+
+// Called inside a transaction, including before a newly-created alias commits.
+func guardClientEventsOptionAlias(tx *gorm.DB, storedKey string) error {
+	if operation_setting.IsClientEventsConfigKey(storedKey) {
+		return operation_setting.ErrClientEventsConfig
+	}
+	var protected Option
+	err := tx.Where(&Option{Key: operation_setting.ClientEventsConfigKey}).First(&protected).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if protected.Key == storedKey {
+		return operation_setting.ErrClientEventsConfig
+	}
+	return nil
 }

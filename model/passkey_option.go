@@ -232,6 +232,9 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 			if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
 				return err
 			}
+			if err := guardClientEventsOptionAlias(tx, option.Key); err != nil {
+				return err
+			}
 			if option.Key == siteInstanceIDKey {
 				return common.NewMessage("Invalid parameters")
 			}

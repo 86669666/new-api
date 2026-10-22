@@ -85,6 +85,9 @@ func GetOptions(c *gin.Context) {
 	optionValues := make(map[string]string)
 	common.OptionMapRWMutex.Lock()
 	for k, v := range common.OptionMap {
+		if operation_setting.IsClientEventsConfigKey(k) {
+			continue
+		}
 		if k == "theme.frontend" || k == "billing_setting.billing_mode" || k == "billing_setting.billing_expr" {
 			continue
 		}
@@ -106,6 +109,12 @@ func GetOptions(c *gin.Context) {
 		}
 	}
 	common.OptionMapRWMutex.Unlock()
+	snapshotJSON, err := common.Marshal(operation_setting.CurrentClientEventsSnapshot())
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Internal Server Error!"))
+		return
+	}
+	options = append(options, &model.Option{Key: operation_setting.ClientEventsConfigKey, Value: string(snapshotJSON)})
 	// Display the same effective expressions used by pricing and settlement,
 	// including built-in defaults absent from persisted administrator options.
 	for key, values := range map[string]map[string]string{
@@ -184,6 +193,25 @@ func UpdateOption(c *gin.Context) {
 	err := common.DecodeJson(c.Request.Body, &option)
 	if err != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
+	if operation_setting.IsClientEventsConfigKey(option.Key) {
+		value, ok := option.Value.(string)
+		if !ok || option.Key != operation_setting.ClientEventsConfigKey {
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+			return
+		}
+		err := model.UpdateClientEventsConfigOption(value)
+		if errors.Is(err, operation_setting.ErrClientEventsConfig) {
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+			return
+		}
+		if err != nil {
+			common.SysError(common.LogText("client events configuration save failed (%T)", err))
+			common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Internal Server Error!"))
+			return
+		}
+		common.ApiSuccessT(c, "", nil)
 		return
 	}
 	switch option.Value.(type) {
@@ -414,6 +442,10 @@ func UpdateOption(c *gin.Context) {
 		return
 	}
 	err = model.UpdateOption(option.Key, option.Value.(string))
+	if errors.Is(err, operation_setting.ErrClientEventsConfig) {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
 	if err != nil {
 		if errors.Is(err, system_setting.ErrPasskeyRPIDInvalid) {
 			writeSecurityOperationError(c, err)

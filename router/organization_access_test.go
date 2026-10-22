@@ -214,7 +214,7 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver", "g19-tools-search", "g20-token-error-codes", "g20-token-usage", "g21-w02-clickhouse", "g20-quota-remaining-display", "g21-organization-create-rate"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver", "g19-tools-search", "g20-token-error-codes", "g20-token-usage", "g21-w02-clickhouse", "g20-quota-remaining-display", "g21-organization-create-rate", "g1-W03-08-client-stats", "g1-W03-09-client-config"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -657,6 +657,8 @@ func TestClientEventsReceiverHTTP(t *testing.T) {
 	})
 	f := newOrganizationHTTPFixture(t)
 	require.NoError(t, f.db.AutoMigrate(&model.ClientEvent{}, &model.SystemTask{}, &model.SystemTaskLock{}))
+	// Init sets only the environment fallback; observe the fresh fixture Option table.
+	require.NoError(t, model.ReloadClientEventsConfig())
 	require.NoError(t, f.engine.SetTrustedProxies(nil))
 	var relay model.Token
 	require.NoError(t, f.db.Where(map[string]any{"key": f.bearer["relay"][3:]}).First(&relay).Error)
@@ -681,6 +683,7 @@ func TestClientEventsReceiverHTTP(t *testing.T) {
 		t.Setenv("CLIENT_EVENTS_ENABLED", strconv.FormatBool(enabled))
 		t.Setenv("CLIENT_EVENTS_RATE_LIMIT", strconv.Itoa(limit))
 		require.NoError(t, service.InitClientEventsConfig())
+		require.NoError(t, model.ReloadClientEventsConfig())
 	}
 	const clientID = "8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11"
 	const privateCanary = "never-store-client-content-canary"

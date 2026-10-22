@@ -12627,7 +12627,7 @@
       "get": {
         "summary": "获取系统选项",
         "deprecated": false,
-        "description": "👑 需要超级管理员权限（Root）。已退役的 theme.frontend 不在列表中返回。",
+        "description": "👑 需要超级管理员权限（Root）。已退役的 theme.frontend 不在列表中返回。 ClientEventsConfig uses the existing root-only option boundary and PAT option:read scope ceiling. Returns a synthesized JSON string ClientEventsConfigSnapshot, including source and valid; does not expose anonymous intake configuration.",
         "tags": [
           "系统设置"
         ],
@@ -12694,12 +12694,15 @@
         "x-auth-source": "middleware/access_token_routes.go; router/channel-router.go",
         "x-pat-scope": "option:read",
         "operationId": "getApiOptionCollection",
-        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
+        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access",
+        "x-client-events-option-schema": {
+          "$ref": "#/components/schemas/ClientEventsConfigOptionRead"
+        }
       },
       "put": {
         "summary": "更新系统选项",
         "deprecated": false,
-        "description": "👑 需要超级管理员权限（Root）。兼容期内 theme.frontend=default 可幂等写入，其他主题值会被拒绝。 ModelCapabilityMetadata is a Root-only full replacement of explicit model facts. value is a serialized ModelCapabilityMetadataMap JSON string, not an object. Invalid input or transaction failure leaves persistence and local published options unchanged. Existing option authorization and audit behavior are unchanged.",
+        "description": "👑 需要超级管理员权限（Root）。兼容期内 theme.frontend=default 可幂等写入，其他主题值会被拒绝。 ModelCapabilityMetadata is a Root-only full replacement of explicit model facts. value is a serialized ModelCapabilityMetadataMap JSON string, not an object. Invalid input or transaction failure leaves persistence and local published options unchanged. Existing option authorization and audit behavior are unchanged. ClientEventsConfig uses the existing root-only option boundary and PAT option:write scope ceiling. For key ClientEventsConfig, value is a JSON STRING encoding exactly enabled:boolean, retention_days:integer8..365, rate_limit:integer1..600. See ClientEventsConfigOptionWrite. Unknown/duplicate fields, null and noncanonical integers are rejected. Invalid config value or wrong key casing returns HTTP400 success:false (Invalid parameters); persistence failures return HTTP503 success:false (Internal Server Error!); success is HTTP200 success:true. No automatic replay after uncertain write. Runtime changes publish after committed write and synchronize to other processes; already-running cleanup retains its captured cutoff.",
         "tags": [
           "系统设置"
         ],
@@ -12752,7 +12755,64 @@
             }
           },
           "400": {
-            "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+            "description": "Invalid ClientEventsConfig parameters, ORG_SELECTOR_INVALID or ORG_SELECTOR_CONFLICT. Organization selector errors are rejected before authentication or resource/provider work.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationCacheControl"
+                },
+                "description": "Set on these canonical GET routes before authentication/rate limiting, and on organization-boundary rejections. Not a promise for framework redirects before middleware."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OrganizationSelectionBadRequestError"
+                    }
+                  ]
+                },
+                "examples": {
+                  "ORG_SELECTOR_INVALID": {
+                    "value": {
+                      "success": false,
+                      "code": "ORG_SELECTOR_INVALID",
+                      "message": "Invalid organization selector.",
+                      "message_key": "Invalid organization selector."
+                    }
+                  },
+                  "ORG_SELECTOR_CONFLICT": {
+                    "value": {
+                      "success": false,
+                      "code": "ORG_SELECTOR_CONFLICT",
+                      "message": "Organization selectors conflict.",
+                      "message_key": "Organization selectors conflict."
+                    }
+                  },
+                  "CLIENT_EVENTS_CONFIG_INVALID": {
+                    "value": {
+                      "success": false,
+                      "message": "Invalid parameters",
+                      "message_key": "Invalid parameters"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Client settings persistence unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagementError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -12783,7 +12843,8 @@
                         "type": "string",
                         "not": {
                           "enum": [
-                            "ModelCapabilityMetadata"
+                            "ModelCapabilityMetadata",
+                            "ClientEventsConfig"
                           ]
                         }
                       },
@@ -12794,11 +12855,17 @@
                       "value"
                     ],
                     "additionalProperties": true
+                  },
+                  {
+                    "$ref": "#/components/schemas/ClientEventsConfigOptionWrite"
                   }
                 ]
               }
             }
           }
+        },
+        "x-client-events-option-schema": {
+          "$ref": "#/components/schemas/ClientEventsConfigOptionWrite"
         }
       }
     },
@@ -20780,7 +20847,7 @@
             "ClientEventsBearer": []
           }
         ],
-        "description": "Startup CLIENT_EVENTS_ENABLED=false by default. Authenticated native-client receiver only, no anonymous mode or admin reporting API. Current enabled/nondeleted owner and unexpired enabled/exhausted token are rechecked under user->token locks, including post-wait key byte equality/IP and expiry immediately before commit. No cache grants authority and no quota/status/access-time/accounting/cache value is changed. Exhaustion is not revocation, but intake still consumes HTTP/CPU/database/storage resources. Initial valid identity authorizes a dedicated default60/min token-ID limiter outside the transaction; existing global IP limiter runs exactly once. Redis failure is503, never memory fallback; intentionally disabled Redis uses per-process memory limits. Body-only events; no query parameters. Existing positive organization selection is refused; no organization proof or dashboard identity is created. Persist one typed main-DB table, separate from usage/accounting. Owner-scoped SHA256 fingerprint binds canonical UUID/channel/type/millisecond client time/normalized allowed fields. Same-owner key rotation is duplicate; other owner separate. Same-ms identical real actions may merge. Missing timestamp is receipt time and cannot guarantee cross-request retry deduplication; the merged Cherry PR44 always sends stable timestamp but no event_id. Count only after one whole transaction commits; duplicate/ignored count0. Any storage/commit uncertainty returns503; timestamped retry converges. Default retention30days (8..365) from server receive time; row/fingerprint deleted together. Hourly bounded1000-ID cleanup uses existing master/lease runner with30s context budget even when intake disabled. Without a running master there is no guaranteed hourly removal. User deletion does not imply anonymity or immediate erasure; strings can be maliciously mislabelled and are not provider-verified billing facts. No real upload/client/deployment acceptance is implied. Canonical POST and its slash rejection return no-store JSON; other methods remain absent and retain existing framework behavior.",
+        "description": "Startup CLIENT_EVENTS_ENABLED=false by default. Authenticated native-client receiver only, no anonymous mode. Current enabled/nondeleted owner and unexpired enabled/exhausted token are rechecked under user->token locks, including post-wait key byte equality/IP and expiry immediately before commit. No cache grants authority and no quota/status/access-time/accounting/cache value is changed. Exhaustion is not revocation, but intake still consumes HTTP/CPU/database/storage resources. Initial valid identity authorizes a dedicated default60/min token-ID limiter outside the transaction; existing global IP limiter runs exactly once. Redis failure is503, never memory fallback; intentionally disabled Redis uses per-process memory limits. Body-only events; no query parameters. Existing positive organization selection is refused; no organization proof or dashboard identity is created. Persist one typed main-DB table, separate from usage/accounting. Owner-scoped SHA256 fingerprint binds canonical UUID/channel/type/millisecond client time/normalized allowed fields. Same-owner key rotation is duplicate; other owner separate. Same-ms identical real actions may merge. Missing timestamp is receipt time and cannot guarantee cross-request retry deduplication; the merged Cherry PR44 always sends stable timestamp but no event_id. Count only after one whole transaction commits; duplicate/ignored count0. Any storage/commit uncertainty returns503; timestamped retry converges. Default retention30days (8..365) from server receive time; row/fingerprint deleted together. Hourly bounded1000-ID cleanup uses existing master/lease runner with30s context budget even when intake disabled. Without a running master there is no guaranteed hourly removal. User deletion does not imply anonymity or immediate erasure; strings can be maliciously mislabelled and are not provider-verified billing facts. No real upload/client/deployment acceptance is implied. Canonical POST and its slash rejection return no-store JSON; other methods remain absent and retain existing framework behavior. Runtime ClientEventsConfig overrides startup environment only after an authoritative Option read. Initial authority unavailable or invalid stored option disables intake and new cleanup; read failure keeps last observed snapshot. Valid disabled intake still allows cleanup. This route remains authenticated; anonymous receiver is not implemented or enabled.",
         "parameters": [
           {
             "$ref": "#/components/parameters/PersonalOrganizationHeader"
@@ -24139,6 +24206,428 @@
             }
           }
         }
+      }
+    },
+    "/api/events/usage": {
+      "get": {
+        "operationId": "getClientEventUsage",
+        "summary": "Read retained client usage aggregates",
+        "tags": [
+          "Client event statistics"
+        ],
+        "description": "Authenticated administrator aggregate of retained client self-reports across users; personal-only selector boundary, not anonymous or organization scoped. Dashboard session or PAT (including root) with log:read ceiling; legacy PAT retains existing retirement policy. Relay/OAuth resource credentials are not accepted. No request body. Only the listed query fields are allowed (including org_id query values, even 0, rejected by the strict handler whitelist); duplicate, unknown, noncanonical numeric, control-character and empty filters are rejected except version= is the explicit unknown-version filter. Default window is last 7 days, [start_time,end_time), UTC; endpoints must be supplied together, span <=31 days, end <=now+1h. Page default1, size50; offset <=2000. Page>1 requires explicit window and result_version. Version hashes normalized query and complete sorted result, excluding pagination; mismatch is409, not a snapshot pin. Bound 50000 candidate rows and2000 groups; exceeds yields422 without partial results. Two process slots and5s deadline,503 on unavailable. Direct authority rechecked before response publication. Reads remain available when intake disabled. data_complete=false means retained self-reports are not authoritative billing/usage totals. intake_enabled/retention_days are operational hints, not proof of complete history. Group by UTC day/model/provider/source. Token sums are arbitrary precision decimal strings or null when every value missing; zero is known zero. Missing-event counters and counter_data_complete describe counter coverage. Existing rate-limit middleware may return empty HTTP429 before the handler. The handler query-error envelope is distinct from existing authentication/selector middleware errors. Do not send an organization selector: positive organization header selection is rejected by the shared boundary; org_id is not a query filter.",
+        "security": [
+          {
+            "DashboardJWT": []
+          },
+          {
+            "PersonalAccessToken": []
+          }
+        ],
+        "x-pat-scope": "log:read",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2000
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          {
+            "in": "query",
+            "name": "result_version",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "chat",
+                "agent"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Complete bounded result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEventUsageResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ClientEventQueryInvalid"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ClientEventQueryUnauthorized"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ClientEventQueryForbidden"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEventQueryChanged"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEventQueryTooLarge"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEventQueryUnavailable"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing SearchRateLimit/global limiter rejection, empty body; Retry-After may be present. Not a CLIENT_EVENTS_QUERY_* error.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Conservative wait when provided by the existing limiter."
+              }
+            }
+          }
+        },
+        "x-organization-selection": "personal-only; positive organization selection rejected before resource access"
+      }
+    },
+    "/api/events/clients": {
+      "get": {
+        "operationId": "getClientEventClients",
+        "summary": "Read retained client clients aggregates",
+        "tags": [
+          "Client event statistics"
+        ],
+        "description": "Authenticated administrator aggregate of retained client self-reports across users; personal-only selector boundary, not anonymous or organization scoped. Dashboard session or PAT (including root) with log:read ceiling; legacy PAT retains existing retirement policy. Relay/OAuth resource credentials are not accepted. No request body. Only the listed query fields are allowed (including org_id query values, even 0, rejected by the strict handler whitelist); duplicate, unknown, noncanonical numeric, control-character and empty filters are rejected except version= is the explicit unknown-version filter. Default window is last 7 days, [start_time,end_time), UTC; endpoints must be supplied together, span <=31 days, end <=now+1h. Page default1, size50; offset <=2000. Page>1 requires explicit window and result_version. Version hashes normalized query and complete sorted result, excluding pagination; mismatch is409, not a snapshot pin. Bound 50000 candidate rows and2000 groups; exceeds yields422 without partial results. Two process slots and5s deadline,503 on unavailable. Direct authority rechecked before response publication. Reads remain available when intake disabled. data_complete=false means retained self-reports are not authoritative billing/usage totals. intake_enabled/retention_days are operational hints, not proof of complete history. Activity is app_launch only; identity=(user,channel,client UUID), version/OS groups overlap so groups_additive=false. Empty version is unknown. app_update is not activity. Existing rate-limit middleware may return empty HTTP429 before the handler. The handler query-error envelope is distinct from existing authentication/selector middleware errors. Do not send an organization selector: positive organization header selection is rejected by the shared boundary; org_id is not a query filter.",
+        "security": [
+          {
+            "DashboardJWT": []
+          },
+          {
+            "PersonalAccessToken": []
+          }
+        ],
+        "x-pat-scope": "log:read",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2000
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          {
+            "in": "query",
+            "name": "result_version",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 32
+            }
+          },
+          {
+            "in": "query",
+            "name": "os",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "darwin",
+                "win32",
+                "linux"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Complete bounded result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEventClientsResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ClientEventQueryInvalid"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ClientEventQueryUnauthorized"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ClientEventQueryForbidden"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ManagementError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEventQueryChanged"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEventQueryTooLarge"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Query failure; no partial data. Existing middleware/selector errors retain their own envelopes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEventQueryUnavailable"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Existing SearchRateLimit/global limiter rejection, empty body; Retry-After may be present. Not a CLIENT_EVENTS_QUERY_* error.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Conservative wait when provided by the existing limiter."
+              }
+            }
+          }
+        },
+        "x-organization-selection": "personal-only; positive organization selection rejected before resource access"
       }
     }
   },
@@ -33662,6 +34151,692 @@
             "enum": [
               "Unable to update organization limits."
             ]
+          }
+        }
+      },
+      "ClientEventsConfigValue": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "retention_days",
+          "rate_limit"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "retention_days": {
+            "type": "integer",
+            "minimum": 8,
+            "maximum": 365
+          },
+          "rate_limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600
+          }
+        }
+      },
+      "ClientEventsConfigSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "retention_days",
+          "rate_limit",
+          "source",
+          "valid"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "retention_days": {
+            "type": "integer",
+            "minimum": 8,
+            "maximum": 365
+          },
+          "rate_limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "environment",
+              "option"
+            ]
+          },
+          "valid": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ClientEventsConfigOptionWrite": {
+        "type": "object",
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "enum": [
+              "ClientEventsConfig"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "JSON-encoded ClientEventsConfigValue, exactly three fields. Boolean and canonical integer JSON tokens required; duplicate/unknown fields, exponent/fraction numbers and null rejected. source and valid are read-only."
+          }
+        }
+      },
+      "ClientEventsConfigOptionRead": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "enum": [
+              "ClientEventsConfig"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "description": "JSON-encoded ClientEventsConfigSnapshot; source and valid describe the current authoritative observation. Unknown/unavailable is not enabled or unlimited."
+          }
+        }
+      },
+      "ClientEventUsageGroup": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "day",
+          "model",
+          "provider",
+          "source",
+          "events",
+          "input_tokens",
+          "output_tokens",
+          "input_missing_events",
+          "output_missing_events",
+          "counter_data_complete"
+        ],
+        "properties": {
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "events": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "input_tokens": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^[0-9]+$(?![\\s\\S])"
+          },
+          "output_tokens": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^[0-9]+$(?![\\s\\S])"
+          },
+          "input_missing_events": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "output_missing_events": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "counter_data_complete": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ClientEventClientGroup": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "os",
+          "active_clients"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "description": "Empty means unknown version, not a different identity."
+          },
+          "os": {
+            "type": "string"
+          },
+          "active_clients": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ClientEventUsagePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "start_time",
+          "end_time",
+          "timezone",
+          "result_version",
+          "provenance",
+          "coverage",
+          "data_complete",
+          "intake_enabled",
+          "retention_days"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientEventUsageGroup"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2000
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "start_time": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_time": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "timezone": {
+            "type": "string",
+            "enum": [
+              "UTC"
+            ]
+          },
+          "result_version": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$(?![\\s\\S])"
+          },
+          "provenance": {
+            "type": "string",
+            "enum": [
+              "client_self_reported"
+            ]
+          },
+          "coverage": {
+            "type": "string",
+            "enum": [
+              "retained_events"
+            ]
+          },
+          "data_complete": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "intake_enabled": {
+            "type": "boolean"
+          },
+          "retention_days": {
+            "type": "integer",
+            "minimum": 8,
+            "maximum": 365
+          }
+        }
+      },
+      "ClientEventUsageResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/ClientEventUsagePage"
+          }
+        }
+      },
+      "ClientEventClientsPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "start_time",
+          "end_time",
+          "timezone",
+          "result_version",
+          "provenance",
+          "coverage",
+          "data_complete",
+          "intake_enabled",
+          "retention_days",
+          "activity_basis",
+          "identity_basis",
+          "groups_additive"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientEventClientGroup"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2000
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "start_time": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_time": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "timezone": {
+            "type": "string",
+            "enum": [
+              "UTC"
+            ]
+          },
+          "result_version": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$(?![\\s\\S])"
+          },
+          "provenance": {
+            "type": "string",
+            "enum": [
+              "client_self_reported"
+            ]
+          },
+          "coverage": {
+            "type": "string",
+            "enum": [
+              "retained_events"
+            ]
+          },
+          "data_complete": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "intake_enabled": {
+            "type": "boolean"
+          },
+          "retention_days": {
+            "type": "integer",
+            "minimum": 8,
+            "maximum": 365
+          },
+          "activity_basis": {
+            "type": "string",
+            "enum": [
+              "app_launch"
+            ]
+          },
+          "identity_basis": {
+            "type": "string",
+            "enum": [
+              "user_channel_client"
+            ]
+          },
+          "groups_additive": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          }
+        }
+      },
+      "ClientEventClientsResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/ClientEventClientsPage"
+          }
+        }
+      },
+      "ClientEventQueryError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "CLIENT_EVENTS_QUERY_INVALID",
+              "CLIENT_EVENTS_QUERY_UNAUTHORIZED",
+              "CLIENT_EVENTS_QUERY_FORBIDDEN",
+              "CLIENT_EVENTS_QUERY_CHANGED",
+              "CLIENT_EVENTS_QUERY_TOO_LARGE",
+              "CLIENT_EVENTS_QUERY_UNAVAILABLE"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string"
+          },
+          "message_params": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "max_candidate_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_groups": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ClientEventQueryInvalid": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "CLIENT_EVENTS_QUERY_INVALID"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string"
+          },
+          "message_params": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ClientEventQueryUnauthorized": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "CLIENT_EVENTS_QUERY_UNAUTHORIZED"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string"
+          },
+          "message_params": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ClientEventQueryForbidden": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "CLIENT_EVENTS_QUERY_FORBIDDEN"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string"
+          },
+          "message_params": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ClientEventQueryChanged": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "CLIENT_EVENTS_QUERY_CHANGED"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string"
+          },
+          "message_params": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ClientEventQueryTooLarge": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key",
+          "max_candidate_rows",
+          "max_groups"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "CLIENT_EVENTS_QUERY_TOO_LARGE"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string"
+          },
+          "message_params": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "max_candidate_rows": {
+            "type": "integer",
+            "enum": [
+              50000
+            ]
+          },
+          "max_groups": {
+            "type": "integer",
+            "enum": [
+              2000
+            ]
+          }
+        }
+      },
+      "ClientEventQueryUnavailable": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "CLIENT_EVENTS_QUERY_UNAVAILABLE"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string"
+          },
+          "message_params": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
           }
         }
       }
