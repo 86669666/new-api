@@ -87,6 +87,23 @@ Those names map to personal access token scopes as `profile` or `email` to `prof
 
 The public token response includes `refresh_token` only when its `scope` contains `offline_access` as its own token. A response with no scope drops the refresh token. Register `offline_access` on the Hydra client when the desktop client needs refresh.
 
+## Resource APIs
+
+These routes exist only while `OAUTH_USERINFO_ENABLED=true`. They use the same bearer introspection as userinfo: access tokens only, the configured client and audience, a current enabled user, and no positive cache. A refresh token is rejected.
+
+| Method | Path | Scope |
+| --- | --- | --- |
+| GET | `/api/v1/oauth/balance` | `balance:read` |
+| GET | `/api/v1/oauth/usage` | `usage:read` |
+| GET | `/api/v1/oauth/tokens` | `tokens:read` |
+| POST | `/api/v1/oauth/tokens` | `tokens:write` |
+
+Balance uses the console envelope. `data` contains `quota`, `used_quota`, `quota_per_unit`, and `display_amount`. `display_amount` is `quota / quota_per_unit` from the live console setting. It is not a fixed 500000 divisor.
+
+Usage follows `/api/log/self`: `p` is the page, and `page` is used only when `p` is absent. A non-positive or non-numeric page or page size is `400 invalid_request`.
+
+`GET /tokens` lists only relay keys this OAuth client created for this user. It does not create a key and does not return plaintext. Manually created keys are absent. `POST /tokens` creates one key when none exists, with `OAUTH_ISSUED_TOKEN_QUOTA` (default 0) and `OAUTH_ISSUED_TOKEN_EXPIRE_DAYS` (default 30). The first response is `{"data":[{"key":"sk-..."}]}`. A later POST does not return the key again. The association is the `oauth_issued_tokens` table and does not change the tokens table. The table is migrated only when userinfo is enabled. Dashboard logout disables that user's issued keys.
+
 ## Limits
 
 - ID token signatures are not verified. The proxy only checks that an `iss` claim matches the configured issuer before forwarding the token. Clients must validate the signature against the published JWKS.
