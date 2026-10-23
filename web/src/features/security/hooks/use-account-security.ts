@@ -24,10 +24,15 @@ import {
   useSecureVerification,
   type RequestVerificationOptions,
 } from '@/features/auth/secure-verification'
-import type { AccountSecurityResult } from '@/features/profile/types'
+import type { ExpectedAuthIdentity } from '@/lib/api'
 import { handleServerError } from '@/lib/handle-server-error'
 import { AuthOperationError } from '@/lib/secure-verification'
 import { useAuthStore } from '@/stores/auth-store'
+
+import {
+  projectAccountOperationError,
+  type AccountOperationError,
+} from '../account-operation-error'
 
 // Account operations compose the shared verification ceremony with the
 // subsequent mutation. Both must be cancelled when the account/session changes.
@@ -41,7 +46,7 @@ export function useAccountSecurity() {
   const requestVerification = verification.requestVerification
   const current = useRef<AbortController | null>(null)
   const [pending, setPending] = useState(false)
-  const [error, setError] = useState<AuthOperationError | null>(null)
+  const [error, setError] = useState<AccountOperationError | null>(null)
 
   const cancel = useCallback(() => {
     current.current?.abort()
@@ -51,13 +56,41 @@ export function useAccountSecurity() {
     setError(null)
   }, [cancelVerification])
 
-  useEffect(() => cancel, [cancel, sessionKey])
+  useEffect(() => cancel, [cancel])
+  useEffect(
+    () =>
+      useAuthStore.subscribe((state, previous) => {
+        if (
+          state.auth.user?.id !== previous.auth.user?.id ||
+          state.auth.session?.sid !== previous.auth.session?.sid
+        ) {
+          cancel()
+        }
+      }),
+    [cancel]
+  )
 
   const run = useCallback(
-    async <T extends AccountSecurityResult>(
-      action: (signal: AbortSignal) => Promise<T>
+    async <T>(
+      action: (signal: AbortSignal) => Promise<T>,
+      options: {
+        expectedAuthIdentity?: ExpectedAuthIdentity
+        throwOnError?: boolean
+      } = {}
     ): Promise<T | undefined> => {
-      if (current.current) return undefined
+      const auth = useAuthStore.getState().auth
+      const expected = options.expectedAuthIdentity
+      if (
+        current.current ||
+        (expected &&
+          (auth.user?.id !== expected.userId ||
+            auth.session?.sid !== expected.sid))
+      ) {
+        if (options.throwOnError) {
+          throw projectAccountOperationError({ code: 'AUTH_CANCELLED' })
+        }
+        return undefined
+      }
       const controller = new AbortController()
       current.current = controller
       setPending(true)
@@ -65,7 +98,12 @@ export function useAccountSecurity() {
       try {
         const result = await action(controller.signal)
         controller.signal.throwIfAborted()
-        if (result.notification_warning) {
+        if (
+          result !== null &&
+          typeof result === 'object' &&
+          'notification_warning' in result &&
+          result.notification_warning === true
+        ) {
           toast.warning(
             t(
               'The change succeeded, but the notification email could not be sent.'
@@ -74,13 +112,16 @@ export function useAccountSecurity() {
         }
         return result
       } catch (error) {
-        if (!controller.signal.aborted) {
-          const failure = AuthOperationError.from(error)
+        const failure = projectAccountOperationError(
+          controller.signal.aborted ? { code: 'AUTH_CANCELLED' } : error
+        )
+        if (!controller.signal.aborted && current.current === controller) {
           if (failure.code !== 'AUTH_CANCELLED') {
             setError(failure)
-            handleServerError(failure)
+            if (!options.throwOnError) handleServerError(failure)
           }
         }
+        if (options.throwOnError) throw failure
         return undefined
       } finally {
         if (current.current === controller) {
@@ -98,13 +139,22 @@ export function useAccountSecurity() {
       signal: AbortSignal,
       initialPassword?: string
     ) => {
-      signal.throwIfAborted()
-      const proof = await requestVerification(operation, initialPassword)
-      signal.throwIfAborted()
-      if (!proof) {
-        throw new AuthOperationError('Verification cancelled', 'AUTH_CANCELLED')
+      try {
+        signal.throwIfAborted()
+        const proof = await requestVerification(operation, initialPassword)
+        signal.throwIfAborted()
+        if (!proof) {
+          throw new AuthOperationError(
+            'Verification cancelled',
+            'AUTH_CANCELLED'
+          )
+        }
+        return proof.proof_token
+      } catch (error) {
+        throw projectAccountOperationError(
+          signal.aborted ? { code: 'AUTH_CANCELLED' } : error
+        )
       }
-      return proof.proof_token
     },
     [requestVerification]
   )

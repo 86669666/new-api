@@ -21,15 +21,26 @@ import {
   act,
   cleanup,
   render,
+  renderHook,
   screen,
   waitFor,
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import {
+  AxiosError,
+  type AxiosAdapter,
+  type InternalAxiosRequestConfig,
+} from 'axios'
 import { createInstance } from 'i18next'
 import { I18nextProvider, initReactI18next } from 'react-i18next'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
+import {
+  changeAccountPassword,
+  getLoginSessions,
+  revokeLoginSession,
+} from '@/features/profile/api'
 import en from '@/i18n/locales/en.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
@@ -42,6 +53,8 @@ import { EmailBindDialog } from '../components/dialogs/email-bind-dialog'
 import { TwoFABackupDialog } from '../components/dialogs/two-fa-backup-dialog'
 import { TwoFADisableDialog } from '../components/dialogs/two-fa-disable-dialog'
 import { TwoFASetupDialog } from '../components/dialogs/two-fa-setup-dialog'
+import { LoginSessionsCard } from '../components/login-sessions-card'
+import { useAccountSecurity } from '../hooks/use-account-security'
 
 const { navigate } = vi.hoisted(() => ({ navigate: vi.fn() }))
 vi.mock('@tanstack/react-router', async (importOriginal) => ({
@@ -50,6 +63,7 @@ vi.mock('@tanstack/react-router', async (importOriginal) => ({
 }))
 
 let client: QueryClient
+const originalAdapter = api.defaults.adapter
 beforeEach(() => {
   client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -60,10 +74,336 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   client.clear()
+  api.defaults.adapter = originalAdapter
   navigate.mockReset()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   useAuthStore.getState().auth.reset('idle')
+})
+
+function signInAccountFixture() {
+  const now = Math.floor(Date.now() / 1000)
+  useAuthStore.getState().auth.setBundle({
+    access_token: 's1-bearer-canary',
+    token_type: 'Bearer',
+    access_expires_at: now + 600,
+    user: { id: 1, username: 'user', role: 1 },
+    session: {
+      sid: 'account-session',
+      current: true,
+      login_method: 'password',
+      ip: '127.0.0.1',
+      user_agent: 'test',
+      created_at: now - 60,
+      last_active_at: now,
+      expires_at: now + 3600,
+    },
+  })
+}
+
+// Account failures must not make request credentials reachable from retained
+// application state, including hidden/symbol properties or the original objects.
+function expectNoAccountSecrets(
+  roots: unknown[],
+  originals: object[],
+  secrets: string[]
+) {
+  const queue = [...roots]
+  const seen = new Set<object>()
+  for (let index = 0; index < queue.length; index++) {
+    const value = queue[index]
+    if (typeof value === 'string') {
+      for (const secret of secrets) expect(value).not.toContain(secret)
+    }
+    if (
+      (typeof value !== 'object' || value === null) &&
+      typeof value !== 'function'
+    ) {
+      continue
+    }
+    const object = value as object
+    expect(originals).not.toContain(object)
+    if (seen.has(object)) continue
+    seen.add(object)
+    for (const key of Reflect.ownKeys(object)) {
+      const property = Object.getOwnPropertyDescriptor(object, key)
+      if (property && 'value' in property) queue.push(property.value)
+    }
+  }
+}
+
+function accountFailureAdapter(status: number, body: Record<string, unknown>) {
+  const originals: object[] = []
+  const secrets = [
+    's1-password-canary',
+    's1-original-password-canary',
+    's1-proof-canary',
+    's1-totp-canary',
+    's1-flow-canary',
+    's1-email-code-canary',
+    's1-bundle-canary',
+    's1-refresh-canary',
+    's1-bearer-canary',
+  ]
+  const adapter: AxiosAdapter = vi.fn(
+    async (config: InternalAxiosRequestConfig) => {
+      const credentials = {
+        password: secrets[0],
+        original_password: secrets[1],
+        proof: secrets[2],
+        totp: secrets[3],
+        flow_token: secrets[4],
+        email_code: secrets[5],
+        auth_bundle: secrets[6],
+        refresh: secrets[7],
+      }
+      const response = {
+        data: {
+          ...body,
+          message_params: credentials,
+          private_data: credentials,
+        },
+        status,
+        statusText: 'controlled failure',
+        headers: { 'retry-after': '1' },
+        config,
+      }
+      const raw = new AxiosError(
+        `unsafe ${secrets[0]}`,
+        'ERR_BAD_RESPONSE',
+        config,
+        credentials,
+        response
+      )
+      const cause = Object.assign(new Error(`nested ${secrets[3]}`), {
+        credentials,
+      })
+      Object.defineProperty(raw, 'cause', { value: cause })
+      Object.defineProperty(raw, 'hidden', { value: credentials })
+      Object.defineProperty(raw, Symbol('credentials'), { value: credentials })
+      originals.push(
+        raw,
+        cause,
+        credentials,
+        response,
+        response.data,
+        config,
+        config.headers
+      )
+      throw raw
+    }
+  )
+  api.defaults.adapter = adapter
+  return { adapter, originals, secrets }
+}
+
+it.each([
+  {
+    name: 'committed pending',
+    status: 503,
+    code: 'AUTH_SESSION_REVOCATION_PENDING',
+    data: {
+      session_revocation_complete: false,
+      credential_change_committed: true,
+      revoked_count: 2,
+    },
+  },
+  {
+    name: 'unknown pending',
+    status: 503,
+    code: 'AUTH_SESSION_REVOCATION_PENDING',
+    data: { session_revocation_complete: false },
+  },
+  {
+    name: 'unknown storage failure',
+    status: 500,
+    code: 'AUTH_INTERNAL_ERROR',
+    data: {},
+  },
+])(
+  'keeps $name safe in mutation cache before reset or garbage collection',
+  async (scenario) => {
+    signInAccountFixture()
+    const failure = accountFailureAdapter(scenario.status, {
+      success: false,
+      code: scenario.code,
+      message: '',
+      data: scenario.data,
+    })
+    const mutation = client.getMutationCache().build(client, {
+      mutationFn: () =>
+        changeAccountPassword(
+          {
+            password: 's1-password-canary',
+            original_password: 's1-original-password-canary',
+          },
+          's1-proof-canary',
+          new AbortController().signal
+        ),
+      retry: false,
+    })
+    await expect(mutation.execute(undefined)).rejects.toMatchObject({
+      code: scenario.code,
+    })
+    expect(failure.adapter).toHaveBeenCalledTimes(1)
+    const retained = mutation.state.error as Error & {
+      credential_change_committed?: boolean
+      revoked_count?: number
+    }
+    if ('credential_change_committed' in scenario.data) {
+      expect(retained).toMatchObject({
+        credential_change_committed: true,
+        revoked_count: 2,
+      })
+    } else {
+      expect(retained).not.toHaveProperty('credential_change_committed')
+      expect(retained).not.toHaveProperty('revoked_count')
+    }
+    expectNoAccountSecrets(
+      [
+        ...client
+          .getMutationCache()
+          .getAll()
+          .map((item) => item.state),
+        ...client
+          .getQueryCache()
+          .getAll()
+          .map((item) => item.state),
+      ],
+      failure.originals,
+      failure.secrets
+    )
+    expect(useAuthStore.getState().auth.accessToken).toBe('s1-bearer-canary')
+  }
+)
+
+it('projects session GET failures before query error and failureReason retain credentials', async () => {
+  signInAccountFixture()
+  const failure = accountFailureAdapter(500, {
+    success: false,
+    code: 'AUTH_INTERNAL_ERROR',
+  })
+  await expect(
+    client.fetchQuery({
+      queryKey: ['s1-sessions'],
+      queryFn: () => getLoginSessions(),
+    })
+  ).rejects.toMatchObject({ code: 'AUTH_INTERNAL_ERROR' })
+  expectNoAccountSecrets(
+    client
+      .getQueryCache()
+      .getAll()
+      .map((item) => item.state),
+    failure.originals,
+    failure.secrets
+  )
+})
+
+it('keeps the public account hook pending error safe without treating it as success', async () => {
+  signInAccountFixture()
+  const failure = accountFailureAdapter(503, {
+    success: false,
+    code: 'AUTH_SESSION_REVOCATION_PENDING',
+    data: {
+      session_revocation_complete: false,
+      credential_change_committed: true,
+    },
+  })
+  const { result } = renderHook(() => useAccountSecurity())
+  let outcome: unknown
+  await act(async () => {
+    outcome = await result.current.run((signal) =>
+      changeAccountPassword(
+        {
+          password: 's1-password-canary',
+          original_password: 's1-original-password-canary',
+        },
+        's1-proof-canary',
+        signal
+      )
+    )
+  })
+  expect(outcome).toBeUndefined()
+  expect(result.current.pending).toBe(false)
+  expect(result.current.error).toMatchObject({
+    code: 'AUTH_SESSION_REVOCATION_PENDING',
+    credential_change_committed: true,
+  })
+  expectNoAccountSecrets(
+    [
+      result.current.error,
+      ...client
+        .getMutationCache()
+        .getAll()
+        .map((item) => item.state),
+      ...client
+        .getQueryCache()
+        .getAll()
+        .map((item) => item.state),
+    ],
+    failure.originals,
+    failure.secrets
+  )
+  expect(failure.adapter).toHaveBeenCalledTimes(1)
+})
+
+it('projects an ordinary initial-password verification failure before the account hook retains it', async () => {
+  signInAccountFixture()
+  const failure = accountFailureAdapter(403, {
+    success: false,
+    code: 'SECURITY_VERIFICATION_FAILED',
+  })
+  const failedAdapter = failure.adapter
+  api.defaults.adapter = async (config) => {
+    if (config.url !== '/api/verify/methods') return failedAdapter(config)
+    return {
+      data: {
+        success: true,
+        data: {
+          scope: 'account.password.change',
+          methods: [{ method: 'password', available: true }],
+          oauth_providers: [],
+          password_encryption_enabled: false,
+        },
+      },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    }
+  }
+  const { result } = renderHook(() => useAccountSecurity())
+  await act(async () => {
+    await result.current.run((signal) =>
+      result.current.verify(
+        { scope: 'account.password.change' },
+        signal,
+        's1-original-password-canary'
+      )
+    )
+  })
+  expect(failedAdapter).toHaveBeenCalledTimes(1)
+  expect(result.current.error).toMatchObject({
+    code: 'SECURITY_VERIFICATION_FAILED',
+    status: 403,
+  })
+  expect(result.current.verificationDialogProps.state.phase).toBe('idle')
+  expectNoAccountSecrets(
+    [
+      result.current.error,
+      result.current.verificationDialogProps.state,
+      ...client
+        .getMutationCache()
+        .getAll()
+        .map((item) => item.state),
+      ...client
+        .getQueryCache()
+        .getAll()
+        .map((item) => item.state),
+    ],
+    failure.originals,
+    failure.secrets
+  )
 })
 
 it('requires verification after username confirmation and cancels without deleting the account', async () => {
@@ -822,4 +1162,122 @@ it('shows complete translated 2FA step descriptions and updates every step on la
     const next = screen.queryByRole('button', { name: 'Next' })
     if (next) await user.click(next)
   }
+})
+
+it('rejects an old session intent after the real asynchronous header turn even without React cancellation', async () => {
+  signInAccountFixture()
+  const failure = accountFailureAdapter(503, {
+    success: false,
+    code: 'AUTH_SESSION_REVOCATION_PENDING',
+  })
+  const previous = useAuthStore.getState().auth
+  const { accessExpiresAt, session: previousSession } = previous
+  if (!previousSession || typeof accessExpiresAt !== 'number') {
+    throw new Error('Missing signed-in account fixture')
+  }
+  const request = revokeLoginSession(
+    'other-session',
+    's1-proof-canary',
+    new AbortController().signal
+  )
+  queueMicrotask(() => {
+    useAuthStore.getState().auth.setBundle({
+      access_token: 'replacement-access',
+      token_type: 'Bearer',
+      access_expires_at: accessExpiresAt,
+      user: { id: 2, username: 'replacement', role: 1 },
+      session: { ...previousSession, sid: 'replacement-session' },
+    })
+  })
+  await expect(request).rejects.toMatchObject({ code: 'AUTH_CANCELLED' })
+  expect(failure.adapter).not.toHaveBeenCalled()
+})
+
+it('keeps the real session card mutation and every retained cache state free of pending Axios credentials', async () => {
+  signInAccountFixture()
+  const session = useAuthStore.getState().auth.session
+  if (!session) throw new Error('Missing signed-in account fixture')
+  const failure = accountFailureAdapter(503, {
+    success: false,
+    code: 'AUTH_SESSION_REVOCATION_PENDING',
+    data: {
+      session_revocation_complete: false,
+      credential_change_committed: false,
+      revoked_count: 0,
+    },
+  })
+  const failedAdapter = failure.adapter
+  api.defaults.adapter = async (config) => {
+    let data: unknown
+    if (config.url === '/api/user/sessions') {
+      data = [session, { ...session, sid: 'other-session', current: false }]
+    } else if (config.url === '/api/verify/methods') {
+      data = {
+        scope: 'session.revoke_others',
+        methods: [{ method: '2fa', available: true }],
+        oauth_providers: [],
+        password_encryption_enabled: false,
+      }
+    } else if (config.url === '/api/verify') {
+      data = {
+        scope: 'session.revoke_others',
+        method: '2fa',
+        proof_token: 's1-proof-canary',
+        expires_at: Math.floor(Date.now() / 1000) + 60,
+      }
+    } else return failedAdapter(config)
+    return {
+      data: { success: true, data },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    }
+  }
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <LoginSessionsCard />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', {
+      name: 'Sign out other sessions',
+    })
+  )
+  await user.click(
+    within(await screen.findByRole('alertdialog')).getByRole('button', {
+      name: 'Sign out others',
+    })
+  )
+  await user.type(
+    await screen.findByLabelText('Authenticator code or backup code', {
+      selector: 'input',
+    }),
+    '123456'
+  )
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+  await waitFor(() =>
+    expect(client.getMutationCache().getAll()[0].state.status).toBe('error')
+  )
+  expect(client.getMutationCache().getAll()[0].state.error).toMatchObject({
+    code: 'AUTH_SESSION_REVOCATION_PENDING',
+    credential_change_committed: false,
+    revoked_count: 0,
+  })
+  expectNoAccountSecrets(
+    [
+      ...client
+        .getMutationCache()
+        .getAll()
+        .map((item) => item.state),
+      ...client
+        .getQueryCache()
+        .getAll()
+        .map((item) => item.state),
+    ],
+    failure.originals,
+    failure.secrets
+  )
+  expect(failedAdapter).toHaveBeenCalledTimes(1)
 })
