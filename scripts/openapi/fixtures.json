@@ -12653,7 +12653,11 @@
           "count": 2,
           "quota": 19
         }
-      ]
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
     },
     "valid": true
   },
@@ -12664,7 +12668,11 @@
     "value": {
       "success": true,
       "message": "",
-      "data": []
+      "data": [],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
     },
     "valid": true
   },
@@ -12675,7 +12683,11 @@
     "value": {
       "success": true,
       "message": "",
-      "data": null
+      "data": null,
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
     },
     "valid": true
   },
@@ -12695,7 +12707,11 @@
     "schema": "#/components/schemas/PersonalQuotaDataResult",
     "value": {
       "success": true,
-      "message": ""
+      "message": "",
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
     },
     "valid": false
   },
@@ -12721,7 +12737,11 @@
           "count": 2,
           "quota": "19"
         }
-      ]
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
     },
     "valid": false
   },
@@ -12747,7 +12767,11 @@
           "count": 1.5,
           "quota": 19
         }
-      ]
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
     },
     "valid": false
   },
@@ -12774,7 +12798,11 @@
           "quota": 19,
           "legacy_extra": "retained"
         }
-      ]
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
     },
     "valid": true
   },
@@ -16413,5 +16441,271 @@
       ]
     },
     "valid": false
+  },
+  {
+    "name": "personal hourly quota series missing metadata granularity",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series missing metadata quota_per_unit",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "granularity": "hour",
+      "data_complete": false,
+      "enable_data_export": true
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series missing metadata data_complete",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "enable_data_export": true
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series missing metadata enable_data_export",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series invalid metadata granularity",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "granularity": "day",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": true
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series invalid metadata quota_per_unit",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "granularity": "hour",
+      "quota_per_unit": "12345.5",
+      "data_complete": false,
+      "enable_data_export": true
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series invalid metadata data_complete",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": true,
+      "enable_data_export": true
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series invalid metadata enable_data_export",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": "false"
+    },
+    "valid": false
+  },
+  {
+    "name": "personal hourly quota series collection off retains historical row",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1700000000,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19
+        }
+      ],
+      "granularity": "hour",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": false
+    },
+    "valid": true
   }
 ]

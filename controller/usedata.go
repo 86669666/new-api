@@ -75,9 +75,13 @@ func GetUserQuotaDates(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    dates,
+		"success":            true,
+		"message":            "",
+		"data":               dates,
+		"granularity":        "hour",
+		"quota_per_unit":     common.QuotaPerUnit,
+		"data_complete":      false,
+		"enable_data_export": common.DataExportEnabled,
 	})
 	return
 }

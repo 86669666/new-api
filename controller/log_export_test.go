@@ -409,7 +409,11 @@ func TestUserQuotaRangeErrorStatus(t *testing.T) {
 					}, body)
 					return
 				}
-				assert.Equal(t, map[string]any{"success": true, "message": "", "data": []any{}}, body)
+				assert.Equal(t, map[string]any{
+					"success": true, "message": "", "data": []any{},
+					"granularity": "hour", "quota_per_unit": common.QuotaPerUnit,
+					"data_complete": false, "enable_data_export": common.DataExportEnabled,
+				}, body)
 			})
 		}
 	}
@@ -426,7 +430,9 @@ func TestUserQuotaDataSeriesContract(t *testing.T) {
 	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	require.NoError(t, db.AutoMigrate(&model.QuotaData{}))
 	previousExport := common.DataExportEnabled
+	previousQuotaPerUnit := common.QuotaPerUnit
 	common.DataExportEnabled = true
+	common.QuotaPerUnit = 123456.75
 	model.CacheQuotaDataLock.Lock()
 	previousCache := model.CacheQuotaData
 	model.CacheQuotaData = make(map[string]*model.QuotaData)
@@ -436,6 +442,7 @@ func TestUserQuotaDataSeriesContract(t *testing.T) {
 	setting.MaxRangeDays = 365
 	t.Cleanup(func() {
 		common.DataExportEnabled = previousExport
+		common.QuotaPerUnit = previousQuotaPerUnit
 		*setting = previousSetting
 		model.CacheQuotaDataLock.Lock()
 		model.CacheQuotaData = previousCache
@@ -487,14 +494,33 @@ func TestUserQuotaDataSeriesContract(t *testing.T) {
 			var body map[string]any
 			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
 			require.Equal(t, http.StatusOK, recorder.Code)
-			require.Len(t, body, 3)
+			require.Len(t, body, 7)
 			assert.Equal(t, true, body["success"])
 			assert.Equal(t, "", body["message"])
+			assert.Equal(t, "hour", body["granularity"])
+			assert.Equal(t, float64(123456.75), body["quota_per_unit"])
+			assert.Equal(t, false, body["data_complete"])
+			assert.Equal(t, tc.enabled, body["enable_data_export"])
 			rows, ok := body["data"].([]any)
 			require.True(t, ok, "the actual empty success value is an array, not null")
 			assert.ElementsMatch(t, tc.want, rows, "hourly aggregates have no ordering guarantee")
 		})
 	}
+	t.Run("admin_series_keeps_existing_root_fields", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		query := url.Values{"start_timestamp": {fmt.Sprint(bucket)}, "end_timestamp": {fmt.Sprint(bucket + 3600)}}
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/data?"+query.Encode(), nil)
+		ctx.Set("role", common.RoleAdminUser)
+		GetAllQuotaDates(ctx)
+		var body map[string]any
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+		require.Equal(t, http.StatusOK, recorder.Code)
+		assert.Len(t, body, 3)
+		assert.Equal(t, true, body["success"])
+		assert.Equal(t, "", body["message"])
+		assert.Contains(t, body, "data")
+	})
 }
 
 func TestLogExportRules(t *testing.T) {

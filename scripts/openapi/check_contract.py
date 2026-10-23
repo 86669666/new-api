@@ -520,10 +520,17 @@ def check_personal_quota_series(api):
     ]}
     success = schemas['PersonalQuotaDataSuccess']
     assert success['type'] == 'object' and 'additionalProperties' not in success
-    assert success['required'] == ['success', 'message', 'data']
-    assert set(success['properties']) == {'success', 'message', 'data'}
+    assert success['required'] == ['success', 'message', 'data', 'granularity', 'quota_per_unit', 'data_complete', 'enable_data_export']
+    assert set(success['properties']) == set(success['required'])
     assert success['properties']['success'] == {'type': 'boolean', 'enum': [True]}
     assert success['properties']['message'] == {'type': 'string', 'enum': ['']}
+    for name, expected in {
+        'granularity': {'type': 'string', 'enum': ['hour']},
+        'quota_per_unit': {'type': 'number'},
+        'data_complete': {'type': 'boolean', 'enum': [False]},
+        'enable_data_export': {'type': 'boolean'},
+    }.items():
+        assert {key: value for key, value in success['properties'][name].items() if key != 'description'} == expected
     data = success['properties']['data']
     assert {key: value for key, value in data.items() if key != 'description'} == {
         'type': 'array', 'nullable': True, 'items': {'$ref': '#/components/schemas/PersonalQuotaDataPoint'}}
@@ -541,7 +548,8 @@ def check_personal_quota_series(api):
     assert 'placeholder' in point['description']
     return {'scope': 'GET /api/data/self existing hourly series', 'query_parameters': [p['name'] for p in parameters],
             'legacy_200_error_preserved': True, 'empty_array_and_nullable_compatibility': True,
-            'collection_disabled_keeps_history': True, 'live_http': False}
+            'collection_disabled_keeps_history': True, 'success_metadata': ['granularity', 'quota_per_unit', 'data_complete', 'enable_data_export'],
+            'historical_completeness': False, 'live_http': False}
 
 
 def check_personal_log_pagination(api):

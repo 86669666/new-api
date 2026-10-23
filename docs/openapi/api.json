@@ -10673,7 +10673,7 @@
       "get": {
         "summary": "获取个人额度数据",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限） Existing personal hourly quota series, grouped by authenticated user, username, model and stored bucket timestamp. Normal collection writes hour-start Unix seconds; filtering is inclusive on these stored bucket timestamps, with no sorting, zero-fill or day aggregation guarantee. DataExportEnabled gates new collection and periodic cache saving, not historical reads. Read current configuration from /api/status data.enable_data_export; this flag does not establish completeness of any historical range or prove zero usage. Quota remains a raw integer; quota_per_unit and existing display settings are separate from a complete currency presentation. The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. The range helper uses min(now,end) only for limit calculation and returns an adjusted start. The original parsed end, including 0 for missing or syntax-invalid input, is still passed to SQL; missing end does not become now. Existing parsing and success/message/data behavior are unchanged. HTTP200 may also contain success:false for a database error; inspect success before using data.",
+        "description": "🔐 需要登录（User权限） Existing personal hourly quota series, grouped by authenticated user, username, model and stored bucket timestamp. Normal collection writes hour-start Unix seconds; filtering is inclusive on these stored bucket timestamps, with no sorting, zero-fill or day aggregation guarantee. DataExportEnabled gates new collection and periodic cache saving, not historical reads. Successful responses also expose granularity=hour, quota_per_unit, fixed data_complete=false and current enable_data_export. The current collection flag is a separate non-atomic configuration snapshot; it does not establish completeness of any historical range or prove zero usage. Quota remains a raw integer; quota_per_unit and existing display settings are separate from a complete currency presentation. The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. The range helper uses min(now,end) only for limit calculation and returns an adjusted start. The original parsed end, including 0 for missing or syntax-invalid input, is still passed to SQL; missing end does not become now. Existing parsing, data rows and errors are unchanged; only the four success-root metadata fields are added. HTTP200 may also contain success:false for a database error; inspect success before using data.",
         "tags": [
           "数据统计"
         ],
@@ -33661,7 +33661,11 @@
         "required": [
           "success",
           "message",
-          "data"
+          "data",
+          "granularity",
+          "quota_per_unit",
+          "data_complete",
+          "enable_data_export"
         ],
         "properties": {
           "success": {
@@ -33683,6 +33687,28 @@
               "$ref": "#/components/schemas/PersonalQuotaDataPoint"
             },
             "description": "The current no-row handler emits []; nullable compatibility is retained without normalizing production data."
+          },
+          "granularity": {
+            "type": "string",
+            "enum": [
+              "hour"
+            ],
+            "description": "Stored hourly aggregation; no new granularity query or day aggregation."
+          },
+          "quota_per_unit": {
+            "type": "number",
+            "description": "Current server quota unit for client display conversion; quota rows remain raw integers."
+          },
+          "data_complete": {
+            "type": "boolean",
+            "enum": [
+              false
+            ],
+            "description": "Historical collection coverage is not proven, even while collection is currently enabled."
+          },
+          "enable_data_export": {
+            "type": "boolean",
+            "description": "Current collection configuration snapshot; disabling collection does not hide stored history."
           }
         }
       },
