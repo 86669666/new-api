@@ -32,8 +32,22 @@ func GetTokenUsageLogs(ctx context.Context, userID, tokenID int, start, end int6
 	if userID <= 0 || tokenID <= 0 {
 		return nil, 0, errors.New("invalid token usage owner")
 	}
-	return queryUsageLogs(LOG_DB.WithContext(ctx).Model(&Log{}).
+	items, total, err := queryUsageLogs(LOG_DB.WithContext(ctx).Model(&Log{}).
 		Where("user_id = ? AND token_id = ? AND type = ? AND created_at >= ? AND created_at <= ?", userID, tokenID, LogTypeConsume, start, end), modelName, offset, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	if total < 0 || total > OAuthUsageMaxInteger {
+		return nil, 0, ErrOAuthUsageNumeric
+	}
+	for _, item := range items {
+		for _, value := range []int64{item.CreatedAt, int64(item.PromptTokens), int64(item.CompletionTokens), int64(item.Quota), int64(item.UseTime)} {
+			if value < -OAuthUsageMaxInteger || value > OAuthUsageMaxInteger {
+				return nil, 0, ErrOAuthUsageNumeric
+			}
+		}
+	}
+	return items, total, nil
 }
 
 // queryUsageLogs shares only the bounded public projection and ordering. Each
@@ -71,19 +85,8 @@ func GetTokenUsageStat(ctx context.Context, userID, tokenID int, start, end int6
 		Select("created_at AS ts, SUM(quota) AS quota, SUM(count) AS requests, SUM(token_used) AS tokens").
 		Where("user_id = ? AND token_id = ? AND created_at >= ? AND created_at <= ?", userID, tokenID, start-start%3600, end-end%3600).
 		Group("created_at").Order("created_at ASC").Scan(&hours).Error
-	if err != nil || granularity == "hour" {
-		return hours, err
+	if err != nil {
+		return nil, err
 	}
-	days := make([]TokenUsageBucket, 0)
-	for _, hour := range hours {
-		ts := hour.TS - hour.TS%86400
-		if len(days) == 0 || days[len(days)-1].TS != ts {
-			days = append(days, TokenUsageBucket{TS: ts})
-		}
-		day := &days[len(days)-1]
-		day.Quota += hour.Quota
-		day.Requests += hour.Requests
-		day.Tokens += hour.Tokens
-	}
-	return days, nil
+	return FoldOAuthUsageHours(hours, granularity)
 }

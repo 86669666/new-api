@@ -948,3 +948,148 @@ func TestOAuthUsageConsumerHTTP(t *testing.T) {
 		assert.NotContains(t, w.Body.String(), "diagnostic")
 	})
 }
+
+// Numeric publication is checked after real storage and through the formal
+// sk-key route. This is read-only reporting, not quota settlement.
+func TestTokenUsageNumericHTTP(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	require.NoError(t, f.db.AutoMigrate(&model.QuotaData{}))
+	oldExport, oldConsume := common.DataExportEnabled, common.LogConsumeEnabled
+	common.DataExportEnabled, common.LogConsumeEnabled = true, true
+	t.Cleanup(func() { common.DataExportEnabled, common.LogConsumeEnabled = oldExport, oldConsume })
+	key, err := common.GenerateRandomCharsKey(40)
+	require.NoError(t, err)
+	token := model.Token{UserId: f.users["owner"].Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, f.db.Create(&token).Error)
+	f.bearer["numeric"] = "sk-" + key
+	base := time.Now().UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour).Unix()
+	window := fmt.Sprintf("start_timestamp=%d&end_timestamp=%d", base, base+3*3600)
+	const safe = model.OAuthUsageMaxInteger
+
+	t.Run("stat", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, column, granularity string
+			values                    []int64
+			separateHours             bool
+			want                      int
+		}{
+			{"safe_max", "quota", "hour", []int64{safe}, false, 200},
+			{"negative_safe", "quota", "day", []int64{-safe}, false, 200},
+			{"zero", "quota", "day", []int64{0}, false, 200},
+			{"hour_max_plus_one", "quota", "hour", []int64{safe, 1}, false, 500},
+			{"hour_negative_unsafe", "quota", "hour", []int64{-safe, -1}, false, 500},
+			{"requests_unsafe", "count", "hour", []int64{safe, 1}, false, 500},
+			{"tokens_unsafe", "token_used", "hour", []int64{safe, 1}, false, 500},
+			{"day_prefix_cannot_cancel", "quota", "day", []int64{safe, 1, -1}, true, 500},
+			{"negative_day_prefix_cannot_cancel", "quota", "day", []int64{-safe, -1, 1}, true, 500},
+			{"sql_sum_overflow", "quota", "hour", []int64{math.MaxInt64, 1}, false, 500},
+			{"sql_sum_underflow", "quota", "hour", []int64{math.MinInt64, -1}, false, 500},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				for i, value := range tc.values {
+					ts := base
+					if tc.separateHours {
+						ts += int64(i) * 3600
+					}
+					row := model.QuotaData{UserID: token.UserId, TokenID: token.Id, CreatedAt: ts, ModelName: fmt.Sprint(i)}
+					require.NoError(t, f.db.Create(&row).Error)
+					require.NoError(t, f.db.Model(&row).UpdateColumn(tc.column, value).Error)
+					var stored int64
+					require.NoError(t, f.db.Model(&row).Select(tc.column).Scan(&stored).Error)
+					require.Equal(t, value, stored)
+				}
+				status, _, body := f.request(t, "GET", "/api/usage/token/stat?"+window+"&granularity="+tc.granularity, "numeric", "", nil)
+				assert.Equal(t, tc.want, status)
+				if tc.want == 500 {
+					assert.Equal(t, "TOKEN_USAGE_QUERY_FAILED", body["code"])
+					assert.NotContains(t, body, "data")
+				} else {
+					require.Equal(t, true, body["success"])
+					items := body["data"].([]any)
+					require.Len(t, items, 1)
+					assert.Equal(t, float64(tc.values[0]), items[0].(map[string]any)["quota"])
+				}
+				if strings.HasPrefix(tc.name, "sql_sum_") {
+					// Assert a real SQL SUM/driver scan failure, independently of
+					// the numeric guard, without relying on dialect error text.
+					var sum int64
+					err := f.db.Model(&model.QuotaData{}).Select("SUM(quota)").Where("token_id = ?", token.Id).Scan(&sum).Error
+					require.Error(t, err)
+				}
+				require.NoError(t, f.db.Where("token_id = ?", token.Id).Delete(&model.QuotaData{}).Error)
+			})
+		}
+	})
+
+	t.Run("logs", func(t *testing.T) {
+		if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+			// The native log writer uses narrower columns. As in the existing
+			// OAuth test, widen only this disposable fixture to represent a
+			// retained Int64 log store; production schema is unchanged.
+			for _, column := range []string{"quota", "prompt_tokens", "completion_tokens", "use_time"} {
+				require.NoError(t, model.LOG_DB.Exec("ALTER TABLE logs MODIFY COLUMN "+column+" Int64").Error)
+			}
+		}
+		for _, column := range []string{"quota", "prompt_tokens", "completion_tokens", "use_time"} {
+			for _, value := range []int64{safe, -safe, safe + 1, -safe - 1} {
+				t.Run(fmt.Sprintf("%s/%d", column, value), func(t *testing.T) {
+					name := fmt.Sprintf("numeric_%s_%d", column, value)
+					row := model.Log{UserId: token.UserId, TokenId: token.Id, CreatedAt: base + 1, Type: model.LogTypeConsume, ModelName: name, RequestId: name}
+					switch column {
+					case "quota":
+						row.Quota = int(value)
+					case "prompt_tokens":
+						row.PromptTokens = int(value)
+					case "completion_tokens":
+						row.CompletionTokens = int(value)
+					case "use_time":
+						row.UseTime = int(value)
+					}
+					require.NoError(t, model.LOG_DB.Create(&row).Error)
+					var stored int64
+					require.NoError(t, model.LOG_DB.Model(&model.Log{}).Select(column).Where("model_name = ?", name).Scan(&stored).Error)
+					require.Equal(t, value, stored)
+					status, _, body := f.request(t, "GET", "/api/usage/token/logs?"+window+"&model_name="+url.QueryEscape(name), "numeric", "", nil)
+					if value > safe || value < -safe {
+						assert.Equal(t, 500, status)
+						assert.Equal(t, "TOKEN_USAGE_QUERY_FAILED", body["code"])
+						assert.NotContains(t, body, "data")
+					} else {
+						require.Equal(t, 200, status)
+						data := body["data"].(map[string]any)
+						assert.Equal(t, float64(1), data["total"])
+						items := data["items"].([]any)
+						require.Len(t, items, 1)
+						assert.Equal(t, float64(value), items[0].(map[string]any)[column])
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("count_publication", func(t *testing.T) {
+		// Cardinalities above 2^53 cannot be materialized in a bounded fixture.
+		// Replace only the completed COUNT observation; real route/auth and
+		// query still execute. This is not a claim of a quadrillion-row DB test.
+		for _, value := range []int64{safe, safe + 1, -1} {
+			t.Run(strconv.FormatInt(value, 10), func(t *testing.T) {
+				name := "token_usage_numeric_count"
+				require.NoError(t, model.LOG_DB.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
+					if count, ok := tx.Statement.Dest.(*int64); ok && strings.Contains(strings.ToLower(tx.Statement.SQL.String()), "count(") {
+						*count = value
+					}
+				}))
+				t.Cleanup(func() { require.NoError(t, model.LOG_DB.Callback().Query().Remove(name)) })
+				status, _, body := f.request(t, "GET", "/api/usage/token/logs?"+window+"&model_name=no-such-numeric-row", "numeric", "", nil)
+				if value == safe {
+					require.Equal(t, 200, status)
+					assert.Equal(t, float64(safe), body["data"].(map[string]any)["total"])
+				} else {
+					assert.Equal(t, 500, status)
+					assert.Equal(t, "TOKEN_USAGE_QUERY_FAILED", body["code"])
+					assert.NotContains(t, body, "data")
+				}
+			})
+		}
+	})
+}
