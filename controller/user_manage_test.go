@@ -698,3 +698,163 @@ func TestManageUserOrganizationMembershipBlocksBothDeleteEntrypoints(t *testing.
 		})
 	}
 }
+
+func TestManageUserDemotePostCommitCacheFailures(t *testing.T) {
+	for _, scenario := range []string{"success", "pending", "policy_reload", "user_reload", "rollback", "cache_failure", "pending_cache_failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			db := setupManageUserTestDB(t)
+			previousMaster := common.IsMasterNode
+			common.IsMasterNode = false
+			t.Cleanup(func() { common.IsMasterNode = previousMaster })
+			require.NoError(t, authz.Init(db))
+			// Initialize the real token lookup's dialect-specific column names.
+			logDB := model.LOG_DB
+			t.Setenv("LOG_SQL_DSN", "")
+			require.NoError(t, model.InitLogDB())
+			model.LOG_DB = logDB
+			require.NoError(t, db.AutoMigrate(&model.Token{}))
+			server := miniredis.RunT(t)
+			previousRDB := common.RDB
+			common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+			common.RedisEnabled = true
+			t.Cleanup(func() { _ = common.RDB.Close(); common.RDB = previousRDB })
+			user := model.User{Username: "demote-cache-target", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, Quota: 4700, UsedQuota: 300}
+			require.NoError(t, db.Create(&user).Error)
+			now := time.Now().Unix()
+			require.NoError(t, db.Create(&model.UserSession{SID: "demote-cache-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "demote-cache-refresh", LoginMethod: "password", LastActiveAt: now, ExpiresAt: now + 3600}).Error)
+			key, err := common.GenerateRandomCharsKey(40)
+			require.NoError(t, err)
+			token := model.Token{UserId: user.Id, Key: key, Name: "demote-cache-relay", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+			require.NoError(t, db.Create(&token).Error)
+			_, err = model.GetTokenByKey(key, false)
+			require.NoError(t, err)
+			cacheKey := "token:" + common.GenerateHMAC(key)
+			fenceKey := "token:fence:" + common.GenerateHMAC(key)
+			require.EqualValues(t, 1, common.RDB.Exists(t.Context(), cacheKey).Val())
+			identity, proof := manageUserProof(t, db, service.VerificationOperation{Scope: service.VerificationScopeAdminUserManage, Context: []byte(fmt.Sprintf(`{"user_id":%d,"action":"demote"}`, user.Id))})
+			pending := scenario == "pending" || scenario == "pending_cache_failure"
+			cacheFailure := scenario == "cache_failure" || scenario == "pending_cache_failure"
+			var cacheAttempted, pendingAttempted, policyAttempted, userReadAttempted, policyRead bool
+			forcedCache := errors.New("demote token enumeration unavailable")
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:demote-cache-query", func(tx *gorm.DB) {
+				if tx.Statement.Table == "tokens" {
+					cacheAttempted = true
+					if cacheFailure {
+						tx.AddError(forcedCache)
+					}
+				}
+				if tx.Statement.Table == "casbin_rule" {
+					policyAttempted = true
+					if scenario == "policy_reload" {
+						tx.AddError(errors.New("demote policy reload unavailable"))
+					}
+				}
+				if tx.Statement.Table == "users" && policyRead && scenario == "user_reload" {
+					userReadAttempted = true
+					tx.AddError(errors.New("demote user reload unavailable"))
+				}
+			}))
+			require.NoError(t, db.Callback().Query().After("gorm:query").Register("test:demote-policy-read", func(tx *gorm.DB) {
+				if tx.Statement.Table == "casbin_rule" {
+					policyRead = true
+				}
+			}))
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:demote-pending", func(tx *gorm.DB) {
+				if pending && tx.Statement.Table == "user_sessions" {
+					pendingAttempted = true
+					tx.AddError(errors.New("demote projection unavailable"))
+				}
+			}))
+			require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:demote-rollback", func(tx *gorm.DB) {
+				if scenario == "rollback" {
+					if _, ok := tx.Statement.Dest.(*model.SessionRevocationEvent); ok {
+						tx.AddError(errors.New("demote intent unavailable"))
+					}
+				}
+			}))
+			t.Cleanup(func() {
+				_ = db.Callback().Query().Remove("test:demote-cache-query")
+				_ = db.Callback().Query().Remove("test:demote-policy-read")
+				_ = db.Callback().Update().Remove("test:demote-pending")
+				_ = db.Callback().Create().Remove("test:demote-rollback")
+			})
+			request := fmt.Sprintf(`{"id":%d,"action":"demote"}`, user.Id)
+			response := performVerifiedManageUserRequest(t, request, identity, proof)
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+			assert.Equal(t, scenario == "success", body["success"])
+			if pending {
+				assert.True(t, pendingAttempted)
+				assert.Equal(t, 503, response.Code)
+				assert.Equal(t, "AUTH_SESSION_REVOCATION_PENDING", body["code"])
+				data, ok := body["data"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, true, data["credential_change_committed"])
+				assert.Equal(t, false, data["session_revocation_complete"])
+			} else {
+				assert.Equal(t, 200, response.Code)
+			}
+			if scenario == "policy_reload" {
+				assert.True(t, policyAttempted)
+				assert.Equal(t, "demote policy reload unavailable", body["message"])
+			}
+			if scenario == "user_reload" {
+				assert.True(t, userReadAttempted)
+				assert.Equal(t, "demote user reload unavailable", body["message"])
+			}
+			if scenario == "cache_failure" {
+				assert.Equal(t, forcedCache.Error(), body["message"])
+			}
+			assert.Equal(t, scenario != "rollback", cacheAttempted, "only a confirmed commit owns invalidation")
+			require.NoError(t, db.Callback().Query().Remove("test:demote-cache-query"))
+			require.NoError(t, db.Callback().Query().Remove("test:demote-policy-read"))
+			var stored model.User
+			require.NoError(t, db.First(&stored, user.Id).Error)
+			version, role := int64(2), common.RoleCommonUser
+			if scenario == "rollback" {
+				version, role = 1, common.RoleAdminUser
+			}
+			assert.Equal(t, version, stored.AuthVersion)
+			assert.Equal(t, role, stored.Role)
+			assert.Equal(t, 4700, stored.Quota)
+			assert.Equal(t, 300, stored.UsedQuota)
+			var events []model.SessionRevocationEvent
+			require.NoError(t, db.Where("user_id = ?", user.Id).Find(&events).Error)
+			if scenario == "rollback" {
+				assert.Empty(t, events)
+			} else {
+				require.Len(t, events, 1)
+				assert.Equal(t, "admin_demote", events[0].Reason)
+			}
+			cacheExists, err := common.RDB.Exists(t.Context(), cacheKey).Result()
+			require.NoError(t, err)
+			fenceExists, err := common.RDB.Exists(t.Context(), fenceKey).Result()
+			require.NoError(t, err)
+			if scenario == "rollback" || cacheFailure {
+				assert.EqualValues(t, 1, cacheExists)
+				assert.Zero(t, fenceExists)
+			} else {
+				assert.Zero(t, cacheExists)
+				assert.EqualValues(t, 1, fenceExists)
+				_, err = model.GetTokenByKey(key, false)
+				require.NoError(t, err)
+				assert.Zero(t, common.RDB.Exists(t.Context(), cacheKey).Val(), "late cache refill stays fenced")
+			}
+			var storedToken model.Token
+			require.NoError(t, db.First(&storedToken, token.Id).Error)
+			assert.Equal(t, common.TokenStatusEnabled, storedToken.Status)
+			operator, err := model.GetUserSessionBySID(identity.SessionID)
+			require.NoError(t, err)
+			assert.Equal(t, model.UserSessionStatusActive, operator.Status)
+			if scenario != "rollback" {
+				replay := performVerifiedManageUserRequest(t, request, identity, proof)
+				assert.Contains(t, replay.Body.String(), `"success":false`)
+				require.NoError(t, db.First(&stored, user.Id).Error)
+				assert.EqualValues(t, 2, stored.AuthVersion)
+				var count int64
+				require.NoError(t, db.Model(&model.SessionRevocationEvent{}).Where("user_id = ?", user.Id).Count(&count).Error)
+				assert.EqualValues(t, 1, count)
+			}
+		})
+	}
+}

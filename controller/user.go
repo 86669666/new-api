@@ -1191,6 +1191,12 @@ func ManageUser(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
+		// The role change is committed. Fence relay metadata before any
+		// completion/reload failure can return; these failures cannot undo it.
+		tokenCacheErr := model.InvalidateUserTokensCache(user.Id)
+		if tokenCacheErr != nil {
+			common.SysLog(common.LogText("failed to invalidate tokens cache for user %d: %s", user.Id, tokenCacheErr.Error()))
+		}
 		if err := user.CompleteSessionRevocation(); err != nil {
 			writeSecurityOperationError(c, err)
 			return
@@ -1203,18 +1209,21 @@ func ManageUser(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
+		// Preserve earlier completion/reload errors, but never report success
+		// when the committed demotion's token cache invalidation failed.
+		if tokenCacheErr != nil {
+			common.ApiError(c, tokenCacheErr)
+			return
+		}
 	} else {
 		if err := user.Update(false); err != nil {
 			writeSessionMutationError(c, err)
 			return
 		}
-	}
-	// Update/UpdateWithTx has already published the new user hash and revoked
-	// browser sessions exactly once. Only PAT/relay token caches still need an
-	// explicit invalidation; deleting the user hash here would discard the
-	// freshly published auth-version floor.
-	if err := model.InvalidateUserTokensCache(user.Id); err != nil {
-		common.SysLog(common.LogText("failed to invalidate tokens cache for user %d: %s", user.Id, err.Error()))
+		// Keep the committed user hash and auth-version floor intact.
+		if err := model.InvalidateUserTokensCache(user.Id); err != nil {
+			common.SysLog(common.LogText("failed to invalidate tokens cache for user %d: %s", user.Id, err.Error()))
+		}
 	}
 	recordManageAuditFor(c, user.Id, "user.manage", map[string]any{
 		"action":              req.Action,
