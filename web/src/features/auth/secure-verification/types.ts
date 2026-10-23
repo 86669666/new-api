@@ -25,6 +25,8 @@ import {
 import { AuthOperationError } from '@/lib/secure-verification'
 import type { AuthBundle, LoginSession } from '@/stores/auth-store'
 
+export type VerificationErrorProjector = (error: unknown) => AuthOperationError
+
 export type OrganizationVerificationScope =
   | 'organization.change_role'
   | 'organization.remove'

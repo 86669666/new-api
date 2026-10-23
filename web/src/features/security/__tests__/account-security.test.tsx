@@ -406,6 +406,299 @@ it('projects an ordinary initial-password verification failure before the accoun
   )
 })
 
+it.each(['requirements', 'factor', 'initialPassword'] as const)(
+  'projects untrusted %s failures before any account verification state retains them',
+  async (stage) => {
+    signInAccountFixture()
+    const failure = accountFailureAdapter(403, {
+      success: false,
+      code: 'UNKNOWN_ACCOUNT_FAILURE',
+      message: 'Untrusted s1-password-canary',
+      message_key: 'Audit failure {{password}}',
+    })
+    const failedAdapter = failure.adapter
+    const methods = vi.fn()
+    api.defaults.adapter = async (config) => {
+      if (stage !== 'requirements' && config.url === '/api/verify/methods') {
+        methods()
+        return {
+          data: {
+            success: true,
+            data: {
+              scope: 'session.revoke',
+              methods: [
+                {
+                  method: stage === 'initialPassword' ? 'password' : '2fa',
+                  available: true,
+                },
+              ],
+              oauth_providers: [],
+              password_encryption_enabled: false,
+            },
+          },
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          config,
+        }
+      }
+      return failedAdapter(config)
+    }
+    const states: unknown[] = []
+    const { result } = renderHook(() => {
+      const security = useAccountSecurity()
+      states.push(security.verificationDialogProps.state)
+      return security
+    })
+    const mutation = client.getMutationCache().build(client, {
+      mutationFn: () =>
+        result.current.run(
+          (signal) =>
+            result.current.verify(
+              { scope: 'session.revoke', context: { sid: 'other-session' } },
+              signal,
+              stage === 'initialPassword'
+                ? 's1-original-password-canary'
+                : undefined
+            ),
+          { throwOnError: true }
+        ),
+      retry: false,
+    })
+    let operation: Promise<unknown> | undefined
+    act(() => {
+      operation = mutation.execute(undefined).catch((error) => error)
+    })
+    if (stage === 'factor') {
+      await waitFor(() =>
+        expect(result.current.verificationDialogProps.state.phase).toBe('ready')
+      )
+      act(() =>
+        result.current.verificationDialogProps.onInputChange({
+          method: '2fa',
+          code: '123456',
+        })
+      )
+      await act(async () => {
+        await result.current.verificationDialogProps.onVerify()
+      })
+    }
+    if (stage === 'initialPassword') {
+      await act(async () => {
+        await operation
+      })
+      expect(mutation.state.status).toBe('error')
+      expect(result.current.error?.message).toBe('Request failed')
+    } else {
+      await waitFor(() =>
+        expect(result.current.verificationDialogProps.state).toHaveProperty(
+          'error',
+          'Request failed'
+        )
+      )
+      expect(mutation.state.status).toBe('pending')
+    }
+    expect(failedAdapter).toHaveBeenCalledTimes(1)
+    if (stage === 'requirements') {
+      act(() => result.current.verificationDialogProps.onRetry())
+      await waitFor(() => expect(failedAdapter).toHaveBeenCalledTimes(2))
+      await waitFor(() =>
+        expect(result.current.verificationDialogProps.state).toHaveProperty(
+          'error',
+          'Request failed'
+        )
+      )
+    }
+    expectNoAccountSecrets(
+      [
+        states,
+        result.current.error,
+        result.current.verificationDialogProps.state,
+        ...client
+          .getMutationCache()
+          .getAll()
+          .map((item) => item.state),
+        ...client
+          .getQueryCache()
+          .getAll()
+          .map((item) => item.state),
+      ],
+      failure.originals,
+      failure.secrets
+    )
+    const staleRetry = result.current.verificationDialogProps.onRetry
+    const calls = vi.mocked(failedAdapter).mock.calls.length
+    act(() => result.current.cancel())
+    act(() => staleRetry())
+    await act(async () => {
+      await operation
+    })
+    expect(result.current.verificationDialogProps.state.phase).toBe('idle')
+    expect(failedAdapter).toHaveBeenCalledTimes(calls)
+    expect(methods).toHaveBeenCalledTimes(stage === 'requirements' ? 0 : 1)
+    expectNoAccountSecrets(
+      [
+        states,
+        result.current.error,
+        ...client
+          .getMutationCache()
+          .getAll()
+          .map((item) => item.state),
+        ...client
+          .getQueryCache()
+          .getAll()
+          .map((item) => item.state),
+      ],
+      failure.originals,
+      failure.secrets
+    )
+    expect(useAuthStore.getState().auth.accessToken).toBe('s1-bearer-canary')
+  }
+)
+
+it.each([
+  { stage: 'requirements', change: 'cancel' },
+  { stage: 'factor', change: 'actor' },
+  { stage: 'factor', change: 'sid' },
+  { stage: 'requirements', change: 'unmount' },
+] as const)(
+  'discards late untrusted $stage errors after $change without reviving the ceremony',
+  async ({ stage, change }) => {
+    signInAccountFixture()
+    const failure = accountFailureAdapter(403, {
+      success: false,
+      code: 'UNKNOWN_ACCOUNT_FAILURE',
+      message_key: 'Audit failure {{password}}',
+    })
+    const failedAdapter = failure.adapter
+    let release: (() => void) | undefined
+    let delivered: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const delivery = new Promise<void>((resolve) => {
+      delivered = resolve
+    })
+    const started = vi.fn()
+    api.defaults.adapter = async (config) => {
+      if (stage === 'factor' && config.url === '/api/verify/methods') {
+        return {
+          data: {
+            success: true,
+            data: {
+              scope: 'session.revoke',
+              methods: [{ method: '2fa', available: true }],
+              oauth_providers: [],
+              password_encryption_enabled: false,
+            },
+          },
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          config,
+        }
+      }
+      started()
+      await gate
+      try {
+        return await failedAdapter(config)
+      } finally {
+        delivered?.()
+      }
+    }
+    const states: unknown[] = []
+    const view = renderHook(() => {
+      const security = useAccountSecurity()
+      states.push(security.verificationDialogProps.state)
+      return security
+    })
+    const write = vi.fn()
+    const mutation = client.getMutationCache().build(client, {
+      mutationFn: () =>
+        view.result.current.run(
+          async (signal) => {
+            await view.result.current.verify(
+              { scope: 'session.revoke', context: { sid: 'other-session' } },
+              signal
+            )
+            write()
+          },
+          { throwOnError: true }
+        ),
+      retry: false,
+    })
+    let operation: Promise<unknown> | undefined
+    let verification: Promise<void> | undefined
+    act(() => {
+      operation = mutation.execute(undefined).catch((error) => error)
+    })
+    if (stage === 'factor') {
+      await waitFor(() =>
+        expect(view.result.current.verificationDialogProps.state.phase).toBe(
+          'ready'
+        )
+      )
+      act(() =>
+        view.result.current.verificationDialogProps.onInputChange({
+          method: '2fa',
+          code: '123456',
+        })
+      )
+      act(() => {
+        verification = view.result.current.verificationDialogProps.onVerify()
+      })
+    }
+    await waitFor(() => expect(started).toHaveBeenCalledTimes(1))
+    if (change === 'unmount') view.unmount()
+    else if (change === 'cancel') act(() => view.result.current.cancel())
+    else {
+      const auth = useAuthStore.getState().auth
+      const { user, session, accessExpiresAt } = auth
+      if (!user || !session || typeof accessExpiresAt !== 'number') {
+        throw new Error('Missing account fixture')
+      }
+      act(() =>
+        auth.setBundle({
+          access_token: 'replacement-access',
+          token_type: 'Bearer',
+          access_expires_at: accessExpiresAt,
+          user: { ...user, id: change === 'actor' ? 2 : user.id },
+          session: {
+            ...session,
+            sid: change === 'sid' ? 'replacement-session' : session.sid,
+          },
+        })
+      )
+    }
+    await act(async () => {
+      release?.()
+      await delivery
+      await verification
+      await operation
+    })
+    expect(mutation.state.status).toBe('error')
+    expect(mutation.state.error).toMatchObject({ code: 'AUTH_CANCELLED' })
+    expect(write).not.toHaveBeenCalled()
+    expect(failedAdapter).toHaveBeenCalledTimes(1)
+    expectNoAccountSecrets(
+      [
+        states,
+        view.result.current.error,
+        ...client
+          .getMutationCache()
+          .getAll()
+          .map((item) => item.state),
+        ...client
+          .getQueryCache()
+          .getAll()
+          .map((item) => item.state),
+      ],
+      failure.originals,
+      failure.secrets
+    )
+  }
+)
+
 it('requires verification after username confirmation and cancels without deleting the account', async () => {
   vi.spyOn(api, 'get').mockResolvedValue({
     data: {

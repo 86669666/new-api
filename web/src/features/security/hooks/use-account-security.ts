@@ -41,7 +41,7 @@ export function useAccountSecurity() {
   const userId = useAuthStore((state) => state.auth.user?.id)
   const sessionId = useAuthStore((state) => state.auth.session?.sid)
   const sessionKey = `${userId ?? ''}:${sessionId ?? ''}`
-  const verification = useSecureVerification()
+  const verification = useSecureVerification(projectAccountOperationError)
   const cancelVerification = verification.cancel
   const requestVerification = verification.requestVerification
   const current = useRef<AbortController | null>(null)
