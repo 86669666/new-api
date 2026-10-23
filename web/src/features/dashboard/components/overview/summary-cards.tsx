@@ -23,6 +23,7 @@ import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { StaggerContainer, StaggerItem } from '@/components/page-transition'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { getUserQuotaDates } from '@/features/dashboard/api'
 import { useSummaryCardsConfig } from '@/features/dashboard/hooks/use-dashboard-config'
@@ -30,7 +31,6 @@ import type { QuotaDataItem } from '@/features/dashboard/types'
 import { useStatus } from '@/hooks/use-status'
 import { getCurrencyLabel, isCurrencyDisplayEnabled } from '@/lib/currency'
 import { formatNumber, formatQuota } from '@/lib/format'
-import { requireServerSuccess } from '@/lib/server-error-message'
 import { computeTimeRange } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
@@ -110,7 +110,7 @@ function getRunwayDays(
   return days
 }
 
-type HealthLevel = 'healthy' | 'caution' | 'critical'
+type HealthLevel = 'healthy' | 'caution' | 'critical' | 'unknown'
 
 function getHealthLevel(remainQuota: number, recentUsage: number): HealthLevel {
   if (remainQuota <= 0) return 'critical'
@@ -123,6 +123,7 @@ const HEALTH_CONFIG: Record<
   HealthLevel,
   { dotClass: string; labelKey: string }
 > = {
+  unknown: { dotClass: 'bg-muted-foreground', labelKey: 'Unknown' },
   healthy: {
     dotClass: 'bg-success',
     labelKey: 'Healthy',
@@ -141,6 +142,8 @@ export function SummaryCards() {
   const { t } = useTranslation()
   const user = useAuthStore((state) => state.auth.user)
   const { status, loading } = useStatus()
+  const userID = user?.id
+  const sessionID = useAuthStore((state) => state.auth.session?.sid)
 
   const summaryTimeRange = useMemo(() => computeTimeRange(1), [])
   const remainQuota = Number(user?.quota ?? 0)
@@ -152,19 +155,41 @@ export function SummaryCards() {
       'dashboard',
       'overview',
       'summary-sparklines',
+      userID,
+      sessionID,
       summaryTimeRange.start_timestamp,
       summaryTimeRange.end_timestamp,
     ],
-    queryFn: async () =>
-      requireServerSuccess(
-        await getUserQuotaDates({
+    queryFn: async ({ signal }) => {
+      const next = await getUserQuotaDates(
+        {
           start_timestamp: summaryTimeRange.start_timestamp,
           end_timestamp: summaryTimeRange.end_timestamp,
           default_time: 'hour',
-        })
-      ),
+        },
+        false,
+        signal
+      )
+      const auth = useAuthStore.getState().auth
+      if (
+        signal.aborted ||
+        auth.user?.id !== userID ||
+        auth.session?.sid !== sessionID
+      ) {
+        throw new DOMException('The usage request was cancelled', 'AbortError')
+      }
+      return next
+    },
+    enabled: userID != null,
+    meta: { errorToast: false },
     staleTime: 60 * 1000,
   })
+
+  // Query data is the last validated result for this actor/SID and range.
+  // A failed refresh keeps that history alongside the existing error notice.
+  const response = usageTrendQuery.data
+  const hasUsageData = response !== undefined && response.data.length > 0
+  const canEstimateRunway = Boolean(response?.data_complete)
 
   const summaryValues = useMemo(() => {
     return {
@@ -186,36 +211,45 @@ export function SummaryCards() {
 
   const sparklineData = useMemo(
     () =>
-      buildSummarySparklines(
-        usageTrendQuery.data?.data ?? [],
-        remainQuota,
-        summaryTimeRange.start_timestamp,
-        summaryTimeRange.end_timestamp
-      ),
+      response && response.data.length > 0
+        ? buildSummarySparklines(
+            response.data,
+            remainQuota,
+            summaryTimeRange.start_timestamp,
+            summaryTimeRange.end_timestamp
+          )
+        : undefined,
     [
       remainQuota,
       summaryTimeRange.end_timestamp,
       summaryTimeRange.start_timestamp,
-      usageTrendQuery.data?.data,
+      response,
     ]
   )
 
   const recentUsage = useMemo(
     () =>
-      (usageTrendQuery.data?.data ?? []).reduce(
+      (response?.data ?? []).reduce(
         (total, item) => total + (Number(item.quota) || 0),
         0
       ),
-    [usageTrendQuery.data?.data]
+    [response]
   )
 
-  const healthLevel = getHealthLevel(remainQuota, recentUsage)
+  const healthLevel =
+    !canEstimateRunway && remainQuota > 0
+      ? 'unknown'
+      : getHealthLevel(remainQuota, recentUsage)
   const healthCfg = HEALTH_CONFIG[healthLevel]
-  const runwayDays = getRunwayDays(remainQuota, recentUsage)
+  const runwayDays = canEstimateRunway
+    ? getRunwayDays(remainQuota, recentUsage)
+    : null
 
-  const todayUsageDisplay = formatQuota(recentUsage)
+  const todayUsageDisplay = hasUsageData ? formatQuota(recentUsage) : '--'
   let runwayDisplay: string
-  if (runwayDays !== null) {
+  if (!canEstimateRunway) {
+    runwayDisplay = '--'
+  } else if (runwayDays !== null) {
     if (runwayDays < 1) {
       runwayDisplay = t('Less than 1 day left')
     } else if (runwayDays > 999) {
@@ -245,15 +279,37 @@ export function SummaryCards() {
       icon: config.icon,
       tone: tones[index] ?? 'accent-3',
       sparkline:
-        config.key === 'todayUsage'
+        sparklineData && config.key === 'todayUsage'
           ? sparklineData.usage
-          : getSummarySparkline(config.key, sparklineData),
+          : sparklineData && getSummarySparkline(config.key, sparklineData),
       sparklineVariant: 'line' as const,
     }
   })
 
   return (
     <div className='bg-card overflow-hidden rounded-2xl border shadow-xs'>
+      {usageTrendQuery.isError && (
+        <Alert variant='destructive'>
+          <AlertDescription>{t('Failed to load')}</AlertDescription>
+        </Alert>
+      )}
+      {response && (
+        <Alert>
+          <AlertDescription>
+            {response.enable_data_export === false && (
+              <p>{t('Collection is off; saved history may still be shown.')}</p>
+            )}
+            {response.enable_data_export === undefined && (
+              <p>{t('Collection status is unknown.')}</p>
+            )}
+            <p>
+              {response.data_complete === false
+                ? t('Historical usage may be incomplete.')
+                : t('Historical usage completeness is unknown.')}
+            </p>
+          </AlertDescription>
+        </Alert>
+      )}
       <div className='grid xl:grid-cols-[minmax(0,1fr)_19rem]'>
         <div className='flex flex-col gap-2.5 p-3 sm:gap-3 sm:p-5'>
           <div className='flex flex-wrap items-start justify-between gap-3'>
@@ -280,7 +336,10 @@ export function SummaryCards() {
                   tone={it.tone}
                   sparkline={it.sparkline}
                   sparklineVariant={it.sparklineVariant}
-                  loading={loading}
+                  loading={
+                    loading ||
+                    (it.key === 'todayUsage' && usageTrendQuery.isPending)
+                  }
                   compactMobile
                 />
               </StaggerItem>
@@ -316,7 +375,7 @@ export function SummaryCards() {
                   <span className='truncate'>{t('Last 24h usage')}</span>
                 </div>
                 <div className='text-foreground mt-1.5 truncate text-xs font-semibold tabular-nums'>
-                  {formatQuota(recentUsage)}
+                  {todayUsageDisplay}
                 </div>
               </div>
               <div className='bg-background/60 rounded-lg px-2.5 py-2'>

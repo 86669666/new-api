@@ -33,6 +33,16 @@ export interface QuotaDataItem {
   quota?: number
 }
 
+export interface QuotaDataResponse {
+  success: true
+  message?: string
+  data: QuotaDataItem[]
+  granularity?: 'hour'
+  quota_per_unit?: number
+  data_complete?: false
+  enable_data_export?: boolean
+}
+
 export interface FlowQuotaDataItem {
   user_id?: number
   username?: string

@@ -16,9 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { IconBadge } from '@/components/ui/icon-badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getUserQuotaDates } from '@/features/dashboard/api'
@@ -31,6 +32,7 @@ import {
 import type {
   QuotaDataItem,
   DashboardFilters,
+  QuotaDataResponse,
 } from '@/features/dashboard/types'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatCompactNumber, formatNumber, formatQuota } from '@/lib/format'
@@ -40,7 +42,11 @@ import { useAuthStore } from '@/stores/auth-store'
 
 interface LogStatCardsProps {
   filters?: DashboardFilters
-  onDataUpdate?: (data: QuotaDataItem[], loading: boolean) => void
+  onDataUpdate?: (
+    data: QuotaDataItem[],
+    loading: boolean,
+    error?: boolean
+  ) => void
 }
 
 const MAX_INLINE_STAT_CHARS = 9
@@ -59,61 +65,96 @@ function formatStatNumber(value: number, locale: Intl.LocalesArgument) {
 }
 
 export function LogStatCards(props: LogStatCardsProps) {
-  const { i18n } = useTranslation()
+  const { t, i18n } = useTranslation()
   const statCardsConfig = useModelStatCardsConfig()
   const user = useAuthStore((state) => state.auth.user)
   const isAdmin = !!(user?.role && user.role >= 10)
-  const [stats, setStats] = useState<{
-    totalQuota: number
-    totalCount: number
-    totalTokens: number
-  } | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(false)
-
-  const [timeRangeMinutes, setTimeRangeMinutes] = useState(0)
-
+  const userID = user?.id
+  const sessionID = useAuthStore((state) => state.auth.session?.sid)
   const { filters, onDataUpdate } = props
-
-  useEffect(() => {
-    const abortController = new AbortController()
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setLoading(true)
-
-    setError(false)
-    onDataUpdate?.([], true)
-
-    const timeRange = computeTimeRange(
+  const params = useMemo(() => {
+    const range = computeTimeRange(
       getDefaultDays(filters?.time_granularity),
       filters?.start_timestamp,
       filters?.end_timestamp
     )
-    const timeDiff = (timeRange.end_timestamp - timeRange.start_timestamp) / 60
-    setTimeRangeMinutes(timeDiff)
+    return buildQueryParams(range, filters)
+  }, [filters])
+  const contextKey = JSON.stringify([userID, sessionID, isAdmin, params])
+  const lastSuccess = useRef<{
+    key: string
+    response: QuotaDataResponse
+  } | null>(null)
+  const [result, setResult] = useState<{
+    key: string
+    response: QuotaDataResponse | null
+    loading: boolean
+    error: boolean
+  } | null>(null)
+  const snapshot = result?.key === contextKey ? result : null
+  const response = snapshot?.response
+  const loading = snapshot?.loading ?? true
+  const error = snapshot?.error ?? false
+  const stats = response ? calculateDashboardStats(response.data) : null
+  const timeRangeMinutes = (params.end_timestamp - params.start_timestamp) / 60
 
-    void getUserQuotaDates(buildQueryParams(timeRange, filters), isAdmin)
-      .then((res) => {
-        if (abortController.signal.aborted) return
-        const data = res?.data || []
-        setStats(calculateDashboardStats(data))
-        onDataUpdate?.(data, false)
+  useEffect(() => {
+    const controller = new AbortController()
+    const previous =
+      lastSuccess.current?.key === contextKey
+        ? lastSuccess.current.response
+        : null
+    setResult({
+      key: contextKey,
+      response: previous,
+      loading: true,
+      error: false,
+    })
+    onDataUpdate?.(previous?.data ?? [], true)
+    if (userID == null) {
+      setResult({
+        key: contextKey,
+        response: null,
+        loading: false,
+        error: true,
+      })
+      onDataUpdate?.([], false, true)
+      return () => controller.abort()
+    }
+    const isCurrent = () => {
+      const auth = useAuthStore.getState().auth
+      return (
+        !controller.signal.aborted &&
+        auth.user?.id === userID &&
+        auth.session?.sid === sessionID
+      )
+    }
+    void getUserQuotaDates(params, isAdmin, controller.signal)
+      .then((next) => {
+        if (!isCurrent()) return
+        lastSuccess.current = { key: contextKey, response: next }
+        setResult({
+          key: contextKey,
+          response: next,
+          loading: false,
+          error: false,
+        })
+        onDataUpdate?.(next.data, false)
       })
       .catch(() => {
-        if (abortController.signal.aborted) return
-        setStats(null)
-        setError(true)
-        onDataUpdate?.([], false)
+        if (!isCurrent()) return
+        setResult({
+          key: contextKey,
+          response: previous,
+          loading: false,
+          error: true,
+        })
+        // End parent loading even without history. The explicit failure flag
+        // keeps this distinct from a successful empty array.
+        onDataUpdate?.(previous?.data ?? [], false, true)
       })
-      .finally(() => {
-        if (!abortController.signal.aborted) {
-          setLoading(false)
-        }
-      })
-
-    return () => {
-      abortController.abort()
-    }
-  }, [filters, isAdmin, onDataUpdate])
+    return () => controller.abort()
+  }, [contextKey, isAdmin, onDataUpdate, params, sessionID, userID])
 
   const adaptedStats = {
     rpm: stats?.totalCount ?? 0,
@@ -144,6 +185,28 @@ export function LogStatCards(props: LogStatCardsProps) {
 
   return (
     <div className='overflow-hidden rounded-lg border'>
+      {error && (
+        <Alert variant='destructive'>
+          <AlertDescription>{t('Failed to load')}</AlertDescription>
+        </Alert>
+      )}
+      {!isAdmin && response && (
+        <Alert>
+          <AlertDescription>
+            {response.enable_data_export === false && (
+              <p>{t('Collection is off; saved history may still be shown.')}</p>
+            )}
+            {response.enable_data_export === undefined && (
+              <p>{t('Collection status is unknown.')}</p>
+            )}
+            <p>
+              {response.data_complete === false
+                ? t('Historical usage may be incomplete.')
+                : t('Historical usage completeness is unknown.')}
+            </p>
+          </AlertDescription>
+        </Alert>
+      )}
       <div className='divide-border/60 grid min-w-0 grid-cols-2 divide-x sm:grid-cols-3 lg:grid-cols-5'>
         {items.map((it, idx) => {
           const Icon = it.icon
@@ -155,7 +218,10 @@ export function LogStatCards(props: LogStatCardsProps) {
                 <Skeleton className='hidden h-3.5 w-28 md:block' />
               </div>
             )
-          } else if (error) {
+          } else if (
+            (error && (isAdmin || !response)) ||
+            (!isAdmin && response?.data.length === 0)
+          ) {
             valueContent = (
               <>
                 <div className='text-muted-foreground mt-1 font-mono text-base leading-tight font-bold tracking-tight tabular-nums sm:mt-2 sm:text-2xl sm:leading-normal'>

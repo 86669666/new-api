@@ -21,6 +21,7 @@ import { Eye, EyeOff } from 'lucide-react'
 import { useState, useCallback, useMemo, lazy, Suspense } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ErrorState } from '@/components/error-state'
 import { SectionPageLayout } from '@/components/layout'
 import { FadeIn } from '@/components/page-transition'
 import { Button } from '@/components/ui/button'
@@ -32,6 +33,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { ROLE } from '@/lib/roles'
+import { computeTimeRange } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -41,6 +43,7 @@ import { OverviewDashboard } from './components/overview/overview-dashboard'
 import { DEFAULT_TIME_GRANULARITY } from './constants'
 import {
   buildDefaultDashboardFilters,
+  buildQueryParams,
   getDefaultDays,
   getSavedChartPreferences,
   getSavedGranularity,
@@ -199,8 +202,15 @@ export function Dashboard() {
   const activeSection = (params.section ??
     DASHBOARD_DEFAULT_SECTION) as DashboardSectionId
 
-  const [modelData, setModelData] = useState<QuotaDataItem[]>([])
-  const [dataLoading, setDataLoading] = useState(false)
+  const userID = useAuthStore((state) => state.auth.user?.id)
+  const sessionID = useAuthStore((state) => state.auth.session?.sid)
+  const isAdmin = Boolean(userRole && userRole >= ROLE.ADMIN)
+  const [modelResult, setModelResult] = useState<{
+    key: string
+    data: QuotaDataItem[] | null
+    loading: boolean
+    error: boolean
+  } | null>(null)
   const [chartPreferences, setChartPreferences] =
     useState<DashboardChartPreferences>(() => getSavedChartPreferences())
   const [modelFilters, setModelFilters] = useState<DashboardFilters>(() =>
@@ -218,6 +228,28 @@ export function Dashboard() {
   )
   const [flowSensitiveVisible, setFlowSensitiveVisible] = useState(true)
 
+  // Derive visibility during render: passive child effects run too late to
+  // clear charts in the first frame of a different actor, SID or query.
+  const modelParams = useMemo(() => {
+    const range = computeTimeRange(
+      getDefaultDays(modelFilters.time_granularity),
+      modelFilters.start_timestamp,
+      modelFilters.end_timestamp
+    )
+    return buildQueryParams(range, modelFilters)
+  }, [modelFilters])
+  const modelContextKey = JSON.stringify([
+    userID,
+    sessionID,
+    isAdmin,
+    modelParams,
+  ])
+  const modelSnapshot =
+    modelResult?.key === modelContextKey ? modelResult : null
+  const modelData = modelSnapshot?.data ?? null
+  const dataLoading = modelSnapshot?.loading ?? true
+  const dataError = modelSnapshot?.error ?? false
+
   const handleFilterChange = useCallback((filters: DashboardFilters) => {
     setModelFilters(filters)
   }, [])
@@ -227,11 +259,16 @@ export function Dashboard() {
   }, [chartPreferences])
 
   const handleDataUpdate = useCallback(
-    (data: QuotaDataItem[], loading: boolean) => {
-      setModelData(data)
-      setDataLoading(loading)
+    (data: QuotaDataItem[], loading: boolean, error = false) => {
+      setModelResult((previous) => {
+        let trustedData: QuotaDataItem[] | null = data
+        if (loading || error) {
+          trustedData = previous?.key === modelContextKey ? previous.data : null
+        }
+        return { key: modelContextKey, data: trustedData, loading, error }
+      })
     },
-    []
+    [modelContextKey]
   )
 
   const handleChartPreferencesChange = useCallback(
@@ -244,7 +281,6 @@ export function Dashboard() {
   )
 
   const meta = SECTION_META[activeSection] ?? SECTION_META.overview
-  const isAdmin = Boolean(userRole && userRole >= ROLE.ADMIN)
   const visibleSections = useMemo(
     () =>
       DASHBOARD_SECTION_IDS.filter(
@@ -317,6 +353,45 @@ export function Dashboard() {
     ) : null
   const sectionActions = modelActions ?? flowActions
 
+  let modelChartsContent
+  if (modelData === null) {
+    modelChartsContent = dataError ? (
+      <ErrorState title={t('Failed to load')} />
+    ) : (
+      <>
+        <ModelChartsFallback />
+        <ModelChartsFallback />
+      </>
+    )
+  } else {
+    modelChartsContent = (
+      <>
+        <FadeIn delay={0.1}>
+          <Suspense fallback={<ModelChartsFallback />}>
+            <LazyConsumptionDistributionChart
+              data={modelData}
+              defaultChartType={chartPreferences.consumptionDistributionChart}
+              timeGranularity={
+                modelFilters.time_granularity || DEFAULT_TIME_GRANULARITY
+              }
+            />
+          </Suspense>
+        </FadeIn>
+        <FadeIn delay={0.15}>
+          <Suspense fallback={<ModelChartsFallback />}>
+            <LazyModelCharts
+              data={modelData}
+              defaultChartTab={chartPreferences.modelAnalyticsChart}
+              timeGranularity={
+                modelFilters.time_granularity || DEFAULT_TIME_GRANULARITY
+              }
+            />
+          </Suspense>
+        </FadeIn>
+      </>
+    )
+  }
+
   if (activeSection === 'overview') {
     return <OverviewDashboard />
   }
@@ -363,32 +438,13 @@ export function Dashboard() {
                   </Suspense>
                 </FadeIn>
               )}
-              <FadeIn delay={0.1}>
-                <Suspense fallback={<ModelChartsFallback />}>
-                  <LazyConsumptionDistributionChart
-                    data={modelData}
-                    loading={dataLoading}
-                    defaultChartType={
-                      chartPreferences.consumptionDistributionChart
-                    }
-                    timeGranularity={
-                      modelFilters.time_granularity || DEFAULT_TIME_GRANULARITY
-                    }
-                  />
-                </Suspense>
-              </FadeIn>
-              <FadeIn delay={0.15}>
-                <Suspense fallback={<ModelChartsFallback />}>
-                  <LazyModelCharts
-                    data={modelData}
-                    loading={dataLoading}
-                    defaultChartTab={chartPreferences.modelAnalyticsChart}
-                    timeGranularity={
-                      modelFilters.time_granularity || DEFAULT_TIME_GRANULARITY
-                    }
-                  />
-                </Suspense>
-              </FadeIn>
+              <section
+                aria-label={t('Model Call Analytics')}
+                aria-busy={dataLoading}
+                className='space-y-3 sm:space-y-4'
+              >
+                {modelChartsContent}
+              </section>
             </>
           )}
           {activeSection === 'users' && (
