@@ -1393,7 +1393,23 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 	for _, key := range diagnostics {
 		redirects = append(redirects, callback+"?"+key+"=registered-context")
 	}
+	var introspection atomic.Pointer[map[string]any]
 	admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/admin/oauth2/introspect" {
+			payload := introspection.Load()
+			if payload == nil || r.ParseForm() != nil || r.PostForm.Get("token") != "synthetic-access-token" {
+				w.WriteHeader(400)
+				return
+			}
+			data, err := common.Marshal(*payload)
+			if err != nil {
+				w.WriteHeader(500)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(data)
+			return
+		}
 		if r.URL.Path != "/admin/clients/boundary-client" {
 			w.WriteHeader(404)
 			return
@@ -1413,8 +1429,31 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 	}))
 	t.Cleanup(admin.Close)
 	var authCalls atomic.Int64
-	forwarded := make(chan http.Header, 1)
+	var tokenCalls atomic.Int64
+	var wrongState atomic.Bool
+	forwarded := make(chan struct {
+		headers http.Header
+		query   url.Values
+	}, 1)
+	tokenForms := make(chan url.Values, 1)
 	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth2/token" {
+			if r.ParseForm() != nil {
+				w.WriteHeader(400)
+				return
+			}
+			tokenForms <- r.PostForm
+			w.Header().Set("Content-Type", "application/json")
+			if tokenCalls.Add(1) > 1 {
+				// The stub supplies issuer replay rejection; this verifies its
+				// propagation, not Hydra's single-use enforcement.
+				w.WriteHeader(400)
+				_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"access_token":"synthetic-access-token","token_type":"bearer","expires_in":600,"scope":"profile"}`)
+			return
+		}
 		if r.URL.Path == "/.well-known/openid-configuration" {
 			data, err := common.Marshal(map[string]any{"issuer": issuer, "authorization_endpoint": issuer + "oauth2/auth", "token_endpoint": issuer + "oauth2/token", "revocation_endpoint": issuer + "oauth2/revoke", "jwks_uri": issuer + ".well-known/jwks.json", "id_token_signing_alg_values_supported": []string{"RS256"}})
 			if err != nil {
@@ -1430,8 +1469,11 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			return
 		}
 		authCalls.Add(1)
-		forwarded <- r.Header.Clone()
 		query := r.URL.Query()
+		forwarded <- struct {
+			headers http.Header
+			query   url.Values
+		}{r.Header.Clone(), query}
 		target, err := url.Parse(query.Get("redirect_uri"))
 		if err != nil {
 			w.WriteHeader(500)
@@ -1447,6 +1489,9 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			}
 		}
 		result.Set("state", query.Get("state"))
+		if wrongState.Load() {
+			result.Set("state", "other-transaction-state")
+		}
 		result.Set("code", "synthetic-code")
 		target.RawQuery = result.Encode()
 		w.Header().Set("Location", target.String())
@@ -1473,15 +1518,17 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 	require.NoError(t, public.ValidateTopology(t.Context()))
 	engine := gin.New()
 	SetOAuthProviderRouter(engine, bridge)
-	serve := func(t *testing.T, redirect, state string, headers http.Header) *httptest.ResponseRecorder {
+	serve := func(t *testing.T, redirect, state string, headers http.Header, params url.Values) *httptest.ResponseRecorder {
 		t.Helper()
 		pkce := sha256.Sum256([]byte(strings.Repeat("v", 43)))
 		query := url.Values{"client_id": {"boundary-client"}, "response_type": {"code"}, "redirect_uri": {redirect}, "scope": {"profile"}, "state": {state}, "code_challenge": {base64.RawURLEncoding.EncodeToString(pkce[:])}, "code_challenge_method": {"S256"}}
+		maps.Copy(query, params)
 		request := httptest.NewRequest(http.MethodGet, "/oauth2/auth?"+query.Encode(), nil)
 		request.Header = headers
 		response := httptest.NewRecorder()
 		engine.ServeHTTP(response, request)
 		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+		assert.Equal(t, "no-referrer", response.Header().Get("Referrer-Policy"))
 		assert.NotContains(t, response.Body.String(), "UPSTREAM-PRIVATE-DIAGNOSTIC")
 		return response
 	}
@@ -1499,7 +1546,9 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			{"numeric_host", "http://2130706433:39874/oauth/callback", false},
 			{"https", "https://127.0.0.1:39874/oauth/callback", false},
 			{"path", "http://127.0.0.1:39874/other", false},
+			{"encoded_path", "http://127.0.0.1:39874/oauth/%63allback", false},
 			{"query", "http://127.0.0.1:39874/oauth/callback?x=1", false},
+			{"empty_query", "http://127.0.0.1:39874/oauth/callback?", false},
 			{"userinfo", "http://user@127.0.0.1:39874/oauth/callback", false},
 			{"fragment", "http://127.0.0.1:39874/oauth/callback#x", false},
 			{"empty_fragment", "http://127.0.0.1:39874/oauth/callback#", false},
@@ -1509,10 +1558,11 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			{"nonnumeric_port", "http://127.0.0.1:x/oauth/callback", false},
 			{"ipv6_unregistered", "http://[::1]:39874/oauth/callback", false},
 			{"ipv6_zone", "http://[::1%25lo]:39874/oauth/callback", false},
+			{"unregistered_custom_scheme", "boxnai://oauth/callback", false},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				before := authCalls.Load()
-				response := serve(t, tc.redirect, "loopback-contract-state", nil)
+				response := serve(t, tc.redirect, "loopback-contract-state", nil, nil)
 				forwardedCount := authCalls.Load() - before
 				if forwardedCount > 0 {
 					<-forwarded
@@ -1531,7 +1581,121 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, requested.Host, target.Host)
 				assert.Equal(t, requested.Path, target.Path)
+				assert.Equal(t, requested.Scheme, target.Scheme)
 				assert.Equal(t, "loopback-contract-state", target.Query().Get("state"))
+				assert.Equal(t, issuer, target.Query().Get("iss"))
+			})
+		}
+	})
+	t.Run("pkce_authorization_contract", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			params url.Values
+		}{
+			{"missing_challenge", url.Values{"code_challenge": nil}},
+			{"plain_method", url.Values{"code_challenge_method": {"plain"}}},
+			{"missing_method", url.Values{"code_challenge_method": nil}},
+			{"short_challenge", url.Values{"code_challenge": {"short"}}},
+			{"padded_challenge", url.Values{"code_challenge": {base64.URLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))}}},
+			{"missing_state", url.Values{"state": nil}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				before := authCalls.Load()
+				response := serve(t, "http://127.0.0.1:39874/oauth/callback", "pkce-contract-state", nil, tc.params)
+				if authCalls.Load() > before {
+					<-forwarded
+				}
+				assert.Equal(t, http.StatusBadRequest, response.Code)
+				assert.Equal(t, before, authCalls.Load(), "invalid PKCE/state must not reach issuer")
+				assert.Empty(t, response.Header().Get("Location"))
+			})
+		}
+	})
+	t.Run("callback_state_mismatch", func(t *testing.T) {
+		wrongState.Store(true)
+		defer wrongState.Store(false)
+		response := serve(t, callback, "expected-transaction-state", nil, nil)
+		<-forwarded
+		assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+		assert.Empty(t, response.Header().Get("Location"))
+		assert.NotContains(t, response.Body.String(), "synthetic-code")
+	})
+	t.Run("loopback_code_exchange_contract", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		common.IsMasterNode = true
+		require.NoError(t, model.InitOAuthGrantStore(true))
+		common.IsMasterNode = false
+		const actualRedirect = "http://127.0.0.1:39874/oauth/callback"
+		const registeredRedirect = "http://127.0.0.1:29873/oauth/callback"
+		verifier := strings.Repeat("v", 43)
+		pkce := sha256.Sum256([]byte(verifier))
+		challenge := base64.RawURLEncoding.EncodeToString(pkce[:])
+		grant := &model.OAuthGrant{GrantID: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)), Issuer: issuer, ClientID: "boundary-client", Subject: strconv.Itoa(f.users["owner"].Id), UserID: f.users["owner"].Id,
+			ConsentRequestID: "loopback-consent", HydraLoginSessionID: "loopback-login", OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("a", 64)}
+		require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+		require.NoError(t, model.ApproveOAuthGrant(t.Context(), grant))
+		// Seed only the completed consent boundary. The formal authorization
+		// route must create the code artifact with the actual redirect and PKCE.
+		op := &model.OAuthOperation{Issuer: issuer, UserID: grant.UserID, ClientID: grant.ClientID, OriginSID: grant.OriginSID, AuthVersion: 1, SessionVersion: 1, GrantRef: grant.GrantRef, Kind: "consent_accept"}
+		require.NoError(t, model.ReserveOAuthOperation(t.Context(), op))
+		require.NoError(t, model.SendOAuthOperation(t.Context(), op))
+		require.NoError(t, model.ObserveOAuthOperation(t.Context(), op, []model.OAuthArtifact{{ArtifactRef: model.OAuthArtifactRef(issuer, "consent_verifier", "synthetic-consent-verifier"), Kind: "consent_verifier", PKCE: challenge, RedirectHash: model.OAuthArtifactRef(issuer, "redirect", actualRedirect), ExpiresAt: time.Now().Add(time.Minute).Unix()}}))
+		claims := map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": issuer, "aud": []string{"boundary-userinfo"}, "client_id": grant.ClientID, "sub": grant.Subject, "exp": time.Now().Unix() + 600, "scope": "profile",
+			"ext": map[string]any{"newapi_auth_version": "1", "newapi_grant_id": grant.GrantID, "newapi_grant_expires_at": strconv.FormatInt(grant.ExpiresAt, 10)}}
+		introspection.Store(&claims)
+		before := authCalls.Load()
+		response := serve(t, actualRedirect, "loopback-exchange-state", nil, url.Values{"consent_verifier": {"synthetic-consent-verifier"}})
+		require.Equal(t, before+1, authCalls.Load(), "authorization must reach issuer")
+		request := <-forwarded
+		require.Equal(t, http.StatusSeeOther, response.Code)
+		assert.Equal(t, actualRedirect, request.query.Get("redirect_uri"))
+		assert.Equal(t, challenge, request.query.Get("code_challenge"))
+		assert.Equal(t, "S256", request.query.Get("code_challenge_method"))
+		target, err := url.Parse(response.Header().Get("Location"))
+		require.NoError(t, err)
+		assert.Equal(t, "127.0.0.1:39874", target.Host)
+		assert.Equal(t, "/oauth/callback", target.Path)
+		assert.Equal(t, "loopback-exchange-state", target.Query().Get("state"))
+		assert.Equal(t, issuer, target.Query().Get("iss"))
+		require.Equal(t, "synthetic-code", target.Query().Get("code"))
+		for _, tc := range []struct {
+			name, redirect, verifier, failure string
+			status                            int
+			forwarded                         bool
+		}{
+			{"registered_port_is_not_authorized_port", registeredRedirect, verifier, "invalid_grant", 400, false},
+			{"wrong_verifier", actualRedirect, strings.Repeat("x", 43), "invalid_grant", 400, false},
+			{"missing_verifier", actualRedirect, "", "invalid_request", 400, false},
+			{"short_verifier", actualRedirect, strings.Repeat("v", 42), "invalid_request", 400, false},
+			{"invalid_verifier_alphabet", actualRedirect, strings.Repeat("v", 42) + "+", "invalid_request", 400, false},
+			{"actual_port_and_verifier", actualRedirect, verifier, "", 200, true},
+			{"issuer_rejects_code_reuse", actualRedirect, verifier, "invalid_grant", 400, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				form := url.Values{"client_id": {grant.ClientID}, "grant_type": {"authorization_code"}, "code": {target.Query().Get("code")}, "redirect_uri": {tc.redirect}, "code_verifier": {tc.verifier}}
+				before := tokenCalls.Load()
+				request := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, request)
+				calls := tokenCalls.Load() - before
+				if calls > 0 {
+					assert.Equal(t, form, <-tokenForms, "exchange parameters must be preserved exactly")
+				}
+				assert.Equal(t, tc.forwarded, calls == 1, "invalid local binding must not reach issuer")
+				require.Equal(t, tc.status, response.Code)
+				assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+				assert.Equal(t, "no-referrer", response.Header().Get("Referrer-Policy"))
+				assert.Empty(t, response.Header().Get("Location"))
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+				if tc.failure != "" {
+					assert.Equal(t, map[string]any{"error": tc.failure}, body)
+				} else {
+					assert.Equal(t, "synthetic-access-token", body["access_token"])
+					assert.Equal(t, "bearer", body["token_type"])
+					assert.Equal(t, "profile", body["scope"])
+				}
 			})
 		}
 	})
@@ -1563,14 +1727,14 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				before := authCalls.Load()
-				response := serve(t, callback, "cookie-check", tc.headers)
+				response := serve(t, callback, "cookie-check", tc.headers, nil)
 				assert.Equal(t, tc.want, response.Code)
 				if authCalls.Load() == before {
 					assert.Equal(t, 400, tc.want)
 					assert.Empty(t, response.Header().Get("Location"))
 					return
 				}
-				headers := <-forwarded
+				headers := (<-forwarded).headers
 				require.Equal(t, 1, int(authCalls.Load()-before))
 				assert.Equal(t, 303, tc.want, "rejected input must not reach the issuer authorization endpoint")
 				cookies := (&http.Request{Header: headers}).Cookies()
@@ -1587,7 +1751,7 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 		for _, key := range diagnostics {
 			for _, state := range []string{"registered-context", "append-diagnostic", "replace-diagnostic"} {
 				t.Run(key+"/"+state, func(t *testing.T) {
-					response := serve(t, callback+"?"+key+"=registered-context", state, nil)
+					response := serve(t, callback+"?"+key+"=registered-context", state, nil, nil)
 					<-forwarded
 					if state != "registered-context" {
 						assert.Equal(t, 503, response.Code)
@@ -1605,7 +1769,7 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			}
 		}
 		t.Run("strip unregistered diagnostics", func(t *testing.T) {
-			response := serve(t, callback, "append-diagnostic", nil)
+			response := serve(t, callback, "append-diagnostic", nil, nil)
 			<-forwarded
 			require.Equal(t, 303, response.Code)
 			target, err := url.Parse(response.Header().Get("Location"))
