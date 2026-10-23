@@ -17,8 +17,24 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { spawnSync } from 'node:child_process'
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import {
+  closeSync,
+  existsSync,
+  fchmodSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, relative } from 'node:path'
 
 const mode = process.argv[2]
 
@@ -73,100 +89,115 @@ function walk(dir, files = []) {
   return files
 }
 
-function snapshotFiles(files) {
+function snapshotFiles(files, scratch) {
   const snapshot = new Map()
   for (const file of files) {
-    snapshot.set(file, readFileSync(file))
+    const content = readFileSync(file)
+    const header = headerExtensions.has(extensionOf(file))
+      ? (content.toString('utf8').match(protectedHeaderPattern)?.[0] ?? '')
+      : ''
+    snapshot.set(file, { content, header, mode: statSync(file).mode & 0o777 })
+    const target = join(scratch, relative(root, file))
+    mkdirSync(dirname(target), { recursive: true })
+    writeFileSync(target, content.subarray(Buffer.byteLength(header)))
   }
   return snapshot
-}
-
-function restoreSnapshot(snapshot) {
-  for (const [file, content] of snapshot) {
-    writeFileSync(file, content)
-  }
-}
-
-function stripProtectedHeaders(files) {
-  const headers = new Map()
-
-  for (const file of files) {
-    if (!headerExtensions.has(extensionOf(file))) {
-      continue
-    }
-
-    const content = readFileSync(file, 'utf8')
-    const match = content.match(protectedHeaderPattern)
-    if (!match) {
-      continue
-    }
-
-    headers.set(file, match[0])
-    writeFileSync(file, content.slice(match[0].length))
-  }
-
-  return headers
-}
-
-function restoreProtectedHeaders(headers) {
-  for (const [file, header] of headers) {
-    const content = readFileSync(file, 'utf8').replace(/^\n+/, '')
-    if (!content.startsWith(header)) {
-      writeFileSync(file, header + content)
-    }
-  }
-}
-
-function listChangedFiles(before, files) {
-  const changed = []
-
-  for (const file of files) {
-    const previous = before.get(file)
-    const current = readFileSync(file)
-    if (!previous || !previous.equals(current)) {
-      changed.push(relative(root, file))
-    }
-  }
-
-  return changed
 }
 
 const files = walk(root).filter(
   (file) => statSync(file).size < 10 * 1024 * 1024
 )
-const before = mode === '--check' ? snapshotFiles(files) : null
-let headers = new Map()
+const scratch = mkdtempSync(join(tmpdir(), 'new-api-format-'))
 let exitCode = 0
 
 try {
-  headers = stripProtectedHeaders(files)
+  // Only this private scratch contains header-free copies. Original files stay
+  // untouched until a successful --write has complete, header-preserving output.
+  const before = snapshotFiles(files, scratch)
+  const modules = join(root, 'node_modules')
+  if (existsSync(modules)) {
+    symlinkSync(modules, join(scratch, 'node_modules'), 'dir')
+  }
   const result = spawnSync(
     'oxfmt',
     ['-c', '.oxfmtrc.json', '--ignore-path', '.gitignore', '--write', '.'],
-    {
-      cwd: root,
-      stdio: 'inherit',
-    }
+    { cwd: scratch, stdio: 'inherit' }
   )
   exitCode = result.status ?? 1
-  restoreProtectedHeaders(headers)
+  if (result.error) throw result.error
 
-  if (mode === '--check' && exitCode === 0) {
-    const changed = listChangedFiles(before, files)
-    if (changed.length > 0) {
-      console.error('Format issues found in protected-header-safe check:')
-      for (const file of changed) {
-        console.error(file)
+  if (exitCode === 0) {
+    const changed = new Map()
+    for (const [file, original] of before) {
+      const output = readFileSync(join(scratch, relative(root, file)))
+      const formatted = original.header
+        ? Buffer.from(
+            original.header + output.toString('utf8').replace(/^\n+/, '')
+          )
+        : output
+      if (!original.content.equals(formatted)) changed.set(file, formatted)
+    }
+
+    // Never restore snapshots over changes made by an editor or another tool.
+    for (const [file, original] of before) {
+      if (
+        !readFileSync(file).equals(original.content) ||
+        (statSync(file).mode & 0o777) !== original.mode
+      ) {
+        throw new Error(
+          `File changed during formatting: ${relative(root, file)}`
+        )
       }
-      exitCode = 1
+    }
+
+    if (mode === '--check') {
+      if (changed.size > 0) {
+        console.error('Format issues found in protected-header-safe check:')
+        for (const file of changed.keys()) console.error(relative(root, file))
+        exitCode = 1
+      }
+    } else {
+      for (const [file, content] of changed) {
+        const original = before.get(file)
+        const temporary = join(
+          dirname(file),
+          `.${basename(file)}.oxfmt-${randomUUID()}`
+        )
+        // Claim a new file before entering cleanup, so a collision cannot cause
+        // removal of a path this process did not create.
+        const descriptor = openSync(temporary, 'wx', original.mode)
+        try {
+          try {
+            writeFileSync(descriptor, content)
+            fchmodSync(descriptor, original.mode)
+          } finally {
+            closeSync(descriptor)
+          }
+          // Recheck this target after preparing its output: earlier batch writes
+          // may have given an editor time to change it. --write still requires a
+          // single writer; the filesystem offers no portable compare-and-swap.
+          if (
+            !readFileSync(file).equals(original.content) ||
+            (statSync(file).mode & 0o777) !== original.mode
+          ) {
+            throw new Error(
+              `File changed during formatting: ${relative(root, file)}`
+            )
+          }
+          renameSync(temporary, file)
+        } finally {
+          rmSync(temporary, { force: true })
+        }
+      }
     }
   }
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error))
+  exitCode = 1
 } finally {
-  if (mode === '--check' && before) {
-    restoreSnapshot(before)
-  } else {
-    restoreProtectedHeaders(headers)
-  }
+  // This exact fresh directory is owned by this invocation. rmSync does not
+  // follow its node_modules symlink, so the shared dependency directory remains.
+  rmSync(scratch, { recursive: true, force: true })
 }
 
 process.exit(exitCode)
