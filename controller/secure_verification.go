@@ -50,6 +50,10 @@ func GetVerificationMethods(c *gin.Context) {
 // writeSecurityOperationError only exposes known, fixed business messages.
 // Unexpected errors retain their cause for the existing server-side auth logger.
 func writeSecurityOperationError(c *gin.Context, err error) {
+	if errors.Is(err, model.ErrSessionRevocationPending) {
+		writeAuthSessionError(c, err)
+		return
+	}
 	status := http.StatusOK
 	var code, message string
 	var protocolError *protocol.Error

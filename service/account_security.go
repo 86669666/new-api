@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"html"
 
@@ -38,4 +39,13 @@ func NotifyAccountSecurityChange(email, event string) error {
 	subject := common.SystemName + " — Account security notification"
 	content := fmt.Sprintf("<p>Your account security settings have changed: %s.</p><p>If you did not make this change, open your account security settings, revoke other login sessions, and contact your administrator.</p>", html.EscapeString(event))
 	return common.SendEmail(subject, email, content)
+}
+
+// CompleteAccountBinding publishes the committed credential transition, drains
+// its exact local intent once, then advances only the authorizing browser SID.
+func CompleteAccountBinding(identity AuthIdentity, event *model.SessionRevocationEvent) (*AuthBundle, error) {
+	if err := errors.Join(model.PublishUserAuthCache(identity.UserID), model.CompleteSessionSecurityChange(event, true)); err != nil {
+		return nil, err
+	}
+	return AdvanceCurrentSessionToUserVersion(identity, "account_binding_changed")
 }

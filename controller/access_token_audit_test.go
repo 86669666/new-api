@@ -861,18 +861,86 @@ type releasedAuditLog struct {
 
 func (releasedAuditLog) TableName() string { return "logs" }
 
+func auditCombinedFixtureBound(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("NEWAPI_COMBINED_RUN_ID") == "" {
+		return false
+	}
+	require.Equal(t, "g2-root-combined-matrix-01", os.Getenv("NEWAPI_COMBINED_OWNER"))
+	require.Regexp(t, `^[a-f0-9]{32}$`, os.Getenv("NEWAPI_COMBINED_RUN_ID"))
+	require.Regexp(t, `^[a-z][a-z0-9_]+$`, os.Getenv("NEWAPI_COMBINED_PHASE"))
+	return true
+}
+
+func auditCombinedFixtureEvent(t *testing.T, event string, observation map[string]any) {
+	t.Helper()
+	if !auditCombinedFixtureBound(t) {
+		return
+	}
+	data, err := common.Marshal(map[string]any{
+		"protocol": "combined-resource-events-v1", "run_id": os.Getenv("NEWAPI_COMBINED_RUN_ID"),
+		"owner": os.Getenv("NEWAPI_COMBINED_OWNER"), "phase": os.Getenv("NEWAPI_COMBINED_PHASE"),
+		"event": event, "observation": observation,
+	})
+	require.NoError(t, err)
+	t.Logf("NEWAPI_COMBINED %s", data)
+}
+
+func auditCombinedFixtureDatabase(t *testing.T, channel string, db *gorm.DB) {
+	t.Helper()
+	if !auditCombinedFixtureBound(t) {
+		return
+	}
+	kind := db.Dialector.Name()
+	query := "SELECT current_database()"
+	var identity, version string
+	if kind == "sqlite" {
+		var databases []struct{ Name, File string }
+		require.NoError(t, db.Raw("PRAGMA database_list").Scan(&databases).Error)
+		for _, database := range databases {
+			if database.Name == "main" {
+				identity = database.File
+			}
+		}
+		query = "SELECT sqlite_version()"
+	} else {
+		if kind == "mysql" {
+			query = "SELECT DATABASE()"
+		}
+		require.NoError(t, db.Raw(query).Scan(&identity).Error)
+		query = "SELECT version()"
+	}
+	require.NoError(t, db.Raw(query).Scan(&version).Error)
+	require.NotEmpty(t, identity)
+	auditCombinedFixtureEvent(t, "database", map[string]any{"channel": channel, "engine": kind, "identity": identity, "version": version})
+}
+
 // External tests create a new database per case on a loopback-only disposable
 // instance. They never drop databases or tables supplied through an environment variable.
 func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 	t.Helper()
+	combined := auditCombinedFixtureBound(t)
 	if kind == "sqlite" {
 		path := t.TempDir() + "/audit.db"
 		db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
 		require.NoError(t, err)
+		connection, err := db.DB()
+		require.NoError(t, err)
+		if combined {
+			t.Cleanup(func() {
+				require.NoError(t, os.Remove(path), "only the successfully created exact SQLite file is removed")
+				_, err := os.Stat(path)
+				require.True(t, os.IsNotExist(err))
+				auditCombinedFixtureEvent(t, "removed", map[string]any{"kind": "sqlite", "identity": path})
+			})
+		}
+		t.Cleanup(func() { require.NoError(t, connection.Close()) })
+		auditCombinedFixtureEvent(t, "created", map[string]any{"kind": "sqlite", "identity": path})
 		return db, path
 	}
 	require.NotEmpty(t, dsn)
-	name := fmt.Sprintf("newapi_audit_%d", time.Now().UnixNano())
+	name := "newapi_audit_" + strings.ToLower(strings.ReplaceAll(common.NewRequestId(), "-", ""))
+	require.Regexp(t, `^[a-z][a-z0-9_]{0,62}$`, name)
 	var original, isolated gorm.Dialector
 	var newDSN string
 	if kind == "mysql" {
@@ -902,15 +970,31 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 	}
 	admin, err := gorm.Open(original, &gorm.Config{})
 	require.NoError(t, err)
+	sqlDB, err := admin.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	// No IF NOT EXISTS: a collision fails before any test data can be written.
 	createSQL := "CREATE DATABASE " + name
 	if kind == "mysql" {
 		createSQL += " CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
 	}
 	require.NoError(t, admin.Exec(createSQL).Error)
-	sqlDB, err := admin.DB()
-	require.NoError(t, err)
-	require.NoError(t, sqlDB.Close())
+	t.Logf("W01-04 owned database=%s engine=%s", name, kind)
+	t.Cleanup(func() {
+		require.NoError(t, admin.Exec("DROP DATABASE "+name).Error)
+		if os.Getenv("NEWAPI_COMBINED_RUN_ID") != "" {
+			query := "SELECT count(*) FROM information_schema.schemata WHERE schema_name = ?"
+			if kind == "postgres" {
+				query = "SELECT count(*) FROM pg_database WHERE datname = ?"
+			}
+			var remaining int64
+			require.NoError(t, admin.Raw(query, name).Scan(&remaining).Error)
+			require.Zero(t, remaining, "exact audit fixture database must be absent after DROP")
+			auditCombinedFixtureEvent(t, "removed", map[string]any{"kind": "database", "identity": name})
+		}
+		t.Logf("W01-04 removed database=%s engine=%s", name, kind)
+	})
+	auditCombinedFixtureEvent(t, "created", map[string]any{"kind": "database", "identity": name})
 	db, err := gorm.Open(isolated, &gorm.Config{})
 	require.NoError(t, err)
 	t.Logf("isolated database: %s (%s)", name, kind)

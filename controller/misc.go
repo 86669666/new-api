@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,6 +24,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func TestStatus(c *gin.Context) {
@@ -354,8 +354,12 @@ func SendPasswordResetEmail(c *gin.Context) {
 		return
 	}
 	if user, err := model.GetUniqueUserByEmail(email); err == nil {
-		code := common.GenerateVerificationCode(0)
-		common.RegisterVerificationCodeWithKey(email, code, common.PasswordResetPurpose)
+		code, err := model.CreatePasswordResetFlow(user.Id, email)
+		if err != nil {
+			logger.LogWarn(c.Request.Context(), common.LogText("skip password reset email for %s: %s", email, err.Error()))
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
+			return
+		}
 		link := fmt.Sprintf("%s/user/reset?email=%s&token=%s", system_setting.ServerAddress, email, code)
 		lang := user.GetSetting().Language
 		if lang == "" {
@@ -372,7 +376,7 @@ func SendPasswordResetEmail(c *gin.Context) {
 			i18n.Translate(lang, i18n.MsgEmailPasswordResetLink, linkParams),
 			i18n.Translate(lang, i18n.MsgEmailPasswordResetLinkFallback, linkParams),
 			i18n.Translate(lang, i18n.MsgEmailPasswordResetValidity, map[string]any{"Minutes": common.VerificationValidMinutes}))
-		err := common.SendEmail(subject, email, content)
+		err = common.SendEmail(subject, email, content)
 		if err != nil {
 			logger.LogError(c.Request.Context(), common.LogText("failed to send password reset email to %s: %s", email, err.Error()))
 		}
@@ -392,9 +396,8 @@ type PasswordResetRequest struct {
 
 func ResetPassword(c *gin.Context) {
 	var req PasswordResetRequest
-	err := json.NewDecoder(c.Request.Body).Decode(&req)
-	if err != nil {
-		common.ApiError(c, err)
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
 	req.Email = model.NormalizeEmail(req.Email)
@@ -402,25 +405,19 @@ func ResetPassword(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	if !common.VerifyCodeWithKey(req.Email, req.Token, common.PasswordResetPurpose) {
-		common.ApiErrorT(c, "Password reset link is invalid or has expired")
-		return
-	}
 	password := common.GenerateVerificationCode(12)
-	err = model.ResetUserPasswordByEmail(req.Email, password)
+	err := model.ResetUserPasswordWithFlow(c.Request.Context(), req.Email, req.Token, password)
 	if err != nil {
-		if errors.Is(err, model.ErrEmailNotFound) || errors.Is(err, model.ErrEmailAmbiguous) {
+		if errors.Is(err, model.ErrSessionRevocationPending) {
+			writeAuthSessionError(c, err)
+			return
+		}
+		if errors.Is(err, model.ErrAuthFlowInvalid) || errors.Is(err, model.ErrAuthFlowExpired) || errors.Is(err, model.ErrAuthFlowConsumed) || errors.Is(err, model.ErrEmailNotFound) || errors.Is(err, model.ErrEmailAmbiguous) || errors.Is(err, gorm.ErrRecordNotFound) {
 			common.ApiErrorT(c, "Password reset link is invalid or has expired")
 			return
 		}
-		common.ApiError(c, err)
+		writeAuthSessionError(c, err)
 		return
 	}
-	common.DeleteKey(req.Email, common.PasswordResetPurpose)
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    password,
-	})
-	return
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": password})
 }

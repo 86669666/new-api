@@ -43,6 +43,7 @@ import (
 
 func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentity) {
 	t.Helper()
+	combined := auditCombinedFixtureBound(t)
 	require.NoError(t, i18n.Init())
 	gin.SetMode(gin.TestMode)
 	previousDB, previousLogDB := model.DB, model.LOG_DB
@@ -61,8 +62,21 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 		// Deferred transactions can fail to upgrade their read lock when concurrent
 		// proof consumption overlaps account deletion or session revocation.
 		var err error
-		db, err = gorm.Open(sqlite.Open(t.TempDir()+"/security.db?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_txlock=immediate"), &gorm.Config{})
+		path := t.TempDir() + "/security.db"
+		db, err = gorm.Open(sqlite.Open(path+"?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_txlock=immediate"), &gorm.Config{})
 		require.NoError(t, err)
+		if combined {
+			connection, err := db.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, os.Remove(path), "only the successfully created exact SQLite file is removed")
+				_, err := os.Stat(path)
+				require.True(t, os.IsNotExist(err))
+				auditCombinedFixtureEvent(t, "removed", map[string]any{"kind": "sqlite", "identity": path})
+			})
+			t.Cleanup(func() { require.NoError(t, connection.Close()) })
+		}
+		auditCombinedFixtureEvent(t, "created", map[string]any{"kind": "sqlite", "identity": path})
 	} else {
 		db, _ = newAuditTestDatabase(t, dialect, dsn)
 	}
@@ -76,7 +90,9 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 	var version string
 	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 	t.Logf("database: %s %s", dialect, version)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.AuthFlow{}, &model.UserOAuthBinding{}, &model.Option{}, &model.UserAccessToken{}))
+	auditCombinedFixtureDatabase(t, "main", db)
+	auditCombinedFixtureDatabase(t, "log", logDB)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.AuthFlow{}, &model.UserOAuthBinding{}, &model.Option{}, &model.UserAccessToken{}))
 	require.NoError(t, logDB.AutoMigrate(&model.AuditLog{}))
 	model.DB, model.LOG_DB = db, logDB
 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))

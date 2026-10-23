@@ -20,7 +20,7 @@ import { Logout01Icon, SmartPhone01Icon } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -42,53 +42,120 @@ import {
 } from '@/components/ui/empty'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SecureVerificationDialog } from '@/features/auth/secure-verification'
 import {
   getLoginSessions,
   revokeLoginSession,
   revokeOtherLoginSessions,
 } from '@/features/profile/api'
-import { clearAuthenticatedClientState } from '@/lib/api'
+import {
+  clearAuthenticatedClientState,
+  type ExpectedAuthIdentity,
+} from '@/lib/api'
 import { handleServerError } from '@/lib/handle-server-error'
-import { createServerError } from '@/lib/server-error-message'
-import type { LoginSession } from '@/stores/auth-store'
+import { useAuthStore, type LoginSession } from '@/stores/auth-store'
 
+import {
+  projectAccountOperationError,
+  type AccountOperationError,
+} from '../account-operation-error'
+import { useAccountSecurity } from '../hooks/use-account-security'
 import { LoginSessionDialogs } from './login-session-dialogs'
 import { LoginSessionItem } from './login-session-item'
 
 const sessionQueryKey = ['profile', 'login-sessions'] as const
 
+interface SessionRevocationIntent {
+  actor: ExpectedAuthIdentity
+  sid: string | null
+}
+
+function currentAccountActor(): ExpectedAuthIdentity | undefined {
+  const auth = useAuthStore.getState().auth
+  return auth.user && auth.session
+    ? { userId: auth.user.id, sid: auth.session.sid }
+    : undefined
+}
+
+function isCurrentAccountActor(expected: ExpectedAuthIdentity): boolean {
+  const actor = currentAccountActor()
+  return actor?.userId === expected.userId && actor.sid === expected.sid
+}
+
 export function LoginSessionsCard() {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const security = useAccountSecurity()
+  const intent = useRef<SessionRevocationIntent | undefined>(undefined)
   const [revokeTarget, setRevokeTarget] = useState<LoginSession | null>(null)
   const [confirmOthers, setConfirmOthers] = useState(false)
 
+  useEffect(() => {
+    intent.current = undefined
+    setRevokeTarget(null)
+    setConfirmOthers(false)
+  }, [security.sessionKey])
+
+  const cancelIntent = () => {
+    intent.current = undefined
+    security.cancel()
+    setRevokeTarget(null)
+    setConfirmOthers(false)
+  }
+
+  const openIntent = (target: LoginSession | null) => {
+    cancelIntent()
+    const actor = currentAccountActor()
+    if (!actor) return
+    intent.current = { actor, sid: target?.sid ?? null }
+    setRevokeTarget(target)
+    setConfirmOthers(!target)
+  }
+
   const sessionsQuery = useQuery({
-    queryKey: sessionQueryKey,
-    queryFn: async () => {
-      const response = await getLoginSessions()
+    queryKey: [...sessionQueryKey, security.sessionKey],
+    queryFn: async ({ signal }) => {
+      const response = await getLoginSessions(signal)
       if (!response.success) {
-        throw createServerError(response, t('Failed to load login sessions'))
+        throw projectAccountOperationError(response)
       }
       return response.data ?? []
     },
   })
 
   const revokeMutation = useMutation({
-    mutationFn: async (sid: string) => {
-      const response = await revokeLoginSession(sid)
-      if (!response.success) {
-        throw createServerError(response, t('Failed to sign out session'))
+    mutationFn: async (request: SessionRevocationIntent) => {
+      const sid = request.sid
+      if (!sid || intent.current !== request) {
+        throw projectAccountOperationError({ code: 'AUTH_CANCELLED' })
       }
-      return sid
-    },
-    onSuccess: async (sid) => {
-      const revokedCurrent = sessionsQuery.data?.some(
-        (session) => session.sid === sid && session.current
+      const response = await security.run(
+        async (signal) => {
+          const proof =
+            sid === request.actor.sid
+              ? undefined
+              : await security.verify(
+                  { scope: 'session.revoke', context: { sid } },
+                  signal
+                )
+          return revokeLoginSession(sid, proof, signal)
+        },
+        { expectedAuthIdentity: request.actor, throwOnError: true }
       )
+      if (!response) {
+        throw projectAccountOperationError({ code: 'AUTH_CANCELLED' })
+      }
+      if (!response.success) throw projectAccountOperationError(response)
+      return request
+    },
+    onSuccess: async (request) => {
+      if (intent.current !== request || !isCurrentAccountActor(request.actor)) {
+        return
+      }
+      intent.current = undefined
       setRevokeTarget(null)
-      if (revokedCurrent) {
+      if (request.sid === request.actor.sid) {
         clearAuthenticatedClientState(queryClient)
         void navigate({ to: '/sign-in', replace: true })
         return
@@ -96,25 +163,44 @@ export function LoginSessionsCard() {
       toast.success(t('Session signed out'))
       await queryClient.invalidateQueries({ queryKey: sessionQueryKey })
     },
-    onError: (error: Error) => handleServerError(error),
+    onError: (error: AccountOperationError) => {
+      if (error.code !== 'AUTH_CANCELLED') handleServerError(error)
+    },
   })
 
   const revokeOthersMutation = useMutation({
-    mutationFn: async () => {
-      const response = await revokeOtherLoginSessions()
-      if (!response.success) {
-        throw createServerError(
-          response,
-          t('Failed to sign out other sessions')
-        )
+    mutationFn: async (request: SessionRevocationIntent) => {
+      if (request.sid !== null || intent.current !== request) {
+        throw projectAccountOperationError({ code: 'AUTH_CANCELLED' })
       }
+      const response = await security.run(
+        async (signal) => {
+          const proof = await security.verify(
+            { scope: 'session.revoke_others' },
+            signal
+          )
+          return revokeOtherLoginSessions(proof, signal)
+        },
+        { expectedAuthIdentity: request.actor, throwOnError: true }
+      )
+      if (!response) {
+        throw projectAccountOperationError({ code: 'AUTH_CANCELLED' })
+      }
+      if (!response.success) throw projectAccountOperationError(response)
+      return request
     },
-    onSuccess: async () => {
+    onSuccess: async (request) => {
+      if (intent.current !== request || !isCurrentAccountActor(request.actor)) {
+        return
+      }
+      intent.current = undefined
       setConfirmOthers(false)
       toast.success(t('Other sessions signed out'))
       await queryClient.invalidateQueries({ queryKey: sessionQueryKey })
     },
-    onError: (error: Error) => handleServerError(error),
+    onError: (error: AccountOperationError) => {
+      if (error.code !== 'AUTH_CANCELLED') handleServerError(error)
+    },
   })
 
   const sessions = sessionsQuery.data ?? []
@@ -165,7 +251,7 @@ export function LoginSessionsCard() {
         {sessions.map((session, index) => (
           <div key={session.sid}>
             {index > 0 && <Separator />}
-            <LoginSessionItem session={session} onRevoke={setRevokeTarget} />
+            <LoginSessionItem session={session} onRevoke={openIntent} />
           </div>
         ))}
       </div>
@@ -185,8 +271,12 @@ export function LoginSessionsCard() {
               type='button'
               variant='outline'
               size='sm'
-              disabled={!hasOtherSessions || revokeOthersMutation.isPending}
-              onClick={() => setConfirmOthers(true)}
+              disabled={
+                !hasOtherSessions ||
+                revokeOthersMutation.isPending ||
+                revokeMutation.isPending
+              }
+              onClick={() => openIntent(null)}
             >
               <HugeiconsIcon
                 icon={Logout01Icon}
@@ -205,12 +295,30 @@ export function LoginSessionsCard() {
         confirmOthers={confirmOthers}
         revoking={revokeMutation.isPending}
         revokingOthers={revokeOthersMutation.isPending}
-        onRevokeTargetChange={setRevokeTarget}
-        onConfirmOthersChange={setConfirmOthers}
-        onRevoke={() => {
-          if (revokeTarget) revokeMutation.mutate(revokeTarget.sid)
+        onRevokeTargetChange={(target) => {
+          if (!target) cancelIntent()
         }}
-        onRevokeOthers={() => revokeOthersMutation.mutate()}
+        onConfirmOthersChange={(open) => {
+          if (!open) cancelIntent()
+        }}
+        onRevoke={() => {
+          const request = intent.current
+          if (request && request.sid && revokeTarget?.sid === request.sid) {
+            setRevokeTarget(null)
+            revokeMutation.mutate(request)
+          }
+        }}
+        onRevokeOthers={() => {
+          const request = intent.current
+          if (request && request.sid === null && confirmOthers) {
+            setConfirmOthers(false)
+            revokeOthersMutation.mutate(request)
+          }
+        }}
+      />
+      <SecureVerificationDialog
+        {...security.verificationDialogProps}
+        onCancel={cancelIntent}
       />
     </>
   )

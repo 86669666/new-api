@@ -56,23 +56,25 @@ type OAuthCleanupTarget struct {
 // Each event has its own immutable scope and targets. New revocations cannot
 // be swallowed by an old worker completing a reused user/client queue row.
 type OAuthCleanupJob struct {
-	JobRef        string `gorm:"type:char(64);primaryKey"`
-	Issuer        string `gorm:"type:text;not null"`
-	UserID        int    `gorm:"not null;index:idx_oauth_cleanup_user"`
-	Subject       string `gorm:"type:varchar(32);not null"`
-	Scope         string `gorm:"type:varchar(16);not null"`
-	Value         string `gorm:"type:text;not null"`
-	Targets       string `gorm:"type:text;not null"`
-	Reason        string `gorm:"type:varchar(32);not null"`
-	State         string `gorm:"type:varchar(16);not null;index:idx_oauth_cleanup_due,priority:1"`
-	NextAttemptAt int64  `gorm:"not null;index:idx_oauth_cleanup_due,priority:2"`
-	Attempt       int    `gorm:"not null"`
-	Generation    int64  `gorm:"not null"`
-	LeaseOwner    string `gorm:"type:varchar(64);not null"`
-	LeaseUntil    int64  `gorm:"not null"`
-	CreatedAt     int64  `gorm:"autoCreateTime:false;not null"`
-	CompletedAt   int64  `gorm:"not null"`
-	ErrorCode     string `gorm:"type:varchar(32);not null"`
+	// Nullable provenance for legacy rows; never an authorization capability.
+	SourceSessionEventRef *string `gorm:"type:varchar(64)"`
+	JobRef                string  `gorm:"type:char(64);primaryKey"`
+	Issuer                string  `gorm:"type:text;not null"`
+	UserID                int     `gorm:"not null;index:idx_oauth_cleanup_user"`
+	Subject               string  `gorm:"type:varchar(32);not null"`
+	Scope                 string  `gorm:"type:varchar(16);not null"`
+	Value                 string  `gorm:"type:text;not null"`
+	Targets               string  `gorm:"type:text;not null"`
+	Reason                string  `gorm:"type:varchar(32);not null"`
+	State                 string  `gorm:"type:varchar(16);not null;index:idx_oauth_cleanup_due,priority:1"`
+	NextAttemptAt         int64   `gorm:"not null;index:idx_oauth_cleanup_due,priority:2"`
+	Attempt               int     `gorm:"not null"`
+	Generation            int64   `gorm:"not null"`
+	LeaseOwner            string  `gorm:"type:varchar(64);not null"`
+	LeaseUntil            int64   `gorm:"not null"`
+	CreatedAt             int64   `gorm:"autoCreateTime:false;not null"`
+	CompletedAt           int64   `gorm:"not null"`
+	ErrorCode             string  `gorm:"type:varchar(32);not null"`
 }
 
 func OAuthCleanupReady() bool { return DB != nil && oauthCleanupDB.Load() == DB }
@@ -164,6 +166,9 @@ func CheckOAuthCleanupWithTx(tx *gorm.DB, issuer string, userID int, client, sid
 	if !OAuthCleanupReady() {
 		return ErrOAuthCleanupHeld
 	}
+	if err := CheckSessionRevocationWithTx(tx, userID, sid); err != nil {
+		return err
+	}
 	var local []OAuthOperation
 	if err := tx.Where("user_id = ? AND state = ?", userID, "local_pending").Find(&local).Error; err != nil {
 		return err
@@ -212,8 +217,14 @@ func CheckOAuthCleanupWithTx(tx *gorm.DB, issuer string, userID int, client, sid
 // RevokeOAuthWithTx joins an existing security transaction. The caller holds
 // the user lock and must use a fixed reason, never a token or caller error.
 // Scope values are trusted local IDs; they do not authenticate a caller.
-func RevokeOAuthWithTx(tx *gorm.DB, userID int, scope, value, reason string) error {
+func RevokeOAuthWithTx(tx *gorm.DB, userID int, scope, value, reason string, sessionEventRef ...string) error {
+	if len(sessionEventRef) > 1 {
+		return ErrOAuthGrantInvalid
+	}
 	if !OAuthCleanupReady() {
+		if len(sessionEventRef) != 0 {
+			return ErrSessionRevocationStore
+		}
 		return nil
 	}
 	if !slices.Contains([]string{"user", "client", "sid", "others", "grant"}, scope) || scope != "user" && value == "" {
@@ -278,6 +289,9 @@ func RevokeOAuthWithTx(tx *gorm.DB, userID int, scope, value, reason string) err
 			return err
 		}
 		job := OAuthCleanupJob{JobRef: fmt.Sprintf("%x", nonce), Issuer: issuer, UserID: userID, Subject: strconv.Itoa(userID), Scope: scope, Value: value, Targets: string(encoded), Reason: reason, State: "pending", CreatedAt: now, NextAttemptAt: now}
+		if len(sessionEventRef) == 1 {
+			job.SourceSessionEventRef = &sessionEventRef[0]
+		}
 		if err := tx.Create(&job).Error; err != nil {
 			return err
 		}
@@ -439,6 +453,10 @@ func ClaimOAuthCleanup(ctx context.Context, ref, owner string, now int64) (*OAut
 		if err := LockOAuthUser(tx, seed.UserID); err != nil {
 			return err
 		}
+		localErr := CheckSessionRevocationWithTx(tx, seed.UserID, "")
+		if localErr != nil && !errors.Is(localErr, ErrSessionRevocationPending) {
+			return localErr
+		}
 		var operations []OAuthOperation
 		if err := lockForUpdate(tx).Where("user_id = ? AND (issuer = ? OR state = ?)", seed.UserID, seed.Issuer, "local_pending").Order("operation_ref").Find(&operations).Error; err != nil {
 			return err
@@ -449,6 +467,9 @@ func ClaimOAuthCleanup(ctx context.Context, ref, owner string, now int64) (*OAut
 		}
 		if job.State == "complete" || job.NextAttemptAt > now || job.State == "leased" && job.LeaseUntil > now {
 			return nil
+		}
+		if localErr != nil {
+			return tx.Model(&job).Updates(map[string]any{"state": "blocked", "error_code": "local_pending", "next_attempt_at": now + 60}).Error
 		}
 		for _, op := range operations {
 			if op.State == "local_pending" {
@@ -570,57 +591,8 @@ func ValidateOAuthOperationPublication(ctx context.Context, op *OAuthOperation) 
 // BeginOAuthSessionRevocation fences the entire range before the existing
 // independently committed session batches start. A failed/crashed batch leaves
 // this durable fence in place; a successful retry completes the same range.
-func BeginOAuthSessionRevocation(userID int, excludedSID string) error {
-	if !OAuthCleanupReady() {
-		return nil
-	}
-	return DB.Transaction(func(tx *gorm.DB) error {
-		if err := LockOAuthUser(tx, userID); err != nil {
-			return err
-		}
-		scope, kind := "user", "sessions_all"
-		if excludedSID != "" {
-			scope, kind = "others", "sessions_others"
-		}
-		if err := RevokeOAuthWithTx(tx, userID, scope, excludedSID, "session_revoked"); err != nil {
-			return err
-		}
-		var nonce [32]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return err
-		}
-		return tx.Create(&OAuthOperation{OperationRef: fmt.Sprintf("%x", nonce), UserID: userID, OriginSID: excludedSID, Kind: kind, State: "local_pending", CreatedAt: time.Now().Unix()}).Error
-	})
-}
-
-func CompleteOAuthSessionRevocation(userID int, excludedSID string) error {
-	if !OAuthCleanupReady() {
-		return nil
-	}
-	return DB.Transaction(func(tx *gorm.DB) error {
-		if err := LockOAuthUser(tx, userID); err != nil {
-			return err
-		}
-		kind := "sessions_all"
-		if excludedSID != "" {
-			kind = "sessions_others"
-		}
-		query := tx.Model(&UserSession{}).Where("user_id = ? AND status = ? AND expires_at > ?", userID, UserSessionStatusActive, time.Now().Unix())
-		if excludedSID != "" {
-			query = query.Where("sid <> ?", excludedSID)
-		}
-		var remaining int64
-		if err := query.Count(&remaining).Error; err != nil {
-			return err
-		}
-		if remaining != 0 {
-			return ErrOAuthCleanupHeld
-		}
-		// The caller reached the empty final batch. This is local completion,
-		// not a statement about any remote sent/unknown issuer operation.
-		return tx.Model(&OAuthOperation{}).Where("user_id = ? AND kind = ? AND origin_sid = ? AND state = ?", userID, kind, excludedSID, "local_pending").Updates(map[string]any{"state": "observed", "observed_at": time.Now().Unix()}).Error
-	})
-}
+func BeginOAuthSessionRevocation(userID int, excludedSID string) error    { return ErrOAuthCleanupHeld }
+func CompleteOAuthSessionRevocation(userID int, excludedSID string) error { return ErrOAuthCleanupHeld }
 
 // DeleteExpiredOAuthSessions retains issuer targets in the same transaction as
 // the bounded source-session deletion. The final predicate is rechecked by SQL.

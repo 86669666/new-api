@@ -17,13 +17,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import {
+  act,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { AxiosError, type InternalAxiosRequestConfig } from 'axios'
 import { useEffect, useState } from 'react'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { AuthOperationError } from '@/lib/secure-verification'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 
 import { OAUTH_POPUP_CALLBACK_MESSAGE } from '../../constants'
@@ -668,6 +676,72 @@ function assertSafeOrganizationState(value: unknown) {
     }
   }
 }
+
+it.each(['login', 'organization'] as const)(
+  'keeps the %s error contract when an optional operation projector is supplied',
+  async (kind) => {
+    if (kind === 'organization') setOrganizationSession()
+    const projector = vi.fn(() => new AuthOperationError('Request failed'))
+    api.defaults.adapter = async (config) => {
+      throw new AxiosError(
+        'Existing non-account failure',
+        'ERR_BAD_RESPONSE',
+        config,
+        undefined,
+        {
+          config,
+          status: 403,
+          statusText: 'Forbidden',
+          headers: {},
+          data: {
+            success: false,
+            code: 'UNKNOWN_NON_ACCOUNT_FAILURE',
+            message: 'Existing non-account failure',
+          },
+        }
+      )
+    }
+    const { result } = renderHook(() => useSecureVerification(projector))
+    let operation: Promise<unknown> | undefined
+    act(() => {
+      operation =
+        kind === 'organization'
+          ? result.current.requestVerification(orgOperation)
+          : result.current.requestLoginVerification({
+              require_verification: true,
+              flow_token: 'pending-login',
+              expires_at: Math.floor(Date.now() / 1000) + 300,
+              methods: [{ method: '2fa', available: true }],
+            })
+    })
+    if (kind === 'login') {
+      await waitFor(() =>
+        expect(result.current.dialogProps.state.phase).toBe('ready')
+      )
+      act(() =>
+        result.current.dialogProps.onInputChange({
+          method: '2fa',
+          code: '123456',
+        })
+      )
+      await act(async () => {
+        await result.current.dialogProps.onVerify()
+      })
+    }
+    await waitFor(() =>
+      expect(result.current.dialogProps.state).toHaveProperty('error')
+    )
+    expect(projector).not.toHaveBeenCalled()
+    expect(result.current.dialogProps.state).toHaveProperty(
+      'error',
+      kind === 'login'
+        ? 'Existing non-account failure'
+        : 'Verification failed. Please try again.'
+    )
+    act(() => result.current.cancel())
+    await expect(operation).resolves.toBeNull()
+  }
+)
 
 it.each([true, false])(
   'organization hook errors expose no credential references in initial-password shortcut: %s',

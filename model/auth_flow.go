@@ -32,6 +32,7 @@ const (
 	AuthFlowPurposeTwoFASetup        = "2fa_setup"
 	AuthFlowPurposeSecurityProof     = "security_proof"
 	AuthFlowPurposeEmailBinding      = "email_binding"
+	AuthFlowPurposePasswordReset     = "password_reset"
 	AuthFlowTokenBytes               = 32
 	AuthFlowDefaultCleanupRetention  = 24 * time.Hour
 )
@@ -108,6 +109,9 @@ type AuthFlowAuthorization struct {
 // user/session locks until the caller's credential change or flow consumption commits.
 // Token-bound identities (pat:<id>) are checked against user_access_tokens instead.
 func ValidateAuthSessionWithTx(tx *gorm.DB, identity AuthSessionIdentity) error {
+	if err := LockOAuthUser(tx, identity.UserID); err != nil {
+		return err
+	}
 	if tokenID, ok := ParseAccessTokenSessionID(identity.SessionID); ok {
 		return validateAccessTokenIdentityWithTx(tx, tokenID, identity)
 	}

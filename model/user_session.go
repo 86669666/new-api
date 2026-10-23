@@ -132,7 +132,10 @@ func userSessionCacheDeadline() time.Time {
 
 func CreateUserSession(session *UserSession) error {
 	cacheDeadline := userSessionCacheDeadline()
-	if err := createUserSessionWithTx(DB, session); err != nil {
+	if session == nil {
+		return ErrUserSessionInvalid
+	}
+	if err := DB.Transaction(func(tx *gorm.DB) error { return createUserSessionWithTx(tx, session) }); err != nil {
 		return err
 	}
 	return publishCreatedUserSession(session, cacheDeadline)
@@ -142,6 +145,40 @@ func createUserSessionWithTx(tx *gorm.DB, session *UserSession) error {
 	now := time.Now().Unix()
 	if session == nil || session.SID == "" || session.UserID <= 0 || session.UserAuthVersion <= 0 || session.RefreshHash == "" || session.ExpiresAt <= now {
 		return ErrUserSessionInvalid
+	}
+	if err := LockOAuthUser(tx, session.UserID); err != nil {
+		return err
+	}
+	now = time.Now().Unix()
+	if session.ExpiresAt <= now {
+		return ErrUserSessionInactive
+	}
+	var user User
+	if err := tx.First(&user, session.UserID).Error; err != nil {
+		return err
+	}
+	if user.Status != common.UserStatusEnabled || user.AuthVersion != session.UserAuthVersion {
+		return ErrUserSessionInactive
+	}
+	var unknown int64
+	if err := tx.Model(&SessionRevocationEvent{}).Where("user_id = ? AND (protocol_version <> ? OR state NOT IN ?)", session.UserID, sessionRevocationProtocol, []string{"pending", "local_complete"}).Count(&unknown).Error; err != nil {
+		return err
+	}
+	if unknown != 0 {
+		return ErrSessionRevocationStore
+	}
+	var activeCount, issuedCount int64
+	if err := tx.Model(&UserSession{}).Where("user_id = ? AND status = ? AND expires_at > ?", session.UserID, UserSessionStatusActive, now).Count(&activeCount).Error; err != nil {
+		return err
+	}
+	if activeCount >= int64(common.UserSessionActiveLimit) {
+		return ErrUserSessionLimit
+	}
+	if err := tx.Model(&UserSession{}).Where("user_id = ? AND created_at > ?", session.UserID, now-common.UserSessionIssuanceWindowSeconds).Count(&issuedCount).Error; err != nil {
+		return err
+	}
+	if issuedCount >= int64(common.UserSessionIssuanceLimit) {
+		return ErrUserSessionIssuanceLimit
 	}
 	if session.Version <= 0 {
 		session.Version = 1
@@ -473,104 +510,74 @@ func ListActiveUserSessions(userID int, currentSID string, now int64) ([]UserSes
 // recognized previous digest outside its grace window is treated as reuse;
 // an unknown secret never revokes the victim session.
 func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, now int64, grace time.Duration) (*UserSession, error) {
-	if userID <= 0 || sid == "" || presentedHash == "" || nextHash == "" || hmac.Equal([]byte(presentedHash), []byte(nextHash)) {
+	if userID <= 0 || sid == "" || presentedHash == "" || nextHash == "" || hmac.Equal([]byte(presentedHash), []byte(nextHash)) || grace < 0 {
 		return nil, ErrUserSessionInvalid
 	}
-	if now <= 0 {
-		now = time.Now().Unix()
-	}
-	graceSeconds := int64(grace / time.Second)
-	if graceSeconds < 0 {
-		return nil, ErrUserSessionInvalid
-	}
-	for range 3 {
-		cacheDeadline := userSessionCacheDeadline()
-		var session UserSession
-		if err := DB.Where("sid = ? AND user_id = ?", sid, userID).First(&session).Error; err != nil {
-			return nil, err
+	deadline := userSessionCacheDeadline()
+	var session UserSession
+	var outcome error
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userID); err != nil {
+			return err
 		}
-		if session.Status != UserSessionStatusActive || session.RevokedAt != 0 || session.ExpiresAt <= now {
-			return nil, ErrUserSessionInactive
+		var user User
+		if err := tx.First(&user, userID).Error; err != nil {
+			return err
 		}
-
+		if err := lockForUpdate(tx).Where("sid = ? AND user_id = ?", sid, userID).First(&session).Error; err != nil {
+			return err
+		}
+		now = max(now, time.Now().Unix())
+		if user.Status != common.UserStatusEnabled || user.AuthVersion != session.UserAuthVersion || session.Status != UserSessionStatusActive || session.RevokedAt != 0 || session.ExpiresAt <= now {
+			return ErrUserSessionInactive
+		}
 		if hmac.Equal([]byte(session.RefreshHash), []byte(presentedHash)) {
-			result := DB.Model(&UserSession{}).
-				Where("sid = ? AND user_id = ? AND status = ? AND revoked_at = ? AND expires_at > ? AND refresh_hash = ?",
-					sid, userID, UserSessionStatusActive, 0, now, presentedHash).
-				Updates(map[string]any{
-					"previous_refresh_hash": session.RefreshHash,
-					"previous_valid_until":  now + graceSeconds,
-					"refresh_hash":          nextHash,
-					"last_active_at":        now,
-				})
-			if result.Error != nil {
-				return nil, result.Error
-			}
-			if result.RowsAffected == 0 {
-				continue
-			}
-			session.PreviousRefreshHash = session.RefreshHash
-			session.PreviousValidUntil = now + graceSeconds
-			session.RefreshHash = nextHash
-			session.LastActiveAt = now
-			if err := writeUserSessionCache(session.cacheEntry(), cacheDeadline); err != nil {
-				if errors.Is(err, errUserSessionCacheObservationStale) {
-					if confirmErr := confirmUserSessionActiveSnapshot(&session); confirmErr != nil {
-						return nil, confirmErr
-					}
-				} else if errors.Is(err, ErrUserSessionInactive) {
-					return nil, err
-				} else {
-					common.SysLog(common.LogText("failed to update rotated user session cache: %s", err.Error()))
-				}
-			}
-			return &session, nil
+			session.PreviousRefreshHash, session.PreviousValidUntil = session.RefreshHash, now+int64(grace/time.Second)
+			session.RefreshHash, session.LastActiveAt = nextHash, now
+			return tx.Model(&UserSession{}).Where("sid = ? AND user_id = ?", sid, userID).Updates(map[string]any{
+				"previous_refresh_hash": session.PreviousRefreshHash, "previous_valid_until": session.PreviousValidUntil,
+				"refresh_hash": session.RefreshHash, "last_active_at": now}).Error
 		}
-
 		if session.PreviousRefreshHash == "" || !hmac.Equal([]byte(session.PreviousRefreshHash), []byte(presentedHash)) {
-			return nil, ErrUserSessionRefreshInvalid
+			return ErrUserSessionRefreshInvalid
 		}
 		if now <= session.PreviousValidUntil {
-			return &session, ErrUserSessionRefreshRace
+			outcome = ErrUserSessionRefreshRace
+			return nil
 		}
-
-		// Once a known previous token is replayed outside the grace window the
-		// whole token family is compromised. Publish the deny fence first, then
-		// revoke the active row regardless of a concurrent refresh rotation.
 		if err := writeUserSessionDenyFence(&session, UserSessionStatusRevoking, now, "refresh_reuse"); err != nil {
-			return nil, err
+			return err
 		}
-		var affected int64
-		err := DB.Transaction(func(tx *gorm.DB) error {
-			if err := LockOAuthUser(tx, userID); err != nil {
-				return err
-			}
-			result := tx.Model(&UserSession{}).Where("sid = ? AND user_id = ? AND status = ? AND revoked_at = ? AND expires_at > ?", sid, userID, UserSessionStatusActive, 0, now).Updates(map[string]any{"status": UserSessionStatusRevoked, "revoked_at": now, "revoked_reason": "refresh_reuse"})
-			if result.Error != nil {
-				return result.Error
-			}
-			affected = result.RowsAffected
-			if affected == 0 {
-				return nil
-			}
-			return RevokeOAuthWithTx(tx, userID, "sid", sid, "session_revoked")
-		})
-		if err != nil {
-			return nil, err
+		if err := revokeSessionOAuthWithTx(tx, userID, "sid", sid, "session_revoked", ""); err != nil {
+			return err
 		}
-		if affected == 0 {
-			return nil, ErrUserSessionInactive
+		if err := tx.Model(&UserSession{}).Where("sid = ? AND user_id = ?", sid, userID).Updates(map[string]any{"status": UserSessionStatusRevoked, "revoked_at": now, "revoked_reason": "refresh_reuse"}).Error; err != nil {
+			return err
 		}
-
-		session.Status = UserSessionStatusRevoked
-		session.RevokedAt = now
-		session.RevokedReason = "refresh_reuse"
-		if err := writeUserSessionCache(session.cacheEntry(), time.Time{}); err != nil {
-			common.SysLog(common.LogText("failed to cache refresh-reuse session revoke: %s", err.Error()))
-		}
-		return nil, ErrUserSessionRefreshReuse
+		session.Status, session.RevokedAt, session.RevokedReason = UserSessionStatusRevoked, now, "refresh_reuse"
+		outcome = ErrUserSessionRefreshReuse
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, ErrUserSessionRefreshInvalid
+	if errors.Is(outcome, ErrUserSessionRefreshRace) {
+		return &session, outcome
+	}
+	if errors.Is(outcome, ErrUserSessionRefreshReuse) {
+		_ = writeUserSessionCache(session.cacheEntry(), time.Time{})
+		return nil, outcome
+	}
+	if err := writeUserSessionCache(session.cacheEntry(), deadline); err != nil {
+		if errors.Is(err, errUserSessionCacheObservationStale) {
+			return &session, confirmUserSessionActiveSnapshot(&session)
+		}
+		if errors.Is(err, ErrUserSessionInactive) {
+			return nil, err
+		}
+		common.SysLog(common.LogText("failed to update rotated user session cache"))
+	}
+	return &session, nil
 }
 
 func RevokeUserSession(userID int, sid, reason string) (bool, error) {
@@ -578,35 +585,48 @@ func RevokeUserSession(userID int, sid, reason string) (bool, error) {
 }
 
 func RevokeUserSessionWithContext(ctx context.Context, userID int, sid, reason string) (bool, error) {
+	return revokeUserSessionWithContext(ctx, userID, sid, reason, nil)
+}
+
+// RevokeUserSessionForSession authorizes a dashboard actor under the same user
+// lock as the target deny, revocation and OAuth attribution. Trusted host and
+// refresh-secret logout retain their separate authentication contracts.
+func RevokeUserSessionForSession(ctx context.Context, identity AuthSessionIdentity, sid, reason string) (bool, error) {
+	if _, pat := ParseAccessTokenSessionID(identity.SessionID); pat {
+		return false, ErrUserSessionInvalid
+	}
+	return revokeUserSessionWithContext(ctx, identity.UserID, sid, reason, &identity)
+}
+
+func revokeUserSessionWithContext(ctx context.Context, userID int, sid, reason string, actor *AuthSessionIdentity) (bool, error) {
 	if userID <= 0 || sid == "" {
 		return false, ErrUserSessionInvalid
 	}
-	now := time.Now().Unix()
 	var candidate UserSession
-	if err := DB.WithContext(ctx).Where("sid = ? AND user_id = ?", sid, userID).First(&candidate).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return false, nil
-		}
-		return false, err
-	}
-	if candidate.Status != UserSessionStatusActive || candidate.RevokedAt != 0 || candidate.ExpiresAt <= now {
-		return false, nil
-	}
-	if err := writeUserSessionDenyFenceWithContext(ctx, &candidate, UserSessionStatusRevoking, now, reason); err != nil {
-		return false, err
-	}
-
+	var now int64
 	var revoked bool
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := LockOAuthUser(tx, userID); err != nil {
 			return err
 		}
+		if actor != nil {
+			if err := ValidateAuthSessionWithTx(tx, *actor); err != nil {
+				return err
+			}
+		}
+		now = time.Now().Unix()
 		var current UserSession
 		if err := lockForUpdate(tx).Where("sid = ? AND user_id = ?", sid, userID).First(&current).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
 			return err
 		}
 		if current.Status != UserSessionStatusActive || current.RevokedAt != 0 || current.ExpiresAt <= now {
 			return nil
+		}
+		if err := writeUserSessionDenyFenceWithContext(ctx, &current, UserSessionStatusRevoking, now, reason); err != nil {
+			return err
 		}
 		result := tx.Model(&UserSession{}).Where("sid = ? AND status = ?", sid, UserSessionStatusActive).Updates(map[string]any{
 			"status":         UserSessionStatusRevoked,
@@ -617,10 +637,11 @@ func RevokeUserSessionWithContext(ctx context.Context, userID int, sid, reason s
 			return result.Error
 		}
 		if result.RowsAffected == 1 {
-			if err := RevokeOAuthWithTx(tx, userID, "sid", sid, "session_revoked"); err != nil {
+			if err := revokeSessionOAuthWithTx(tx, userID, "sid", sid, "session_revoked", ""); err != nil {
 				return err
 			}
 		}
+		candidate = current
 		revoked = result.RowsAffected == 1
 		return nil
 	})
@@ -686,7 +707,7 @@ func RevokeUserSessionByRefreshHash(sid, presentedHash, reason string) (bool, er
 			return result.Error
 		}
 		if result.RowsAffected == 1 {
-			if err := RevokeOAuthWithTx(tx, session.UserID, "sid", sid, "session_revoked"); err != nil {
+			if err := revokeSessionOAuthWithTx(tx, session.UserID, "sid", sid, "session_revoked", ""); err != nil {
 				return err
 			}
 		}
@@ -723,6 +744,14 @@ func AdvanceUserSessionAuthVersion(userID int, sid string, expectedSessionVersio
 		if err := LockOAuthUser(tx, userID); err != nil {
 			return err
 		}
+		var user User
+		if err := tx.First(&user, userID).Error; err != nil {
+			return err
+		}
+		if user.Status != common.UserStatusEnabled || user.AuthVersion != nextUserAuthVersion {
+			return ErrUserSessionInactive
+		}
+		now = time.Now().Unix()
 		if err := lockForUpdate(tx).Where("sid = ? AND user_id = ?", sid, userID).First(&session).Error; err != nil {
 			return err
 		}
@@ -767,78 +796,42 @@ func RevokeOtherUserSessions(userID int, currentSID, reason string) (int64, erro
 	return revokeUserSessions(userID, currentSID, reason)
 }
 
+// RevokeOtherUserSessionsForSession is the browser HTTP entry: revalidate the
+// actor inside the same user-first transaction that persists the new intent.
+func RevokeOtherUserSessionsForSession(identity AuthSessionIdentity, reason string) (int64, error) {
+	if _, pat := ParseAccessTokenSessionID(identity.SessionID); pat {
+		return 0, ErrUserSessionInactive
+	}
+	var event *SessionRevocationEvent
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
+			return err
+		}
+		var err error
+		event, err = StartSessionRevocationWithTx(tx, identity.UserID, identity.SessionID, reason)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	err := CompleteSessionSecurityChange(event, false)
+	return event.AffectedCount, err
+}
+
 func RevokeAllUserSessions(userID int, reason string) (int64, error) {
 	return revokeUserSessions(userID, "", reason)
 }
 
 func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
-	if userID <= 0 {
-		return 0, ErrUserSessionInvalid
-	}
-	if err := BeginOAuthSessionRevocation(userID, excludedSID); err != nil {
+	var event *SessionRevocationEvent
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		event, err = StartSessionRevocationWithTx(tx, userID, excludedSID, reason)
+		return err
+	}); err != nil {
 		return 0, err
 	}
-	now := time.Now().Unix()
-	var totalAffected int64
-	for {
-		query := DB.Where("user_id = ? AND status = ? AND expires_at > ?", userID, UserSessionStatusActive, now)
-		if excludedSID != "" {
-			query = query.Where("sid <> ?", excludedSID)
-		}
-		var candidates []UserSession
-		if err := query.Order("sid").Limit(userSessionRevokeBatchSize).Find(&candidates).Error; err != nil {
-			return totalAffected, err
-		}
-		if len(candidates) == 0 {
-			return totalAffected, CompleteOAuthSessionRevocation(userID, excludedSID)
-		}
-		for i := range candidates {
-			if err := writeUserSessionDenyFence(&candidates[i], UserSessionStatusRevoking, now, reason); err != nil {
-				return totalAffected, err
-			}
-		}
-
-		sids := make([]string, 0, len(candidates))
-		for i := range candidates {
-			sids = append(sids, candidates[i].SID)
-		}
-		var affected int64
-		var revoked []UserSession
-		err := DB.Transaction(func(tx *gorm.DB) error {
-			if err := LockOAuthUser(tx, userID); err != nil {
-				return err
-			}
-			if err := lockForUpdate(tx).Where("sid IN ? AND status = ?", sids, UserSessionStatusActive).Find(&revoked).Error; err != nil {
-				return err
-			}
-			if len(revoked) == 0 {
-				return nil
-			}
-			lockedSIDs := make([]string, 0, len(revoked))
-			for i := range revoked {
-				lockedSIDs = append(lockedSIDs, revoked[i].SID)
-			}
-			result := tx.Model(&UserSession{}).Where("sid IN ? AND status = ?", lockedSIDs, UserSessionStatusActive).Updates(map[string]any{
-				"status":         UserSessionStatusRevoked,
-				"revoked_at":     now,
-				"revoked_reason": reason,
-			})
-			affected = result.RowsAffected
-			return result.Error
-		})
-		if err != nil {
-			return totalAffected, err
-		}
-		totalAffected += affected
-		for i := range revoked {
-			revoked[i].Status = UserSessionStatusRevoked
-			revoked[i].RevokedAt = now
-			revoked[i].RevokedReason = reason
-			if err := writeUserSessionCache(revoked[i].cacheEntry(), time.Time{}); err != nil {
-				common.SysLog(common.LogText("failed to finalize bulk user session revoke tombstone: %s", err.Error()))
-			}
-		}
-	}
+	err := CompleteSessionSecurityChange(event, false)
+	return event.AffectedCount, err
 }
 
 func DeleteExpiredUserSessions(now int64) error {
@@ -975,7 +968,7 @@ func RotateOrganizationSessionWithContext(ctx context.Context, identity AuthSess
 		if err := tx.Model(&UserSession{}).Where("sid = ? AND version = ? AND status = ?", old.SID, identity.SessionVersion, UserSessionStatusActive).Updates(map[string]any{"status": UserSessionStatusRevoked, "revoked_at": now, "revoked_reason": "organization_verification", "previous_refresh_hash": "", "previous_valid_until": 0, "refresh_hash": ""}).Error; err != nil {
 			return err
 		}
-		if err := RevokeOAuthWithTx(tx, identity.UserID, "sid", old.SID, "session_revoked"); err != nil {
+		if err := revokeSessionOAuthWithTx(tx, identity.UserID, "sid", old.SID, "session_revoked", ""); err != nil {
 			return err
 		}
 		next.ExpiresAt = old.ExpiresAt

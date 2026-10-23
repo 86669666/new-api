@@ -682,6 +682,7 @@ it('clears global records and open details on revocation, falls back to self, an
           success: true,
           data: {
             ...admin,
+            role: 1,
             permissions: { admin_permissions: { audit: { read: false } } },
           },
         },
@@ -740,7 +741,15 @@ it('clears global records and open details on revocation, falls back to self, an
   await waitFor(() =>
     expect(get).toHaveBeenCalledWith('/api/audit/self', expect.anything())
   )
-  await waitFor(() => expect(get).toHaveBeenCalledWith('/api/user/self'))
+  await waitFor(() =>
+    expect(get).toHaveBeenCalledWith(
+      '/api/user/self',
+      expect.objectContaining({
+        skipBusinessError: true,
+        skipErrorHandler: true,
+      })
+    )
+  )
   expect(screen.queryByText('other-account')).not.toBeInTheDocument()
   expect(screen.queryByRole('tab', { name: 'All' })).not.toBeInTheDocument()
   expect(client.getQueriesData({ queryKey: ['audit', 1, 'all'] })).toHaveLength(
@@ -753,6 +762,7 @@ it('clears global records and open details on revocation, falls back to self, an
     useAuthStore.getState().auth.user?.permissions?.admin_permissions?.audit
       .read
   ).toBe(false)
+  await waitFor(() => expect(useAuthStore.getState().auth.user?.role).toBe(1))
 })
 
 it('mobile access history keeps pagination visible and puts result filters in a drawer', async () => {

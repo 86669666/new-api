@@ -43,6 +43,8 @@ func TestTokenUsageReadOnlyHTTP(t *testing.T) {
 		require.NoError(t, logDB.AutoMigrate(&model.Log{}))
 		model.LOG_DB = logDB
 	}
+	combinedFixtureDatabase(t, "main", f.db)
+	combinedFixtureDatabase(t, "log", model.LOG_DB)
 	oldExport, oldConsume, oldQuota := common.DataExportEnabled, common.LogConsumeEnabled, common.QuotaPerUnit
 	oldRange := operation_setting.GetLogSetting().MaxRangeDays
 	model.CacheQuotaDataLock.Lock()
@@ -531,6 +533,8 @@ func TestOAuthUsageConsumerHTTP(t *testing.T) {
 		require.NoError(t, logDB.AutoMigrate(&model.Log{}))
 		model.LOG_DB = logDB
 	}
+	combinedFixtureDatabase(t, "main", f.db)
+	combinedFixtureDatabase(t, "log", model.LOG_DB)
 	require.NotSame(t, f.db, model.LOG_DB, "usage history must read its independently configured log database")
 	require.NoError(t, f.db.AutoMigrate(&model.QuotaData{}))
 	common.IsMasterNode = true

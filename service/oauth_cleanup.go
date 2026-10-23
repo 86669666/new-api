@@ -18,7 +18,7 @@ import (
 type OAuthCleanupHandler struct{}
 
 func (OAuthCleanupHandler) Type() string            { return "oauth_cleanup" }
-func (OAuthCleanupHandler) Enabled() bool           { return model.OAuthCleanupReady() }
+func (OAuthCleanupHandler) Enabled() bool           { return model.DB != nil }
 func (OAuthCleanupHandler) Interval() time.Duration { return 15 * time.Second }
 func (OAuthCleanupHandler) NewPayload() any         { return nil }
 func (OAuthCleanupHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
@@ -38,8 +38,13 @@ func (OAuthCleanupHandler) Run(ctx context.Context, task *model.SystemTask, runn
 // missing/mismatched bridge retains the job and never redirects it to an issuer
 // taken from a database row. Only configured, TLS-verified Admin is contacted.
 func RunOAuthCleanup(ctx context.Context, bridge *OAuthProviderBridge, owner string) (int, error) {
+	// Local events are independent of the OAuth bridge and flags.
+	local, err := model.RunDueSessionRevocations(ctx)
+	if err != nil {
+		return local, err
+	}
 	if !model.OAuthCleanupReady() {
-		return 0, nil
+		return local, nil
 	}
 	// Age only moves an abandoned sending permission into a permanent hold;
 	// it never proves that the issuer stopped or permits remote deletion.
@@ -60,7 +65,7 @@ func RunOAuthCleanup(ctx context.Context, bridge *OAuthProviderBridge, owner str
 	if err := model.DB.WithContext(ctx).Where("state <> ? AND next_attempt_at <= ?", "complete", now).Order("next_attempt_at, job_ref").Limit(20).Find(&jobs).Error; err != nil {
 		return 0, err
 	}
-	count := 0
+	count := local
 	for _, seed := range jobs {
 		job, err := model.ClaimOAuthCleanup(ctx, seed.JobRef, owner, time.Now().Unix())
 		if err != nil {

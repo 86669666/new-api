@@ -25,6 +25,8 @@ import {
 import { AuthOperationError } from '@/lib/secure-verification'
 import type { AuthBundle, LoginSession } from '@/stores/auth-store'
 
+export type VerificationErrorProjector = (error: unknown) => AuthOperationError
+
 export type OrganizationVerificationScope =
   | 'organization.change_role'
   | 'organization.remove'
@@ -212,6 +214,8 @@ export type SecurityProofScope =
   | 'account.password.set'
   | 'account.password.change'
   | 'account.delete'
+  | 'session.revoke'
+  | 'session.revoke_others'
   | 'admin.user.create'
   | 'admin.user.update'
   | 'admin.user.delete'
@@ -231,6 +235,7 @@ export type VerificationOperation =
       context: { provider: string; email?: string; code?: string }
     }
   | { scope: 'account.binding.unbind'; context: { provider_id: number } }
+  | { scope: 'session.revoke'; context: { sid: string } }
   | { scope: 'admin.user.create'; context: { role: number } }
   | {
       scope:
@@ -268,6 +273,7 @@ export type VerificationOperation =
         | 'channel.key.read'
         | 'account.binding.bind'
         | 'account.binding.unbind'
+        | 'session.revoke'
         | 'access_token.generate'
         | 'access_token.update'
         | 'access_token.revoke'

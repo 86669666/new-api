@@ -541,6 +541,11 @@ func UnbindCustomOAuth(c *gin.Context) {
 		writeSecurityOperationError(c, err)
 		return
 	}
+	bundle, err := service.AdvanceCurrentSessionToUserVersion(identity, "account_binding_changed")
+	if err != nil {
+		writeSecurityOperationError(c, err)
+		return
+	}
 	succeeded = true
 	user, err := model.GetUserById(identity.UserID, false)
 	if err != nil {
@@ -549,7 +554,9 @@ func UnbindCustomOAuth(c *gin.Context) {
 	}
 	notificationFailed = service.NotifyAccountSecurityChange(user.Email, "Login account unlinked") != nil
 
-	common.ApiSuccessT(c, "Unbound successfully", gin.H{"notification_warning": notificationFailed})
+	data := authRotationData(bundle)
+	data["notification_warning"] = notificationFailed
+	common.ApiSuccessT(c, "Unbound successfully", data)
 }
 
 func UnbindCustomOAuthByAdmin(c *gin.Context) {
@@ -584,7 +591,7 @@ func UnbindCustomOAuthByAdmin(c *gin.Context) {
 	}
 
 	if err := model.DeleteUserOAuthBinding(userId, providerId); err != nil {
-		common.ApiError(c, err)
+		writeSecurityOperationError(c, err)
 		return
 	}
 

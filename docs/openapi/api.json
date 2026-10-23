@@ -745,7 +745,7 @@
       "get": {
         "summary": "发送密码重置邮件",
         "deprecated": false,
-        "description": "🔓 无需鉴权",
+        "description": "🔓 无需鉴权 Newly mailed links use a durable one-time flow with the configured verification expiry; responses retain the same public success envelope regardless of account existence.",
         "tags": [
           "用户登陆注册"
         ],
@@ -787,7 +787,7 @@
       "post": {
         "summary": "重置密码",
         "deprecated": false,
-        "description": "🔓 无需鉴权",
+        "description": "🔓 无需鉴权 Reset authorization is a hashed durable password_reset flow, bound to the issued account, normalized recovery email and AuthVersion. Flow consumption, password/version update and S1 intent commit atomically. Expired/replayed proofs never authorize a second commit; a committed pending response never contains the generated password. Legacy in-memory reset links must be reissued after the coordinated deployment.",
         "tags": [
           "用户登陆注册"
         ],
@@ -829,6 +829,9 @@
           },
           "403": {
             "$ref": "#/components/responses/OrganizationSelectionUnsupported"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [],
@@ -1470,7 +1473,7 @@
       "delete": {
         "summary": "撤销指定登录会话",
         "deprecated": false,
-        "description": "🔐 需要面板 Access Token，可撤销当前会话",
+        "description": "🔐 需要面板 Access Token，可撤销当前会话 Sensitive termination uses the existing server-side proof flow. The actor identity is revalidated inside the same user-first transaction as target mutation.",
         "tags": [
           "用户登陆注册"
         ],
@@ -1489,6 +1492,9 @@
           },
           {
             "$ref": "#/components/parameters/PersonalOrganizationQuery"
+          },
+          {
+            "$ref": "#/components/parameters/SessionRevokeProof"
           }
         ],
         "responses": {
@@ -1590,14 +1596,24 @@
         "x-auth-source": "middleware/access_token_routes.go; router/channel-router.go",
         "x-pat-policy": "denied: dashboard login session required",
         "operationId": "deleteApiUserSessionsSid",
-        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
+        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access",
+        "x-security-proof": {
+          "scope": "session.revoke",
+          "context": {
+            "sid": "exact target path SID"
+          },
+          "single_use": true,
+          "expiry_seconds": 60,
+          "identity_and_target_bound": true,
+          "self_logout_exempt": true
+        }
       }
     },
     "/api/user/sessions/revoke-others": {
       "post": {
         "summary": "撤销其他登录会话",
         "deprecated": false,
-        "description": "🔐 保留当前登录会话并撤销该用户的其他会话，包含列表不可见的旧 user_auth_version active 残留行",
+        "description": "🔐 保留当前登录会话并撤销该用户的其他会话，包含列表不可见的旧 user_auth_version active 残留行 Sensitive termination uses the existing server-side proof flow. The actor identity is revalidated inside the same user-first transaction as target mutation.",
         "tags": [
           "用户登陆注册"
         ],
@@ -1607,6 +1623,9 @@
           },
           {
             "$ref": "#/components/parameters/PersonalOrganizationQuery"
+          },
+          {
+            "$ref": "#/components/parameters/SessionsRevokeOthersProof"
           }
         ],
         "responses": {
@@ -1685,6 +1704,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -1695,7 +1717,15 @@
         "x-auth-source": "middleware/access_token_routes.go; router/channel-router.go",
         "x-pat-policy": "denied: dashboard login session required",
         "operationId": "postApiUserSessionsRevokeOthers",
-        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
+        "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access",
+        "x-security-proof": {
+          "scope": "session.revoke_others",
+          "context": {},
+          "single_use": true,
+          "expiry_seconds": 60,
+          "identity_and_target_bound": true,
+          "self_logout_exempt": false
+        }
       }
     },
     "/api/user/groups": {
@@ -2186,7 +2216,7 @@
       "post": {
         "summary": "绑定微信",
         "deprecated": false,
-        "description": "🔐 需要面板 Access Token",
+        "description": "🔐 需要面板 Access Token A committed binding change advances AuthVersion and persists an exact S1 intent in the business transaction. Successful browser responses include access/session rotation data; committed pending responses withhold dependent credentials and must not be automatically replayed.",
         "tags": [
           "OAuth"
         ],
@@ -2258,6 +2288,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -2278,7 +2311,7 @@
       "post": {
         "summary": "绑定邮箱",
         "deprecated": false,
-        "description": "🔐 需要面板 Access Token",
+        "description": "🔐 需要面板 Access Token A committed binding change advances AuthVersion and persists an exact S1 intent in the business transaction. Successful browser responses include access/session rotation data; committed pending responses withhold dependent credentials and must not be automatically replayed.",
         "tags": [
           "OAuth"
         ],
@@ -2297,16 +2330,23 @@
               "schema": {
                 "type": "object",
                 "required": [
-                  "email",
-                  "code"
+                  "flow_token",
+                  "new_code"
                 ],
                 "properties": {
-                  "email": {
+                  "flow_token": {
                     "type": "string",
-                    "format": "email"
+                    "writeOnly": true
                   },
-                  "code": {
-                    "type": "string"
+                  "new_code": {
+                    "type": "string",
+                    "pattern": "^[0-9]{6}$",
+                    "writeOnly": true
+                  },
+                  "old_code": {
+                    "type": "string",
+                    "description": "Required when the authorized flow replaces an existing recovery email",
+                    "writeOnly": true
                   }
                 }
               }
@@ -2355,6 +2395,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -2781,6 +2824,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -2853,6 +2899,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -3073,6 +3122,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -3221,6 +3273,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -4216,6 +4271,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -4548,6 +4606,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -4632,6 +4693,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -4716,6 +4780,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -4814,6 +4881,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -5667,6 +5737,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -5755,6 +5828,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -5829,6 +5905,9 @@
           },
           "400": {
             "$ref": "#/components/responses/OrganizationSelectionBadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/SessionRevocationPending"
           }
         },
         "security": [
@@ -25792,7 +25871,7 @@
           "method",
           "scope"
         ],
-        "description": "Method must be offered by GET /api/verify/methods for this identity and scope. 2fa uses code; password uses plaintext or encrypted fields according to configuration. Passkey/OAuth use their dedicated flows. Context is operation-specific: channel.key.read requires {channel_id}; access_token.generate requires {scopes,expires_at}. Proofs are single-use, expire, and cannot be replayed for another identity, scope or context."
+        "description": "Method must be offered by GET /api/verify/methods for this identity and scope. 2fa uses code; password uses plaintext or encrypted fields according to configuration. Passkey/OAuth use their dedicated flows. Context is operation-specific: channel.key.read requires {channel_id}; access_token.generate requires {scopes,expires_at}. Proofs are single-use, expire, and cannot be replayed for another identity, scope or context. session.revoke requires {sid}; session.revoke_others requires empty context. Both are browser-only and require a freshly authenticated factor."
       },
       "VerifyLoginRequest": {
         "type": "object",
@@ -35744,6 +35823,61 @@
           "code"
         ],
         "additionalProperties": false
+      },
+      "SessionRevocationPendingError": {
+        "type": "object",
+        "required": [
+          "success",
+          "code",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "AUTH_SESSION_REVOCATION_PENDING"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "type": "object",
+            "required": [
+              "session_revocation_complete"
+            ],
+            "properties": {
+              "session_revocation_complete": {
+                "type": "boolean",
+                "enum": [
+                  false
+                ]
+              },
+              "credential_change_committed": {
+                "type": "boolean",
+                "description": "Present only when the committed mutation fact is known; false identifies a standalone session revocation."
+              },
+              "revoked_count": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0,
+                "description": "Present only after an exact event read/commit confirmed the count; omitted for an ambiguous unobserved commit."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
       }
     },
     "responses": {
@@ -36529,6 +36663,34 @@
             }
           }
         }
+      },
+      "SessionRevocationPending": {
+        "description": "The durable local session revocation is pending. A credential change may already be committed. No dependent auth bundle is returned. A retry requires normal authorization and never resumes an event by a supplied reference.",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1"
+              ]
+            }
+          },
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "no-store"
+              ]
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SessionRevocationPendingError"
+            }
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -36656,6 +36818,24 @@
           "default": 20
         },
         "description": "Page size, default 20. The raw query must be canonical positive decimal 1..100; duplicates, signs, leading zeros, decimal/exponent forms and overflow are rejected."
+      },
+      "SessionRevokeProof": {
+        "name": "X-Security-Proof",
+        "in": "header",
+        "required": false,
+        "description": "A fresh single-use session.revoke proof bound to {sid} and this browser identity is required when terminating another SID. Terminating the current SID retains ordinary self logout semantics. PATs remain denied.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "SessionsRevokeOthersProof": {
+        "name": "X-Security-Proof",
+        "in": "header",
+        "required": true,
+        "description": "Fresh single-use session.revoke_others proof with empty operation context, bound to the current browser identity. Obtain it through the existing verification ceremonies; ordinary bearer possession is insufficient.",
+        "schema": {
+          "type": "string"
+        }
       }
     }
   },

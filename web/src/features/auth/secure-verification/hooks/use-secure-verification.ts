@@ -39,6 +39,7 @@ import {
   type VerificationInput,
   type VerificationRequirements,
   type VerificationProofFor,
+  type VerificationErrorProjector,
   isOrganizationVerificationScope,
   projectOrganizationVerificationError,
 } from '../types'
@@ -122,6 +123,7 @@ function verificationReducer(
 
 interface PendingVerificationBase {
   expectedAuthIdentity?: ExpectedAuthIdentity
+  projectError?: VerificationErrorProjector
   controller: AbortController
   reject: (error: unknown) => void
   submitting: boolean
@@ -143,7 +145,29 @@ type PendingVerification = PendingVerificationBase &
       }
   )
 
-export function useSecureVerification() {
+function verificationFailure(
+  error: unknown,
+  current: Pick<
+    PendingVerificationBase,
+    'expectedAuthIdentity' | 'projectError'
+  >
+): AuthOperationError {
+  if (current.expectedAuthIdentity) {
+    return projectOrganizationVerificationError(error)
+  }
+  if (!current.projectError) return AuthOperationError.from(error)
+  try {
+    return current.projectError(error)
+  } catch {
+    return new AuthOperationError('Verification failed. Please try again.')
+  }
+}
+
+// The optional policy applies only to operation ceremonies and is captured per
+// request. Login and the organization producer retain their own error contracts.
+export function useSecureVerification(
+  projectOperationError?: VerificationErrorProjector
+) {
   const [state, dispatch] = useReducer(verificationReducer, { phase: 'idle' })
   const pending = useRef<PendingVerification | null>(null)
   const [passkeyDomains, setPasskeyDomains] = useState<PasskeyDomains | null>(
@@ -219,8 +243,8 @@ export function useSecureVerification() {
           pending.current = null
           dispatch({ type: 'reset' })
           current.reject(
-            current.expectedAuthIdentity
-              ? projectOrganizationVerificationError(error)
+            current.expectedAuthIdentity || current.projectError
+              ? verificationFailure(error, current)
               : error
           )
         }
@@ -251,10 +275,7 @@ export function useSecureVerification() {
       if (pending.current === current) {
         dispatch({
           type: 'error',
-          error: (current.expectedAuthIdentity
-            ? projectOrganizationVerificationError(error)
-            : AuthOperationError.from(error)
-          ).message,
+          error: verificationFailure(error, current).message,
         })
       }
     }
@@ -286,8 +307,11 @@ export function useSecureVerification() {
         cloned = structuredClone(request)
       } catch (error) {
         return Promise.reject(
-          expectedAuthIdentity
-            ? projectOrganizationVerificationError(error)
+          expectedAuthIdentity || projectOperationError
+            ? verificationFailure(error, {
+                expectedAuthIdentity,
+                projectError: projectOperationError,
+              })
             : error
         )
       }
@@ -299,6 +323,7 @@ export function useSecureVerification() {
           resolve: (proof) => resolve(proof as VerificationProofFor<T> | null),
           reject,
           expectedAuthIdentity,
+          projectError: projectOperationError,
           initialPassword,
           controller: new AbortController(),
           submitting: false,
@@ -308,7 +333,7 @@ export function useSecureVerification() {
         void loadRequirements(current)
       })
     },
-    [loadRequirements]
+    [loadRequirements, projectOperationError]
   )
 
   const requestLoginVerification = useCallback(
@@ -377,9 +402,7 @@ export function useSecureVerification() {
         dispatch({ type: 'reset' })
       } catch (error) {
         if (pending.current !== current) return
-        const failure = current.expectedAuthIdentity
-          ? projectOrganizationVerificationError(error)
-          : AuthOperationError.from(error)
+        const failure = verificationFailure(error, current)
         if (failure.code === 'AUTH_CANCELLED') {
           cancel()
           return

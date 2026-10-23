@@ -1,22 +1,27 @@
 package controller
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/textproto"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -875,6 +880,214 @@ func TestSecurityAccountUnbindPreservesUsableLoginMethod(t *testing.T) {
 				assert.ErrorIs(t, err, model.ErrLastLoginMethod)
 				var binding model.UserOAuthBinding
 				require.NoError(t, model.DB.Where("user_id = ? AND provider_id = ?", user.Id, 31).First(&binding).Error)
+			}
+		})
+	}
+}
+
+func securityPasswordResetLink(t *testing.T, mailbox *securityMailbox, email string) string {
+	t.Helper()
+	response := securityEnrollmentRequest(http.MethodGet, "/api/reset_password?email="+url.QueryEscape(email), "", "", service.AuthIdentity{}, SendPasswordResetEmail)
+	require.Equal(t, http.StatusOK, response.Code)
+	mailbox.mutex.Lock()
+	defer mailbox.mutex.Unlock()
+	for _, message := range mailbox.mail[email] {
+		match := regexp.MustCompile(`token=([A-Za-z0-9_-]+)`).FindStringSubmatch(message)
+		if len(match) == 2 {
+			return match[1]
+		}
+	}
+	t.Fatal("reset email was not delivered")
+	return ""
+}
+
+func TestSessionRevocationS1ResetConcurrentSingleUse(t *testing.T) {
+	user, _ := setupSecurityEnrollmentTest(t)
+	const email = "s1-reset@example.com"
+	require.NoError(t, model.DB.Model(user).Update("email", email).Error)
+	mailbox := newSecurityMailbox(t)
+	token := securityPasswordResetLink(t, mailbox, email)
+	// Both requests reach an authoritative preflight read after HTTP parsing.
+	// Exclude locked transaction reads so the barrier never inverts user locks.
+	var arrivals atomic.Int64
+	release := make(chan struct{})
+	require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register("s1:reset-preflight", func(tx *gorm.DB) {
+		if _, inTransaction := tx.Statement.ConnPool.(gorm.TxCommitter); inTransaction {
+			return
+		}
+		if tx.Statement.Table != "users" && tx.Statement.Table != "auth_flows" {
+			return
+		}
+		n := arrivals.Add(1)
+		if n == 2 {
+			close(release)
+		}
+		if n <= 2 {
+			select {
+			case <-release:
+			case <-t.Context().Done():
+				tx.AddError(t.Context().Err())
+			}
+		}
+	}))
+	t.Cleanup(func() { _ = model.DB.Callback().Query().Remove("s1:reset-preflight") })
+	body, err := common.Marshal(PasswordResetRequest{Email: email, Token: token})
+	require.NoError(t, err)
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Go(func() {
+			responses <- securityEnrollmentRequest(http.MethodPost, "/api/user/reset", string(body), "", service.AuthIdentity{}, ResetPassword)
+		})
+	}
+	workers.Wait()
+	close(responses)
+	successes := 0
+	for response := range responses {
+		var result struct {
+			Success bool `json:"success"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		if result.Success {
+			successes++
+		}
+	}
+	assert.Equal(t, 1, successes, "one recovery proof authorizes only one credential transition")
+	var updated model.User
+	require.NoError(t, model.DB.First(&updated, user.Id).Error)
+	assert.EqualValues(t, 2, updated.AuthVersion)
+	var events int64
+	require.NoError(t, model.DB.Model(&model.SessionRevocationEvent{}).Where("user_id = ?", user.Id).Count(&events).Error)
+	assert.EqualValues(t, 1, events)
+	replay := securityEnrollmentRequest(http.MethodPost, "/api/user/reset", string(body), "", service.AuthIdentity{}, ResetPassword)
+	assert.Contains(t, replay.Body.String(), `"success":false`)
+}
+
+type sessionResetUncertainPool struct {
+	gorm.ConnPool
+	fired *atomic.Bool
+}
+
+func (p *sessionResetUncertainPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	var pool gorm.ConnPool
+	var err error
+	if b, ok := p.ConnPool.(gorm.ConnPoolBeginner); ok {
+		pool, err = b.BeginTx(ctx, opts)
+	} else if b, ok := p.ConnPool.(gorm.TxBeginner); ok {
+		pool, err = b.BeginTx(ctx, opts)
+	} else {
+		return nil, errors.New("fixture cannot begin transaction")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &sessionResetUncertainTx{ConnPool: pool, fired: p.fired}, nil
+}
+
+type sessionResetUncertainTx struct {
+	gorm.ConnPool
+	fired *atomic.Bool
+}
+
+func (tx *sessionResetUncertainTx) Commit() error {
+	err := tx.ConnPool.(gorm.TxCommitter).Commit()
+	if err == nil && tx.fired.CompareAndSwap(false, true) {
+		return errors.New("fixture real commit acknowledgement lost")
+	}
+	return err
+}
+func (tx *sessionResetUncertainTx) Rollback() error { return tx.ConnPool.(gorm.TxCommitter).Rollback() }
+
+func TestSessionRevocationS1ResetBoundaries(t *testing.T) {
+	for _, scenario := range []string{"expired", "intent_rollback", "commit_ack_lost", "committed_pending", "email_changed", "legacy_email"} {
+		t.Run(scenario, func(t *testing.T) {
+			user, _ := setupSecurityEnrollmentTest(t)
+			email := "s1-reset-bound@example.com"
+			storedEmail := email
+			if scenario == "legacy_email" {
+				storedEmail = strings.ToUpper(email)
+			}
+			require.NoError(t, model.DB.Model(user).Update("email", storedEmail).Error)
+			mailbox := newSecurityMailbox(t)
+			token := securityPasswordResetLink(t, mailbox, email)
+			var original model.User
+			require.NoError(t, model.DB.First(&original, user.Id).Error)
+			forced := errors.New("S1 reset intent unavailable")
+			switch scenario {
+			case "expired":
+				require.NoError(t, model.DB.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposePasswordReset).Update("expires_at", time.Now().Add(-time.Second)).Error)
+			case "intent_rollback":
+				require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register("s1:reset-intent", func(tx *gorm.DB) {
+					if _, ok := tx.Statement.Dest.(*model.SessionRevocationEvent); ok {
+						tx.AddError(forced)
+					}
+				}))
+				t.Cleanup(func() { _ = model.DB.Callback().Create().Remove("s1:reset-intent") })
+			case "committed_pending":
+				require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("s1:reset-pending", func(tx *gorm.DB) {
+					if tx.Statement.Table == "user_sessions" {
+						tx.AddError(forced)
+					}
+				}))
+				t.Cleanup(func() { _ = model.DB.Callback().Update().Remove("s1:reset-pending") })
+			case "email_changed":
+				require.NoError(t, model.DB.Model(user).Update("email", "other-s1@example.com").Error)
+			}
+			pool, statementPool := model.DB.Config.ConnPool, model.DB.Statement.ConnPool
+			var fired atomic.Bool
+			if scenario == "commit_ack_lost" {
+				wrapper := &sessionResetUncertainPool{ConnPool: pool, fired: &fired}
+				model.DB.Config.ConnPool, model.DB.Statement.ConnPool = wrapper, wrapper
+			}
+			body, err := common.Marshal(PasswordResetRequest{Email: email, Token: token})
+			require.NoError(t, err)
+			response := securityEnrollmentRequest(http.MethodPost, "/api/user/reset", string(body), "", service.AuthIdentity{}, ResetPassword)
+			model.DB.Config.ConnPool, model.DB.Statement.ConnPool = pool, statementPool
+			var result map[string]any
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			var current model.User
+			require.NoError(t, model.DB.First(&current, user.Id).Error)
+			if scenario == "expired" || scenario == "email_changed" || scenario == "intent_rollback" {
+				assert.Equal(t, false, result["success"])
+				assert.EqualValues(t, 1, current.AuthVersion)
+				assert.Equal(t, original.Password, current.Password)
+			} else {
+				assert.EqualValues(t, 2, current.AuthVersion)
+				assert.NotEqual(t, original.Password, current.Password)
+			}
+			if scenario == "intent_rollback" {
+				require.NoError(t, model.DB.Callback().Create().Remove("s1:reset-intent"))
+				flow, err := model.GetAuthFlow(token, model.AuthFlowMatch{Purpose: model.AuthFlowPurposePasswordReset, UserId: user.Id})
+				require.NoError(t, err)
+				assert.Nil(t, flow.ConsumedAt)
+				retried := securityEnrollmentRequest(http.MethodPost, "/api/user/reset", string(body), "", service.AuthIdentity{}, ResetPassword)
+				assert.Contains(t, retried.Body.String(), `"success":true`)
+			}
+			if scenario == "committed_pending" {
+				assert.Equal(t, 503, response.Code)
+				assert.Equal(t, "AUTH_SESSION_REVOCATION_PENDING", result["code"])
+				data, ok := result["data"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, true, data["credential_change_committed"])
+				assert.Equal(t, false, data["session_revocation_complete"])
+				require.NoError(t, model.DB.Callback().Update().Remove("s1:reset-pending"))
+			}
+			if scenario == "commit_ack_lost" {
+				assert.True(t, fired.Load())
+				assert.Equal(t, 500, response.Code)
+				assert.NotContains(t, result, "data")
+			}
+			if scenario == "commit_ack_lost" || scenario == "committed_pending" || scenario == "legacy_email" || scenario == "intent_rollback" {
+				replay := securityEnrollmentRequest(http.MethodPost, "/api/user/reset", string(body), "", service.AuthIdentity{}, ResetPassword)
+				assert.Contains(t, replay.Body.String(), `"success":false`)
+				_, err = model.RunDueSessionRevocations(t.Context())
+				require.NoError(t, err)
+				var events []model.SessionRevocationEvent
+				require.NoError(t, model.DB.Where("user_id = ?", user.Id).Find(&events).Error)
+				require.Len(t, events, 1)
+				assert.Equal(t, "local_complete", events[0].State)
+				require.NoError(t, model.DB.First(&current, user.Id).Error)
+				assert.EqualValues(t, 2, current.AuthVersion)
 			}
 		})
 	}

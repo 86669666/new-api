@@ -99,6 +99,11 @@ func EmailBind(c *gin.Context) {
 		writeSecurityOperationError(c, err)
 		return
 	}
+	bundle, err := service.AdvanceCurrentSessionToUserVersion(identity, "email_binding_changed")
+	if err != nil {
+		writeSecurityOperationError(c, err)
+		return
+	}
 	succeeded = true
 	notificationFailed = service.NotifyAccountSecurityChange(state.CurrentEmail, "Email address changed") != nil
 	if err := service.NotifyAccountSecurityChange(state.Email, "Email address confirmed"); err != nil {
@@ -108,5 +113,7 @@ func EmailBind(c *gin.Context) {
 		writeSecurityOperationError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{"notification_warning": notificationFailed}})
+	data := authRotationData(bundle)
+	data["notification_warning"] = notificationFailed
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": data})
 }

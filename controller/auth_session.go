@@ -117,7 +117,17 @@ func DeleteLoginSession(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "AUTH_SESSION_ID_REQUIRED", "message": "session id is required"})
 		return
 	}
-	revoked, err := model.RevokeUserSession(identity.UserID, sid, "user_revoked")
+	if sid != identity.SessionID {
+		context, err := common.Marshal(service.SessionRevokeContext{SID: sid})
+		if err != nil {
+			writeAuthSessionError(c, err)
+			return
+		}
+		if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeSessionRevoke, Context: context}) == nil {
+			return
+		}
+	}
+	revoked, err := model.RevokeUserSessionForSession(c.Request.Context(), identity, sid, "user_revoked")
 	if err != nil {
 		writeAuthSessionError(c, err)
 		return
@@ -140,7 +150,10 @@ func RevokeOtherLoginSessions(c *gin.Context) {
 	if !ok {
 		return
 	}
-	count, err := model.RevokeOtherUserSessions(identity.UserID, identity.SessionID, "user_revoked_others")
+	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeSessionsRevokeOthers}) == nil {
+		return
+	}
+	count, err := model.RevokeOtherUserSessionsForSession(identity, "user_revoked_others")
 	if err != nil {
 		writeAuthSessionError(c, err)
 		return
@@ -162,6 +175,20 @@ func requireBrowserSession(c *gin.Context) (service.AuthIdentity, bool) {
 }
 
 func writeAuthSessionError(c *gin.Context, err error) {
+	if errors.Is(err, model.ErrSessionRevocationPending) {
+		c.Header("Retry-After", "1")
+		c.Header("Cache-Control", "no-store")
+		data := gin.H{"session_revocation_complete": false}
+		var pending *model.SessionRevocationPendingError
+		if errors.As(err, &pending) {
+			data["credential_change_committed"] = pending.CredentialChangeCommitted
+			if pending.ProgressKnown {
+				data["revoked_count"] = pending.AffectedCount
+			}
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "code": "AUTH_SESSION_REVOCATION_PENDING", "message": "", "data": data})
+		return
+	}
 	status, code := service.AuthSessionErrorCode(err)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		status, code = http.StatusUnauthorized, "AUTH_UNAUTHORIZED"
@@ -199,4 +226,14 @@ func dashboardBearer(header string) (string, bool) {
 		return "", false
 	}
 	return parts[1], true
+}
+
+// writeSessionMutationError preserves existing business errors while giving every
+// committed-but-pending mutation the same fixed response contract.
+func writeSessionMutationError(c *gin.Context, err error) {
+	if errors.Is(err, model.ErrSessionRevocationPending) || errors.Is(err, model.ErrSessionRevocationStore) || errors.Is(err, model.ErrSessionRevocationStale) || errors.Is(err, model.ErrSessionDeletionBlocked) {
+		writeAuthSessionError(c, err)
+		return
+	}
+	common.ApiError(c, err)
 }

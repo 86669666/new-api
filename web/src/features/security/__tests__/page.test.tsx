@@ -26,12 +26,20 @@ import {
 } from '@tanstack/react-router'
 import {
   cleanup,
+  act,
   render,
   screen,
   waitFor,
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import {
+  AxiosError,
+  type AxiosAdapter,
+  type AxiosRequestTransformer,
+  type InternalAxiosRequestConfig,
+} from 'axios'
+import { toast } from 'sonner'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { Profile } from '@/features/profile'
@@ -40,6 +48,10 @@ import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { Security } from '../index'
+
+const originalAdapter = api.defaults.adapter
+const originalTransformRequest = api.defaults.transformRequest
+const pageClients: QueryClient[] = []
 
 const profile: UserProfile = {
   id: 1,
@@ -106,15 +118,19 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  for (const client of pageClients.splice(0)) client.clear()
   vi.unstubAllGlobals()
   useAuthStore.getState().auth.reset()
   vi.restoreAllMocks()
+  api.defaults.adapter = originalAdapter
+  api.defaults.transformRequest = originalTransformRequest
 })
 
 async function renderPage(path = '/security') {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
+  pageClients.push(client)
   client.setQueryData(['status'], {
     checkin_enabled: false,
     wechat_login: true,
@@ -152,8 +168,188 @@ async function renderPage(path = '/security') {
       <RouterProvider router={router} />
     </QueryClientProvider>
   )
-  return { ...rendered, router }
+  return { ...rendered, router, client }
 }
+
+function signInSessionActor(userId = 1, sid = 'current-session') {
+  const now = Math.floor(Date.now() / 1000)
+  const session = {
+    sid,
+    current: true,
+    login_method: 'password',
+    ip: '127.0.0.1',
+    user_agent: 'test',
+    created_at: now - 60,
+    last_active_at: now,
+    expires_at: now + 3600,
+  }
+  useAuthStore.getState().auth.setBundle({
+    access_token: 's1-session-access',
+    token_type: 'Bearer',
+    access_expires_at: now + 600,
+    user: { id: userId, username: 'alice', role: 1 },
+    session,
+  })
+  return session
+}
+
+function sessionCeremonyAdapter(
+  options: {
+    beforeProof?: () => Promise<void>
+    beforeWrite?: () => Promise<void>
+    writeStatus?: number
+    pendingData?: Record<string, unknown>
+  } = {}
+) {
+  const session = signInSessionActor()
+  const writes: InternalAxiosRequestConfig[] = []
+  const proofs: Record<string, unknown>[] = []
+  const proofResponses = vi.fn()
+  vi.mocked(api.get).mockRestore()
+  const adapter: AxiosAdapter = vi.fn(async (config) => {
+    let data: unknown
+    if (config.url === '/api/user/self') {
+      data = profile
+    } else if (config.url === '/api/user/sessions') {
+      data = [session, { ...session, sid: 'other-session', current: false }]
+    } else if (config.url === '/api/user/access_tokens') {
+      data = { items: [], legacy: null }
+    } else if (config.url === '/api/user/access_tokens/catalog') {
+      data = { groups: [], max_tokens: 20, default_expiry_days: 30 }
+    } else if (config.url === '/api/user/passkey') {
+      data = { enabled: false }
+    } else if (config.url === '/api/user/2fa/status') {
+      data = { enabled: false, locked: false, backup_codes_remaining: 0 }
+    } else if (config.url === '/api/user/oauth/bindings') {
+      data = []
+    } else if (config.url === '/api/verify/methods') {
+      data = {
+        scope: config.params.scope,
+        methods: [{ method: '2fa', available: true }],
+        oauth_providers: [],
+        password_encryption_enabled: false,
+      }
+    } else if (config.url === '/api/verify') {
+      const body = JSON.parse(config.data) as Record<string, unknown>
+      proofs.push(body)
+      await options.beforeProof?.()
+      data = {
+        proof_token: 'session-proof',
+        scope: body.scope,
+        method: '2fa',
+        expires_at: Math.floor(Date.now() / 1000) + 60,
+      }
+      proofResponses()
+    } else if (config.url?.startsWith('/api/user/sessions/')) {
+      writes.push(config)
+      await options.beforeWrite?.()
+      if (options.writeStatus) {
+        throw new AxiosError(
+          'private session failure',
+          'ERR_BAD_RESPONSE',
+          config,
+          undefined,
+          {
+            data: {
+              success: false,
+              code:
+                options.writeStatus === 401
+                  ? 'AUTH_UNAUTHORIZED'
+                  : 'AUTH_SESSION_REVOCATION_PENDING',
+              data: {
+                ...options.pendingData,
+                auth_bundle: { access_token: 'unusable-response-canary' },
+              },
+            },
+            status: options.writeStatus,
+            statusText: 'controlled failure',
+            headers: {},
+            config,
+          }
+        )
+      }
+      data = {
+        revoked_sid: config.url.split('/').at(-1),
+        current: config.url.endsWith('/current-session'),
+        revoked_count: 1,
+      }
+    } else throw new Error(`Unexpected controlled route ${config.url}`)
+    return {
+      data: { success: true, data },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+    }
+  })
+  api.defaults.adapter = adapter
+  return { adapter, writes, proofs, proofResponses }
+}
+
+it.each([
+  {
+    name: 'one other SID',
+    action: 'Revoke',
+    confirm: 'Revoke',
+    scope: 'session.revoke',
+    context: { sid: 'other-session' },
+    url: '/api/user/sessions/other-session',
+  },
+  {
+    name: 'all other SIDs',
+    action: 'Sign out other sessions',
+    confirm: 'Sign out others',
+    scope: 'session.revoke_others',
+    context: undefined,
+    url: '/api/user/sessions/revoke-others',
+  },
+])(
+  'verifies $name once before sending its exact session action',
+  async (scenario) => {
+    const controlled = sessionCeremonyAdapter()
+    const user = userEvent.setup()
+    const view = await renderPage()
+    await user.click(
+      await screen.findByRole('button', { name: scenario.action })
+    )
+    await user.click(
+      within(await screen.findByRole('alertdialog')).getByRole('button', {
+        name: scenario.confirm,
+      })
+    )
+    const code = await screen.findByLabelText(
+      'Authenticator code or backup code',
+      { selector: 'input' }
+    )
+    expect(controlled.writes).toHaveLength(0)
+    await user.type(code, '123456')
+    await user.click(screen.getByRole('button', { name: 'Verify' }))
+    await waitFor(() => expect(controlled.writes).toHaveLength(1))
+    expect(controlled.proofs).toEqual([
+      {
+        method: '2fa',
+        scope: scenario.scope,
+        ...(scenario.context ? { context: scenario.context } : {}),
+        code: '123456',
+      },
+    ])
+    expect(controlled.writes[0].url).toBe(scenario.url)
+    expect(controlled.writes[0].headers.get('X-Security-Proof')).toBe(
+      'session-proof'
+    )
+    expect(controlled.writes[0].singleUseAuthorization).toBe(true)
+    expect(controlled.writes[0].skipAuthRefresh).toBe(true)
+    await waitFor(() =>
+      expect(
+        view.client
+          .getMutationCache()
+          .getAll()
+          .every((item) => item.state.status !== 'pending')
+      ).toBe(true)
+    )
+    view.client.clear()
+  }
+)
 
 describe('security page migration', () => {
   it('places account management on the left and verification and privacy on the right', async () => {
@@ -274,5 +470,222 @@ describe('security page migration', () => {
     expect(
       await screen.findByRole('button', { name: 'Delete Account' })
     ).toBeVisible()
+  })
+})
+
+async function beginOtherSessionAction(
+  user: ReturnType<typeof userEvent.setup>
+) {
+  await user.click(await screen.findByRole('button', { name: 'Revoke' }))
+  await user.click(
+    within(await screen.findByRole('alertdialog')).getByRole('button', {
+      name: 'Revoke',
+    })
+  )
+}
+
+async function submitSessionFactor(user: ReturnType<typeof userEvent.setup>) {
+  await user.type(
+    await screen.findByLabelText('Authenticator code or backup code', {
+      selector: 'input',
+    }),
+    '123456'
+  )
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+}
+
+it('keeps current-session sign out on its ordinary policy without a factor', async () => {
+  const controlled = sessionCeremonyAdapter()
+  const user = userEvent.setup()
+  await renderPage()
+  await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+  await user.click(
+    within(await screen.findByRole('alertdialog')).getByRole('button', {
+      name: 'Sign out',
+    })
+  )
+  await waitFor(() => expect(controlled.writes).toHaveLength(1))
+  expect(controlled.writes[0].url).toBe('/api/user/sessions/current-session')
+  expect(controlled.writes[0].headers.has('X-Security-Proof')).toBe(false)
+  expect(controlled.proofs).toHaveLength(0)
+  await waitFor(() => expect(useAuthStore.getState().auth.user).toBeFalsy())
+})
+
+it.each(['close', 'actor', 'sid', 'unmount'] as const)(
+  'cancels %s while a factor response is pending and never sends the late proof',
+  async (change) => {
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const controlled = sessionCeremonyAdapter({ beforeProof: () => gate })
+    const success = vi.spyOn(toast, 'success')
+    const user = userEvent.setup()
+    const view = await renderPage()
+    await beginOtherSessionAction(user)
+    await submitSessionFactor(user)
+    await waitFor(() => expect(controlled.proofs).toHaveLength(1))
+    if (change === 'close') await user.keyboard('{Escape}')
+    else if (change === 'unmount') view.unmount()
+    else {
+      await act(() => {
+        signInSessionActor(change === 'actor' ? 2 : 1, 'replacement-session')
+      })
+    }
+    await act(async () => {
+      release?.()
+    })
+    await waitFor(() =>
+      expect(controlled.proofResponses).toHaveBeenCalledTimes(1)
+    )
+    await waitFor(() =>
+      expect(
+        view.client
+          .getMutationCache()
+          .getAll()
+          .map((item) => item.state.status)
+      ).toEqual(['error'])
+    )
+    expect(controlled.writes).toHaveLength(0)
+    expect(success).not.toHaveBeenCalled()
+    expect(
+      view.client.getMutationCache().getAll()[0].state.error
+    ).toMatchObject({ code: 'AUTH_CANCELLED' })
+  }
+)
+
+it('does not let a cancelled late factor revive the old target or close a new confirmation', async () => {
+  let release: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const controlled = sessionCeremonyAdapter({ beforeProof: () => gate })
+  const user = userEvent.setup()
+  const view = await renderPage()
+  await beginOtherSessionAction(user)
+  await submitSessionFactor(user)
+  await waitFor(() => expect(controlled.proofs).toHaveLength(1))
+  await user.keyboard('{Escape}')
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await user.click(screen.getByRole('button', { name: 'Sign out' }))
+  await act(async () => {
+    release?.()
+  })
+  await waitFor(() =>
+    expect(view.client.getMutationCache().getAll()[0].state.status).toBe(
+      'error'
+    )
+  )
+  expect(await screen.findByRole('alertdialog')).toHaveAccessibleName(
+    'Sign out this device?'
+  )
+  expect(controlled.writes).toHaveLength(0)
+})
+
+it.each([
+  { name: '401', status: 401, pendingData: {}, committed: undefined },
+  {
+    name: 'committed503',
+    status: 503,
+    pendingData: {
+      session_revocation_complete: false,
+      credential_change_committed: true,
+    },
+    committed: true,
+  },
+  { name: 'unknown503', status: 503, pendingData: {}, committed: undefined },
+])(
+  'does not replay or report success for $name after consuming one factor',
+  async (scenario) => {
+    const controlled = sessionCeremonyAdapter({
+      writeStatus: scenario.status,
+      pendingData: scenario.pendingData,
+    })
+    const success = vi.spyOn(toast, 'success')
+    const user = userEvent.setup()
+    const view = await renderPage()
+    await beginOtherSessionAction(user)
+    await submitSessionFactor(user)
+    await waitFor(() =>
+      expect(view.client.getMutationCache().getAll()[0].state.status).toBe(
+        'error'
+      )
+    )
+    expect(controlled.proofs).toHaveLength(1)
+    expect(controlled.writes).toHaveLength(1)
+    expect(controlled.writes[0].skipAuthRefresh).toBe(true)
+    expect(success).not.toHaveBeenCalled()
+    expect(useAuthStore.getState().auth.accessToken).toBe('s1-session-access')
+    const error = view.client.getMutationCache().getAll()[0].state.error
+    expect(error).toMatchObject({ status: scenario.status })
+    if (scenario.committed === undefined) {
+      expect(error).not.toHaveProperty('credential_change_committed')
+    } else expect(error).toHaveProperty('credential_change_committed', true)
+  }
+)
+
+it('rejects a late session write response after an actor change without reporting success', async () => {
+  let release: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const controlled = sessionCeremonyAdapter({ beforeWrite: () => gate })
+  const success = vi.spyOn(toast, 'success')
+  const user = userEvent.setup()
+  const view = await renderPage()
+  await beginOtherSessionAction(user)
+  await submitSessionFactor(user)
+  await waitFor(() => expect(controlled.writes).toHaveLength(1))
+  await act(() => {
+    signInSessionActor(2, 'replacement-session')
+  })
+  await act(async () => {
+    release?.()
+  })
+  await waitFor(() =>
+    expect(view.client.getMutationCache().getAll()[0].state.status).toBe(
+      'error'
+    )
+  )
+  expect(view.client.getMutationCache().getAll()[0].state.error).toMatchObject({
+    code: 'AUTH_CANCELLED',
+  })
+  expect(controlled.proofs).toHaveLength(1)
+  expect(controlled.writes).toHaveLength(1)
+  expect(success).not.toHaveBeenCalled()
+  expect(useAuthStore.getState().auth.user?.id).toBe(2)
+})
+
+it('uses the captured identity guard when the actor changes after transformRequest but before adapter dispatch', async () => {
+  const controlled = sessionCeremonyAdapter()
+  const transformed = vi.fn()
+  const swap: AxiosRequestTransformer = function (data) {
+    if (this.url === '/api/user/sessions/other-session') {
+      transformed()
+      signInSessionActor(2, 'replacement-session')
+    }
+    return data
+  }
+  api.defaults.transformRequest = [
+    ...[originalTransformRequest ?? []].flat(),
+    swap,
+  ]
+  const success = vi.spyOn(toast, 'success')
+  const user = userEvent.setup()
+  const view = await renderPage()
+  await beginOtherSessionAction(user)
+  await submitSessionFactor(user)
+  await waitFor(() =>
+    expect(view.client.getMutationCache().getAll()[0].state.status).toBe(
+      'error'
+    )
+  )
+  expect(transformed).toHaveBeenCalledTimes(1)
+  expect(controlled.writes).toHaveLength(0)
+  expect(success).not.toHaveBeenCalled()
+  expect(view.client.getMutationCache().getAll()[0].state.error).toMatchObject({
+    code: 'AUTH_CANCELLED',
   })
 })

@@ -33,9 +33,11 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
@@ -322,6 +324,8 @@ func oauthPublicUsageDatabase(t *testing.T, f *organizationHTTPFixture) {
 	require.NoError(t, f.db.Raw(query).Scan(&mainVersion).Error)
 	require.NoError(t, logDB.Raw(query).Scan(&logVersion).Error)
 	t.Logf("OAuth usage stores: main_engine=%s main_version=%s log_engine=%s log_version=%s independent_log=true cleanup=registered", kind, mainVersion, logDB.Dialector.Name(), logVersion)
+	combinedFixtureDatabase(t, "main", f.db)
+	combinedFixtureDatabase(t, "log", logDB)
 }
 
 func TestOAuthPublicHydraHTTP(t *testing.T) {
@@ -1308,6 +1312,7 @@ func oauthPublicDatabase(t *testing.T, f *organizationHTTPFixture) {
 		var version string
 		require.NoError(t, f.db.Raw("SELECT sqlite_version()").Scan(&version).Error)
 		t.Logf("OAuth primary database=sqlite version=%s", version)
+		combinedFixtureDatabase(t, "main", f.db)
 		return
 	}
 	require.Contains(t, []string{"mysql", "postgres"}, kind)
@@ -1339,14 +1344,32 @@ func oauthPublicDatabase(t *testing.T, f *organizationHTTPFixture) {
 	adminConnection := connection
 	t.Cleanup(func() { require.NoError(t, adminConnection.Close()) })
 	require.NoError(t, admin.Exec("CREATE DATABASE "+name).Error)
-	t.Cleanup(func() { require.NoError(t, admin.Exec("DROP DATABASE "+name).Error) })
+	t.Logf("W01-03 owned database=%s engine=%s", name, kind)
+	t.Cleanup(func() {
+		err := admin.Exec("DROP DATABASE " + name).Error
+		require.NoError(t, err)
+		if err == nil {
+			if combinedFixtureBound(t) {
+				query := "SELECT count(*) FROM information_schema.schemata WHERE schema_name = ?"
+				if kind == "postgres" {
+					query = "SELECT count(*) FROM pg_database WHERE datname = ?"
+				}
+				var remaining int64
+				require.NoError(t, admin.Raw(query, name).Scan(&remaining).Error)
+				require.Zero(t, remaining, "exact OAuth fixture database must be absent after DROP")
+				combinedFixtureEvent(t, "removed", map[string]any{"kind": "database", "identity": name})
+			}
+			t.Logf("W01-03 removed database=%s engine=%s", name, kind)
+		}
+	})
+	combinedFixtureEvent(t, "created", map[string]any{"kind": "database", "identity": name})
 	db, err := gorm.Open(testDial, config)
 	require.NoError(t, err)
 	connection, err = db.DB()
 	require.NoError(t, err)
 	owned := connection
 	t.Cleanup(func() { require.NoError(t, owned.Close()) })
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.AuthFlow{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.AuthFlow{}))
 	var users []model.User
 	var sessions []model.UserSession
 	require.NoError(t, f.db.Find(&users).Error)
@@ -1360,6 +1383,7 @@ func oauthPublicDatabase(t *testing.T, f *organizationHTTPFixture) {
 	var version string
 	require.NoError(t, db.Raw("SELECT version()").Scan(&version).Error)
 	t.Logf("OAuth primary database=%s engine=%s version=%s", name, kind, version)
+	combinedFixtureDatabase(t, "main", db)
 }
 
 func TestOAuthPublicRateLimitHTTP(t *testing.T) {
@@ -2459,23 +2483,13 @@ func TestOAuthCleanupFailureFences(t *testing.T) {
 				require.NoError(t, f.db.Model(&model.OAuthCleanupJob{}).Count(&count).Error)
 				assert.Zero(t, count)
 			case "bulk_interruption":
-				// The starting range fence is durable even if the process stops
-				// before its first session batch. An ordinary retry finishes it.
-				require.NoError(t, model.BeginOAuthSessionRevocation(userID, ""))
-				newGrant := *grant
-				newGrant.GrantID = strings.Repeat("y", 43)
-				newGrant.ConsentRequestID = "new-consent"
-				require.ErrorIs(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, &newGrant) }), model.ErrOAuthCleanupHeld)
-				var job model.OAuthCleanupJob
-				require.NoError(t, f.db.First(&job).Error)
-				claimed, err := model.ClaimOAuthCleanup(t.Context(), job.JobRef, "after-restart", time.Now().Unix())
+				legacy := &model.OAuthOperation{OperationRef: strings.Repeat("e", 64), UserID: userID, Kind: "sessions_all", State: "local_pending", CreatedAt: time.Now().Unix()}
+				require.NoError(t, f.db.Create(legacy).Error)
+				_, err := model.RevokeAllUserSessions(userID, "session_revoked")
 				require.NoError(t, err)
-				require.Nil(t, claimed)
-				_, err = model.RevokeAllUserSessions(userID, "retry")
-				require.NoError(t, err)
-				var remaining int64
-				require.NoError(t, f.db.Model(&model.OAuthOperation{}).Where("state = ?", "local_pending").Count(&remaining).Error)
-				assert.Zero(t, remaining)
+				require.ErrorIs(t, model.CompleteOAuthSessionRevocation(userID, ""), model.ErrOAuthCleanupHeld)
+				require.NoError(t, f.db.Where("operation_ref = ?", legacy.OperationRef).First(legacy).Error)
+				assert.Equal(t, "local_pending", legacy.State)
 			case "orphan_sent":
 				op := &model.OAuthOperation{Issuer: grant.Issuer, UserID: userID, ClientID: grant.ClientID, OriginSID: sid, GrantRef: grant.GrantRef, AuthVersion: 1, SessionVersion: 1, Kind: "code_exchange"}
 				require.NoError(t, model.ReserveOAuthOperation(t.Context(), op))
@@ -2491,5 +2505,1573 @@ func TestOAuthCleanupFailureFences(t *testing.T) {
 				assert.Equal(t, "unknown", op.State)
 			}
 		})
+	}
+}
+
+// seedSessionRevocationSessions is a bounded, deterministic batch-boundary fixture.
+// It intentionally inserts old valid sessions directly; creation limits are tested
+// separately through the production creator after the first batch frees capacity.
+func seedSessionRevocationSessions(t *testing.T, f *organizationHTTPFixture, count int) {
+	t.Helper()
+	now := time.Now().Unix()
+	rows := make([]model.UserSession, count)
+	for i := range rows {
+		rows[i] = model.UserSession{SID: fmt.Sprintf("s1-z-%04d-%d", i, f.users["owner"].Id), UserID: f.users["owner"].Id,
+			Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("a", 64),
+			LoginMethod: "password", CreatedAt: now, LastActiveAt: now, ExpiresAt: now + 3600}
+	}
+	require.NoError(t, f.db.CreateInBatches(&rows, 100).Error)
+}
+
+// Proposed for the root's exact A+B+C three-engine fixture run. This package
+// compiles these cases but does not launch the fixture servers/databases here.
+func TestSessionRevocationS1(t *testing.T) {
+	for _, scenario := range []string{"dynamic_and_stale", "overlapping_others", "credential_intent_rollback", "sid_outbox_rollback", "http_pending", "hard_delete_capacity", "claim_pending", "unknown_version", "missing_store", "lost_historical_store"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newOrganizationHTTPFixture(t)
+			oauthPublicDatabase(t, f)
+			common.IsMasterNode = true
+			require.NoError(t, model.InitOAuthGrantStore(true))
+			common.IsMasterNode = false
+			require.NoError(t, model.ValidateSessionRevocationStore())
+			userID, sid := f.users["owner"].Id, f.sids["owner"]
+			var source model.UserSession
+			require.NoError(t, f.db.Where("sid = ?", sid).First(&source).Error)
+			if scenario == "lost_historical_store" {
+				var event *model.SessionRevocationEvent
+				require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error {
+					var err error
+					event, err = model.StartSessionRevocationWithTx(tx, userID, "", "session_revoked")
+					return err
+				}))
+				require.True(t, event.OAuthAttributionRequired)
+				require.NoError(t, model.InitOAuthCleanupStore(false))
+				require.NoError(t, f.db.Migrator().DropTable(&model.OAuthArtifact{}, &model.OAuthCleanupJob{}, &model.OAuthOperation{}, &model.OAuthGrant{}))
+				require.ErrorIs(t, model.ValidateSessionOAuthHistoryBeforeMigration(), model.ErrSessionRevocationStore)
+				require.ErrorIs(t, model.ValidateSessionRevocationStore(), model.ErrSessionRevocationStore)
+				_, err := model.RunSessionRevocationBatch(t.Context(), *event)
+				require.ErrorIs(t, err, model.ErrSessionRevocationStore)
+				return
+			}
+			if scenario == "unknown_version" {
+				event := &model.SessionRevocationEvent{EventRef: strings.Repeat("f", 64), ProtocolVersion: 2, UserID: userID, Scope: "all",
+					Reason: "session_revoked", State: "pending", Revision: 1, CreatedAt: time.Now().Unix()}
+				require.NoError(t, f.db.Create(event).Error)
+				require.ErrorIs(t, model.ValidateSessionRevocationStore(), model.ErrSessionRevocationStore)
+				copy := source
+				copy.SID = "s1-unknown-version"
+				require.ErrorIs(t, model.CreateUserSession(&copy), model.ErrSessionRevocationStore)
+				return
+			}
+			if scenario == "missing_store" {
+				require.NoError(t, f.db.Migrator().DropTable(&model.SessionRevocationEvent{}))
+				_, err := model.RevokeAllUserSessions(userID, "session_revoked")
+				require.Error(t, err)
+				copy := source
+				copy.SID = "s1-missing-store"
+				require.Error(t, model.CreateUserSession(&copy))
+				require.NoError(t, f.db.Where("sid = ?", sid).First(&source).Error)
+				assert.Equal(t, model.UserSessionStatusActive, source.Status)
+				return
+			}
+			if scenario == "credential_intent_rollback" || scenario == "sid_outbox_rollback" || scenario == "claim_pending" {
+				grant := &model.OAuthGrant{GrantID: strings.Repeat("a", 43), Issuer: "https://s1.example/", ClientID: "desktop",
+					Subject: strconv.Itoa(userID), UserID: userID, ConsentRequestID: "s1-consent", HydraLoginSessionID: "s1-login",
+					OriginSID: sid, SessionVersion: 1, UserAuthVersion: 1, Scopes: "[\"profile\"]", PolicyHash: strings.Repeat("b", 64)}
+				require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+			}
+			if scenario == "credential_intent_rollback" {
+				oldHash, err := common.HashAccountPassword("S1-original-password-731")
+				require.NoError(t, err)
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", userID).Update("password", oldHash).Error)
+				forced := errors.New("s1 initial attribution rejected")
+				require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register("s1:initial-outbox", func(tx *gorm.DB) {
+					if job, ok := tx.Statement.Dest.(*model.OAuthCleanupJob); ok && job.SourceSessionEventRef != nil {
+						tx.AddError(forced)
+					}
+				}))
+				t.Cleanup(func() { _ = f.db.Callback().Create().Remove("s1:initial-outbox") })
+				identity := model.AuthSessionIdentity{UserID: userID, SessionID: sid, UserAuthVersion: 1, SessionVersion: 1}
+				err = model.ChangeUserPassword(identity, &model.User{Id: userID, Password: "S1-next-password-927", OriginalPassword: "S1-original-password-731"}, false)
+				require.ErrorIs(t, err, forced)
+				var user model.User
+				require.NoError(t, f.db.First(&user, userID).Error)
+				assert.Equal(t, oldHash, user.Password)
+				assert.Equal(t, int64(1), user.AuthVersion)
+				var events, jobs int64
+				require.NoError(t, f.db.Model(&model.SessionRevocationEvent{}).Where("user_id = ?", userID).Count(&events).Error)
+				require.NoError(t, f.db.Model(&model.OAuthCleanupJob{}).Where("user_id = ?", userID).Count(&jobs).Error)
+				assert.Zero(t, events)
+				assert.Zero(t, jobs)
+				return
+			}
+			if scenario == "hard_delete_capacity" {
+				seedSessionRevocationSessions(t, f, 500)
+				err := f.db.Transaction(func(tx *gorm.DB) error {
+					_, event, err := model.AdvanceUserSecurityWithTx(tx, userID, nil)
+					if err != nil {
+						return err
+					}
+					_, err = model.RevokeSessionsForUserDeletionWithTx(tx, event)
+					return err
+				})
+				require.ErrorIs(t, err, model.ErrSessionDeletionBlocked)
+				var user model.User
+				require.NoError(t, f.db.First(&user, userID).Error)
+				assert.Equal(t, int64(1), user.AuthVersion)
+				var intents int64
+				require.NoError(t, f.db.Model(&model.SessionRevocationEvent{}).Where("user_id = ?", userID).Count(&intents).Error)
+				assert.Zero(t, intents, "capacity failure rolls back the entire deletion intent")
+				return
+			}
+			if scenario == "http_pending" {
+				seedSessionRevocationSessions(t, f, 501)
+				require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}))
+				proof := sessionRevocationProof(t, f, "owner", service.VerificationScopeSessionsRevokeOthers, nil)
+				status, headers, body := f.request(t, http.MethodPost, "/api/user/sessions/revoke-others", "owner", "", http.Header{"X-Security-Proof": {proof}})
+				require.Equal(t, http.StatusServiceUnavailable, status)
+				assert.Equal(t, "1", headers.Get("Retry-After"))
+				assert.Contains(t, headers.Get("Cache-Control"), "no-store")
+				assert.Equal(t, "AUTH_SESSION_REVOCATION_PENDING", body["code"])
+				assert.Equal(t, false, body["success"])
+				data, ok := body["data"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, false, data["credential_change_committed"])
+				assert.Equal(t, false, data["session_revocation_complete"])
+				assert.Equal(t, float64(500), data["revoked_count"])
+				assert.NotContains(t, data, "event_ref")
+				assert.NotContains(t, data, "access_token")
+				var event model.SessionRevocationEvent
+				require.NoError(t, f.db.Where("user_id = ?", userID).First(&event).Error)
+				completed, err := model.RunSessionRevocationBatch(t.Context(), event)
+				require.NoError(t, err)
+				assert.Equal(t, "local_complete", completed.State)
+				assert.Equal(t, int64(501), completed.AffectedCount)
+				return
+			}
+			if scenario == "overlapping_others" {
+				copy := source
+				copy.SID = "s1-other"
+				require.NoError(t, model.CreateUserSession(&copy))
+				var first, second *model.SessionRevocationEvent
+				require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error {
+					var err error
+					first, err = model.StartSessionRevocationWithTx(tx, userID, sid, "session_revoked")
+					if err != nil {
+						return err
+					}
+					second, err = model.StartSessionRevocationWithTx(tx, userID, copy.SID, "session_revoked")
+					return err
+				}))
+				a, err := model.RunSessionRevocationBatch(t.Context(), *first)
+				require.NoError(t, err)
+				b, err := model.RunSessionRevocationBatch(t.Context(), *second)
+				require.NoError(t, err)
+				assert.Equal(t, int64(1), a.AffectedCount)
+				assert.Equal(t, int64(1), b.AffectedCount)
+				var active int64
+				require.NoError(t, f.db.Model(&model.UserSession{}).Where("user_id = ? AND status = ?", userID, model.UserSessionStatusActive).Count(&active).Error)
+				assert.Zero(t, active)
+				return
+			}
+			if scenario == "dynamic_and_stale" {
+				seedSessionRevocationSessions(t, f, 500)
+			}
+			var event *model.SessionRevocationEvent
+			require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error {
+				var err error
+				event, err = model.StartSessionRevocationWithTx(tx, userID, "", "session_revoked")
+				return err
+			}))
+			if scenario == "claim_pending" {
+				var job model.OAuthCleanupJob
+				require.NoError(t, f.db.Where("user_id = ?", userID).First(&job).Error)
+				claimed, err := model.ClaimOAuthCleanup(t.Context(), job.JobRef, "s1-cleanup", time.Now().Unix())
+				require.NoError(t, err)
+				require.Nil(t, claimed)
+				require.NoError(t, f.db.Where("job_ref = ?", job.JobRef).First(&job).Error)
+				assert.Equal(t, "blocked", job.State)
+				assert.Equal(t, "local_pending", job.ErrorCode)
+				return
+			}
+			if scenario == "sid_outbox_rollback" {
+				forced := errors.New("s1 per-SID outbox rejected")
+				require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register("s1:sid-outbox", func(tx *gorm.DB) {
+					if job, ok := tx.Statement.Dest.(*model.OAuthCleanupJob); ok && job.Scope == "sid" {
+						tx.AddError(forced)
+					}
+				}))
+				t.Cleanup(func() { _ = f.db.Callback().Create().Remove("s1:sid-outbox") })
+				_, err := model.RunSessionRevocationBatch(t.Context(), *event)
+				require.ErrorIs(t, err, forced)
+				var current model.SessionRevocationEvent
+				require.NoError(t, f.db.Where("event_ref = ?", event.EventRef).First(&current).Error)
+				assert.Equal(t, int64(1), current.Revision)
+				assert.Zero(t, current.AffectedCount)
+				require.NoError(t, f.db.Where("sid = ?", sid).First(&source).Error)
+				assert.Equal(t, model.UserSessionStatusActive, source.Status)
+				var jobs []model.OAuthCleanupJob
+				require.NoError(t, f.db.Where("user_id = ?", userID).Find(&jobs).Error)
+				require.Len(t, jobs, 1, "only committed initial attribution survives")
+				require.NotNil(t, jobs[0].SourceSessionEventRef)
+				assert.Equal(t, event.EventRef, *jobs[0].SourceSessionEventRef)
+				return
+			}
+			first, err := model.RunSessionRevocationBatch(t.Context(), *event)
+			require.NoError(t, err)
+			require.Equal(t, "pending", first.State)
+			assert.Equal(t, int64(500), first.AffectedCount)
+			oldLimit := common.UserSessionIssuanceLimit
+			common.UserSessionIssuanceLimit = 2000
+			t.Cleanup(func() { common.UserSessionIssuanceLimit = oldLimit })
+			early := source
+			early.SID = "s1-a-created-before-finalize"
+			require.NoError(t, model.CreateUserSession(&early))
+			second, err := model.RunSessionRevocationBatch(t.Context(), *first)
+			require.NoError(t, err)
+			require.Equal(t, "local_complete", second.State)
+			assert.Equal(t, int64(502), second.AffectedCount)
+			late := source
+			late.SID = "s1-created-after-finalize"
+			require.NoError(t, model.CreateUserSession(&late))
+			_, err = model.RunSessionRevocationBatch(t.Context(), *first)
+			require.ErrorIs(t, err, model.ErrSessionRevocationStale)
+			require.NoError(t, f.db.Where("sid = ?", late.SID).First(&late).Error)
+			assert.Equal(t, model.UserSessionStatusActive, late.Status)
+			var legacy int64
+			require.NoError(t, f.db.Model(&model.OAuthOperation{}).Where("user_id = ? AND state = ?", userID, "local_pending").Count(&legacy).Error)
+			assert.Zero(t, legacy, "new events do not create legacy range identities")
+		})
+	}
+}
+
+// W01-03 author verification: report driver/catalog contracts without altering
+// the frozen production candidate or weakening its startup validation.
+func TestSessionRevocationS1StoreDiagnostics(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	oauthPublicDatabase(t, f)
+	stmt := &gorm.Statement{DB: f.db}
+	require.NoError(t, stmt.Parse(&model.SessionRevocationEvent{}))
+	t.Logf("attribution_field_db_name=%s", stmt.Schema.LookUpField("OAuthAttributionRequired").DBName)
+	columns, err := f.db.Migrator().ColumnTypes(&model.SessionRevocationEvent{})
+	require.NoError(t, err)
+	for _, column := range columns {
+		primary, supported := column.PrimaryKey()
+		t.Logf("column=%s primary=%v primary_supported=%v", column.Name(), primary, supported)
+	}
+	indexes, err := f.db.Migrator().GetIndexes(&model.SessionRevocationEvent{})
+	require.NoError(t, err)
+	for _, index := range indexes {
+		t.Logf("index=%s columns=%v", index.Name(), index.Columns())
+	}
+	if f.db.Dialector.Name() == "postgres" {
+		var rows []struct {
+			Indexname string
+			Indexdef  string
+		}
+		require.NoError(t, f.db.Raw("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = ? AND schemaname = CURRENT_SCHEMA()", "session_revocation_events").Scan(&rows).Error)
+		for _, row := range rows {
+			t.Logf("catalog_index=%s definition=%s", row.Indexname, row.Indexdef)
+		}
+	}
+	t.Run("fresh_startup_preflight", func(t *testing.T) { require.NoError(t, model.ValidateSessionOAuthHistoryBeforeMigration()) })
+	common.IsMasterNode = true
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	common.IsMasterNode = false
+	t.Run("ready_oauth_store_validation", func(t *testing.T) { require.NoError(t, model.ValidateSessionRevocationStore()) })
+}
+
+func TestSessionRevocationS1Namespace(t *testing.T) {
+	require.Equal(t, "postgres", os.Getenv("NEWAPI_W01_MAIN_KIND"))
+	for _, restricted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restricted_%v", restricted), func(t *testing.T) {
+			f := newOrganizationHTTPFixture(t)
+			oauthPublicDatabase(t, f)
+			require.NoError(t, model.InitOAuthCleanupStore(false))
+			require.NoError(t, f.db.AutoMigrate(&model.OAuthGrant{}, &model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}))
+			require.NoError(t, f.db.Exec("CREATE SCHEMA app").Error)
+			require.NoError(t, f.db.Exec("ALTER TABLE public.users SET SCHEMA app").Error)
+			require.NoError(t, f.db.Exec("ALTER TABLE public.session_revocation_events SET SCHEMA app").Error)
+			role := "w01s104_" + strings.ToLower(strings.ReplaceAll(common.NewRequestId(), "-", ""))
+			require.Regexp(t, `^[a-z][a-z0-9_]+$`, role)
+			if restricted {
+				require.NoError(t, f.db.Exec("CREATE ROLE "+role+" NOLOGIN").Error)
+				t.Logf("W01-04 owned role=%s", role)
+				t.Cleanup(func() {
+					require.NoError(t, f.db.Exec("DROP OWNED BY "+role).Error)
+					require.NoError(t, f.db.Exec("DROP ROLE "+role).Error)
+					t.Logf("W01-04 removed role=%s", role)
+				})
+				require.NoError(t, f.db.Exec("REVOKE ALL ON SCHEMA public FROM PUBLIC").Error)
+				require.NoError(t, f.db.Exec("GRANT USAGE ON SCHEMA app TO "+role).Error)
+				require.NoError(t, f.db.Exec("GRANT SELECT, UPDATE ON app.users TO "+role).Error)
+				require.NoError(t, f.db.Exec("GRANT SELECT, INSERT, UPDATE ON app.session_revocation_events TO "+role).Error)
+			}
+			require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error {
+				require.NoError(t, tx.Exec("SET LOCAL search_path = app, public").Error)
+				if restricted {
+					require.NoError(t, tx.Exec("SET LOCAL ROLE "+role).Error)
+				}
+				before := model.DB
+				model.DB = tx
+				defer func() { model.DB = before }()
+				assert.ErrorIs(t, model.ValidateSessionOAuthHistoryBeforeMigration(), model.ErrSessionRevocationStore)
+				_, err := model.StartSessionRevocationWithTx(tx, f.users["owner"].Id, "", "session_revoked")
+				assert.ErrorIs(t, err, model.ErrSessionRevocationStore)
+				return nil
+			}))
+			var events int64
+			require.NoError(t, f.db.Table("app.session_revocation_events").Count(&events).Error)
+			assert.Zero(t, events, "hidden history cannot be replaced by a false no-history event")
+			for _, table := range []string{"oauth_grants", "o_auth_operations", "o_auth_artifacts", "o_auth_cleanup_jobs"} {
+				var count int64
+				require.NoError(t, f.db.Raw("SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=?", table).Scan(&count).Error)
+				assert.EqualValues(t, 1, count)
+			}
+		})
+	}
+}
+
+func sessionRevocationRepairFixture(t *testing.T) *organizationHTTPFixture {
+	t.Helper()
+	f := newOrganizationHTTPFixture(t)
+	oauthPublicDatabase(t, f)
+	require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Option{}, &model.UserAccessToken{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}, &model.ExternalIdentityClaim{}, &model.CasbinRule{}, &model.AuthzRole{}))
+	common.IsMasterNode = true
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	require.NoError(t, authz.Init(f.db))
+	common.IsMasterNode = false
+	return f
+}
+
+func sessionRevocationProof(t *testing.T, f *organizationHTTPFixture, actor, scope string, context any) string {
+	t.Helper()
+	identity, err := service.ParseAccessToken(f.bearer[actor])
+	require.NoError(t, err)
+	var payload []byte
+	if context != nil {
+		payload, err = common.Marshal(context)
+		require.NoError(t, err)
+	}
+	binding, err := service.BindVerificationOperation(service.VerificationOperation{Scope: scope, Context: payload})
+	require.NoError(t, err)
+	proof, _, err := service.IssueSecurityProof(identity, service.VerificationMethodPassword, binding)
+	require.NoError(t, err)
+	return proof
+}
+
+func TestSessionRevocationS1Permissions(t *testing.T) {
+	for _, reloadFailure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reload_failure_%v", reloadFailure), func(t *testing.T) {
+			f := sessionRevocationRepairFixture(t)
+			target := f.users["admin"]
+			require.NoError(t, f.db.Model(target).Update("role", common.RoleAdminUser).Error)
+			require.NoError(t, model.PublishUserAuthCache(target.Id))
+			raw := "nap_" + strings.ToLower(strings.ReplaceAll(common.NewRequestId(), "-", ""))
+			pat := &model.UserAccessToken{UserId: target.Id, TokenHash: model.AccessTokenFingerprint(raw), Name: "S1 permission regression"}
+			require.NoError(t, pat.SetScopes([]string{"channel:read"}))
+			require.NoError(t, model.CreateUserAccessToken(target.Id, pat, 10))
+			const path = "/w01/s1-permission"
+			middleware.DeclareAccessTokenPermissionRoute(http.MethodGet, path, authz.ChannelRead)
+			f.engine.GET(path, middleware.UserAuth(), middleware.RequirePermission(authz.ChannelRead), func(c *gin.Context) { c.JSON(200, gin.H{"success": true}) })
+			status, _, _ := f.request(t, http.MethodGet, path, raw, "", nil)
+			require.Equal(t, 200, status)
+			// Fail only post-credential session writes, so a real intent commits and
+			// completion returns pending without requiring 501 duplicate fixture rows.
+			require.NoError(t, f.db.Callback().Update().Before("gorm:update").Register("s1:pending", func(tx *gorm.DB) {
+				if tx.Statement.Table == "user_sessions" {
+					tx.AddError(errors.New("S1 batch write unavailable"))
+				}
+			}))
+			t.Cleanup(func() { _ = f.db.Callback().Update().Remove("s1:pending") })
+			var reloadAttempted atomic.Bool
+			if reloadFailure {
+				require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register("s1:reload", func(tx *gorm.DB) {
+					if tx.Statement.Table == "casbin_rule" {
+						reloadAttempted.Store(true)
+						tx.AddError(errors.New("S1 policy read unavailable"))
+					}
+				}))
+				t.Cleanup(func() { _ = f.db.Callback().Query().Remove("s1:reload") })
+			}
+			proof := sessionRevocationProof(t, f, "root", service.VerificationScopeAdminUserUpdate, service.AdminUserContext{UserID: target.Id})
+			body, err := common.Marshal(map[string]any{"id": target.Id, "username": target.Username, "role": common.RoleAdminUser, "group": "default", "password": "S1-replaced-password-783", "admin_permissions": authz.PermissionsMap{"channel": {"read": false}}})
+			require.NoError(t, err)
+			status, _, response := f.request(t, http.MethodPut, "/api/user/", "root", string(body), http.Header{"X-Security-Proof": {proof}})
+			assert.Equal(t, false, response["success"])
+			if reloadFailure {
+				assert.True(t, status == 500 || status == 503)
+				assert.True(t, reloadAttempted.Load())
+			} else {
+				assert.Equal(t, 503, status)
+				assert.Equal(t, "AUTH_SESSION_REVOCATION_PENDING", response["code"])
+			}
+			var user model.User
+			require.NoError(t, f.db.First(&user, target.Id).Error)
+			assert.EqualValues(t, 2, user.AuthVersion)
+			assert.True(t, common.ValidatePasswordAndHash("S1-replaced-password-783", user.Password))
+			var token model.UserAccessToken
+			require.NoError(t, f.db.First(&token, pat.Id).Error)
+			status, _, _ = f.request(t, http.MethodGet, path, raw, "", nil)
+			assert.Equal(t, http.StatusForbidden, status, "a still-valid PAT cannot retain the committed removed permission")
+		})
+	}
+}
+
+func TestSessionRevocationS1Bindings(t *testing.T) {
+	for _, scenario := range []string{"email_bind", "email_replace", "email_intent_rollback", "self_unlink", "admin_clear", "admin_custom_unlink", "builtin_bind", "builtin_replace", "custom_bind", "custom_replace", "telegram_bind", "builtin_intent_rollback", "last_login_method"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := sessionRevocationRepairFixture(t)
+			user := f.users["owner"]
+			identity, err := service.ParseAccessToken(f.bearer["owner"])
+			require.NoError(t, err)
+			forced := errors.New("S1 event insert unavailable")
+			if strings.HasSuffix(scenario, "intent_rollback") {
+				require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register("s1:binding-intent", func(tx *gorm.DB) {
+					if _, ok := tx.Statement.Dest.(*model.SessionRevocationEvent); ok {
+						tx.AddError(forced)
+					}
+				}))
+				t.Cleanup(func() { _ = f.db.Callback().Create().Remove("s1:binding-intent") })
+			}
+			switch scenario {
+			case "email_bind", "email_replace", "email_intent_rollback":
+				current := ""
+				if scenario == "email_replace" {
+					current = "old-s1@example.com"
+				}
+				require.NoError(t, f.db.Model(user).Update("email", current).Error)
+				hash, err := common.Password2Hash("194638")
+				require.NoError(t, err)
+				state := model.EmailBindingState{CurrentEmail: current, Email: "new-s1@example.com", NewCodeHash: hash, Authorization: &model.AuthFlowAuthorization{AuthSessionIdentity: identity, ProofID: 1, Scope: service.VerificationScopeAccountBind, ContextHash: "S1-bound-test"}}
+				if current != "" {
+					state.OldCodeHash = hash
+				}
+				flow, _, err := model.CreateEmailBinding(identity, state)
+				require.NoError(t, err)
+				_, err = model.CompleteEmailBinding(identity, flow, state.Email, "194638", "194638")
+				if scenario == "email_intent_rollback" {
+					assert.ErrorIs(t, err, forced)
+				} else {
+					require.NoError(t, err)
+				}
+			case "self_unlink", "admin_custom_unlink":
+				require.NoError(t, f.db.Create(&model.UserOAuthBinding{UserId: user.Id, ProviderId: 1, ProviderUserId: "S1-bound-subject"}).Error)
+				if scenario == "self_unlink" {
+					require.NoError(t, model.UnbindUserOAuthForSession(identity, 1, model.AccountLoginMethods{Password: true}))
+				} else {
+					require.NoError(t, model.DeleteUserOAuthBinding(user.Id, 1))
+				}
+			case "builtin_bind", "builtin_replace", "custom_bind", "custom_replace", "telegram_bind", "builtin_intent_rollback":
+				if scenario == "builtin_replace" {
+					require.NoError(t, f.db.Model(user).Update("github_id", "old-subject").Error)
+				}
+				if scenario == "custom_replace" {
+					require.NoError(t, f.db.Create(&model.UserOAuthBinding{UserId: user.Id, ProviderId: 1, ProviderUserId: "old-subject"}).Error)
+				}
+				var event *model.SessionRevocationEvent
+				err := f.db.Transaction(func(tx *gorm.DB) error {
+					var err error
+					if strings.HasPrefix(scenario, "custom_") {
+						event, err = model.UpdateUserOAuthBindingForSessionWithTx(tx, identity, 1, "new-subject")
+					} else if scenario == "telegram_bind" {
+						event, err = model.BindTelegramForSessionWithTx(tx, identity, "123456789")
+					} else {
+						event, err = model.UpdateUserBindColumnForSessionWithTx(tx, identity, "github_id", "new-subject")
+					}
+					return err
+				})
+				if scenario == "builtin_intent_rollback" {
+					assert.ErrorIs(t, err, forced)
+				} else {
+					require.NoError(t, err)
+					_, err = service.CompleteAccountBinding(identity, event)
+					require.NoError(t, err)
+				}
+			case "last_login_method":
+				require.NoError(t, f.db.Create(&model.UserOAuthBinding{UserId: user.Id, ProviderId: 1, ProviderUserId: "only-login"}).Error)
+				assert.ErrorIs(t, model.UnbindUserOAuthForSession(identity, 1, model.AccountLoginMethods{}), model.ErrLastLoginMethod)
+			case "admin_clear":
+				require.NoError(t, f.db.Model(user).Update("github_id", "S1-old-binding").Error)
+				require.NoError(t, user.ClearBinding("github"))
+			}
+			var updated model.User
+			require.NoError(t, f.db.First(&updated, user.Id).Error)
+			var events []model.SessionRevocationEvent
+			require.NoError(t, f.db.Where("user_id = ?", user.Id).Find(&events).Error)
+			if strings.HasSuffix(scenario, "intent_rollback") || scenario == "last_login_method" {
+				assert.Empty(t, updated.GitHubId)
+				assert.EqualValues(t, 1, updated.AuthVersion)
+				assert.Empty(t, updated.Email)
+				assert.Empty(t, events)
+				return
+			}
+			assert.EqualValues(t, 2, updated.AuthVersion)
+			require.Len(t, events, 1)
+			assert.Equal(t, "security_changed", events[0].Reason)
+			if strings.HasPrefix(scenario, "admin_") {
+				assert.Equal(t, "all", events[0].Scope)
+			} else {
+				assert.Equal(t, "others", events[0].Scope)
+				assert.Equal(t, identity.SessionID, events[0].ExcludedSID)
+			}
+		})
+	}
+}
+
+func TestSessionRevocationS1ProofRequired(t *testing.T) {
+	for _, path := range []string{"/api/user/sessions/revoke-others", "/api/user/sessions/"} {
+		t.Run(path, func(t *testing.T) {
+			f := sessionRevocationRepairFixture(t)
+			method := http.MethodPost
+			if strings.HasSuffix(path, "/") {
+				method = http.MethodDelete
+				var session model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", f.sids["owner"]).First(&session).Error)
+				session.SID = "s1-proof-target"
+				require.NoError(t, model.CreateUserSession(&session))
+				path += session.SID
+			}
+			status, _, body := f.request(t, method, path, "owner", "", nil)
+			assert.Equal(t, http.StatusForbidden, status)
+			assert.Equal(t, "SECURITY_PROOF_REQUIRED", body["code"])
+		})
+	}
+}
+
+// Pause the business transaction after the separate proof-consumption commit.
+// The same production connection-pool interfaces are used by both dialects.
+type sessionRevocationActorPausePool struct {
+	gorm.ConnPool
+	begun   atomic.Int64
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *sessionRevocationActorPausePool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	if p.begun.Add(1) == 2 {
+		close(p.entered)
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if b, ok := p.ConnPool.(gorm.ConnPoolBeginner); ok {
+		return b.BeginTx(ctx, opts)
+	}
+	if b, ok := p.ConnPool.(gorm.TxBeginner); ok {
+		return b.BeginTx(ctx, opts)
+	}
+	return nil, errors.New("fixture cannot begin transaction")
+}
+
+func TestSessionRevocationS1StaleActor(t *testing.T) {
+	f := sessionRevocationRepairFixture(t)
+	var target model.UserSession
+	require.NoError(t, f.db.Where("sid = ?", f.sids["owner"]).First(&target).Error)
+	target.SID = "s1-actor-target"
+	require.NoError(t, model.CreateUserSession(&target))
+	grant := &model.OAuthGrant{GrantID: strings.Repeat("x", 43), Issuer: "https://s1-actor.example/", ClientID: "desktop", Subject: strconv.Itoa(target.UserID), UserID: target.UserID, ConsentRequestID: "actor-target-consent", HydraLoginSessionID: "actor-login", OriginSID: target.SID, SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("b", 64)}
+	require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+	proof := sessionRevocationProof(t, f, "owner", "session.revoke", map[string]any{"sid": target.SID})
+	pool, statementPool := f.db.Config.ConnPool, f.db.Statement.ConnPool
+	pause := &sessionRevocationActorPausePool{ConnPool: pool, entered: make(chan struct{}), release: make(chan struct{})}
+	f.db.Config.ConnPool, f.db.Statement.ConnPool = pause, pause
+	defer func() { f.db.Config.ConnPool, f.db.Statement.ConnPool = pool, statementPool }()
+	done := make(chan int, 1)
+	go func() {
+		status, _, _ := f.request(t, http.MethodDelete, "/api/user/sessions/"+target.SID, "owner", "", http.Header{"X-Security-Proof": {proof}})
+		done <- status
+	}()
+	select {
+	case <-pause.entered:
+	case <-time.After(10 * time.Second):
+		close(pause.release)
+		t.Fatal("business transaction did not reach actor race barrier")
+	}
+	revoked, err := model.RevokeUserSession(target.UserID, f.sids["owner"], "fixture_actor_terminated")
+	close(pause.release)
+	require.NoError(t, err)
+	require.True(t, revoked)
+	select {
+	case status := <-done:
+		assert.NotEqual(t, http.StatusOK, status)
+	case <-time.After(10 * time.Second):
+		t.Fatal("single-SID action did not finish")
+	}
+	require.NoError(t, f.db.Where("sid = ?", target.SID).First(&target).Error)
+	assert.Equal(t, model.UserSessionStatusActive, target.Status)
+	var jobs int64
+	require.NoError(t, f.db.Model(&model.OAuthCleanupJob{}).Where("user_id = ? AND scope = ? AND value = ?", target.UserID, "sid", target.SID).Count(&jobs).Error)
+	assert.Zero(t, jobs, "a terminated actor creates no target attribution")
+}
+
+func TestSessionRevocationS1ProofBindings(t *testing.T) {
+	for _, scenario := range []string{"wrong_action", "wrong_target", "wrong_session", "expired", "replayed", "pat", "correct", "own_logout"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := sessionRevocationRepairFixture(t)
+			var target model.UserSession
+			require.NoError(t, f.db.Where("sid = ?", f.sids["owner"]).First(&target).Error)
+			target.SID = "s1-proof-binding-target"
+			require.NoError(t, model.CreateUserSession(&target))
+			raw, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: target.UserID, SessionID: target.SID, UserAuthVersion: 1, SessionVersion: 1})
+			require.NoError(t, err)
+			f.bearer["second"] = raw
+			scope, actor, context := "session.revoke", "owner", any(map[string]any{"sid": target.SID})
+			if scenario == "wrong_action" {
+				scope, context = service.VerificationScopePasswordChange, nil
+			}
+			if scenario == "wrong_target" {
+				context = map[string]any{"sid": "s1-unrelated-target"}
+			}
+			if scenario == "wrong_session" {
+				actor = "second"
+			}
+			proof := sessionRevocationProof(t, f, actor, scope, context)
+			if scenario == "expired" {
+				require.NoError(t, f.db.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposeSecurityProof).Update("expires_at", time.Now().Add(-time.Second)).Error)
+			}
+			requestActor, path := "owner", "/api/user/sessions/"+target.SID
+			if scenario == "pat" {
+				raw := "nap_" + strings.ToLower(common.NewRequestId())
+				token := &model.UserAccessToken{UserId: target.UserID, TokenHash: model.AccessTokenFingerprint(raw), Name: "session ceiling"}
+				require.NoError(t, token.SetScopes([]string{"account_security:write"}))
+				require.NoError(t, model.CreateUserAccessToken(target.UserID, token, 10))
+				requestActor = raw
+			}
+			if scenario == "own_logout" {
+				path = "/api/user/sessions/" + f.sids["owner"]
+				proof = ""
+			}
+			status, _, _ := f.request(t, http.MethodDelete, path, requestActor, "", http.Header{"X-Security-Proof": {proof}})
+			if scenario == "correct" || scenario == "replayed" || scenario == "own_logout" {
+				require.Equal(t, 200, status)
+			} else {
+				assert.Equal(t, 403, status)
+			}
+			if scenario == "replayed" {
+				status, _, body := f.request(t, http.MethodDelete, path, "owner", "", http.Header{"X-Security-Proof": {proof}})
+				assert.Equal(t, 403, status)
+				assert.Equal(t, "SECURITY_PROOF_CONSUMED", body["code"])
+			}
+			require.NoError(t, f.db.Where("sid = ?", target.SID).First(&target).Error)
+			if scenario == "correct" || scenario == "replayed" {
+				assert.Equal(t, model.UserSessionStatusRevoked, target.Status)
+			} else {
+				assert.Equal(t, model.UserSessionStatusActive, target.Status)
+			}
+		})
+	}
+}
+
+func TestSessionRevocationS1WrongIndexOrder(t *testing.T) {
+	f := sessionRevocationRepairFixture(t)
+	require.NoError(t, model.ValidateSessionRevocationStore())
+	drop := "DROP INDEX idx_session_revocation_due"
+	if f.db.Dialector.Name() == "mysql" {
+		drop += " ON session_revocation_events"
+	}
+	require.NoError(t, f.db.Exec(drop).Error)
+	require.NoError(t, f.db.Exec("CREATE INDEX idx_session_revocation_due ON session_revocation_events (event_ref,state,next_attempt_at)").Error)
+	assert.ErrorIs(t, model.ValidateSessionRevocationStore(), model.ErrSessionRevocationStore)
+}
+
+// Every physical key is confined to a random04 namespace. The production Lua
+// and values are unchanged; a hook rewrites only declared Redis key arguments.
+type sessionRevocationRedisPrefix struct {
+	prefix  string
+	mu      sync.Mutex
+	keys    map[string]struct{}
+	delay   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+	unblock sync.Once
+}
+
+func (h *sessionRevocationRedisPrefix) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	args := cmd.Args()
+	first, last := 1, 2
+	switch cmd.Name() {
+	case "eval", "evalsha":
+		if len(args) < 3 {
+			return ctx, errors.New("fixture Redis shape rejected")
+		}
+		n, err := strconv.Atoi(fmt.Sprint(args[2]))
+		if err != nil || n < 1 {
+			return ctx, errors.New("fixture Redis key count rejected")
+		}
+		first, last = 3, 3+n
+	case "del", "exists":
+		last = len(args)
+	case "get", "set", "setnx", "hget", "hgetall", "hset", "hmget", "expire", "pexpire", "ttl", "pttl":
+	case "ping":
+		return ctx, nil
+	default:
+		return ctx, errors.New("fixture Redis command rejected")
+	}
+	if last > len(args) {
+		return ctx, errors.New("fixture Redis key shape rejected")
+	}
+	h.mu.Lock()
+	for i := first; i < last; i++ {
+		key := h.prefix + fmt.Sprint(args[i])
+		args[i] = key
+		h.keys[key] = struct{}{}
+	}
+	h.mu.Unlock()
+	if cmd.Name() == "eval" && last == 4 && len(args) > 8 && fmt.Sprint(args[8]) == "active" && h.delay.CompareAndSwap(true, false) {
+		close(h.entered)
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+			return ctx, ctx.Err()
+		}
+	}
+	return ctx, nil
+}
+func (*sessionRevocationRedisPrefix) AfterProcess(context.Context, redis.Cmder) error { return nil }
+func (h *sessionRevocationRedisPrefix) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
+	for _, cmd := range cmds {
+		var err error
+		ctx, err = h.BeforeProcess(ctx, cmd)
+		if err != nil {
+			return ctx, err
+		}
+	}
+	return ctx, nil
+}
+func (*sessionRevocationRedisPrefix) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
+
+func TestSessionRevocationS1RealRedis(t *testing.T) {
+	for _, scenario := range []string{"deny_wrong_type", "outbox_rollback", "late_active_fill", "credential_rollback"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := sessionRevocationRepairFixture(t)
+			endpoint := os.Getenv("NEWAPI_W01_REDIS_ADDR")
+			host, port, err := net.SplitHostPort(endpoint)
+			require.NoError(t, err)
+			require.Equal(t, "127.0.0.1", host)
+			require.True(t, port == os.Getenv("NEWAPI_W01_REDIS_ALLOWED_PORT"))
+			nonce := make([]byte, 12)
+			_, err = rand.Read(nonce)
+			require.NoError(t, err)
+			prefix := "w01:s104:" + fmt.Sprintf("%x", nonce) + ":"
+			database := 1 + int(nonce[0])%14
+			control := redis.NewClient(&redis.Options{Addr: endpoint, DB: database, MaxRetries: -1, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second})
+			require.True(t, control.Ping(t.Context()).Err() == nil, "authorized real Redis unavailable")
+			info, err := control.Info(t.Context(), "server").Result()
+			require.NoError(t, err)
+			version := ""
+			for line := range strings.SplitSeq(info, "\n") {
+				if value, ok := strings.CutPrefix(line, "redis_version:"); ok {
+					version = strings.TrimSpace(value)
+				}
+			}
+			t.Logf("real Redis version=%s", version)
+			var initialCursor uint64
+			for {
+				before, next, err := control.Scan(t.Context(), initialCursor, prefix+"*", 100).Result()
+				require.NoError(t, err)
+				require.Empty(t, before)
+				if next == 0 {
+					break
+				}
+				initialCursor = next
+			}
+			hook := &sessionRevocationRedisPrefix{prefix: prefix, keys: map[string]struct{}{}, entered: make(chan struct{}), release: make(chan struct{})}
+			client := redis.NewClient(&redis.Options{Addr: endpoint, DB: database, MaxRetries: -1, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second})
+			client.AddHook(hook)
+			oldEnabled, oldClient := common.RedisEnabled, common.RDB
+			common.RedisEnabled, common.RDB = true, client
+			var background sync.WaitGroup
+			t.Logf("W01-04 owned redis_prefix=%s db=%d", prefix, database)
+			combinedFixtureEvent(t, "created", map[string]any{"kind": "redis_prefix", "identity": fmt.Sprintf("redis:%d/%s", database, prefix)})
+			t.Cleanup(func() {
+				hook.unblock.Do(func() { close(hook.release) })
+				background.Wait()
+				common.RedisEnabled, common.RDB = oldEnabled, oldClient
+				require.NoError(t, client.Close())
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				var keys []string
+				for key := range hook.keys {
+					require.True(t, strings.HasPrefix(key, prefix))
+					keys = append(keys, key)
+				}
+				if len(keys) > 0 {
+					require.NoError(t, control.Del(ctx, keys...).Err())
+				}
+				var cursor uint64
+				for {
+					remaining, next, err := control.Scan(ctx, cursor, prefix+"*", 100).Result()
+					require.NoError(t, err)
+					require.Empty(t, remaining)
+					if next == 0 {
+						break
+					}
+					cursor = next
+				}
+				require.NoError(t, control.Close())
+				combinedFixtureEvent(t, "removed", map[string]any{"kind": "redis_prefix", "identity": fmt.Sprintf("redis:%d/%s", database, prefix)})
+				t.Logf("W01-04 removed redis_prefix=%s db=%d keys=%d", prefix, database, len(keys))
+			})
+			userID, sid := f.users["owner"].Id, f.sids["owner"]
+			_, err = model.GetUserSessionCached(sid)
+			require.NoError(t, err)
+			physical := ""
+			hook.mu.Lock()
+			for key := range hook.keys {
+				if strings.HasPrefix(key, prefix+"auth:session:") {
+					physical = key
+				}
+			}
+			hook.mu.Unlock()
+			require.NotEmpty(t, physical, "observe the real cache key instead of duplicating its HMAC naming")
+			if scenario == "credential_rollback" {
+				require.NoError(t, model.PublishUserAuthCache(userID))
+				forced := errors.New("S1 event create failed")
+				require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register("s1:redis-intent", func(tx *gorm.DB) {
+					if _, ok := tx.Statement.Dest.(*model.SessionRevocationEvent); ok {
+						tx.AddError(forced)
+					}
+				}))
+				_, err := model.BumpUserAuthVersion(userID)
+				assert.ErrorIs(t, err, forced)
+				require.NoError(t, f.db.Callback().Create().Remove("s1:redis-intent"))
+				var user model.User
+				require.NoError(t, f.db.First(&user, userID).Error)
+				assert.EqualValues(t, 1, user.AuthVersion)
+				floor, err := control.Get(t.Context(), prefix+fmt.Sprintf("auth:user:version:%d", userID)).Int64()
+				require.NoError(t, err)
+				assert.EqualValues(t, 1, floor, "a rolled back credential cannot publish committed version2")
+				var count int64
+				require.NoError(t, f.db.Model(&model.SessionRevocationEvent{}).Where("user_id = ?", userID).Count(&count).Error)
+				assert.Zero(t, count)
+				return
+			}
+			var event *model.SessionRevocationEvent
+			require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error {
+				var err error
+				event, err = model.StartSessionRevocationWithTx(tx, userID, "", "session_revoked")
+				return err
+			}))
+			if scenario == "outbox_rollback" {
+				grant := &model.OAuthGrant{GrantID: strings.Repeat("g", 43), Issuer: "https://s1-redis.example/", ClientID: "desktop", Subject: strconv.Itoa(userID), UserID: userID, ConsentRequestID: "redis-consent", HydraLoginSessionID: "redis-login", OriginSID: sid, SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("b", 64)}
+				// The event already blocks fresh grants; seed existing authoritative
+				// history directly to exercise a transaction's per-SID outbox failure.
+				grant.GrantRef = model.OAuthGrantRef(grant.Issuer, grant.GrantID)
+				grant.State = "active"
+				grant.Revision = 1
+				grant.ExpiresAt = time.Now().Unix() + 3600
+				require.NoError(t, f.db.Create(grant).Error)
+				forced := errors.New("S1 SID attribution failed")
+				require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register("s1:redis-outbox", func(tx *gorm.DB) {
+					if job, ok := tx.Statement.Dest.(*model.OAuthCleanupJob); ok && job.Scope == "sid" {
+						tx.AddError(forced)
+					}
+				}))
+				_, err := model.RunSessionRevocationBatch(t.Context(), *event)
+				assert.ErrorIs(t, err, forced)
+				require.NoError(t, f.db.Callback().Create().Remove("s1:redis-outbox"))
+				status, err := control.HGet(t.Context(), physical, "Status").Result()
+				require.NoError(t, err)
+				assert.Equal(t, "revoking", status)
+				var session model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", sid).First(&session).Error)
+				assert.Equal(t, model.UserSessionStatusActive, session.Status)
+				var current model.SessionRevocationEvent
+				require.NoError(t, f.db.Where("event_ref = ?", event.EventRef).First(&current).Error)
+				assert.EqualValues(t, 1, current.Revision)
+				assert.Zero(t, current.AffectedCount)
+			}
+			if scenario == "deny_wrong_type" {
+				require.NoError(t, control.Set(t.Context(), physical, "wrong-type", time.Minute).Err())
+				_, err := model.RunSessionRevocationBatch(t.Context(), *event)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "WRONGTYPE")
+				var session model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", sid).First(&session).Error)
+				assert.Equal(t, model.UserSessionStatusActive, session.Status)
+				var current model.SessionRevocationEvent
+				require.NoError(t, f.db.Where("event_ref = ?", event.EventRef).First(&current).Error)
+				assert.EqualValues(t, 1, current.Revision)
+				assert.Zero(t, current.AffectedCount)
+				require.NoError(t, control.Del(t.Context(), physical).Err())
+			}
+			var late chan error
+			if scenario == "late_active_fill" {
+				require.NoError(t, control.Del(t.Context(), physical).Err())
+				hook.delay.Store(true)
+				late = make(chan error, 1)
+				background.Go(func() { _, err := model.GetUserSessionCached(sid); late <- err })
+				select {
+				case <-hook.entered:
+				case <-time.After(10 * time.Second):
+					t.Fatal("positive fill did not reach real Redis barrier")
+				}
+			}
+			complete, err := model.RunSessionRevocationBatch(t.Context(), *event)
+			require.NoError(t, err)
+			assert.Equal(t, "local_complete", complete.State)
+			assert.EqualValues(t, 1, complete.AffectedCount)
+			hook.unblock.Do(func() { close(hook.release) })
+			if late != nil {
+				select {
+				case err := <-late:
+					assert.ErrorIs(t, err, model.ErrUserSessionInactive)
+				case <-time.After(10 * time.Second):
+					t.Fatal("late fill did not complete")
+				}
+			}
+			status, err := control.HGet(t.Context(), physical, "Status").Result()
+			require.NoError(t, err)
+			assert.Equal(t, "revoked", status)
+			_, err = model.RunSessionRevocationBatch(t.Context(), *event)
+			assert.ErrorIs(t, err, model.ErrSessionRevocationStale)
+		})
+	}
+}
+
+func TestSessionRevocationS1CreatorFinalizeRaces(t *testing.T) {
+	for _, creator := range []string{"direct", "login_flow", "organization_rotation"} {
+		for _, creatorFirst := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s_creator_first_%v", creator, creatorFirst), func(t *testing.T) {
+				f := sessionRevocationRepairFixture(t)
+				userID := f.users["owner"].Id
+				identity, err := service.ParseAccessToken(f.bearer["owner"])
+				require.NoError(t, err)
+				var source model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", identity.SessionID).First(&source).Error)
+				next := source
+				next.SID = "s1-a-concurrent-new-session"
+				next.Version = 1
+				next.RevokedAt = 0
+				next.RevokedReason = ""
+				var token string
+				if creator == "login_flow" {
+					token, _, err = model.CreateAuthFlow(model.AuthFlowCreate{Purpose: model.AuthFlowPurposeLoginVerification, UserId: userID, ExpiresAt: time.Now().Add(time.Minute)})
+					require.NoError(t, err)
+				}
+				var event *model.SessionRevocationEvent
+				require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error {
+					var err error
+					event, err = model.StartSessionRevocationWithTx(tx, userID, source.SID, "session_revoked")
+					return err
+				}))
+				hint := *event
+				if creatorFirst {
+					// Existing rows use higher SIDs, so this also catches a persisted SID
+					// cursor that would skip the newly inserted lower lexical member.
+					seedSessionRevocationSessions(t, f, 501)
+					oldIssuanceLimit := common.UserSessionIssuanceLimit
+					common.UserSessionIssuanceLimit = 2000
+					t.Cleanup(func() { common.UserSessionIssuanceLimit = oldIssuanceLimit })
+					first, err := model.RunSessionRevocationBatch(t.Context(), hint)
+					require.NoError(t, err)
+					require.Equal(t, "pending", first.State)
+					hint = *first
+				}
+				create := func() error {
+					switch creator {
+					case "direct":
+						return model.CreateUserSession(&next)
+					case "login_flow":
+						return model.CreateUserSessionFromLoginFlow(token, &next, func(*gorm.DB, *model.AuthFlow, *model.UserVerificationState) error { return nil })
+					default:
+						return model.RotateOrganizationSessionWithContext(t.Context(), identity, &next, func(*gorm.DB, *model.UserVerificationState) error { return nil })
+					}
+				}
+				entered, release, attempted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				var enterOnce, attemptOnce, releaseOnce sync.Once
+				t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+				callback := "s1:race-" + creator
+				if creatorFirst {
+					require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+						if row, ok := tx.Statement.Dest.(*model.UserSession); ok && row.SID == next.SID {
+							enterOnce.Do(func() { close(entered) })
+							select {
+							case <-release:
+							case <-t.Context().Done():
+								tx.AddError(t.Context().Err())
+							}
+						}
+					}))
+					t.Cleanup(func() { _ = f.db.Callback().Create().Remove(callback) })
+				} else {
+					require.NoError(t, f.db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+						if tx.Statement.Table == "session_revocation_events" {
+							if changes, ok := tx.Statement.Dest.(map[string]any); ok && changes["state"] == "local_complete" {
+								enterOnce.Do(func() { close(entered) })
+								select {
+								case <-release:
+								case <-t.Context().Done():
+									tx.AddError(t.Context().Err())
+								}
+							}
+						}
+					}))
+					t.Cleanup(func() { _ = f.db.Callback().Update().Remove(callback) })
+				}
+				created := make(chan error, 1)
+				finished := make(chan error, 1)
+				finalize := func() { _, err := model.RunSessionRevocationBatch(t.Context(), hint); finished <- err }
+				if creatorFirst {
+					go func() { created <- create() }()
+				} else {
+					go finalize()
+				}
+				select {
+				case <-entered:
+				case <-time.After(10 * time.Second):
+					t.Fatal("first transaction did not reach shared-lock race barrier")
+				}
+				require.NoError(t, f.db.Callback().Update().Before("gorm:update").Register("s1:race-attempt", func(tx *gorm.DB) {
+					if tx.Statement.Table == "users" {
+						attemptOnce.Do(func() { close(attempted) })
+					}
+				}))
+				require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register("s1:race-attempt", func(tx *gorm.DB) {
+					if tx.Statement.Table == "users" {
+						attemptOnce.Do(func() { close(attempted) })
+					}
+				}))
+				t.Cleanup(func() { _ = f.db.Callback().Update().Remove("s1:race-attempt") })
+				t.Cleanup(func() { _ = f.db.Callback().Query().Remove("s1:race-attempt") })
+				if creatorFirst {
+					go finalize()
+				} else {
+					go func() { created <- create() }()
+				}
+				select {
+				case <-attempted:
+				case <-time.After(10 * time.Second):
+					t.Fatal("second operation did not attempt user lock")
+				}
+				releaseOnce.Do(func() { close(release) })
+				require.NoError(t, <-finished)
+				err = <-created
+				if err != nil {
+					require.True(t, creatorFirst && errors.Is(err, model.ErrUserSessionInactive), "creation may withhold its bundle after an immediately following revocation")
+				}
+				var actual model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", next.SID).First(&actual).Error)
+				if creatorFirst {
+					assert.Equal(t, model.UserSessionStatusRevoked, actual.Status)
+				} else {
+					assert.Equal(t, model.UserSessionStatusActive, actual.Status)
+				}
+				var done model.SessionRevocationEvent
+				require.NoError(t, f.db.Where("event_ref = ?", event.EventRef).First(&done).Error)
+				assert.Equal(t, "local_complete", done.State)
+				assert.Equal(t, source.SID, done.ExcludedSID)
+				if creatorFirst {
+					assert.EqualValues(t, 502, done.AffectedCount)
+				} else {
+					assert.Zero(t, done.AffectedCount)
+				}
+				_, err = model.RunSessionRevocationBatch(t.Context(), hint)
+				assert.ErrorIs(t, err, model.ErrSessionRevocationStale)
+			})
+		}
+	}
+}
+
+func TestSessionRevocationS1CommitAcknowledgementLost(t *testing.T) {
+	f := sessionRevocationRepairFixture(t)
+	var event *model.SessionRevocationEvent
+	require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		event, err = model.StartSessionRevocationWithTx(tx, f.users["owner"].Id, "", "session_revoked")
+		return err
+	}))
+	var fired atomic.Bool
+	pool, statementPool := f.db.Config.ConnPool, f.db.Statement.ConnPool
+	wrapper := &clientEventsUncertainPool{ConnPool: pool, fired: &fired}
+	f.db.Config.ConnPool, f.db.Statement.ConnPool = wrapper, wrapper
+	err := model.CompleteSessionSecurityChange(event, false)
+	f.db.Config.ConnPool, f.db.Statement.ConnPool = pool, statementPool
+	require.True(t, fired.Load(), "a real commit completed before its acknowledgement was lost")
+	require.NoError(t, err, "only the exact committed event may resolve an uncertain batch")
+	var current model.SessionRevocationEvent
+	require.NoError(t, f.db.Where("event_ref = ?", event.EventRef).First(&current).Error)
+	assert.Equal(t, "local_complete", current.State)
+	assert.EqualValues(t, 1, current.AffectedCount)
+	assert.EqualValues(t, 2, current.Revision)
+	_, err = model.RunSessionRevocationBatch(t.Context(), *event)
+	assert.ErrorIs(t, err, model.ErrSessionRevocationStale)
+	require.NoError(t, f.db.Where("event_ref = ?", event.EventRef).First(&current).Error)
+	assert.EqualValues(t, 1, current.AffectedCount)
+}
+
+// K1a uses organizationTestDB through the shared fixture: each selected engine
+// gets a fresh private database and the existing ownership/DSN/cleanup guards.
+// NEWAPI_S2_MAIN selects the engine; a supplied W01 selector must agree rather
+// than silently leaving this suite on SQLite. The controller owns runtime tags.
+func newOAuthDerivedK1aDatabaseFixture(t *testing.T) *organizationHTTPFixture {
+	t.Helper()
+	kind := os.Getenv("NEWAPI_S2_MAIN")
+	if kind == "" {
+		kind = "sqlite"
+	}
+	require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
+	if selected := os.Getenv("NEWAPI_W01_MAIN_KIND"); selected != "" {
+		require.Equal(t, selected, kind, "K1a consumes NEWAPI_S2_MAIN and NEWAPI_S2_MAIN_DSN; selectors must agree")
+	}
+	if source := os.Getenv("NEWAPI_W01_MAIN_DSN"); source != "" {
+		require.True(t, source == os.Getenv("NEWAPI_S2_MAIN_DSN"), "K1a consumes NEWAPI_S2_MAIN_DSN; a supplied W01 DSN must agree")
+	}
+	if kind == "sqlite" {
+		require.True(t, os.Getenv("NEWAPI_S2_MAIN_DSN") == "", "SQLite uses a fresh temporary file and must not ignore a supplied main DSN")
+	}
+	logKind := os.Getenv("NEWAPI_S2_LOG")
+	if logKind == "sqlite" || logKind == "" && kind == "sqlite" {
+		require.True(t, os.Getenv("NEWAPI_S2_LOG_DSN") == "", "SQLite uses a fresh temporary file and must not ignore a supplied log DSN")
+	}
+	f := newOrganizationHTTPFixture(t)
+	require.Equal(t, kind, f.db.Dialector.Name(), "the selected engine must not fall back")
+	return f
+}
+
+// Only these ready-state domain/handler fixtures explicitly create the K1a
+// tables and seed a test seal. Schema tests start without either table. Neither
+// fixture enables a public tokens:read producer or a real Hydra GET chain.
+func newOAuthDerivedK1aFixture(t *testing.T) *organizationHTTPFixture {
+	t.Helper()
+	f := newOAuthDerivedK1aDatabaseFixture(t)
+	common.IsMasterNode = true
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	common.IsMasterNode = false
+	require.NoError(t, f.db.AutoMigrate(&model.OAuthDerivedTokenSource{}, &model.OAuthDerivedTokenHistory{}))
+	require.NoError(t, f.db.Create(&model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: model.OAuthDerivedTokenKeyRef("explicit private K1a fixture history"), SealedAt: time.Now().Unix()}).Error)
+	return f
+}
+
+func seedOAuthDerivedK1aSource(t *testing.T, f *organizationHTTPFixture) (*model.OAuthGrant, *model.OAuthDerivedTokenSource, *model.Token) {
+	t.Helper()
+	random := make([]byte, 32)
+	_, err := rand.Read(random)
+	require.NoError(t, err)
+	id := base64.RawURLEncoding.EncodeToString(random)
+	scopes := []string{"profile", "tokens:read", "tokens:write"}
+	encoded, err := common.Marshal(scopes)
+	require.NoError(t, err)
+	userID := f.users["owner"].Id
+	grant := &model.OAuthGrant{GrantID: id, Issuer: "https://gateway.example/", ClientID: "k1a-client", Subject: strconv.Itoa(userID), UserID: userID,
+		ConsentRequestID: "k1a-" + id, HydraLoginSessionID: "k1a-login-" + id, OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1,
+		Scopes: string(encoded), PolicyHash: strings.Repeat("a", 64)}
+	require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+	require.NoError(t, model.ApproveOAuthGrant(t.Context(), grant))
+	_, err = model.AuthorizeOAuthGrant(t.Context(), model.OAuthGrantAuthorization{Issuer: grant.Issuer, GrantID: grant.GrantID, ClientID: grant.ClientID, Subject: grant.Subject,
+		UserID: userID, AuthVersion: 1, GrantExpiresAt: grant.ExpiresAt, TokenExpiresAt: time.Now().Unix() + 600, Scopes: scopes, Activate: true})
+	require.NoError(t, err)
+	require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).First(grant).Error)
+	now := time.Now().Unix()
+	key, err := common.GenerateKey()
+	require.NoError(t, err)
+	token := &model.Token{UserId: userID, Key: key, Status: common.TokenStatusEnabled, Name: "K1a private fixture", CreatedTime: now, ExpiredTime: min(now+600, grant.ExpiresAt), RemainQuota: 900, UsedQuota: 100}
+	require.NoError(t, f.db.Create(token).Error)
+	keyRef, idem, requestHash := model.OAuthDerivedTokenKeyRef(key), model.OAuthDerivedTokenKeyRef("idem-"+id), model.OAuthDerivedTokenKeyRef("request-"+id)
+	source := &model.OAuthDerivedTokenSource{GrantRef: grant.GrantRef, UserID: userID, SchemaVersion: 1, QuotaLimit: 1000, ExpiresAt: token.ExpiredTime,
+		PolicyHash: strings.Repeat("b", 64), BindingHash: strings.Repeat("c", 64), VerifiedAt: grant.CreatedAt, ProofExpiresAt: grant.CreatedAt + 60, PermitDeadline: grant.CreatedAt + 60,
+		VerifiedMethod: "password", ProofFlowID: int64(token.Id), TokenID: &token.Id, KeyRef: &keyRef, IdemHash: &idem, RequestHash: &requestHash, CreatedAt: &now}
+	require.NoError(t, f.db.Create(source).Error)
+	return grant, source, token
+}
+
+func TestOAuthDerivedK1aSchema(t *testing.T) {
+	f := newOAuthDerivedK1aDatabaseFixture(t)
+	require.False(t, f.db.Migrator().HasTable(&model.OAuthDerivedTokenSource{}))
+	require.False(t, f.db.Migrator().HasTable(&model.OAuthDerivedTokenHistory{}))
+	assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+	assert.False(t, f.db.Migrator().HasTable(&model.OAuthDerivedTokenHistory{}), "validation must never bootstrap")
+	require.NoError(t, f.db.AutoMigrate(&model.OAuthDerivedTokenSource{}, &model.OAuthDerivedTokenHistory{}))
+	assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+	history := &model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: strings.Repeat("a", 64), SealedAt: time.Now().Unix()}
+	require.NoError(t, f.db.Create(history).Error)
+	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+	for _, tc := range []struct {
+		name    string
+		updates map[string]any
+	}{
+		{"unknown seal version", map[string]any{"schema_version": 2}},
+		{"malformed seal", map[string]any{"history_seal": "not-a-seal"}},
+		{"future seal", map[string]any{"sealed_at": time.Now().Unix() + 3600}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, f.db.Model(history).Updates(tc.updates).Error)
+			assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+			require.NoError(t, f.db.Model(history).Updates(map[string]any{"schema_version": 1, "history_seal": strings.Repeat("a", 64), "sealed_at": time.Now().Unix()}).Error)
+		})
+	}
+	for _, name := range []string{"uq_oauth_derived_proof", "uq_oauth_derived_token", "uq_oauth_derived_key", "uq_oauth_derived_grant_idem", "idx_oauth_derived_user_created"} {
+		t.Run(name, func(t *testing.T) {
+			require.NoError(t, f.db.Migrator().DropIndex(&model.OAuthDerivedTokenSource{}, name))
+			assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+			require.NoError(t, f.db.Migrator().CreateIndex(&model.OAuthDerivedTokenSource{}, name))
+			require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+		})
+	}
+	require.NoError(t, f.db.Migrator().DropIndex(&model.OAuthDerivedTokenSource{}, "uq_oauth_derived_token"))
+	require.NoError(t, f.db.Exec("CREATE UNIQUE INDEX uq_oauth_derived_token ON oauth_derived_token_sources(user_id)").Error)
+	assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown, "index name alone does not prove its columns")
+	require.NoError(t, f.db.Migrator().DropTable(&model.OAuthDerivedTokenSource{}))
+	require.NoError(t, f.db.Exec("CREATE TABLE oauth_derived_token_sources (grant_ref CHAR(64) PRIMARY KEY)").Error)
+	assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+}
+
+func TestOAuthDerivedK1aIndexCoverage(t *testing.T) {
+	if os.Getenv("NEWAPI_S2_MAIN") == "mysql" {
+		t.Log("not applicable: partial proof index admits duplicate valid proofs; MySQL has no partial indexes")
+	} else {
+		t.Run("partial proof index admits duplicate valid proofs", func(t *testing.T) {
+			f := newOAuthDerivedK1aFixture(t)
+			_, source, _ := seedOAuthDerivedK1aSource(t, f)
+			_, second, _ := seedOAuthDerivedK1aSource(t, f)
+			require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+			require.NoError(t, f.db.Migrator().DropIndex(&model.OAuthDerivedTokenSource{}, "uq_oauth_derived_proof"))
+			require.NoError(t, f.db.Exec("CREATE UNIQUE INDEX uq_oauth_derived_proof ON oauth_derived_token_sources(proof_flow_id) WHERE proof_flow_id < 0").Error)
+			assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+			// The audit counterexample: every individually valid source is outside
+			// this index, so SQL permits reuse of an already bound positive proof.
+			require.NoError(t, f.db.Model(second).UpdateColumn("proof_flow_id", source.ProofFlowID).Error)
+			var rows []model.OAuthDerivedTokenSource
+			require.NoError(t, f.db.Where("proof_flow_id = ?", source.ProofFlowID).Find(&rows).Error)
+			require.Len(t, rows, 2)
+			for i := range rows {
+				require.NoError(t, rows[i].Validate(time.Now().Unix()))
+			}
+			assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+			// Restore distinct proofs before restoring the full unique constraint.
+			require.NoError(t, f.db.Model(second).UpdateColumn("proof_flow_id", source.ProofFlowID+1).Error)
+			require.NoError(t, f.db.Migrator().DropIndex(&model.OAuthDerivedTokenSource{}, "uq_oauth_derived_proof"))
+			require.NoError(t, f.db.Migrator().CreateIndex(&model.OAuthDerivedTokenSource{}, "uq_oauth_derived_proof"))
+			require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+			assert.Error(t, f.db.Model(second).UpdateColumn("proof_flow_id", source.ProofFlowID).Error)
+		})
+	}
+	for _, tc := range []struct {
+		name, index, definition string
+		partial                 bool
+	}{
+		{"partial token", "uq_oauth_derived_token", "token_id) WHERE token_id < 0", true},
+		{"partial key", "uq_oauth_derived_key", "key_ref) WHERE user_id < 0", true},
+		{"partial grant idempotency", "uq_oauth_derived_grant_idem", "grant_ref, idem_hash) WHERE user_id < 0", true},
+		{"truncated key", "uq_oauth_derived_key", "substr(key_ref, 1, 8))", false},
+	} {
+		if tc.partial && os.Getenv("NEWAPI_S2_MAIN") == "mysql" {
+			t.Logf("not applicable: %s; MySQL has no partial indexes", tc.name)
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			f := newOAuthDerivedK1aFixture(t)
+			definition := tc.definition
+			if f.db.Dialector.Name() == "mysql" {
+				definition = "key_ref(8))"
+			}
+			seedOAuthDerivedK1aSource(t, f)
+			require.NoError(t, f.db.Migrator().DropIndex(&model.OAuthDerivedTokenSource{}, tc.index))
+			require.NoError(t, f.db.Exec("CREATE UNIQUE INDEX "+tc.index+" ON oauth_derived_token_sources("+definition).Error)
+			assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+			require.NoError(t, f.db.Migrator().DropIndex(&model.OAuthDerivedTokenSource{}, tc.index))
+			require.NoError(t, f.db.Migrator().CreateIndex(&model.OAuthDerivedTokenSource{}, tc.index))
+			require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+		})
+	}
+	metadataQueries := []string{"pragma_index_list", "pragma_index_xinfo"}
+	switch os.Getenv("NEWAPI_S2_MAIN") {
+	case "mysql":
+		metadataQueries = []string{"information_schema.statistics"}
+	case "postgres":
+		metadataQueries = []string{"pg_catalog.pg_index"}
+	}
+	for _, metadata := range metadataQueries {
+		t.Run("unreadable "+metadata, func(t *testing.T) {
+			f := newOAuthDerivedK1aFixture(t)
+			require.NoError(t, f.db.Callback().Row().Before("gorm:row").Register("k1a_metadata_error", func(tx *gorm.DB) {
+				if strings.Contains(tx.Statement.SQL.String(), metadata) {
+					tx.AddError(errors.New("private K1a metadata read failure"))
+				}
+			}))
+			t.Cleanup(func() { _ = f.db.Callback().Row().Remove("k1a_metadata_error") })
+			assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
+			require.NoError(t, f.db.Callback().Row().Remove("k1a_metadata_error"))
+			require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+		})
+	}
+}
+
+func TestOAuthDerivedK1aMetadata(t *testing.T) {
+	f := newOAuthDerivedK1aFixture(t)
+	grant, source, token := seedOAuthDerivedK1aSource(t, f)
+	other, _, otherToken := seedOAuthDerivedK1aSource(t, f)
+	snapshot, err := model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Items, 1)
+	assert.Equal(t, model.OAuthDerivedTokenMetadata{TokenID: strconv.Itoa(token.Id), Status: "active", QuotaLimit: 1000, RemainingQuota: common.GetPointer(int64(900)), UsedQuota: common.GetPointer(int64(100)), ExpiresAt: token.ExpiredTime}, snapshot.Items[0])
+	wire, err := common.Marshal(snapshot.Items)
+	require.NoError(t, err)
+	var items []map[string]any
+	require.NoError(t, common.Unmarshal(wire, &items))
+	assert.Len(t, items[0], 6)
+	for _, secret := range []string{token.Key, *source.KeyRef, source.PolicyHash, source.BindingHash, *source.IdemHash} {
+		assert.NotContains(t, string(wire), secret)
+	}
+	assert.NotEqual(t, strconv.Itoa(otherToken.Id), snapshot.Items[0].TokenID)
+	assert.NotEqual(t, other.GrantRef, grant.GrantRef)
+	_, err = model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, f.users["foreign"].Id)
+	assert.ErrorIs(t, err, model.ErrOAuthGrantInvalid)
+
+	for _, tc := range []struct {
+		name            string
+		updates         map[string]any
+		status          string
+		remaining, used int64
+	}{
+		{"disabled", map[string]any{"status": common.TokenStatusDisabled}, "disabled", 900, 100},
+		{"exhausted", map[string]any{"status": common.TokenStatusExhausted, "remain_quota": 0, "used_quota": 1000}, "exhausted", 0, 1000},
+		{"legitimate over-estimate settlement", map[string]any{"status": common.TokenStatusExhausted, "remain_quota": -100, "used_quota": 1100}, "exhausted", -100, 1100},
+		{"recorded token expiry", map[string]any{"status": common.TokenStatusExpired, "expired_time": time.Now().Unix() - 1}, "expired", 900, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", token.Id).Updates(tc.updates).Error)
+			got, err := model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+			require.NoError(t, err)
+			require.Len(t, got.Items, 1)
+			assert.Equal(t, tc.status, got.Items[0].Status)
+			assert.Equal(t, tc.remaining, *got.Items[0].RemainingQuota)
+			assert.Equal(t, tc.used, *got.Items[0].UsedQuota)
+			wantExpiry := source.ExpiresAt
+			if expiry, ok := tc.updates["expired_time"].(int64); ok {
+				wantExpiry = expiry
+			}
+			assert.Equal(t, wantExpiry, got.Items[0].ExpiresAt)
+			require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"status": common.TokenStatusEnabled, "remain_quota": 900, "used_quota": 100, "expired_time": source.ExpiresAt}).Error)
+		})
+	}
+	require.NoError(t, f.db.Model(source).UpdateColumn("terminal_reason", "deleted").Error)
+	_, err = model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+	assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown, "a partial terminal tuple is unknown")
+	now := time.Now().Unix()
+	require.NoError(t, f.db.Model(source).UpdateColumn("terminal_at", now).Error)
+	require.NoError(t, f.db.Delete(token).Error)
+	got, err := model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	assert.Equal(t, "deleted", got.Items[0].Status)
+	assert.Nil(t, got.Items[0].RemainingQuota)
+	assert.Nil(t, got.Items[0].UsedQuota)
+	require.NoError(t, f.db.Unscoped().Delete(token).Error)
+	_, err = model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+	assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown, "physical absence never reconstructs owner-effective values")
+	var retained model.OAuthDerivedTokenSource
+	require.NoError(t, f.db.First(&retained, "grant_ref = ?", grant.GrantRef).Error)
+	assert.Equal(t, *source.CreatedAt, *retained.CreatedAt)
+	assert.Equal(t, *source.TokenID, *retained.TokenID)
+	// Historical verification is not a fresh-auth requirement on metadata.
+	agedGrant, agedSource, agedToken := seedOAuthDerivedK1aSource(t, f)
+	past := time.Now().Unix() - 180
+	require.NoError(t, f.db.Model(agedGrant).UpdateColumns(map[string]any{"created_at": past, "approved_at": past}).Error)
+	require.NoError(t, f.db.Model(agedSource).UpdateColumns(map[string]any{"verified_at": past, "proof_expires_at": past + 60, "permit_deadline": past + 60, "created_at": past + 1, "expires_at": past + 120}).Error)
+	aged, err := model.ReadOAuthDerivedTokenMetadata(t.Context(), agedGrant.GrantRef, agedGrant.UserID)
+	require.NoError(t, err)
+	require.Len(t, aged.Items, 1)
+	assert.Equal(t, "expired", aged.Items[0].Status)
+	assert.Equal(t, strconv.Itoa(agedToken.Id), aged.Items[0].TokenID)
+	assert.Equal(t, past+120, aged.Items[0].ExpiresAt)
+
+}
+
+func TestOAuthDerivedK1aClassification(t *testing.T) {
+	f := newOAuthDerivedK1aFixture(t)
+	grant, source, token := seedOAuthDerivedK1aSource(t, f)
+	kind, err := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+	require.NoError(t, err)
+	assert.Equal(t, model.OAuthDerivedTokenBound, kind)
+	key, err := common.GenerateKey()
+	require.NoError(t, err)
+	manual := &model.Token{UserId: grant.UserID, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, f.db.Create(manual).Error)
+	kind, err = model.ClassifyOAuthDerivedToken(t.Context(), manual.Id)
+	require.NoError(t, err)
+	assert.Equal(t, model.OAuthDerivedTokenManualProven, kind)
+	require.NoError(t, f.db.Delete(&model.OAuthDerivedTokenHistory{}, 1).Error)
+	kind, err = model.ClassifyOAuthDerivedToken(t.Context(), manual.Id)
+	assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+	assert.Equal(t, model.OAuthDerivedTokenUnknown, kind)
+	require.NoError(t, f.db.Create(&model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: strings.Repeat("d", 64), SealedAt: time.Now().Unix()}).Error)
+	t.Run("missing both lookup members cannot become manual", func(t *testing.T) {
+		keyRef := *source.KeyRef
+		require.NoError(t, f.db.Model(source).UpdateColumns(map[string]any{"token_id": nil, "key_ref": nil}).Error)
+		kind, err := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+		assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+		assert.Equal(t, model.OAuthDerivedTokenUnknown, kind)
+		require.NoError(t, f.db.Model(source).UpdateColumns(map[string]any{"token_id": token.Id, "key_ref": keyRef}).Error)
+	})
+
+	for _, tc := range []struct {
+		name, column   string
+		value, restore any
+	}{
+		{"missing success member", "request_hash", nil, *source.RequestHash},
+		{"invalid token id", "token_id", 0, token.Id},
+		{"unsafe token id", "token_id", model.OAuthUsageMaxInteger + 1, token.Id},
+		{"mismatched user", "user_id", f.users["foreign"].Id, source.UserID},
+		{"unsafe quota", "quota_limit", model.OAuthUsageMaxInteger + 1, source.QuotaLimit},
+		{"future verification", "verified_at", time.Now().Unix() + 3600, source.VerifiedAt},
+		{"extended deadline", "permit_deadline", source.VerifiedAt + 61, source.PermitDeadline},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, f.db.Model(source).UpdateColumn(tc.column, tc.value).Error)
+			kind, err := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+			assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+			assert.Equal(t, model.OAuthDerivedTokenUnknown, kind)
+			_, err = model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+			assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+			require.NoError(t, f.db.Model(source).UpdateColumn(tc.column, tc.restore).Error)
+		})
+	}
+	for _, tc := range []struct {
+		name, column   string
+		value, restore any
+	}{
+		{"unsafe remaining", "remain_quota", model.OAuthUsageMaxInteger + 1, 900},
+		{"unsafe used", "used_quota", model.OAuthUsageMaxInteger + 1, 100},
+		{"unsafe expiry", "expired_time", model.OAuthUsageMaxInteger + 1, source.ExpiresAt},
+		{"unlimited contradiction", "unlimited_quota", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", token.Id).UpdateColumn(tc.column, tc.value).Error)
+			_, err := model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+			assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+			require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", token.Id).UpdateColumn(tc.column, tc.restore).Error)
+		})
+	}
+
+	require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", grant.GrantRef).UpdateColumn("state", "prepared").Error)
+	_, err = model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+	assert.ErrorIs(t, err, model.ErrOAuthGrantInvalid)
+	require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).Delete(&model.OAuthGrant{}).Error)
+	kind, err = model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+	assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+	assert.Equal(t, model.OAuthDerivedTokenUnknown, kind)
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(cancelled), model.ErrOAuthDerivedTokenUnknown)
+}
+
+func TestOAuthDerivedK1aPermitUniqueness(t *testing.T) {
+	f := newOAuthDerivedK1aFixture(t)
+	grant, source, _ := seedOAuthDerivedK1aSource(t, f)
+	other, second, _ := seedOAuthDerivedK1aSource(t, f)
+	for _, tc := range []struct {
+		name, column string
+		value        any
+	}{
+		{"token", "token_id", *source.TokenID},
+		{"key", "key_ref", *source.KeyRef},
+		{"proof", "proof_flow_id", source.ProofFlowID},
+	} {
+		t.Run(tc.name, func(t *testing.T) { assert.Error(t, f.db.Model(second).UpdateColumn(tc.column, tc.value).Error) })
+	}
+	duplicate := *source
+	duplicate.ProofFlowID += 1000000
+	assert.Error(t, f.db.Create(&duplicate).Error, "another idem cannot create a second grant row")
+	for _, row := range []*model.OAuthDerivedTokenSource{source, second} {
+		require.NoError(t, f.db.Model(row).Updates(map[string]any{"token_id": nil, "key_ref": nil, "idem_hash": nil, "request_hash": nil, "created_at": nil}).Error)
+	}
+	for _, current := range []*model.OAuthGrant{grant, other} {
+		got, err := model.ReadOAuthDerivedTokenMetadata(t.Context(), current.GrantRef, current.UserID)
+		require.NoError(t, err)
+		assert.Empty(t, got.Items)
+		assert.NotNil(t, got.Items)
+	}
+	require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).Delete(&model.OAuthDerivedTokenSource{}).Error)
+	got, err := model.ReadOAuthDerivedTokenMetadata(t.Context(), grant.GrantRef, grant.UserID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Items)
+}
+
+func TestOAuthDerivedK1aHandlerBoundary(t *testing.T) {
+	f := newOAuthDerivedK1aFixture(t)
+	grant, _, _ := seedOAuthDerivedK1aSource(t, f)
+	// Existing public scopes are intentionally unchanged. A real profile access
+	// can reach the private handler but cannot acquire tokens:read in K1a.
+	require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", `["profile"]`).Error)
+	var calls atomic.Int64
+	var revokeAt atomic.Int64
+	admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == revokeAt.Load() {
+			require.NoError(t, f.db.Model(grant).UpdateColumns(map[string]any{"state": "revoked", "revoked_at": time.Now().Unix()}).Error)
+		}
+		data, err := common.Marshal(map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": grant.Issuer, "aud": []string{"k1a"}, "client_id": grant.ClientID, "sub": grant.Subject,
+			"exp": time.Now().Unix() + 600, "scope": "profile", "ext": map[string]any{"newapi_auth_version": "1", "newapi_grant_id": grant.GrantID, "newapi_grant_expires_at": strconv.FormatInt(grant.ExpiresAt, 10)}})
+		require.NoError(t, err)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(admin.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(admin.Certificate())
+	resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: admin.URL + "/admin/oauth2/introspect", Issuer: grant.Issuer, Audience: "k1a", ClientIDs: []string{grant.ClientID}}, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: admin.URL, AuthorizationURL: grant.Issuer + "oauth2/auth"}, resource)
+	require.NoError(t, err)
+	_, err = service.NewOAuthPublic(service.OAuthPublicConfig{Enabled: true, BaseURL: "https://k1a-private.example"}, bridge)
+	require.NoError(t, err)
+	engine := gin.New()
+	engine.RedirectTrailingSlash, engine.RedirectFixedPath = false, false
+	engine.Any("/api/v1/oauth/tokens", middleware.OAuthUserInfoAuth(resource), controller.GetOAuthDerivedTokenMetadata)
+	engine.Any("/api/v1/oauth/tokens/*trailing", controller.GetOAuthDerivedTokenMetadata)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/oauth/tokens", nil)
+	request.Header.Set("Authorization", "Bearer k1a-fixture-opaque")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, request)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, `Bearer error="insufficient_scope", scope="tokens:read"`, w.Header().Get("WWW-Authenticate"))
+	assert.Equal(t, int64(2), calls.Load(), "reuse real current resource authorization before scope denial")
+	assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+	assert.Empty(t, w.Header().Get("Location"))
+
+	// Recheck a real resource identity after middleware, even before a scope
+	// denial; this does not claim the unreachable post-encoding success branch.
+	revokeAt.Store(calls.Load() + 2)
+	late := httptest.NewRecorder()
+	lateRequest := httptest.NewRequest(http.MethodGet, "/api/v1/oauth/tokens", nil)
+	lateRequest.Header.Set("Authorization", "Bearer k1a-fixture-opaque")
+	engine.ServeHTTP(late, lateRequest)
+	assert.Equal(t, http.StatusUnauthorized, late.Code)
+	assert.NotContains(t, late.Body.String(), "data")
+
+	private := gin.New()
+	private.RedirectTrailingSlash, private.RedirectFixedPath = false, false
+	private.Any("/api/v1/oauth/tokens", controller.GetOAuthDerivedTokenMetadata)
+	private.Any("/api/v1/oauth/tokens/*trailing", controller.GetOAuthDerivedTokenMetadata)
+	for _, tc := range []struct {
+		method, path, body string
+		org                bool
+		want               int
+	}{
+		{"GET", "/api/v1/oauth/tokens", "", false, 401},
+		{"GET", "/api/v1/oauth/tokens?user_id=1", "", false, 400},
+		{"GET", "/api/v1/oauth/tokens?", "", false, 400},
+		{"GET", "/api/v1/oauth/tokens", "{}", false, 400},
+		{"GET", "/api/v1/oauth/tokens", "", true, 400},
+		{"POST", "/api/v1/oauth/tokens", "", false, 400},
+		{"GET", "/api/v1/oauth/tokens/", "", false, 400},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		if tc.org {
+			req.Header.Set("X-Organization-Id", "0")
+		}
+		response := httptest.NewRecorder()
+		private.ServeHTTP(response, req)
+		assert.Equal(t, tc.want, response.Code, tc.path)
+		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+		assert.Equal(t, "no-referrer", response.Header().Get("Referrer-Policy"))
+		assert.Empty(t, response.Header().Get("Location"))
+		assert.NotContains(t, response.Body.String(), "k1a-fixture-opaque")
 	}
 }

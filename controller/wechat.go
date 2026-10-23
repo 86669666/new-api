@@ -145,9 +145,17 @@ func WeChatBind(c *gin.Context) {
 		return
 	}
 	// 只更新绑定列，避免完整用户快照覆盖并发的封禁、降权或分组变更。
+	var event *model.SessionRevocationEvent
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
-		return model.UpdateUserBindColumnForSessionWithTx(tx, identity, "wechat_id", wechatId)
+		var err error
+		event, err = model.UpdateUserBindColumnForSessionWithTx(tx, identity, "wechat_id", wechatId)
+		return err
 	}); err != nil {
+		writeSecurityOperationError(c, err)
+		return
+	}
+	bundle, err := service.CompleteAccountBinding(identity, event)
+	if err != nil {
 		writeSecurityOperationError(c, err)
 		return
 	}
@@ -158,10 +166,8 @@ func WeChatBind(c *gin.Context) {
 		return
 	}
 	notificationFailed = service.NotifyAccountSecurityChange(user.Email, "WeChat account linked") != nil
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    gin.H{"notification_warning": notificationFailed},
-	})
+	data := authRotationData(bundle)
+	data["notification_warning"] = notificationFailed
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": data})
 	return
 }

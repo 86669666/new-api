@@ -455,10 +455,6 @@ func AdminResetPasskey(c *gin.Context) {
 		writeSecurityOperationError(c, err)
 		return
 	}
-	if _, err := model.RevokeAllUserSessions(user.Id, "admin_passkey_reset"); err != nil {
-		writeSecurityOperationError(c, err)
-		return
-	}
 
 	recordManageAuditFor(c, user.Id, "user.reset_passkey", map[string]any{
 		"username":            user.Username,

@@ -101,12 +101,16 @@ func ResendEmailBinding(identity AuthSessionIdentity, token, newCodeHash, oldCod
 func CompleteEmailBinding(identity AuthSessionIdentity, token, email, newCode, oldCode string) (*EmailBindingState, error) {
 	var state *EmailBindingState
 	var verificationError error
+	var event *SessionRevocationEvent
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		// Acquire ownership protection before the first consistent read. Under
 		// MySQL REPEATABLE READ, a snapshot created before this lock could hide
 		// an address claimed by a concurrent transaction while we were waiting.
 		if email == "" || email != NormalizeEmail(email) {
 			return ErrAuthFlowInvalid
+		}
+		if err := LockOAuthUser(tx, identity.UserID); err != nil {
+			return err
 		}
 		if err := lockNormalizedEmail(tx, email); err != nil {
 			return err
@@ -141,15 +145,25 @@ func CompleteEmailBinding(identity AuthSessionIdentity, token, email, newCode, o
 		if err := tx.Model(&User{}).Where("id = ?", identity.UserID).Update("email", state.Email).Error; err != nil {
 			return err
 		}
+		_, event, err = AdvanceUserSecurityWithTx(tx, identity.UserID, &identity)
+		if err != nil {
+			return err
+		}
 		return tx.Model(flow).Update("consumed_at", time.Now()).Error
 	})
 	if err != nil {
 		return nil, err
 	}
-	return state, verificationError
+	if verificationError != nil {
+		return state, verificationError
+	}
+	return state, errors.Join(PublishUserAuthCache(identity.UserID), CompleteSessionSecurityChange(event, true))
 }
 
 func lockEmailBindingWithTx(tx *gorm.DB, identity AuthSessionIdentity, token string) (*AuthFlow, *EmailBindingState, error) {
+	if err := LockOAuthUser(tx, identity.UserID); err != nil {
+		return nil, nil, err
+	}
 	match := AuthFlowMatch{Purpose: AuthFlowPurposeEmailBinding, UserId: identity.UserID, SessionId: identity.SessionID}
 	// Make the first statement a write so SQLite does not have to upgrade a
 	// deferred read transaction. A no-op update also locks the row on MySQL and

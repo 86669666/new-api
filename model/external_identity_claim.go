@@ -84,28 +84,29 @@ func GetUserByTelegramID(telegramID string) (*User, error) {
 
 // BindTelegramForSessionWithTx preserves single ownership and the session that
 // started the binding. The caller consumes its OAuth flow in this transaction.
-func BindTelegramForSessionWithTx(tx *gorm.DB, identity AuthSessionIdentity, telegramID string) error {
+func BindTelegramForSessionWithTx(tx *gorm.DB, identity AuthSessionIdentity, telegramID string) (*SessionRevocationEvent, error) {
 	if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
-		return err
+		return nil, err
 	}
 	var user User
 	if err := tx.Select("id", "telegram_id").First(&user, identity.UserID).Error; err != nil {
-		return err
+		return nil, err
 	}
 	if user.TelegramId != "" {
-		return ErrExternalIdentityAlreadyClaimed
+		return nil, ErrExternalIdentityAlreadyClaimed
 	}
 	if err := ClaimExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, telegramID, user.Id); err != nil {
-		return err
+		return nil, err
 	}
 	result := tx.Model(&User{}).Where("id = ? AND (telegram_id = ? OR telegram_id IS NULL)", user.Id, "").Update("telegram_id", telegramID)
 	if result.Error != nil {
-		return result.Error
+		return nil, result.Error
 	}
 	if result.RowsAffected != 1 {
-		return ErrExternalIdentityAlreadyClaimed
+		return nil, ErrExternalIdentityAlreadyClaimed
 	}
-	return nil
+	_, event, err := AdvanceUserSecurityWithTx(tx, identity.UserID, &identity)
+	return event, err
 }
 
 func releaseAllExternalIdentitiesWithTx(tx *gorm.DB, userId int) error {

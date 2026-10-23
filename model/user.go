@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -78,6 +79,7 @@ func resolveUserSortOptions(sortOptions []UserSortOptions) UserSortOptions {
 // User if you add sensitive fields, don't forget to clean them in setupLogin function.
 // Otherwise, the sensitive information will be saved on local storage in plain text!
 type User struct {
+	sessionRevocation    *SessionRevocationEvent
 	Id                   int                        `json:"id"`
 	Username             string                     `json:"username" gorm:"unique;index" validate:"max=20"`
 	Password             string                     `json:"password" gorm:"not null;" validate:"min=8,max=128"`
@@ -649,6 +651,9 @@ func (user *User) prepareForInsert(tx *gorm.DB) error {
 func BindEmailToUser(user *User, email string) error {
 	email = NormalizeEmail(email)
 	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, user.Id); err != nil {
+			return err
+		}
 		return withNormalizedEmailLock(tx, email, func(tx *gorm.DB) error {
 			if err := ensureEmailAvailableWithTx(tx, email, user.Id); err != nil {
 				return err
@@ -659,7 +664,7 @@ func BindEmailToUser(user *User, email string) error {
 	}); err != nil {
 		return err
 	}
-	return updateUserCache(*user)
+	return errors.Join(updateUserCache(*user), user.CompleteSessionRevocation())
 }
 
 func ensureEmailAvailableWithTx(tx *gorm.DB, email string, excludeUserID int) error {
@@ -796,26 +801,22 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 }
 
 func (user *User) Update(updatePassword bool) error {
-	var previousAuthVersion int64
-	if err := DB.Model(&User{}).Where("id = ?", user.Id).Select("auth_version").Find(&previousAuthVersion).Error; err != nil {
-		return err
-	}
 	if err := DB.Transaction(func(tx *gorm.DB) error {
 		return user.UpdateWithTx(tx, updatePassword)
 	}); err != nil {
 		return err
 	}
-	if err := updateUserCache(*user); err != nil {
+	if err := user.CompleteSessionRevocation(); err != nil {
 		return err
 	}
-	if user.AuthVersion > previousAuthVersion {
-		_, err := RevokeAllUserSessions(user.Id, "user_security_changed")
-		return err
-	}
-	return nil
+	return updateUserCache(*user)
 }
 
-func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
+func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool, revocationReason ...string) error {
+	if err := LockOAuthUser(tx, user.Id); err != nil {
+		return err
+	}
+	var event *SessionRevocationEvent
 	var err error
 	if updatePassword {
 		user.Password, err = common.HashAccountPassword(user.Password)
@@ -834,9 +835,16 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	authChanged := (updatePassword && current.Password != newUser.Password) ||
 		(newUser.Role != 0 && current.Role != newUser.Role) ||
 		(newUser.Status != 0 && current.Status != newUser.Status) ||
-		(newUser.Group != "" && current.Group != newUser.Group)
+		(newUser.Group != "" && current.Group != newUser.Group) ||
+		(newUser.Email != "" && current.Email != newUser.Email) ||
+		(newUser.GitHubId != "" && current.GitHubId != newUser.GitHubId) ||
+		(newUser.DiscordId != "" && current.DiscordId != newUser.DiscordId) ||
+		(newUser.OidcId != "" && current.OidcId != newUser.OidcId) ||
+		(newUser.WeChatId != "" && current.WeChatId != newUser.WeChatId) ||
+		(newUser.TelegramId != "" && current.TelegramId != newUser.TelegramId) ||
+		(newUser.LinuxDOId != "" && current.LinuxDOId != newUser.LinuxDOId)
 	if authChanged {
-		newUser.AuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
+		newUser.AuthVersion, event, err = AdvanceUserSecurityWithTx(tx, user.Id, nil, revocationReason...)
 		if err != nil {
 			return err
 		}
@@ -853,30 +861,30 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	).Updates(newUser).Error; err != nil {
 		return err
 	}
-	return tx.First(user, user.Id).Error
+	if err := tx.First(user, user.Id).Error; err != nil {
+		return err
+	}
+	user.sessionRevocation = event
+	return nil
 }
 
 func (user *User) Edit(updatePassword bool) error {
-	var previousAuthVersion int64
-	if err := DB.Model(&User{}).Where("id = ?", user.Id).Select("auth_version").Find(&previousAuthVersion).Error; err != nil {
-		return err
-	}
 	if err := DB.Transaction(func(tx *gorm.DB) error {
 		return user.EditWithTx(tx, updatePassword)
 	}); err != nil {
 		return err
 	}
-	if err := updateUserCache(*user); err != nil {
+	if err := user.CompleteSessionRevocation(); err != nil {
 		return err
 	}
-	if user.AuthVersion > previousAuthVersion {
-		_, err := RevokeAllUserSessions(user.Id, "user_security_changed")
-		return err
-	}
-	return nil
+	return updateUserCache(*user)
 }
 
 func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
+	if err := LockOAuthUser(tx, user.Id); err != nil {
+		return err
+	}
+	var event *SessionRevocationEvent
 	var err error
 	if updatePassword {
 		user.Password, err = common.HashAccountPassword(user.Password)
@@ -902,7 +910,7 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	}
 	authChanged := (updatePassword && current.Password != newUser.Password) || current.Group != newUser.Group
 	if authChanged {
-		newUser.AuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
+		newUser.AuthVersion, event, err = AdvanceUserSecurityWithTx(tx, user.Id, nil)
 		if err != nil {
 			return err
 		}
@@ -910,7 +918,16 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	if err = tx.Model(&current).Updates(updates).Error; err != nil {
 		return err
 	}
-	return tx.First(user, user.Id).Error
+	if err := tx.First(user, user.Id).Error; err != nil {
+		return err
+	}
+	user.sessionRevocation = event
+	return nil
+}
+
+// CompleteSessionRevocation consumes only the exact receipt from this mutation.
+func (user *User) CompleteSessionRevocation() error {
+	return CompleteSessionSecurityChange(user.sessionRevocation, true)
 }
 
 func (user *User) ClearBinding(bindingType string) error {
@@ -933,14 +950,22 @@ func (user *User) ClearBinding(bindingType string) error {
 		return errors.New("invalid binding type")
 	}
 
+	var event *SessionRevocationEvent
 	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, user.Id); err != nil {
+			return err
+		}
 		if err := tx.Model(&User{}).Where("id = ?", user.Id).Update(column, "").Error; err != nil {
 			return err
 		}
 		if bindingType == ExternalIdentityProviderTelegram {
-			return ReleaseExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.Id)
+			if err := ReleaseExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.Id); err != nil {
+				return err
+			}
 		}
-		return nil
+		_, receipt, err := AdvanceUserSecurityWithTx(tx, user.Id, nil)
+		event = receipt
+		return err
 	}); err != nil {
 		return err
 	}
@@ -949,7 +974,7 @@ func (user *User) ClearBinding(bindingType string) error {
 		return err
 	}
 
-	return updateUserCache(*user)
+	return errors.Join(updateUserCache(*user), CompleteSessionSecurityChange(event, true))
 }
 
 func (user *User) Delete() (int64, error) {
@@ -965,6 +990,7 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 	if user.Id == 0 {
 		return 0, common.NewMessage("ID is empty!")
 	}
+	var event *SessionRevocationEvent
 	var nextAuthVersion int64
 	var revokedAccessTokens int64
 	if err := DB.Transaction(func(tx *gorm.DB) error {
@@ -981,10 +1007,13 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 			}
 		}
 		var err error
+		if err := LockOAuthUser(tx, user.Id); err != nil {
+			return err
+		}
 		if err := guardOrganizationUserDeletion(tx, user.Id); err != nil {
 			return err
 		}
-		nextAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
+		nextAuthVersion, event, err = AdvanceUserSecurityWithTx(tx, user.Id, nil)
 		if err != nil {
 			return err
 		}
@@ -996,10 +1025,10 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 	}); err != nil {
 		return 0, err
 	}
-	if err := publishCommittedUserAuthVersion(user.Id, nextAuthVersion); err != nil {
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
 		return revokedAccessTokens, err
 	}
-	if _, err := RevokeAllUserSessions(user.Id, "user_deleted"); err != nil {
+	if err := publishCommittedUserAuthVersion(user.Id, nextAuthVersion); err != nil {
 		return revokedAccessTokens, err
 	}
 	return revokedAccessTokens, invalidateUserCache(user.Id)
@@ -1009,15 +1038,24 @@ func (user *User) HardDelete() (int64, error) {
 	if user.Id == 0 {
 		return 0, common.NewMessage("ID is empty!")
 	}
+	var revokedSessions []UserSession
+	var event *SessionRevocationEvent
 	var tokens []Token
 	var deletedAuthVersion int64
 	var revokedAccessTokens int64
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var err error
+		if err := LockOAuthUser(tx, user.Id); err != nil {
+			return err
+		}
 		if err := guardOrganizationUserDeletion(tx, user.Id); err != nil {
 			return err
 		}
-		deletedAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
+		deletedAuthVersion, event, err = AdvanceUserSecurityWithTx(tx, user.Id, nil)
+		if err != nil {
+			return err
+		}
+		revokedSessions, err = RevokeSessionsForUserDeletionWithTx(tx, event)
 		if err != nil {
 			return err
 		}
@@ -1033,10 +1071,19 @@ func (user *User) HardDelete() (int64, error) {
 		if err := deleteUserAuthenticationData(tx, user.Id); err != nil {
 			return err
 		}
+		if err := CompleteDeletedUserSessionEventsWithTx(tx, user.Id); err != nil {
+			return err
+		}
 		return tx.Unscoped().Delete(user).Error
 	})
 	if err != nil {
 		return 0, err
+	}
+	for i := range revokedSessions {
+		_ = writeUserSessionCache(revokedSessions[i].cacheEntry(), time.Time{})
+	}
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
+		return revokedAccessTokens, err
 	}
 	if err := publishCommittedUserAuthVersion(user.Id, deletedAuthVersion); err != nil {
 		common.SysError(common.LogText("failed to publish auth tombstone after hard deleting user %d: %v", user.Id, err))
@@ -1212,19 +1259,27 @@ func ResetUserPasswordByEmail(email string, password string) error {
 	if err != nil {
 		return err
 	}
+	var event *SessionRevocationEvent
 	if err = DB.Transaction(func(tx *gorm.DB) error {
-		if _, err := IncrementUserAuthVersionWithTx(tx, user.Id); err != nil {
+		if _, receipt, err := AdvanceUserSecurityWithTx(tx, user.Id, nil, "password_reset"); err != nil {
+			return err
+		} else {
+			event = receipt
+		}
+		if err := tx.Where("id = ? AND email = ?", user.Id, user.Email).First(&User{}).Error; err != nil {
 			return err
 		}
 		return tx.Model(&User{}).Where("id = ?", user.Id).Update("password", hashedPassword).Error
 	}); err != nil {
 		return err
 	}
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
+		return err
+	}
 	if err := PublishUserAuthCache(user.Id); err != nil {
 		return err
 	}
-	_, err = RevokeAllUserSessions(user.Id, "password_reset")
-	return err
+	return nil
 }
 
 func IsAdmin(userId int) bool {
