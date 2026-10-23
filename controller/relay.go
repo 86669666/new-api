@@ -111,6 +111,10 @@ func bindToolsSearchLegacyPrice(info *relaycommon.RelayInfo) error {
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+	if kind, _, _ := middleware.OAuthTokenPrincipal(c); kind != model.OAuthDerivedTokenManualProven && !middleware.HasPlaygroundRelayPrincipal(c) {
+		relay.HandleOAuthDerivedSelectedText(c, relayFormat)
+		return
+	}
 
 	requestId := c.GetString(common.RequestIdKey)
 	//group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	"reflect"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -32,6 +33,42 @@ type OAuthTextFacts struct {
 	CacheRatio      float64
 	PromptEstimate  int
 	MaxCompletion   int
+}
+
+// ReadOAuthDerivedTextAuthority reads initial server-owned identity facts, not
+// spending permission. Request, route and pricing facts remain unset; Reserve
+// and Claim must still revalidate current authority after the producer fills them.
+func ReadOAuthDerivedTextAuthority(ctx context.Context, userID, tokenID int) (*OAuthTextFacts, error) {
+	if ctx == nil || userID <= 0 || tokenID <= 0 || DB == nil {
+		return nil, ErrOAuthTextCharge
+	}
+	kind, err := ClassifyOAuthDerivedToken(ctx, tokenID)
+	if err != nil || kind != OAuthDerivedTokenBound {
+		return nil, ErrOAuthTextCharge
+	}
+	// This preliminary row locates the grant; it cannot authorize the read.
+	var seed OAuthDerivedTokenSource
+	if err := DB.WithContext(ctx).Where("token_id = ? AND user_id = ?", tokenID, userID).First(&seed).Error; err != nil {
+		return nil, ErrOAuthTextCharge
+	}
+	facts := OAuthTextFacts{GrantRef: seed.GrantRef, UserID: userID, TokenID: tokenID, PolicyHash: seed.PolicyHash}
+	var deadline int64
+	var out OAuthTextFacts
+	err = withOAuthTextAdmission(ctx, facts, func(tx *gorm.DB, user *User, token *Token, source *OAuthDerivedTokenSource, session *UserSession, grant *OAuthGrant) error {
+		// Compare values, including nullable tuple members, after the original
+		// user/session/grant/cleanup -> source -> token locking prefix.
+		if !reflect.DeepEqual(seed, *source) {
+			return ErrOAuthTextCharge
+		}
+		var err error
+		deadline, err = oauthTextDeadline(facts, user, token, source, session, grant, time.Now().Unix())
+		out = OAuthTextFacts{GrantRef: grant.GrantRef, UserID: user.Id, TokenID: token.Id, PolicyHash: source.PolicyHash}
+		return err
+	})
+	if err != nil || ctx.Err() != nil || time.Now().Unix() >= deadline {
+		return nil, ErrOAuthTextCharge
+	}
+	return &out, nil
 }
 
 type OAuthDerivedTextCharge struct {

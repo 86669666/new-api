@@ -1,8 +1,10 @@
 package middleware
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -22,6 +25,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 const (
@@ -52,6 +56,7 @@ func validUserInfo(username string, role int) bool {
 }
 
 func authHelper(c *gin.Context, minRole int) {
+	c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), dashboardRelayIdentityKey{}, service.AuthIdentity{}))
 	if _, started := c.Get(accessTokenAuditContextKey); !started {
 		defer finishAccessTokenAudit(c)
 	}
@@ -80,6 +85,9 @@ func authHelper(c *gin.Context, minRole int) {
 		return
 	}
 	setDashboardAuthContext(c, user, identity, useAccessToken)
+	if !useAccessToken && identity.UserID == user.Id && identity.SessionID != "" {
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), dashboardRelayIdentityKey{}, identity))
+	}
 	if lookup != nil {
 		setAccessTokenContext(c, lookup)
 	}
@@ -612,8 +620,64 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 	}
 }
 
+// Dashboard sessions and API tokens are separate principals. Only the formal
+// successful UserAuth chain can establish a dashboard relay identity; neither
+// gin string fields nor a synthetic playground token can establish one.
+type dashboardRelayIdentityKey struct{}
+type playgroundRelayPrincipalKey struct{}
+
+// PreparePlaygroundRelay revalidates UserAuth's session before the existing
+// playground prepares its synthetic token. It does not classify that token as manual.
+func PreparePlaygroundRelay(c *gin.Context) (*model.UserBase, error) {
+	identity, ok := c.Request.Context().Value(dashboardRelayIdentityKey{}).(service.AuthIdentity)
+	if !ok || identity.UserID <= 0 || identity.SessionID == "" ||
+		c.Request.Method != http.MethodPost || c.Request.URL.Path != "/pg/chat/completions" {
+		return nil, service.ErrAuthTokenInvalid
+	}
+	_, user, err := service.ValidateLoginSession(identity)
+	if err != nil {
+		return nil, err
+	}
+	c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), playgroundRelayPrincipalKey{}, identity))
+	return user, nil
+}
+
+// HasPlaygroundRelayPrincipal recognizes only the separately verified session
+// handoff on the formal playground route, never an arbitrary is_playground flag.
+func HasPlaygroundRelayPrincipal(c *gin.Context) bool {
+	if c == nil || c.Request == nil || c.Request.Method != http.MethodPost || c.Request.URL.Path != "/pg/chat/completions" {
+		return false
+	}
+	identity, ok := c.Request.Context().Value(playgroundRelayPrincipalKey{}).(service.AuthIdentity)
+	authenticated, authOK := c.Request.Context().Value(dashboardRelayIdentityKey{}).(service.AuthIdentity)
+	return ok && authOK && identity == authenticated && identity.UserID > 0 && identity.SessionID != "" && identity.UserID == c.GetInt("id")
+}
+
+// oauthTokenPrincipalKey cannot be supplied through HTTP headers or gin keys.
+// Only TokenAuth installs this credential-bound SQL identity. Classification is
+// provenance, never authorization to spend or evidence of an immutable policy.
+type oauthTokenPrincipalKey struct{}
+type oauthTokenPrincipal struct {
+	class           model.OAuthDerivedTokenClass
+	userID, tokenID int
+}
+
+// OAuthTokenPrincipal returns TokenAuth provenance without granting spend permission.
+func OAuthTokenPrincipal(c *gin.Context) (model.OAuthDerivedTokenClass, int, int) {
+	if c == nil || c.Request == nil {
+		return model.OAuthDerivedTokenUnknown, 0, 0
+	}
+	p, ok := c.Request.Context().Value(oauthTokenPrincipalKey{}).(oauthTokenPrincipal)
+	if !ok {
+		return model.OAuthDerivedTokenUnknown, 0, 0
+	}
+	return p.class, p.userID, p.tokenID
+}
+
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		// Reset any inherited principal before examining this request's credential.
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), oauthTokenPrincipalKey{}, oauthTokenPrincipal{class: model.OAuthDerivedTokenUnknown}))
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
 		// 检查path包含/v1/messages 或 /v1/models
@@ -656,7 +720,69 @@ func TokenAuth() func(c *gin.Context) {
 			parts = strings.Split(key, "-")
 			key = parts[0]
 		}
-		token, err := model.ValidateUserToken(key)
+		// Classify by the credential's fresh SQL row before legacy validation can
+		// update status or consult a cached identity. Never infer manual from an
+		// absent/unready provenance store. Silence SQL logging of the credential.
+		var sqlToken model.Token
+		if key == "" || model.DB == nil {
+			abortWithOpenAiMessage(c, http.StatusUnauthorized, i18n.T(c, i18n.MsgTokenInvalid), types.ErrorCode("token_invalid"))
+			return
+		}
+		err := model.DB.WithContext(c.Request.Context()).Session(&gorm.Session{Logger: gormlogger.Default.LogMode(gormlogger.Silent)}).
+			Where(&model.Token{Key: key}).First(&sqlToken).Error
+		if err != nil || sqlToken.Id <= 0 || sqlToken.UserId <= 0 || sqlToken.Key != key {
+			abortWithOpenAiMessage(c, http.StatusUnauthorized, i18n.T(c, i18n.MsgTokenInvalid), types.ErrorCode("token_invalid"))
+			return
+		}
+		kind, err := model.ClassifyOAuthDerivedToken(c.Request.Context(), sqlToken.Id)
+		if err != nil || (kind != model.OAuthDerivedTokenManualProven && kind != model.OAuthDerivedTokenBound) {
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTokenStatusUnavailable))
+			return
+		}
+		// Fresh SQL security checks retain the public #21 error contract.
+		switch sqlToken.Status {
+		case common.TokenStatusExpired:
+			err = model.ErrTokenExpired
+		case common.TokenStatusExhausted:
+			err = model.ErrTokenExhausted
+		case common.TokenStatusDisabled:
+			err = model.ErrTokenDisabled
+		case common.TokenStatusEnabled:
+			if sqlToken.ExpiredTime != -1 && sqlToken.ExpiredTime < common.GetTimestamp() {
+				err = model.ErrTokenExpired
+			} else if !sqlToken.UnlimitedQuota && sqlToken.RemainQuota <= 0 {
+				err = model.ErrTokenExhausted
+			}
+		default:
+			err = model.ErrTokenInvalid
+		}
+		token := &sqlToken
+		if err == nil && kind == model.OAuthDerivedTokenManualProven {
+			// Preserve legacy quota/cache validation, but a cache hit must not
+			// change the SQL credential's owner or token identity.
+			cached, cacheErr := model.GetTokenByKey(key, false)
+			if cacheErr != nil || cached == nil || cached.Id != sqlToken.Id || cached.UserId != sqlToken.UserId || cached.Key != sqlToken.Key {
+				abortWithOpenAiMessage(c, http.StatusUnauthorized, i18n.T(c, i18n.MsgTokenInvalid), types.ErrorCode("token_invalid"))
+				return
+			}
+			token, err = model.ValidateUserToken(key)
+			if err == nil && (token == nil || token.Id != sqlToken.Id || token.UserId != sqlToken.UserId || token.Key != sqlToken.Key) {
+				abortWithOpenAiMessage(c, http.StatusUnauthorized, i18n.T(c, i18n.MsgTokenInvalid), types.ErrorCode("token_invalid"))
+				return
+			}
+			if err == nil {
+				// SQL owns identity and restrictions, but token quota has not
+				// cut over to SQL. Preserve the validated legacy snapshot's
+				// monetary quantities, including concurrent Redis reservations.
+				sqlToken.RemainQuota, sqlToken.UsedQuota = token.RemainQuota, token.UsedQuota
+				token = &sqlToken
+			}
+		} else if err == nil && kind == model.OAuthDerivedTokenBound && (c.Request.Method != http.MethodPost || c.Request.URL.Path != "/v1/chat/completions" ||
+			c.Request.URL.RawQuery != "" || c.Request.URL.RawPath != "" || len(parts) != 1 ||
+			c.Request.Header.Get("Upgrade") != "" || c.Request.Header.Get("Sec-WebSocket-Protocol") != "") {
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTokenStatusUnavailable))
+			return
+		}
 		if token != nil {
 			id := c.GetInt("id")
 			if id == 0 {
@@ -700,7 +826,18 @@ func TokenAuth() func(c *gin.Context) {
 			logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
 		}
 
-		userCache, err := model.GetUserCache(token.UserId)
+		var userCache *model.UserBase
+		if kind == model.OAuthDerivedTokenBound {
+			var user model.User
+			err = model.DB.WithContext(c.Request.Context()).First(&user, token.UserId).Error
+			userCache = user.ToBaseUser()
+			if err == nil && userCache.GetSetting().BillingPreference != "wallet_only" {
+				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTokenStatusUnavailable))
+				return
+			}
+		} else {
+			userCache, err = model.GetUserCache(token.UserId)
+		}
 		if err != nil {
 			common.SysLog(common.LogText("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
 			abortWithOpenAiMessage(c, http.StatusInternalServerError,
@@ -711,6 +848,31 @@ func TokenAuth() func(c *gin.Context) {
 		if !userEnabled {
 			abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthUserBanned))
 			return
+		}
+
+		if kind == model.OAuthDerivedTokenBound {
+			// Validate original raw shape before channel selection can rotate a
+			// key or apply ordinary provider settings. All unsupported output
+			// protocols are rejected here, not merely at the eventual writer.
+			mediaType, _, mediaErr := mime.ParseMediaType(c.Request.Header.Get("Content-Type"))
+			if mediaErr != nil || mediaType != "application/json" || c.Request.Header.Get("Content-Encoding") != "" {
+				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTokenStatusUnavailable))
+				return
+			}
+			storage, readErr := common.GetBodyStorage(c)
+			if readErr != nil {
+				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTokenStatusUnavailable))
+				return
+			}
+			body, readErr := storage.Bytes()
+			if readErr != nil {
+				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTokenStatusUnavailable))
+				return
+			}
+			if _, validationErr := helper.ValidateOAuthDerivedTextRequest(body); validationErr != nil {
+				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgTokenStatusUnavailable))
+				return
+			}
 		}
 
 		userCache.WriteContext(c)
@@ -738,6 +900,7 @@ func TokenAuth() func(c *gin.Context) {
 		if err != nil {
 			return
 		}
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), oauthTokenPrincipalKey{}, oauthTokenPrincipal{class: kind, userID: sqlToken.UserId, tokenID: sqlToken.Id}))
 		c.Next()
 	}
 }

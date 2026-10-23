@@ -25,11 +25,13 @@ func Playground(c *gin.Context) {
 		}
 	}()
 
-	useAccessToken := c.GetBool("use_access_token")
-	if useAccessToken {
-		newAPIError = types.NewError(errors.New(i18n.T(c, i18n.MsgRelayAccessTokenUnsupported)), types.ErrorCodeAccessDenied, types.ErrOptionWithSkipRetry())
+	userCache, err := middleware.PreparePlaygroundRelay(c)
+	if err != nil {
+		newAPIError = types.NewError(errors.New(i18n.T(c, i18n.MsgRelayAccessTokenUnsupported)), types.ErrorCodeAccessDenied, types.ErrOptionWithStatusCode(403), types.ErrOptionWithSkipRetry())
 		return
 	}
+	c.Set("id", userCache.Id)
+	userCache.WriteContext(c)
 
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatOpenAI, nil, nil)
 	if err != nil {
@@ -37,15 +39,7 @@ func Playground(c *gin.Context) {
 		return
 	}
 
-	userId := c.GetInt("id")
-
-	// Write user context to ensure acceptUnsetRatio is available
-	userCache, err := model.GetUserCache(userId)
-	if err != nil {
-		newAPIError = types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
-		return
-	}
-	userCache.WriteContext(c)
+	userId := userCache.Id
 
 	tempToken := &model.Token{
 		UserId: userId,
