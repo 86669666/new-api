@@ -19,7 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 import { CanceledError } from 'axios'
 import { z } from 'zod'
 
-import { api } from '@/lib/api'
+import { api, organizationRequestOptions } from '@/lib/api'
+import { AuthOperationError } from '@/lib/secure-verification'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -59,6 +60,233 @@ const membersSchema = z.object({
   next_after_id: idSchema.nullable(),
 })
 
+export type OrganizationDetail = z.infer<typeof detailSchema>
+export type OrganizationMember = z.infer<typeof membersSchema>['items'][number]
+export type RemoveMemberIntent = {
+  orgId: string
+  targetUserId: string
+  memberId: string
+  revision: string
+}
+
+const failureMessages: Record<string, readonly [number, string]> = {
+  ORG_REQUEST_INVALID: [400, 'Invalid organization request.'],
+  AUTH_SESSION_REVOKED: [401, 'The login session is no longer active.'],
+  AUTH_UNAUTHORIZED: [401, 'Session expired!'],
+  AUTH_SESSION_REQUIRED: [403, 'A dashboard session is required.'],
+  AUTH_ORIGIN_FORBIDDEN: [403, 'request origin is not allowed'],
+  ORG_FORBIDDEN: [403, 'Organization operation is forbidden.'],
+  ORG_NOT_FOUND: [404, 'Organization is unavailable.'],
+  ORG_STATE_CHANGED: [
+    409,
+    'Organization state changed. Refresh the organization state before retrying.',
+  ],
+  ORG_DISABLED: [409, 'Organization is disabled.'],
+  ORG_REQUEST_RESOLVED: [409, 'Organization request is already resolved.'],
+  ORG_INTERNAL_ERROR: [500, 'Unable to complete organization operation.'],
+  SECURITY_PROOF_REQUIRED: [
+    403,
+    'Organization state changed. Refresh the organization state before retrying.',
+  ],
+  REQUEST_TOO_LARGE: [413, 'Unable to complete organization operation.'],
+  UNSUPPORTED_MEDIA_TYPE: [415, 'Unable to complete organization operation.'],
+}
+
+/** Only primitive, fixed messages cross the feature's public/cache boundary. */
+export class OrganizationRequestFailure extends AuthOperationError {
+  readonly __CANCEL__?: true
+  constructor(
+    code?: string,
+    readonly status?: number,
+    readonly retryAfter?: number,
+    readonly cancelled = false
+  ) {
+    const entry =
+      code && Object.hasOwn(failureMessages, code)
+        ? failureMessages[code]
+        : undefined
+    let safeCode = entry ? code : undefined
+    if (cancelled) safeCode = 'AUTH_CANCELLED'
+    super(
+      entry && entry[0] === status
+        ? entry[1]
+        : 'Unable to complete organization operation.',
+      safeCode
+    )
+    if (cancelled) this.__CANCEL__ = true
+  }
+}
+
+// Do not evaluate source getters or copy any source object (including causes).
+function own(value: unknown, key: string): unknown {
+  try {
+    if (!value || typeof value !== 'object') return undefined
+    return Object.getOwnPropertyDescriptor(value, key)?.value
+  } catch {
+    return undefined
+  }
+}
+
+export function projectOrganizationRequestFailure(
+  error: unknown,
+  signal?: AbortSignal
+): OrganizationRequestFailure {
+  let status: number | undefined
+  let code: string | undefined
+  let retryAfter: number | undefined
+  let cancelled = signal?.aborted === true
+  const pending = [error]
+  const seen = new Set<unknown>()
+  for (let i = 0; i < pending.length && i < 16; i++) {
+    const value = pending[i]
+    if (!value || typeof value !== 'object' || seen.has(value)) continue
+    seen.add(value)
+    const candidate = own(value, 'status')
+    if (
+      typeof candidate === 'number' &&
+      Number.isInteger(candidate) &&
+      candidate >= 100 &&
+      candidate <= 599 &&
+      status === undefined
+    ) {
+      status = candidate
+    }
+    const candidateCode = own(value, 'code')
+    if (
+      typeof candidateCode === 'string' &&
+      Object.hasOwn(failureMessages, candidateCode)
+    ) {
+      code ??= candidateCode
+    }
+    cancelled ||=
+      own(value, '__CANCEL__') === true ||
+      candidateCode === 'ERR_CANCELED' ||
+      candidateCode === 'AUTH_CANCELLED' ||
+      own(value, 'name') === 'AbortError'
+    const headers = own(value, 'headers')
+    let headerRetry: unknown
+    try {
+      if (headers && typeof headers === 'object') {
+        const key = Object.getOwnPropertyNames(headers).find(
+          (name) => name.toLowerCase() === 'retry-after'
+        )
+        if (key) headerRetry = own(headers, key)
+      }
+    } catch {
+      // Exotic headers still project to the fixed fallback without references.
+    }
+    const retry = own(value, 'retryAfter') ?? headerRetry
+    let seconds: number | undefined
+    if (typeof retry === 'number') {
+      seconds = retry
+    } else if (
+      typeof retry === 'string' &&
+      /^(0|[1-9][0-9]{0,4})$(?![\s\S])/.test(retry)
+    ) {
+      seconds = Number(retry)
+    }
+    if (
+      seconds !== undefined &&
+      Number.isSafeInteger(seconds) &&
+      seconds >= 0 &&
+      seconds <= 86400
+    ) {
+      retryAfter ??= seconds
+    }
+    pending.push(
+      own(value, 'response'),
+      own(value, 'data'),
+      own(value, 'cause'),
+      own(value, 'error')
+    )
+  }
+  return new OrganizationRequestFailure(code, status, retryAfter, cancelled)
+}
+
+const wireIdSchema = idSchema.refine(
+  (value) => BigInt(value) <= 9223372036854775807n
+)
+export function canRemoveOrganizationMember(
+  actorId: number,
+  detail: OrganizationDetail,
+  member: OrganizationMember
+) {
+  return (
+    Number.isSafeInteger(actorId) &&
+    actorId > 0 &&
+    (detail.my_role === 'owner' || detail.my_role === 'admin') &&
+    member.role === 'member' &&
+    member.user_id !== String(actorId) &&
+    [
+      detail.org_id,
+      detail.revision,
+      detail.my_member_revision,
+      member.member_id,
+      member.user_id,
+      member.revision,
+    ].every((id) => wireIdSchema.safeParse(id).success)
+  )
+}
+
+const receiptSchema = z.object({
+  organization_id: wireIdSchema,
+  revision: wireIdSchema,
+  action: z.literal('remove'),
+  event_id: wireIdSchema,
+  object_kind: z.literal('member'),
+  object_id: wireIdSchema,
+  generation: z.null(),
+  status: z.null(),
+})
+
+export async function removeOrganizationMember(
+  actorId: number,
+  sid: string,
+  intent: RemoveMemberIntent,
+  signal: AbortSignal
+) {
+  try {
+    if (
+      !Number.isSafeInteger(actorId) ||
+      actorId <= 0 ||
+      intent.targetUserId === String(actorId)
+    ) {
+      throw new Error()
+    }
+    for (const id of [
+      intent.orgId,
+      intent.targetUserId,
+      intent.memberId,
+      intent.revision,
+    ]) {
+      wireIdSchema.parse(id)
+    }
+    const response = await api.delete(
+      `/api/organizations/${intent.orgId}/members/${intent.targetUserId}`,
+      {
+        ...organizationRequestOptions({ userId: actorId, sid }, signal),
+        data: { revision: intent.revision },
+      }
+    )
+    if (response.status !== 200) throw new Error()
+    const receipt = receiptSchema.parse(
+      z
+        .object({ success: z.literal(true), data: z.unknown() })
+        .parse(requireServerSuccess(response.data)).data
+    )
+    if (
+      receipt.organization_id !== intent.orgId ||
+      receipt.object_id !== intent.memberId ||
+      BigInt(receipt.revision) <= BigInt(intent.revision)
+    ) {
+      throw new Error()
+    }
+    return receipt
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, signal)
+  }
+}
+
 // All organization reads share the subject/session and cancellation boundary.
 async function readOrganizationData(
   actorId: number,
@@ -82,6 +310,9 @@ async function readOrganizationData(
     params,
     signal,
     disableDuplicate: true,
+    expectedAuthIdentity: { userId: actorId, sid },
+    skipErrorHandler: true,
+    skipBusinessError: true,
   })
   assertIdentity()
   const result = requireServerSuccess(response.data)
@@ -102,14 +333,18 @@ export async function getMyOrganizations(
   afterId: string,
   signal: AbortSignal
 ) {
-  const page = directorySchema.parse(
-    await readOrganizationData(actorId, sid, '/api/organizations', signal, {
-      after_id: afterId,
-      limit: 20,
-    })
-  )
-  validateCursor(page.next_after_id, afterId)
-  return page
+  try {
+    const page = directorySchema.parse(
+      await readOrganizationData(actorId, sid, '/api/organizations', signal, {
+        after_id: afterId,
+        limit: 20,
+      })
+    )
+    validateCursor(page.next_after_id, afterId)
+    return page
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, signal)
+  }
 }
 
 export async function getOrganizationDetails(
@@ -118,19 +353,23 @@ export async function getOrganizationDetails(
   orgId: string,
   signal: AbortSignal
 ) {
-  idSchema.parse(orgId)
-  const detail = detailSchema.parse(
-    await readOrganizationData(
-      actorId,
-      sid,
-      `/api/organizations/${orgId}`,
-      signal
+  try {
+    idSchema.parse(orgId)
+    const detail = detailSchema.parse(
+      await readOrganizationData(
+        actorId,
+        sid,
+        `/api/organizations/${orgId}`,
+        signal
+      )
     )
-  )
-  if (detail.org_id !== orgId) {
-    throw new Error('Organization response identity mismatch')
+    if (detail.org_id !== orgId) {
+      throw new Error('Organization response identity mismatch')
+    }
+    return detail
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, signal)
   }
-  return detail
 }
 
 export async function getOrganizationMembers(
@@ -140,17 +379,21 @@ export async function getOrganizationMembers(
   afterId: string,
   signal: AbortSignal
 ) {
-  idSchema.parse(orgId)
-  z.union([z.literal('0'), idSchema]).parse(afterId)
-  const page = membersSchema.parse(
-    await readOrganizationData(
-      actorId,
-      sid,
-      `/api/organizations/${orgId}/members`,
-      signal,
-      { after_id: afterId, limit: 20 }
+  try {
+    idSchema.parse(orgId)
+    z.union([z.literal('0'), idSchema]).parse(afterId)
+    const page = membersSchema.parse(
+      await readOrganizationData(
+        actorId,
+        sid,
+        `/api/organizations/${orgId}/members`,
+        signal,
+        { after_id: afterId, limit: 20 }
+      )
     )
-  )
-  validateCursor(page.next_after_id, afterId)
-  return page
+    validateCursor(page.next_after_id, afterId)
+    return page
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, signal)
+  }
 }

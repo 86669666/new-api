@@ -18,6 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   focusManager,
+  MutationCache,
+  onlineManager,
   QueryClient,
   QueryClientProvider,
 } from '@tanstack/react-query'
@@ -25,6 +27,7 @@ import {
   act,
   cleanup,
   render,
+  renderHook,
   screen,
   waitFor,
   within,
@@ -37,7 +40,7 @@ import {
 } from 'axios'
 import { createInstance, type i18n } from 'i18next'
 import { I18nextProvider } from 'react-i18next'
-import { afterEach, beforeEach, expect, test } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
 import {
@@ -46,8 +49,18 @@ import {
 } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { getOrganizationDetails, getOrganizationMembers } from '../api'
+import {
+  getMyOrganizations,
+  getOrganizationDetails,
+  getOrganizationMembers,
+  removeOrganizationMember,
+  projectOrganizationRequestFailure,
+  canRemoveOrganizationMember,
+  type OrganizationDetail,
+  type OrganizationMember,
+} from '../api'
 import { MyOrganizationsCard } from '../my-organizations-card'
+import { useRemoveMember } from '../use-remove-member'
 
 const originalAdapter = api.defaults.adapter
 let client: QueryClient
@@ -127,6 +140,8 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
+  vi.unstubAllGlobals()
+  onlineManager.setOnline(true)
   focusManager.setFocused(undefined)
   cleanup()
   client.clear()
@@ -532,7 +547,8 @@ test('slow API response is cancelled on SID replacement without a component', as
     new AbortController().signal
   )
   const rejected = expect(request).rejects.toMatchObject({
-    name: 'CanceledError',
+    cancelled: true,
+    __CANCEL__: true,
   })
   await waitFor(() => expect(calls.length).toBe(1))
   login(1, 'replacement-session')
@@ -827,3 +843,1128 @@ test.each(['empty', 'pending'])(
     }
   }
 )
+
+test('organization GET failures discard original credential-bearing objects before QueryCache', async () => {
+  let raw: unknown
+  handler = async (config) => {
+    raw = new AxiosError(
+      'raw-password-canary',
+      'ERR_BAD_REQUEST',
+      config,
+      { flow: 'flow-canary' },
+      {
+        config,
+        status: 403,
+        statusText: 'Rejected',
+        headers: {},
+        data: {
+          success: false,
+          code: 'ORG_FORBIDDEN',
+          message_params: { secret: 'raw-password-canary' },
+          proof_token: 'proof-canary',
+        },
+      }
+    )
+    throw raw
+  }
+  await client
+    .fetchQuery({
+      queryKey: ['organizations', 'safe-failure'],
+      queryFn: ({ signal }) => getMyOrganizations(1, 'session-1', '0', signal),
+    })
+    .catch(() => undefined)
+  const failure = client.getQueryCache().getAll()[0].state.error
+  expect(failure).not.toBe(raw)
+  expect(failure).not.toHaveProperty('cause')
+  expect(getServerErrorStatus(failure)).toBe(403)
+})
+
+test('an owner has a Remove action only for another ordinary member', async () => {
+  handler = async (config) => {
+    if (config.url === `/api/organizations/${orgId}`) {
+      return response(config, detail(orgId, 'owner'))
+    }
+    if (config.url?.endsWith('/members')) {
+      return response(config, members(['owner', 'admin', 'ordinary']))
+    }
+    return response(config, payload(config))
+  }
+  show()
+  const dialog = await openOrganization()
+  await within(dialog).findByText('ordinary')
+  const buttons = within(dialog).getAllByRole('button', { name: /Remove/ })
+  expect(buttons).toHaveLength(1)
+})
+
+const ordinaryPage = () => {
+  const page = members(['ordinary'])
+  page.data.items[0].role = 'member'
+  return page
+}
+const removalIntent = {
+  orgId,
+  memberId: String(firstMemberId),
+  targetUserId: String(firstMemberId + 1000n),
+  revision: '9007199254741201',
+}
+function receipt() {
+  return {
+    success: true,
+    data: {
+      organization_id: orgId,
+      revision: '9007199254741202',
+      action: 'remove',
+      event_id: '9007199254741400',
+      object_kind: 'member',
+      object_id: removalIntent.memberId,
+      generation: null,
+      status: null,
+      access_token: 'access-canary',
+    },
+  }
+}
+function selection() {
+  return {
+    detail: detail(orgId, 'owner').data as OrganizationDetail,
+    member: ordinaryPage().data.items[0] as OrganizationMember,
+    afterId: '0',
+  }
+}
+function hook() {
+  return renderHook(() => useRemoveMember(1, 'session-1', orgId), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  })
+}
+function installRemovalHandler(
+  write: (
+    config: InternalAxiosRequestConfig
+  ) => Promise<AxiosResponse> = async (config) => response(config, receipt())
+) {
+  handler = async (config) => {
+    if (config.method === 'delete') return write(config)
+    if (config.url === `/api/organizations/${orgId}`) {
+      return response(config, detail(orgId, 'owner'))
+    }
+    if (config.url?.endsWith('/members')) {
+      return response(config, ordinaryPage())
+    }
+    return response(config, payload(config))
+  }
+}
+async function openRemoval() {
+  show()
+  const dialog = await openOrganization()
+  await within(dialog).findByText('ordinary')
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Remove' }))
+  return screen.findByRole('alertdialog', { name: 'Remove member' })
+}
+const canaries = [
+  'fixture-1',
+  'password-canary',
+  'flow-canary',
+  'proof-canary',
+  'access-canary',
+  'refresh-canary',
+  'params-canary',
+]
+/** Walk live object identities, including nonenumerable and symbol properties. */
+function assertSafeGraph(root: unknown, forbidden: unknown[] = []) {
+  const seen = new Set<unknown>()
+  function visit(value: unknown) {
+    expect(forbidden.includes(value)).toBe(false)
+    if (typeof value === 'string') {
+      for (const canary of canaries) expect(value).not.toContain(canary)
+    }
+    if (
+      !value ||
+      (typeof value !== 'object' && typeof value !== 'function') ||
+      seen.has(value)
+    ) {
+      return
+    }
+    seen.add(value)
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (!descriptor) continue
+      if ('value' in descriptor) visit(descriptor.value)
+      else {
+        if (descriptor.get) visit(descriptor.get)
+        if (descriptor.set) visit(descriptor.set)
+      }
+    }
+  }
+  visit(root)
+}
+function cacheStates() {
+  return [
+    ...client
+      .getQueryCache()
+      .getAll()
+      .map((query) => query.state),
+    ...client
+      .getMutationCache()
+      .getAll()
+      .map((mutation) => mutation.state),
+  ]
+}
+function poisonedError(
+  config: InternalAxiosRequestConfig,
+  status: number,
+  code: string,
+  retry: string | number = '12'
+) {
+  const body = {
+    success: false,
+    code,
+    message: 'password-canary',
+    message_key: 'proof-canary',
+    message_params: { token: 'params-canary' },
+    access_token: 'access-canary',
+    refresh_token: 'refresh-canary',
+  }
+  const request = { flow: 'flow-canary' }
+  const headers = { 'Retry-After': retry }
+  const rawResponse = {
+    data: body,
+    config,
+    status,
+    statusText: 'Rejected',
+    headers,
+  }
+  const raw = new AxiosError(
+    'password-canary',
+    undefined,
+    config,
+    request,
+    rawResponse
+  )
+  Object.defineProperty(raw, 'private', { value: request })
+  Object.defineProperty(raw, Symbol('secret'), { value: body })
+  return {
+    raw,
+    refs: [
+      raw,
+      config,
+      config.headers,
+      request,
+      body,
+      body.message_params,
+      headers,
+      rawResponse,
+    ],
+  }
+}
+
+test.each(['owner', 'admin', 'member'] as const)(
+  'only fresh %s eligibility permits a nonself ordinary target',
+  (role) => {
+    const selected = selection()
+    selected.detail.my_role = role
+    expect(
+      canRemoveOrganizationMember(1, selected.detail, selected.member)
+    ).toBe(role !== 'member')
+    selected.member.user_id = '1'
+    expect(
+      canRemoveOrganizationMember(1, selected.detail, selected.member)
+    ).toBe(false)
+    selected.member.user_id = removalIntent.targetUserId
+    for (const targetRole of ['owner', 'admin'] as const) {
+      selected.member.role = targetRole
+      expect(
+        canRemoveOrganizationMember(1, selected.detail, selected.member)
+      ).toBe(false)
+    }
+  }
+)
+
+test.each([0, -1, 1.1, Number.MAX_SAFE_INTEGER + 1, Number.NaN])(
+  'invalid actor %s cannot reach the adapter',
+  async (actorId) => {
+    await expect(
+      removeOrganizationMember(
+        actorId,
+        'session-1',
+        removalIntent,
+        new AbortController().signal
+      )
+    ).rejects.toMatchObject({
+      message: 'Unable to complete organization operation.',
+    })
+    expect(calls).toHaveLength(0)
+  }
+)
+
+test.each(['0', '01', '1\n', '9223372036854775808', '1e3'])(
+  'noncanonical write id %s never reaches adapter',
+  async (id) => {
+    await expect(
+      removeOrganizationMember(
+        1,
+        'session-1',
+        { ...removalIntent, orgId: id },
+        new AbortController().signal
+      )
+    ).rejects.toBeInstanceOf(Error)
+    expect(calls).toHaveLength(0)
+  }
+)
+
+test('DELETE uses exact string target user, revision-only body and whitelisted member receipt', async () => {
+  installRemovalHandler()
+  const result = await removeOrganizationMember(
+    1,
+    'session-1',
+    removalIntent,
+    new AbortController().signal
+  )
+  const config = calls[0]
+  expect(config.url).toBe(
+    `/api/organizations/${orgId}/members/${removalIntent.targetUserId}`
+  )
+  expect(config.url).not.toContain(`/members/${removalIntent.memberId}`)
+  expect(JSON.parse(config.data)).toEqual({ revision: removalIntent.revision })
+  expect(config.headers.has('X-Security-Proof')).toBe(false)
+  expect(config.headers.has('Idempotency-Key')).toBe(false)
+  expect(config.expectedAuthIdentity).toEqual({ userId: 1, sid: 'session-1' })
+  expect(config.singleUseAuthorization).toBe(true)
+  expect(config.skipAuthRefresh).toBe(true)
+  expect(result).toEqual(
+    Object.fromEntries(
+      Object.entries(receipt().data).filter(([key]) => key !== 'access_token')
+    )
+  )
+  assertSafeGraph(result)
+})
+
+test.each([
+  ['organization_id', secondOrgId],
+  ['object_id', removalIntent.targetUserId],
+  ['action', 'update'],
+  ['object_kind', 'organization'],
+  ['revision', removalIntent.revision],
+  ['event_id', '01'],
+  ['generation', '1'],
+  ['status', 'active'],
+  ['revision', '9223372036854775808'],
+])('receipt with wrong %s is never successful', async (field, value) => {
+  installRemovalHandler(async (config) =>
+    response(config, {
+      success: true,
+      data: { ...receipt().data, [field]: value },
+    })
+  )
+  const { result } = hook()
+  let output: unknown
+  await act(async () => {
+    output = await result.current.remove(selection())
+  })
+  expect(output).toMatchObject({ kind: 'failure', unconfirmed: true })
+  expect(client.getMutationCache().getAll()[0].state.status).toBe('error')
+  assertSafeGraph([cacheStates(), result.current, output])
+  expect(calls.filter((call) => call.method === 'delete')).toHaveLength(1)
+})
+
+test.each([
+  [403, 'ORG_FORBIDDEN'],
+  [403, 'SECURITY_PROOF_REQUIRED'],
+  [404, 'ORG_NOT_FOUND'],
+  [409, 'ORG_STATE_CHANGED'],
+  [401, 'AUTH_UNAUTHORIZED'],
+  [429, 'UNKNOWN'],
+  [500, 'ORG_INTERNAL_ERROR'],
+])(
+  'DELETE %i %s is projected before live MutationCache and public hook results',
+  async (status, code) => {
+    let refs: unknown[] = []
+    installRemovalHandler(async (config) => {
+      const poison = poisonedError(config, status as number, code as string)
+      refs = poison.refs
+      throw poison.raw
+    })
+    const { result } = hook()
+    let output: unknown
+    await act(async () => {
+      output = await result.current.remove(selection())
+    })
+    expect(output).toMatchObject({
+      kind: 'failure',
+      error: { status, retryAfter: 12 },
+    })
+    const mutation = client.getMutationCache().getAll()[0]
+    expect(mutation.state.error).not.toBe(refs[0])
+    expect(mutation.state.context).toBeUndefined()
+    expect(mutation.state.variables).toEqual(removalIntent)
+    expect(mutation.options.retry).toBe(false)
+    expect(mutation.options.networkMode).toBe('always')
+    expect(mutation.state.isPaused).toBe(false)
+    assertSafeGraph(
+      [
+        cacheStates(),
+        result.current,
+        output,
+        mutation.options.mutationKey,
+        mutation.meta,
+      ],
+      refs
+    )
+    expect(calls.filter((call) => call.method === 'delete')).toHaveLength(1)
+    expect(
+      calls.filter(
+        (call) =>
+          call.url?.includes('authorization-context') ||
+          call.url?.includes('verification')
+      )
+    ).toHaveLength(0)
+  }
+)
+
+test.each(['directory', 'detail', 'members'] as const)(
+  'all %s GET failure states discard raw error references',
+  async (kind) => {
+    let refs: unknown[] = []
+    handler = async (config) => {
+      const poison = poisonedError(config, 403, 'ORG_FORBIDDEN')
+      refs = poison.refs
+      throw poison.raw
+    }
+    const queryFn = async ({
+      signal,
+    }: {
+      signal: AbortSignal
+    }): Promise<unknown> => {
+      if (kind === 'directory') {
+        return getMyOrganizations(1, 'session-1', '0', signal)
+      }
+      if (kind === 'detail') {
+        return getOrganizationDetails(1, 'session-1', orgId, signal)
+      }
+      return getOrganizationMembers(1, 'session-1', orgId, '0', signal)
+    }
+    await client
+      .fetchQuery({ queryKey: ['organizations', kind], queryFn })
+      .catch(() => undefined)
+    expect(client.getQueryCache().getAll()[0].state.error).toMatchObject({
+      code: 'ORG_FORBIDDEN',
+      status: 403,
+    })
+    assertSafeGraph(cacheStates(), refs)
+  }
+)
+
+test.each(['business', 'dto', 'cursor', 'network'] as const)(
+  'GET %s failures are projected before cache',
+  async (mode) => {
+    let raw: unknown
+    handler = async (config) => {
+      if (mode === 'network') {
+        raw = Object.assign(new Error('password-canary'), {
+          request: { flow: 'flow-canary' },
+        })
+        throw raw
+      }
+      if (mode === 'business') {
+        raw = {
+          success: false,
+          code: 'ORG_NOT_FOUND',
+          message: 'password-canary',
+          message_params: { proof: 'proof-canary' },
+        }
+      } else if (mode === 'cursor') {
+        raw = {
+          ...ordinaryPage(),
+          data: { ...ordinaryPage().data, next_after_id: '1' },
+        }
+      } else {
+        raw = { success: true, data: { items: 'password-canary' } }
+      }
+      return response(config, raw)
+    }
+    await client
+      .fetchQuery({
+        queryKey: ['organizations', mode],
+        queryFn: ({ signal }) =>
+          getOrganizationMembers(
+            1,
+            'session-1',
+            orgId,
+            mode === 'cursor' ? '2' : '0',
+            signal
+          ),
+      })
+      .catch(() => undefined)
+    expect(client.getQueryCache().getAll()[0].state.status).toBe('error')
+    assertSafeGraph(cacheStates(), [raw])
+  }
+)
+
+test.each([
+  '0',
+  '86400',
+  12,
+  '-1',
+  '01',
+  '86401',
+  'Thu, 01 Jan 2099 00:00:00 GMT',
+  'params-canary',
+])('Retry-After %s retains only bounded canonical delta seconds', (retry) => {
+  const error = projectOrganizationRequestFailure({
+    response: {
+      status: 429,
+      headers: { 'Retry-After': retry },
+      data: { code: 'UNKNOWN', message: 'password-canary' },
+    },
+  })
+  expect(error.retryAfter).toBe(
+    ['0', '86400', 12].includes(retry) ? Number(retry) : undefined
+  )
+  expect(error.code).toBeUndefined()
+  assertSafeGraph(error)
+})
+
+test('source getters and symbol metadata are not evaluated or retained', () => {
+  const source = Object.create(null)
+  Object.defineProperty(source, 'response', {
+    get() {
+      throw new Error('password-canary')
+    },
+  })
+  source[Symbol('secret')] = { token: 'access-canary' }
+  const error = projectOrganizationRequestFailure(source)
+  expect(error.message).toBe('Unable to complete organization operation.')
+  assertSafeGraph(error, [source])
+})
+
+test.each([
+  'revision',
+  'role',
+  'memberRevision',
+  'row',
+  'user',
+  'missing',
+  'actorRole',
+] as const)('preflight %s change stops without DELETE', async (change) => {
+  installRemovalHandler()
+  const confirm = await openRemoval()
+  const base = handler
+  handler = async (config) => {
+    if (config.url === `/api/organizations/${orgId}`) {
+      const value = detail(orgId, change === 'actorRole' ? 'member' : 'owner')
+      if (change === 'revision') value.data.revision = '9007199254741202'
+      return response(config, value)
+    }
+    if (config.url?.endsWith('/members')) {
+      const value = ordinaryPage()
+      if (change === 'missing') value.data.items = []
+      else if (change === 'role') value.data.items[0].role = 'admin'
+      else if (change === 'row') value.data.items[0].member_id = '999'
+      else if (change === 'user') value.data.items[0].user_id = '999'
+      else if (change === 'memberRevision') value.data.items[0].revision = '999'
+      return response(config, value)
+    }
+    return base(config)
+  }
+  await userEvent.click(within(confirm).getByRole('button', { name: 'Remove' }))
+  await screen.findByText(
+    'Organization state changed. Refresh the organization state before retrying.'
+  )
+  expect(calls.some((call) => call.method === 'delete')).toBe(false)
+  expect(screen.queryByText('ordinary')).not.toBeInTheDocument()
+})
+
+test('SECURITY_PROOF_REQUIRED uses fixed state changed copy without opening proof', async () => {
+  installRemovalHandler(async (config) =>
+    response(
+      config,
+      {
+        success: false,
+        code: 'SECURITY_PROOF_REQUIRED',
+        message: 'password-canary',
+      },
+      403
+    )
+  )
+  const confirm = await openRemoval()
+  await userEvent.click(within(confirm).getByRole('button', { name: 'Remove' }))
+  await screen.findByText(
+    'Organization state changed. Refresh the organization state before retrying.'
+  )
+  expect(
+    screen.queryByText('Additional verification required')
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByText('Organization member removed')
+  ).not.toBeInTheDocument()
+})
+
+test('single flight covers double click, Enter and Space while Cancel stays enabled', async () => {
+  const gate = defer()
+  installRemovalHandler(async (config) => {
+    await gate.promise
+    return response(config, receipt())
+  })
+  const confirm = await openRemoval()
+  const remove = within(confirm).getByRole('button', { name: 'Remove' })
+  await userEvent.dblClick(remove)
+  await userEvent.keyboard('{Enter} ')
+  await waitFor(() =>
+    expect(calls.filter((call) => call.method === 'delete')).toHaveLength(1)
+  )
+  const cancel = within(confirm).getByRole('button', { name: 'Cancel' })
+  expect(cancel).toBeEnabled()
+  await userEvent.click(cancel)
+  await screen.findByText(
+    'The result could not be confirmed. Refresh the organization before trying again.'
+  )
+  await act(async () => {
+    gate.resolve()
+  })
+  await waitFor(() =>
+    expect(client.getMutationCache().getAll()[0].state.status).toBe('error')
+  )
+  expect(
+    screen.queryByText('Organization member removed')
+  ).not.toBeInTheDocument()
+  assertSafeGraph(cacheStates())
+})
+
+test('Cancel during preflight aborts before any mutation is scheduled', async () => {
+  installRemovalHandler()
+  const confirm = await openRemoval()
+  const gate = defer()
+  const base = handler
+  handler = async (config) => {
+    if (config.url?.endsWith('/members')) await gate.promise
+    return base(config)
+  }
+  await userEvent.click(within(confirm).getByRole('button', { name: 'Remove' }))
+  await userEvent.click(within(confirm).getByRole('button', { name: 'Cancel' }))
+  await act(async () => {
+    gate.resolve()
+  })
+  expect(calls.some((call) => call.method === 'delete')).toBe(false)
+  expect(client.getMutationCache().getAll()).toHaveLength(0)
+  expect(
+    screen.queryByText('Organization member removed')
+  ).not.toBeInTheDocument()
+})
+
+test.each(['sid', 'actor', 'unmount'] as const)(
+  '%s change invalidates a submitted ticket and late receipt',
+  async (change) => {
+    const gate = defer()
+    installRemovalHandler(async (config) => {
+      await gate.promise
+      return response(config, receipt())
+    })
+    const view = hook()
+    let pending: Promise<unknown> | undefined
+    act(() => {
+      pending = view.result.current.remove(selection())
+    })
+    await waitFor(() =>
+      expect(calls.some((call) => call.method === 'delete')).toBe(true)
+    )
+    act(() => {
+      if (change === 'unmount') view.unmount()
+      else login(change === 'actor' ? 2 : 1, 'new-session')
+    })
+    let output: unknown
+    await act(async () => {
+      gate.resolve()
+      output = await pending
+    })
+    expect(output).toBeUndefined()
+    expect(client.getMutationCache().getAll()[0].state.status).toBe('error')
+    assertSafeGraph(cacheStates())
+  }
+)
+
+test('transformRequest identity change is stopped before the actual DELETE adapter', async () => {
+  installRemovalHandler()
+  const original = api.defaults.transformRequest
+  const transforms = original ? [original].flat() : []
+  api.defaults.transformRequest = [
+    ...transforms,
+    function (data) {
+      login(1, 'replaced-sid')
+      return data
+    },
+  ]
+  try {
+    await expect(
+      removeOrganizationMember(
+        1,
+        'session-1',
+        removalIntent,
+        new AbortController().signal
+      )
+    ).rejects.toMatchObject({ cancelled: true })
+    expect(calls).toHaveLength(0)
+  } finally {
+    api.defaults.transformRequest = original
+  }
+})
+
+test.each([false, true])(
+  'matched write receipt stays successful when refreshed GET fails=%s',
+  async (readFails) => {
+    let deleted = false
+    const refs: unknown[] = []
+    installRemovalHandler(async (config) => {
+      deleted = true
+      return response(config, receipt())
+    })
+    const base = handler
+    handler = async (config) => {
+      if (
+        deleted &&
+        config.method !== 'delete' &&
+        config.url?.includes(orgId)
+      ) {
+        if (readFails) {
+          const poison = poisonedError(config, 403, 'ORG_FORBIDDEN')
+          refs.push(...poison.refs)
+          throw poison.raw
+        }
+        if (config.url.endsWith('/members')) {
+          return response(config, members([]))
+        }
+      }
+      return base(config)
+    }
+    const confirm = await openRemoval()
+    const memberReads = calls.filter((call) =>
+      call.url?.endsWith('/members')
+    ).length
+    const directoryReads = calls.filter(
+      (call) => call.url === '/api/organizations'
+    ).length
+    await userEvent.click(
+      within(confirm).getByRole('button', { name: 'Remove' })
+    )
+    await screen.findByText('Organization member removed')
+    await screen.findByText(
+      readFails ? 'Unable to load organization' : 'No members to display'
+    )
+    expect(screen.queryByText('ordinary')).not.toBeInTheDocument()
+    const mutation = client.getMutationCache().getAll()[0]
+    expect(mutation.state.status).toBe('success')
+    expect(mutation.state.error).toBeNull()
+    expect(mutation.state.data).toHaveProperty(
+      'object_id',
+      removalIntent.memberId
+    )
+    const newReads = calls.filter((call) => call.url?.endsWith('/members'))
+    expect(newReads.length).toBeGreaterThan(memberReads + 1)
+    expect(newReads.at(-1)?.params).toEqual({ after_id: '0', limit: 20 })
+    expect(
+      calls.filter((call) => call.url === '/api/organizations').length
+    ).toBeGreaterThan(directoryReads)
+    const dialog = screen.getByRole('dialog', { name: 'Organization details' })
+    const refresh = within(dialog).getByRole('button', { name: 'Refresh' })
+    await waitFor(() => expect(refresh).toHaveFocus())
+    assertSafeGraph(cacheStates(), refs)
+  }
+)
+
+test.each(['network', 'business', 'malformed', '202'] as const)(
+  'DELETE %s failure remains unconfirmed and credential free',
+  async (mode) => {
+    let raw: unknown
+    installRemovalHandler(async (config) => {
+      if (mode === 'network') {
+        raw = Object.assign(new Error('password-canary'), { config })
+        throw raw
+      }
+      if (mode === 'business') {
+        raw = {
+          success: false,
+          message: 'password-canary',
+          message_params: { proof: 'proof-canary' },
+        }
+      } else if (mode === 'malformed') {
+        raw = { success: true, data: 'password-canary' }
+      } else {
+        raw = receipt()
+      }
+      return response(config, raw, mode === '202' ? 202 : 200)
+    })
+    const view = hook()
+    let output: unknown
+    await act(async () => {
+      output = await view.result.current.remove(selection())
+    })
+    expect(output).toMatchObject({ kind: 'failure', unconfirmed: true })
+    expect(calls.filter((call) => call.method === 'delete')).toHaveLength(1)
+    assertSafeGraph([cacheStates(), view.result.current, output], [raw])
+  }
+)
+
+test('offline status does not retain a paused DELETE for reconnect replay', async () => {
+  installRemovalHandler(async (config) => {
+    throw poisonedError(config, 500, 'ORG_INTERNAL_ERROR').raw
+  })
+  onlineManager.setOnline(false)
+  const view = hook()
+  await act(async () => {
+    await view.result.current.remove(selection())
+  })
+  expect(client.getMutationCache().getAll()[0].state.isPaused).toBe(false)
+  const count = calls.length
+  await act(async () => {
+    onlineManager.setOnline(true)
+    await client.resumePausedMutations()
+  })
+  expect(calls).toHaveLength(count)
+  expect(calls.filter((call) => call.method === 'delete')).toHaveLength(1)
+})
+
+test('a cancelled scheduled mutation cannot borrow the next preflight ticket', async () => {
+  const mutationGate = defer()
+  client = new QueryClient({
+    mutationCache: new MutationCache({ onMutate: () => mutationGate.promise }),
+  })
+  installRemovalHandler()
+  const view = hook()
+  let first: Promise<unknown> | undefined
+  act(() => {
+    first = view.result.current.remove(selection())
+  })
+  await waitFor(() =>
+    expect(client.getMutationCache().getAll()).toHaveLength(1)
+  )
+  act(() => {
+    view.result.current.cancel()
+  })
+  const readGate = defer()
+  const base = handler
+  handler = async (config) => {
+    if (config.url?.endsWith('/members')) await readGate.promise
+    return base(config)
+  }
+  let second: Promise<unknown> | undefined
+  act(() => {
+    second = view.result.current.remove(selection())
+  })
+  await waitFor(() =>
+    expect(calls.filter((call) => call.url?.endsWith('/members'))).toHaveLength(
+      2
+    )
+  )
+  await act(async () => {
+    mutationGate.resolve()
+    await first
+  })
+  expect(calls.some((call) => call.method === 'delete')).toBe(false)
+  act(() => {
+    view.result.current.cancel()
+  })
+  await act(async () => {
+    readGate.resolve()
+    await second
+  })
+  expect(calls.some((call) => call.method === 'delete')).toBe(false)
+  assertSafeGraph(cacheStates())
+})
+
+test('expiring headers that replace identity never send the DELETE', async () => {
+  const bundle = useAuthStore.getState().auth
+  if (!bundle.user || !bundle.session || !bundle.accessToken) {
+    throw new Error('Fixture requires authentication')
+  }
+  useAuthStore.getState().auth.setBundle({
+    user: bundle.user,
+    session: bundle.session,
+    access_token: bundle.accessToken,
+    token_type: 'Bearer',
+    access_expires_at: 1,
+  })
+  const refresh = vi.fn()
+  vi.stubGlobal(
+    'XMLHttpRequest',
+    class {
+      status = 200
+      statusText = 'OK'
+      readyState = 4
+      responseText = JSON.stringify({
+        success: true,
+        data: {
+          user: { id: 2, username: 'other', role: 1 },
+          session: { ...bundle.session, sid: 'other-sid' },
+          access_token: 'access-canary',
+          token_type: 'Bearer',
+          access_expires_at: 1900000000,
+        },
+      })
+      onloadend: (() => void) | null = null
+      open(_method: string, url: string) {
+        refresh(url)
+      }
+      setRequestHeader() {}
+      getAllResponseHeaders() {
+        return 'content-type: application/json'
+      }
+      abort() {}
+      send() {
+        queueMicrotask(() => this.onloadend?.())
+      }
+    }
+  )
+  const failure = await removeOrganizationMember(
+    1,
+    'session-1',
+    removalIntent,
+    new AbortController().signal
+  ).catch((error: unknown) => error)
+  expect(refresh).toHaveBeenCalledWith('/api/user/auth/refresh')
+  expect(failure).toMatchObject({ cancelled: true })
+  expect(calls).toHaveLength(0)
+  assertSafeGraph(failure)
+})
+
+test.each([false, true])(
+  'late DELETE success/rejection=%s is discarded after SID changes',
+  async (reject) => {
+    const gate = defer()
+    let raw: unknown
+    installRemovalHandler(async (config) => {
+      await gate.promise
+      if (reject) {
+        raw = poisonedError(config, 403, 'ORG_FORBIDDEN').raw
+        throw raw
+      }
+      raw = receipt()
+      return response(config, raw)
+    })
+    const operation = removeOrganizationMember(
+      1,
+      'session-1',
+      removalIntent,
+      new AbortController().signal
+    ).catch((error: unknown) => error)
+    await waitFor(() => expect(calls).toHaveLength(1))
+    login(1, 'replacement-sid')
+    gate.resolve()
+    const failure = await operation
+    expect(failure).toMatchObject({ cancelled: true })
+    assertSafeGraph(failure, [raw])
+  }
+)
+
+test('a successful removal on a later page resets to a fresh first page and stable Refresh focus', async () => {
+  let deleted = false
+  installRemovalHandler(async (config) => {
+    deleted = true
+    return response(config, receipt())
+  })
+  const base = handler
+  handler = async (config) => {
+    if (config.url?.endsWith('/members')) {
+      if (deleted) return response(config, members([]))
+      if (config.params.after_id === '0') {
+        return response(config, members(['first-page'], '9007199254741101'))
+      }
+      return response(config, ordinaryPage())
+    }
+    return base(config)
+  }
+  show()
+  const dialog = await openOrganization()
+  await within(dialog).findByText('first-page')
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Next' }))
+  await within(dialog).findByText('ordinary')
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Remove' }))
+  const confirm = await screen.findByRole('alertdialog')
+  await userEvent.click(within(confirm).getByRole('button', { name: 'Remove' }))
+  await within(dialog).findByText('No members to display')
+  expect(
+    [...calls].reverse().find((call) => call.url?.endsWith('/members'))?.params
+      .after_id
+  ).toBe('0')
+  expect(
+    within(dialog).getByRole('button', { name: 'Previous' })
+  ).toHaveAttribute('aria-disabled', 'true')
+  await waitFor(() =>
+    expect(
+      within(dialog).getByRole('button', { name: 'Refresh' })
+    ).toHaveFocus()
+  )
+  expect(
+    client
+      .getQueryCache()
+      .getAll()
+      .some((query) => query.queryKey.includes('9007199254741101'))
+  ).toBe(false)
+})
+
+test('receipt success hides old protected rows while refreshed reads are pending', async () => {
+  const gate = defer()
+  let deleted = false
+  installRemovalHandler(async (config) => {
+    deleted = true
+    return response(config, receipt())
+  })
+  const base = handler
+  handler = async (config) => {
+    if (deleted && config.method !== 'delete' && config.url?.includes(orgId)) {
+      await gate.promise
+    }
+    return base(config)
+  }
+  const confirm = await openRemoval()
+  await userEvent.click(within(confirm).getByRole('button', { name: 'Remove' }))
+  await screen.findByText('Organization member removed')
+  const dialog = screen.getByRole('dialog')
+  await within(dialog).findByText('Loading...')
+  expect(within(dialog).queryByText('ordinary')).not.toBeInTheDocument()
+  expect(
+    within(dialog).queryByText('Fresh organization')
+  ).not.toBeInTheDocument()
+  const refresh = within(dialog).getByRole('button', { name: 'Refresh' })
+  expect(refresh).toHaveAttribute('aria-disabled', 'true')
+  await waitFor(() => expect(refresh).toHaveFocus())
+  expect(client.getMutationCache().getAll()[0].state.status).toBe('success')
+  await act(async () => {
+    gate.resolve()
+  })
+})
+
+test.each(['en', 'zh'] as const)(
+  'confirmation in %s wraps long names and falls back to the target user ID',
+  async (locale) => {
+    if (locale === 'zh') {
+      const zh = await import('@/i18n/locales/zh.json')
+      language.addResourceBundle('zh', 'translation', zh.default.translation)
+    }
+    await language.changeLanguage(locale)
+    const name = '组'.repeat(64)
+    installRemovalHandler()
+    const base = handler
+    handler = async (config) => {
+      if (config.url === `/api/organizations/${orgId}`) {
+        return response(config, detail(orgId, 'owner', name))
+      }
+      if (config.url?.endsWith('/members')) {
+        const page = ordinaryPage()
+        page.data.items[0].username = ''
+        return response(config, page)
+      }
+      return base(config)
+    }
+    show()
+    await userEvent.click(
+      await screen.findByRole('button', {
+        name: language.t('View {{name}}', { name: 'Org A' }),
+      })
+    )
+    const dialog = await screen.findByRole('dialog', {
+      name: language.t('Organization details'),
+    })
+    await within(dialog).findByText(name)
+    await userEvent.click(
+      within(dialog).getByRole('button', { name: language.t('Remove') })
+    )
+    const confirm = await screen.findByRole('alertdialog', {
+      name: language.t('Remove member'),
+    })
+    const targetLabel = language.t('User ID: {{id}}', {
+      id: removalIntent.targetUserId,
+    })
+    const description = within(confirm).getByText(
+      language.t('Remove {{member}} from {{organization}}?', {
+        member: targetLabel,
+        organization: name,
+      })
+    )
+    expect(description.parentElement).toHaveClass('break-all')
+    expect(within(confirm).getByText(targetLabel)).toBeVisible()
+    await userEvent.click(
+      within(confirm).getByRole('button', { name: language.t('Cancel') })
+    )
+    expect(calls.some((call) => call.method === 'delete')).toBe(false)
+  }
+)
+
+test('organization replacement unmounts the old submitted operation without late feedback', async () => {
+  const gate = defer()
+  installRemovalHandler(async (config) => {
+    await gate.promise
+    return response(config, receipt())
+  })
+  const view = renderHook(
+    ({ organization }) => useRemoveMember(1, 'session-1', organization),
+    {
+      initialProps: { organization: orgId },
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    }
+  )
+  let operation: Promise<unknown> | undefined
+  act(() => {
+    operation = view.result.current.remove(selection())
+  })
+  await waitFor(() =>
+    expect(calls.some((call) => call.method === 'delete')).toBe(true)
+  )
+  view.rerender({ organization: secondOrgId })
+  let output: unknown
+  await act(async () => {
+    gate.resolve()
+    output = await operation
+  })
+  expect(output).toBeUndefined()
+  expect(client.getMutationCache().getAll()[0].state.status).toBe('error')
+  assertSafeGraph([cacheStates(), view.result.current])
+})
+
+test('closing details during preflight aborts the intent and preserves the existing directory focus fallback', async () => {
+  installRemovalHandler()
+  const confirm = await openRemoval()
+  const gate = defer()
+  const base = handler
+  handler = async (config) => {
+    if (config.url?.endsWith('/members')) await gate.promise
+    return base(config)
+  }
+  await userEvent.click(within(confirm).getByRole('button', { name: 'Remove' }))
+  // The explicit confirmation Cancel remains reachable, then details can close.
+  await userEvent.click(within(confirm).getByRole('button', { name: 'Cancel' }))
+  await userEvent.click(
+    within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' })
+  )
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'View Org A' })).toHaveFocus()
+  )
+  await act(async () => {
+    gate.resolve()
+  })
+  expect(calls.some((call) => call.method === 'delete')).toBe(false)
+})
+
+test.each([1, 10])(
+  'global user role %s with only ordinary organization membership has no Remove button',
+  async (globalRole) => {
+    login(1, 'session-1', globalRole)
+    show()
+    const dialog = await openOrganization()
+    await within(dialog).findByText('alice')
+    expect(
+      within(dialog).queryByRole('button', { name: 'Remove' })
+    ).not.toBeInTheDocument()
+  }
+)
+
+test('mixed-case HTTP Retry-After headers retain only their primitive delta', () => {
+  const headers = { 'rEtRy-AfTeR': '12', password: 'password-canary' }
+  const error = projectOrganizationRequestFailure({
+    response: { status: 429, headers },
+  })
+  expect(error.retryAfter).toBe(12)
+  assertSafeGraph(error, [headers])
+})

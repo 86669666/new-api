@@ -16,10 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Dialog } from '@/components/dialog'
 import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
@@ -30,8 +31,18 @@ import {
   getServerErrorMessage,
   getServerErrorStatus,
 } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
-import { getOrganizationDetails, getOrganizationMembers } from './api'
+import {
+  canRemoveOrganizationMember,
+  getOrganizationDetails,
+  getOrganizationMembers,
+  OrganizationRequestFailure,
+  projectOrganizationRequestFailure,
+  type OrganizationDetail,
+  type OrganizationMember,
+} from './api'
+import { useRemoveMember } from './use-remove-member'
 
 type OrganizationDetailsProps = {
   actorId: number
@@ -68,7 +79,132 @@ export function OrganizationDetailsDialog(props: OrganizationDetailsProps) {
 
 function OrganizationDetails(props: OrganizationDetailsProps) {
   const { t } = useTranslation()
+  const client = useQueryClient()
+  const removal = useRemoveMember(props.actorId, props.sid, props.orgId)
+  const refreshButton = useRef<HTMLButtonElement>(null)
+  const mounted = useRef(true)
+  const [selection, setSelection] = useState<{
+    detail: OrganizationDetail
+    member: OrganizationMember
+    afterId: string
+  } | null>(null)
+  const [blocked, setBlocked] = useState(false)
+  const [readFailure, setReadFailure] =
+    useState<OrganizationRequestFailure | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const [cursors, setCursors] = useState(['0'])
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
+
+  function isCurrentView() {
+    const auth = useAuthStore.getState().auth
+    return (
+      mounted.current &&
+      auth.user?.id === props.actorId &&
+      auth.session?.sid === props.sid
+    )
+  }
+
+  function refresh() {
+    setBlocked(false)
+    setReadFailure(null)
+    setNotice(null)
+    void query.refetch()
+  }
+
+  async function refreshAfterWrite() {
+    const detailKey = [
+      'organizations',
+      props.actorId,
+      props.sid,
+      'personal',
+      'detail',
+      props.orgId,
+    ]
+    try {
+      await client.cancelQueries({ queryKey: detailKey })
+      if (!isCurrentView()) return
+      client.removeQueries({ queryKey: detailKey })
+      setCursors(['0'])
+      // fetchQuery explicitly reads page zero even when page zero was already open.
+      const freshRead = client.fetchQuery({
+        queryKey: [...detailKey, '0'],
+        queryFn: async ({ signal }) => {
+          const [detail, members] = await Promise.all([
+            getOrganizationDetails(
+              props.actorId,
+              props.sid,
+              props.orgId,
+              signal
+            ),
+            getOrganizationMembers(
+              props.actorId,
+              props.sid,
+              props.orgId,
+              '0',
+              signal
+            ),
+          ])
+          return { detail, members }
+        },
+        staleTime: 0,
+        gcTime: 0,
+        retry: false,
+        meta: { errorToast: false },
+      })
+      void client.invalidateQueries({
+        queryKey: [
+          'organizations',
+          props.actorId,
+          props.sid,
+          'personal',
+          'directory',
+        ],
+      })
+      await freshRead
+      if (isCurrentView()) setBlocked(false)
+    } catch (error) {
+      if (isCurrentView()) {
+        setReadFailure(projectOrganizationRequestFailure(error))
+      }
+    }
+  }
+
+  async function confirmRemoval() {
+    if (!selection) return
+    const result = await removal.remove(selection)
+    if (!result || !isCurrentView()) return
+    setSelection(null)
+    setBlocked(true)
+    if (result.kind === 'success') {
+      setNotice('Organization member removed')
+      // This GET work is outside mutationFn and all mutation lifecycle callbacks.
+      void refreshAfterWrite()
+    } else {
+      setNotice(
+        result.unconfirmed
+          ? 'The result could not be confirmed. Refresh the organization before trying again.'
+          : result.error.message
+      )
+    }
+    if (refreshButton.current?.isConnected) refreshButton.current.focus()
+  }
+
+  function closeConfirmation() {
+    const invoked = removal.cancel()
+    setSelection(null)
+    if (invoked) {
+      setBlocked(true)
+      setNotice(
+        'The result could not be confirmed. Refresh the organization before trying again.'
+      )
+    }
+    if (refreshButton.current?.isConnected) refreshButton.current.focus()
+  }
   const afterId = cursors.at(-1) ?? '0'
   const query = useQuery({
     queryKey: [
@@ -99,25 +235,28 @@ function OrganizationDetails(props: OrganizationDetailsProps) {
     refetchOnWindowFocus: 'always',
     meta: { errorToast: false },
   })
-  const data = query.isFetching || query.isError ? undefined : query.data
+  const data =
+    blocked || query.isFetching || query.isError ? undefined : query.data
   const roles = {
     owner: t('Organization owner'),
     admin: t('Organization administrator'),
     member: t('Organization member'),
   }
+  let readErrorMessage: string | undefined
+  if (query.error instanceof OrganizationRequestFailure) {
+    readErrorMessage = t(query.error.message)
+  } else if (getServerErrorStatus(query.error)) {
+    readErrorMessage = getServerErrorMessage(query.error)
+  }
   let content
   if (query.isFetching || query.isPending) {
     content = <LoadingState />
-  } else if (query.isError || !query.data) {
+  } else if (blocked || query.isError || !query.data) {
     content = (
       <ErrorState
         title={t('Unable to load organization')}
-        description={
-          getServerErrorStatus(query.error)
-            ? getServerErrorMessage(query.error)
-            : undefined
-        }
-        onRetry={() => void query.refetch()}
+        description={readFailure ? t(readFailure.message) : readErrorMessage}
+        onRetry={refresh}
       />
     )
   } else {
@@ -137,7 +276,29 @@ function OrganizationDetails(props: OrganizationDetailsProps) {
               ) : (
                 <span className='text-muted-foreground text-sm'>—</span>
               )}
-              <Badge variant='secondary'>{roles[member.role]}</Badge>
+              <div className='flex flex-wrap items-center gap-2'>
+                <Badge variant='secondary'>{roles[member.role]}</Badge>
+                {canRemoveOrganizationMember(
+                  props.actorId,
+                  query.data.detail,
+                  member
+                ) && (
+                  <Button
+                    variant='destructive'
+                    size='sm'
+                    disabled={removal.pending}
+                    onClick={() =>
+                      setSelection({
+                        detail: query.data.detail,
+                        member,
+                        afterId,
+                      })
+                    }
+                  >
+                    {t('Remove')}
+                  </Button>
+                )}
+              </div>
             </li>
           ))}
         </ul>
@@ -145,6 +306,11 @@ function OrganizationDetails(props: OrganizationDetailsProps) {
   }
   return (
     <div className='space-y-4' aria-busy={query.isFetching} aria-live='polite'>
+      {notice && (
+        <p role='status' className='break-words'>
+          {t(notice)}
+        </p>
+      )}
       {data && (
         <div className='flex min-w-0 flex-wrap items-center justify-between gap-2'>
           <h3 className='min-w-0 font-medium break-all'>{data.detail.name}</h3>
@@ -158,8 +324,9 @@ function OrganizationDetails(props: OrganizationDetailsProps) {
           size='sm'
           className='data-disabled:opacity-50'
           focusableWhenDisabled
-          disabled={query.isFetching}
-          onClick={() => void query.refetch()}
+          ref={refreshButton}
+          disabled={query.isFetching || removal.pending}
+          onClick={refresh}
         >
           {t('Refresh')}
         </Button>
@@ -190,6 +357,37 @@ function OrganizationDetails(props: OrganizationDetailsProps) {
           {t('Next')}
         </Button>
       </div>
+      <ConfirmDialog
+        open={selection !== null}
+        onOpenChange={(open) => {
+          if (!open) closeConfirmation()
+        }}
+        title={t('Remove member')}
+        desc={
+          selection ? (
+            <div className='space-y-2 break-all'>
+              <p>
+                {t('Remove {{member}} from {{organization}}?', {
+                  member:
+                    selection.member.username ||
+                    t('User ID: {{id}}', { id: selection.member.user_id }),
+                  organization: selection.detail.name,
+                })}
+              </p>
+              <p>{t('User ID: {{id}}', { id: selection.member.user_id })}</p>
+              <p>{t('This member will lose access to the organization.')}</p>
+            </div>
+          ) : (
+            ''
+          )
+        }
+        confirmText={t('Remove')}
+        destructive
+        disabled={removal.pending}
+        handleConfirm={() => void confirmRemoval()}
+      >
+        {removal.pending && <LoadingState />}
+      </ConfirmDialog>
     </div>
   )
 }
