@@ -354,6 +354,7 @@ func migrateDB() error {
 		&OrganizationWalletEntry{},
 		&UserSession{},
 		&SessionRevocationEvent{},
+		&OAuthDerivedTextCharge{},
 		&AuthFlow{},
 		&ExternalIdentityClaim{},
 		&PasskeyCredential{},
