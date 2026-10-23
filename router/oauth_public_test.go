@@ -1389,7 +1389,7 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 	const issuer = "https://gateway.example/"
 	const callback = "https://client.example/cb"
 	diagnostics := []string{"error_description", "error_hint", "error_debug"}
-	redirects := []string{callback}
+	redirects := []string{callback, "http://127.0.0.1:29873/oauth/callback", "cherrystudio://oauth/callback"}
 	for _, key := range diagnostics {
 		redirects = append(redirects, callback+"?"+key+"=registered-context")
 	}
@@ -1485,6 +1485,56 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 		assert.NotContains(t, response.Body.String(), "UPSTREAM-PRIVATE-DIAGNOSTIC")
 		return response
 	}
+	t.Run("loopback_redirect_contract", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, redirect string
+			accepted       bool
+		}{
+			{"different_port", "http://127.0.0.1:39874/oauth/callback", true},
+			{"minimum_port", "http://127.0.0.1:1/oauth/callback", true},
+			{"maximum_port", "http://127.0.0.1:65535/oauth/callback", true},
+			{"legacy_registered_scheme", "cherrystudio://oauth/callback", true},
+			{"localhost", "http://localhost:39874/oauth/callback", false},
+			{"host_suffix", "http://127.0.0.1.evil:39874/oauth/callback", false},
+			{"numeric_host", "http://2130706433:39874/oauth/callback", false},
+			{"https", "https://127.0.0.1:39874/oauth/callback", false},
+			{"path", "http://127.0.0.1:39874/other", false},
+			{"query", "http://127.0.0.1:39874/oauth/callback?x=1", false},
+			{"userinfo", "http://user@127.0.0.1:39874/oauth/callback", false},
+			{"fragment", "http://127.0.0.1:39874/oauth/callback#x", false},
+			{"empty_fragment", "http://127.0.0.1:39874/oauth/callback#", false},
+			{"missing_port", "http://127.0.0.1/oauth/callback", false},
+			{"zero_port", "http://127.0.0.1:0/oauth/callback", false},
+			{"over_port", "http://127.0.0.1:65536/oauth/callback", false},
+			{"nonnumeric_port", "http://127.0.0.1:x/oauth/callback", false},
+			{"ipv6_unregistered", "http://[::1]:39874/oauth/callback", false},
+			{"ipv6_zone", "http://[::1%25lo]:39874/oauth/callback", false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				before := authCalls.Load()
+				response := serve(t, tc.redirect, "loopback-contract-state", nil)
+				forwardedCount := authCalls.Load() - before
+				if forwardedCount > 0 {
+					<-forwarded
+				}
+				if !tc.accepted {
+					assert.Equal(t, http.StatusBadRequest, response.Code)
+					assert.Zero(t, forwardedCount, "invalid redirect must not reach issuer")
+					assert.Empty(t, response.Header().Get("Location"))
+					return
+				}
+				require.Equal(t, http.StatusSeeOther, response.Code)
+				assert.EqualValues(t, 1, forwardedCount)
+				target, err := url.Parse(response.Header().Get("Location"))
+				require.NoError(t, err)
+				requested, err := url.Parse(tc.redirect)
+				require.NoError(t, err)
+				assert.Equal(t, requested.Host, target.Host)
+				assert.Equal(t, requested.Path, target.Path)
+				assert.Equal(t, "loopback-contract-state", target.Query().Get("state"))
+			})
+		}
+	})
 	t.Run("cookie_headers", func(t *testing.T) {
 		allowed := "__Host-newapi_oauth_login_csrf_1=login"
 		second := "__Host-newapi_oauth_consent_csrf_2=consent"
