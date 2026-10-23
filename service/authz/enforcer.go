@@ -12,8 +12,9 @@ import (
 )
 
 var (
-	enforcerMu sync.RWMutex
-	enforcer   *casbin.SyncedEnforcer
+	enforcerMu  sync.RWMutex
+	enforcer    *casbin.SyncedEnforcer
+	policyReady bool
 )
 
 const modelText = `
@@ -52,6 +53,7 @@ func Init(db *gorm.DB) error {
 
 	enforcerMu.Lock()
 	enforcer = e
+	policyReady = true
 	enforcerMu.Unlock()
 
 	if !common.IsMasterNode {
@@ -63,6 +65,9 @@ func Init(db *gorm.DB) error {
 func currentEnforcer() *casbin.SyncedEnforcer {
 	enforcerMu.RLock()
 	defer enforcerMu.RUnlock()
+	if !policyReady {
+		return nil
+	}
 	return enforcer
 }
 
@@ -72,7 +77,12 @@ func ReloadPolicy() error {
 	if enforcer == nil {
 		return fmt.Errorf("authz enforcer is not initialized")
 	}
-	return enforcer.LoadPolicy()
+	policyReady = false
+	if err := enforcer.LoadPolicy(); err != nil {
+		return err
+	}
+	policyReady = true
+	return nil
 }
 
 // StartPolicySync periodically reloads the authorization policy from the database.

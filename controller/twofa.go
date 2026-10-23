@@ -134,7 +134,7 @@ func RegenerateBackupCodes(c *gin.Context) {
 
 	// 保存新的备用码并原子推进用户鉴权版本
 	if err := model.ReplaceBackupCodesForSession(identity, backupCodes); err != nil {
-		common.ApiErrorT(c, "Failed to save backup codes")
+		writeSecurityOperationError(c, err)
 		common.SysLog(common.LogText("failed to save backup codes: %s", err.Error()))
 		return
 	}
@@ -208,10 +208,6 @@ func AdminDisable2FA(c *gin.Context) {
 			common.ApiErrorT(c, "Two-factor authentication is not enabled.")
 			return
 		}
-		writeSecurityOperationError(c, err)
-		return
-	}
-	if _, err := model.RevokeAllUserSessions(userId, "admin_twofa_disabled"); err != nil {
 		writeSecurityOperationError(c, err)
 		return
 	}

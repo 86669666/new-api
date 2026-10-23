@@ -284,7 +284,11 @@ func upsertPasskeyCredentialWithAuthVersion(credential *PasskeyCredential, ident
 	}
 	passkeyOptionMutex.Lock()
 	defer passkeyOptionMutex.Unlock()
+	var event *SessionRevocationEvent
 	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, credential.UserID); err != nil {
+			return err
+		}
 		if identity != nil && (credential.RPID == nil || *credential.RPID == "") {
 			return system_setting.ErrPasskeyRPIDUnavailable
 		}
@@ -301,14 +305,20 @@ func upsertPasskeyCredentialWithAuthVersion(credential *PasskeyCredential, ident
 				return err
 			}
 		}
-		if _, err := IncrementUserAuthVersionWithTx(tx, credential.UserID); err != nil {
+		if _, receipt, err := AdvanceUserSecurityWithTx(tx, credential.UserID, identity); err != nil {
 			return err
+		} else {
+			event = receipt
 		}
 		return upsertPasskeyCredentialWithTx(tx, credential)
 	}); err != nil {
 		return err
 	}
-	return PublishUserAuthCache(credential.UserID)
+	cacheErr := PublishUserAuthCache(credential.UserID)
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
+		return err
+	}
+	return cacheErr
 }
 
 func DeletePasskeyByUserIDWithAuthVersion(userID int) error {
@@ -323,7 +333,11 @@ func deletePasskeyWithAuthVersion(userID int, identity *AuthSessionIdentity) err
 	if userID == 0 {
 		return errors.New("failed to delete the Passkey, please try again")
 	}
+	var event *SessionRevocationEvent
 	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userID); err != nil {
+			return err
+		}
 		if identity != nil {
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
 				return err
@@ -336,8 +350,10 @@ func deletePasskeyWithAuthVersion(userID int, identity *AuthSessionIdentity) err
 			}
 			return err
 		}
-		if _, err := IncrementUserAuthVersionWithTx(tx, userID); err != nil {
+		if _, receipt, err := AdvanceUserSecurityWithTx(tx, userID, identity); err != nil {
 			return err
+		} else {
+			event = receipt
 		}
 		result := tx.Unscoped().Delete(&credential)
 		if result.Error != nil {
@@ -350,5 +366,9 @@ func deletePasskeyWithAuthVersion(userID int, identity *AuthSessionIdentity) err
 	}); err != nil {
 		return err
 	}
-	return PublishUserAuthCache(userID)
+	cacheErr := PublishUserAuthCache(userID)
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
+		return err
+	}
+	return cacheErr
 }

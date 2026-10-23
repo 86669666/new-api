@@ -71,21 +71,6 @@ func createLoginSession(userID int, expectedAuthVersion int64, loginMethod, ip, 
 	if expectedAuthVersion > 0 && user.AuthVersion != expectedAuthVersion {
 		return nil, ErrLoginSessionRevoked
 	}
-	now := time.Now().Unix()
-	activeCount, err := model.CountActiveUserSessions(userID, now)
-	if err != nil {
-		return nil, err
-	}
-	if activeCount >= int64(common.UserSessionActiveLimit) {
-		return nil, model.ErrUserSessionLimit
-	}
-	issuanceCount, err := model.CountUserSessionsCreatedSince(userID, now-common.UserSessionIssuanceWindowSeconds)
-	if err != nil {
-		return nil, err
-	}
-	if issuanceCount >= int64(common.UserSessionIssuanceLimit) {
-		return nil, model.ErrUserSessionIssuanceLimit
-	}
 	session, refreshSecret, err := newLoginSession(userID, user.AuthVersion, loginMethod, ip, userAgent)
 	if err != nil {
 		return nil, err
@@ -187,7 +172,7 @@ func ValidateSessionReference(userID int, sid string) (AuthIdentity, error) {
 // security-setting mutation that did not already advance AuthVersion. When the
 // change was made through an access token it returns a nil bundle.
 func AdvanceCurrentSessionSecurity(identity AuthIdentity, reason string) (*AuthBundle, error) {
-	nextUserAuthVersion, err := model.BumpUserAuthVersion(identity.UserID)
+	nextUserAuthVersion, err := model.BumpUserAuthVersionForSession(identity)
 	if err != nil {
 		return nil, err
 	}
@@ -198,11 +183,11 @@ func AdvanceCurrentSessionSecurity(identity AuthIdentity, reason string) (*AuthB
 // AuthVersion increment were committed in the same transaction (for example,
 // a password change).
 func AdvanceCurrentSessionToUserVersion(identity AuthIdentity, reason string) (*AuthBundle, error) {
-	user, err := model.GetUserCache(identity.UserID)
+	user, err := model.GetUserById(identity.UserID, false)
 	if err != nil {
 		return nil, err
 	}
-	if user.Status != common.UserStatusEnabled || user.AuthVersion <= identity.UserAuthVersion {
+	if user.Status != common.UserStatusEnabled || user.AuthVersion <= identity.UserAuthVersion || user.AuthVersion-identity.UserAuthVersion != 1 {
 		return nil, ErrLoginSessionRevoked
 	}
 	return advanceCurrentSessionToVersion(identity, user.AuthVersion, reason)
@@ -212,8 +197,7 @@ func advanceCurrentSessionToVersion(identity AuthIdentity, nextUserAuthVersion i
 	// An access token has no browser session to keep, so every browser session
 	// signs in again at the new auth version. The token itself stays valid.
 	if _, ok := model.ParseAccessTokenSessionID(identity.SessionID); ok {
-		_, err := model.RevokeAllUserSessions(identity.UserID, reason)
-		return nil, err
+		return nil, nil
 	}
 	session, err := model.AdvanceUserSessionAuthVersion(
 		identity.UserID,
@@ -223,9 +207,6 @@ func advanceCurrentSessionToVersion(identity AuthIdentity, nextUserAuthVersion i
 		nextUserAuthVersion,
 	)
 	if err != nil {
-		return nil, err
-	}
-	if _, err := model.RevokeOtherUserSessions(identity.UserID, identity.SessionID, reason); err != nil {
 		return nil, err
 	}
 	return issueAuthBundle(session, "", true)
@@ -462,6 +443,8 @@ func truncateAuthMetadata(value string, max int) string {
 
 func authSessionErrorCode(err error) (int, string) {
 	switch {
+	case errors.Is(err, model.ErrSessionRevocationPending):
+		return http.StatusServiceUnavailable, "AUTH_SESSION_REVOCATION_PENDING"
 	case errors.Is(err, model.ErrUserSessionLimit):
 		return http.StatusConflict, "AUTH_SESSION_LIMIT"
 	case errors.Is(err, model.ErrUserSessionIssuanceLimit):

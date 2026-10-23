@@ -164,7 +164,11 @@ func ReplaceBackupCodesForSession(identity AuthSessionIdentity, codes []string) 
 }
 
 func replaceBackupCodesWithAuthVersion(userId int, codes []string, identity *AuthSessionIdentity) error {
+	var event *SessionRevocationEvent
 	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userId); err != nil {
+			return err
+		}
 		if identity != nil {
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
 				return err
@@ -179,14 +183,20 @@ func replaceBackupCodesWithAuthVersion(userId int, codes []string, identity *Aut
 			}
 			return err
 		}
-		if _, err := IncrementUserAuthVersionWithTx(tx, userId); err != nil {
+		if _, receipt, err := AdvanceUserSecurityWithTx(tx, userId, identity); err != nil {
 			return err
+		} else {
+			event = receipt
 		}
 		return replaceBackupCodesWithTx(tx, userId, codes)
 	}); err != nil {
 		return err
 	}
-	return PublishUserAuthCache(userId)
+	cacheErr := PublishUserAuthCache(userId)
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
+		return err
+	}
+	return cacheErr
 }
 
 // ValidateBackupCode 验证并使用备用码
@@ -241,7 +251,11 @@ func DisableTwoFAForSession(identity AuthSessionIdentity) error {
 }
 
 func disableTwoFAWithAuthVersion(userId int, identity *AuthSessionIdentity) error {
+	var event *SessionRevocationEvent
 	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userId); err != nil {
+			return err
+		}
 		if identity != nil {
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
 				return err
@@ -256,8 +270,10 @@ func disableTwoFAWithAuthVersion(userId int, identity *AuthSessionIdentity) erro
 			}
 			return err
 		}
-		if _, err := IncrementUserAuthVersionWithTx(tx, userId); err != nil {
+		if _, receipt, err := AdvanceUserSecurityWithTx(tx, userId, identity); err != nil {
 			return err
+		} else {
+			event = receipt
 		}
 		if err := tx.Unscoped().Where("user_id = ?", userId).Delete(&TwoFABackupCode{}).Error; err != nil {
 			return err
@@ -266,7 +282,11 @@ func disableTwoFAWithAuthVersion(userId int, identity *AuthSessionIdentity) erro
 	}); err != nil {
 		return err
 	}
-	return PublishUserAuthCache(userId)
+	cacheErr := PublishUserAuthCache(userId)
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
+		return err
+	}
+	return cacheErr
 }
 
 // ValidateTOTPAndUpdateUsage 验证TOTP并更新使用记录

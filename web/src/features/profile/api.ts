@@ -16,10 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { api } from '@/lib/api'
+import { accountOperation } from '@/features/security/account-operation-error'
+import { api, type ApiRequestConfig } from '@/lib/api'
 import type { CustomOAuthBinding } from '@/lib/oauth'
 import { authRequestOptions, authResult } from '@/lib/secure-verification'
-import type { LoginSession } from '@/stores/auth-store'
+import { useAuthStore, type LoginSession } from '@/stores/auth-store'
 
 import { normalizeUserSettings } from './lib/user-settings'
 import type {
@@ -33,6 +34,21 @@ import type {
   EmailBindingFlow,
 } from './types'
 
+const accountResult: typeof authResult = (request, fallback) =>
+  accountOperation(authResult(request, fallback))
+
+function accountActorOptions(signal?: AbortSignal): ApiRequestConfig {
+  const auth = useAuthStore.getState().auth
+  return {
+    ...authRequestOptions,
+    signal,
+    expectedAuthIdentity:
+      auth.user && auth.session
+        ? { userId: auth.user.id, sid: auth.session.sid }
+        : undefined,
+  }
+}
+
 // ============================================================================
 // User Profile APIs
 // ============================================================================
@@ -41,7 +57,9 @@ import type {
  * Get current user profile
  */
 export async function getUserProfile(): Promise<ApiResponse<UserProfile>> {
-  const res = await api.get('/api/user/self')
+  const res = await accountOperation(
+    api.get('/api/user/self', accountActorOptions())
+  )
   return res.data
 }
 
@@ -51,9 +69,12 @@ export async function getUserProfile(): Promise<ApiResponse<UserProfile>> {
 export async function updateUserProfile(
   data: UpdateUserRequest
 ): Promise<ApiResponse> {
-  const res = await api.put('/api/user/self', data, {
-    acceptAuthRotation: Boolean(data.password),
-  })
+  const res = await accountOperation(
+    api.put('/api/user/self', data, {
+      acceptAuthRotation: Boolean(data.password),
+      ...accountActorOptions(),
+    })
+  )
   return res.data
 }
 
@@ -62,13 +83,13 @@ export function changeAccountPassword(
   proofToken: string,
   signal: AbortSignal
 ): Promise<AccountSecurityResult & { has_password: boolean }> {
-  return authResult(
+  return accountResult(
     api.put('/api/user/self', data, {
       ...authRequestOptions,
       headers: { 'X-Security-Proof': proofToken },
       acceptAuthRotation: true,
       singleUseAuthorization: true,
-      signal,
+      ...accountActorOptions(signal),
     })
   )
 }
@@ -79,7 +100,8 @@ export function changeAccountPassword(
 export async function updateUserSettings(
   data: UpdateUserSettingsRequest
 ): Promise<ApiResponse> {
-  const profile = await getUserProfile()
+  const { data: profile } =
+    await api.get<ApiResponse<UserProfile>>('/api/user/self')
   if (!profile.success || !profile.data) {
     return { success: false, message: profile.message }
   }
@@ -105,12 +127,12 @@ export function deleteUserAccount(
   proof: string,
   signal: AbortSignal
 ): Promise<AccountSecurityResult> {
-  return authResult(
+  return accountResult(
     api.delete('/api/user/self', {
       ...authRequestOptions,
       headers: { 'X-Security-Proof': proof },
       singleUseAuthorization: true,
-      signal,
+      ...accountActorOptions(signal),
     }),
     'Failed to delete account'
   )
@@ -143,7 +165,7 @@ export function startEmailBinding(
   proofToken: string,
   signal: AbortSignal
 ): Promise<EmailBindingFlow> {
-  return authResult(
+  return accountResult(
     api.post(
       '/api/oauth/email/bind/start',
       { email },
@@ -151,7 +173,7 @@ export function startEmailBinding(
         ...authRequestOptions,
         headers: { 'X-Security-Proof': proofToken },
         singleUseAuthorization: true,
-        signal,
+        ...accountActorOptions(signal),
       }
     )
   )
@@ -161,14 +183,14 @@ export function resendEmailBinding(
   flowToken: string,
   signal: AbortSignal
 ): Promise<EmailBindingFlow> {
-  return authResult(
+  return accountResult(
     api.post(
       '/api/oauth/email/bind/resend',
       { flow_token: flowToken },
       {
         ...authRequestOptions,
         singleUseAuthorization: true,
-        signal,
+        ...accountActorOptions(signal),
       }
     )
   )
@@ -180,14 +202,14 @@ export function bindEmail(
   oldCode: string,
   signal: AbortSignal
 ): Promise<AccountSecurityResult> {
-  return authResult(
+  return accountResult(
     api.post(
       '/api/oauth/email/bind',
       { flow_token: flowToken, new_code: newCode, old_code: oldCode },
       {
         ...authRequestOptions,
         singleUseAuthorization: true,
-        signal,
+        ...accountActorOptions(signal),
       }
     )
   )
@@ -201,7 +223,7 @@ export function bindWeChat(
   proofToken: string,
   signal: AbortSignal
 ): Promise<AccountSecurityResult> {
-  return authResult(
+  return accountResult(
     api.post(
       '/api/oauth/wechat/bind',
       { code },
@@ -209,7 +231,7 @@ export function bindWeChat(
         ...authRequestOptions,
         headers: { 'X-Security-Proof': proofToken },
         singleUseAuthorization: true,
-        signal,
+        ...accountActorOptions(signal),
       }
     )
   )
@@ -224,7 +246,9 @@ export interface TelegramBindFlow {
 export async function startTelegramBind(): Promise<
   ApiResponse<TelegramBindFlow>
 > {
-  const res = await api.post('/api/oauth/telegram/bind/start')
+  const res = await accountOperation(
+    api.post('/api/oauth/telegram/bind/start', undefined, accountActorOptions())
+  )
   return res.data
 }
 
@@ -232,18 +256,43 @@ export async function startTelegramBind(): Promise<
 // Login Session APIs
 // ============================================================================
 
-export async function getLoginSessions(): Promise<ApiResponse<LoginSession[]>> {
-  const res = await api.get('/api/user/sessions')
+export async function getLoginSessions(
+  signal?: AbortSignal
+): Promise<ApiResponse<LoginSession[]>> {
+  const res = await accountOperation(
+    api.get('/api/user/sessions', accountActorOptions(signal))
+  )
   return res.data
 }
 
-export async function revokeLoginSession(sid: string): Promise<ApiResponse> {
-  const res = await api.delete(`/api/user/sessions/${encodeURIComponent(sid)}`)
+export async function revokeLoginSession(
+  sid: string,
+  proofToken: string | undefined,
+  signal: AbortSignal
+): Promise<ApiResponse> {
+  const res = await accountOperation(
+    api.delete(`/api/user/sessions/${encodeURIComponent(sid)}`, {
+      ...authRequestOptions,
+      ...accountActorOptions(signal),
+      headers: proofToken ? { 'X-Security-Proof': proofToken } : undefined,
+      singleUseAuthorization: true,
+    })
+  )
   return res.data
 }
 
-export async function revokeOtherLoginSessions(): Promise<ApiResponse> {
-  const res = await api.post('/api/user/sessions/revoke-others')
+export async function revokeOtherLoginSessions(
+  proofToken: string,
+  signal: AbortSignal
+): Promise<ApiResponse> {
+  const res = await accountOperation(
+    api.post('/api/user/sessions/revoke-others', undefined, {
+      ...authRequestOptions,
+      ...accountActorOptions(signal),
+      headers: { 'X-Security-Proof': proofToken },
+      singleUseAuthorization: true,
+    })
+  )
   return res.data
 }
 
@@ -257,7 +306,9 @@ export async function revokeOtherLoginSessions(): Promise<ApiResponse> {
 export async function getSelfOAuthBindings(): Promise<
   ApiResponse<CustomOAuthBinding[]>
 > {
-  const res = await api.get('/api/user/oauth/bindings')
+  const res = await accountOperation(
+    api.get('/api/user/oauth/bindings', accountActorOptions())
+  )
   return res.data
 }
 
@@ -269,12 +320,12 @@ export function unbindCustomOAuth(
   proofToken: string,
   signal: AbortSignal
 ): Promise<AccountSecurityResult> {
-  return authResult(
+  return accountResult(
     api.delete(`/api/user/oauth/bindings/${providerId}`, {
       ...authRequestOptions,
       headers: { 'X-Security-Proof': proofToken },
       singleUseAuthorization: true,
-      signal,
+      ...accountActorOptions(signal),
     })
   )
 }

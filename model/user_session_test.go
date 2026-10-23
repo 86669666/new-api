@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,7 +43,7 @@ func (setMiniRedisTimeOnEvalHook) AfterProcessPipeline(context.Context, []redis.
 
 func setupUserSessionTest(t *testing.T) {
 	t.Helper()
-	require.NoError(t, DB.AutoMigrate(&User{}, &UserSession{}))
+	require.NoError(t, DB.AutoMigrate(&User{}, &UserSession{}, &SessionRevocationEvent{}))
 	require.NoError(t, DB.Exec("DELETE FROM user_sessions").Error)
 	oldRedisEnabled := common.RedisEnabled
 	oldActiveLimit := common.UserSessionActiveLimit
@@ -345,7 +346,11 @@ func TestRevokeOtherUserSessionsKeepsCurrent(t *testing.T) {
 	for _, sid := range []string{"current-session", "other-one", "other-two"} {
 		session := newTestUserSession(sid, 1003, now)
 		if sid == "other-one" {
+			// A historical active row can carry another auth version. New admission
+			// correctly rejects it, so seed this legacy residual directly.
 			session.UserAuthVersion = 99
+			require.NoError(t, DB.Create(session).Error)
+			continue
 		}
 		require.NoError(t, CreateUserSession(session))
 	}
@@ -460,42 +465,43 @@ func TestRevokeUserSessionsReturnsCumulativeProgressAndSupportsRetry(t *testing.
 	setupUserSessionTest(t)
 	now := time.Now().Unix()
 	createUserSessionTestUser(t, 1008, 1)
-	rows := make([]UserSession, 0, userSessionRevokeBatchSize+1)
-	for i := range userSessionRevokeBatchSize + 1 {
-		rows = append(rows, *newTestUserSession(fmt.Sprintf("batch-revoke-%03d", i), 1008, now))
+	rows := make([]UserSession, 501)
+	for i := range rows {
+		rows[i] = *newTestUserSession(fmt.Sprintf("batch-revoke-%03d", i), 1008, now)
 	}
 	require.NoError(t, DB.CreateInBatches(rows, 100).Error)
-
-	forcedErr := errors.New("forced second revoke batch failure")
-	callbackName := "test:fail_second_user_session_revoke_batch"
-	updateCalls := 0
-	callbackRegistered := true
+	var event *SessionRevocationEvent
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		event, err = StartSessionRevocationWithTx(tx, 1008, "", "session_revoked")
+		return err
+	}))
+	first, err := RunSessionRevocationBatch(t.Context(), *event)
+	require.NoError(t, err)
+	require.Equal(t, "pending", first.State)
+	require.Equal(t, int64(500), first.AffectedCount)
+	forcedErr := errors.New("forced next event batch failure")
+	callbackName := "test:fail_next_session_event_batch"
 	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
 		if tx.Statement != nil && tx.Statement.Table == "user_sessions" {
-			updateCalls++
-			if updateCalls == 2 {
-				tx.AddError(forcedErr)
-			}
+			tx.AddError(forcedErr)
 		}
 	}))
-	t.Cleanup(func() {
-		if callbackRegistered {
-			_ = DB.Callback().Update().Remove(callbackName)
-		}
-	})
-
-	affected, err := RevokeAllUserSessions(1008, "batch-test")
-	assert.ErrorIs(t, err, forcedErr)
-	assert.Equal(t, int64(userSessionRevokeBatchSize), affected)
+	t.Cleanup(func() { _ = DB.Callback().Update().Remove(callbackName) })
+	_, err = RunSessionRevocationBatch(t.Context(), *first)
+	require.ErrorIs(t, err, forcedErr)
+	var unchanged SessionRevocationEvent
+	require.NoError(t, DB.Where("event_ref = ?", first.EventRef).First(&unchanged).Error)
+	assert.Equal(t, first.Revision, unchanged.Revision)
+	assert.Equal(t, int64(500), unchanged.AffectedCount)
 	require.NoError(t, DB.Callback().Update().Remove(callbackName))
-	callbackRegistered = false
-
-	retried, err := RevokeAllUserSessions(1008, "batch-test-retry")
+	completed, err := RunSessionRevocationBatch(t.Context(), unchanged)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), retried)
-	var activeCount int64
-	require.NoError(t, DB.Model(&UserSession{}).Where("user_id = ? AND status = ?", 1008, UserSessionStatusActive).Count(&activeCount).Error)
-	assert.Zero(t, activeCount)
+	assert.Equal(t, "local_complete", completed.State)
+	assert.Equal(t, int64(501), completed.AffectedCount)
+	var active int64
+	require.NoError(t, DB.Model(&UserSession{}).Where("user_id = ? AND status = ?", 1008, UserSessionStatusActive).Count(&active).Error)
+	assert.Zero(t, active)
 }
 
 func TestDeleteExpiredUserSessionsLoopsInChunksAndRechecksPredicate(t *testing.T) {
@@ -629,27 +635,151 @@ func TestUserUpdateBumpsAuthVersionOnlyForAuthorizationChanges(t *testing.T) {
 }
 
 func TestPasswordResetBumpsAuthVersionAndRevokesSessions(t *testing.T) {
-	setupUserSessionTest(t)
-	now := time.Now().Unix()
-	user := &User{
-		Username: "password-reset-user",
-		Password: "old-hash",
-		Email:    "password-reset@example.com",
-		Role:     common.RoleCommonUser,
-		Status:   common.UserStatusEnabled,
-		Group:    "default",
-	}
-	require.NoError(t, DB.Create(user).Error)
-	t.Cleanup(func() { _ = DB.Unscoped().Delete(&User{}, user.Id).Error })
-	session := newTestUserSession("password-reset-session", user.Id, now)
-	require.NoError(t, CreateUserSession(session))
+	for _, source := range []string{"trusted", "recovery_flow"} {
+		t.Run(source, func(t *testing.T) {
+			setupUserSessionTest(t)
+			user := &User{
+				Username: "password-reset-user", Password: "old-hash", Email: "password-reset@example.com",
+				Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default",
+			}
+			require.NoError(t, DB.Create(user).Error)
+			t.Cleanup(func() { _ = DB.Unscoped().Delete(&User{}, user.Id).Error })
+			session := newTestUserSession("password-reset-session", user.Id, time.Now().Unix())
+			require.NoError(t, CreateUserSession(session))
 
-	require.NoError(t, ResetUserPasswordByEmail(user.Email, "new-password"))
-	var stored User
-	require.NoError(t, DB.First(&stored, user.Id).Error)
-	assert.Equal(t, int64(2), stored.AuthVersion)
-	storedSession, err := GetUserSessionBySID(session.SID)
-	require.NoError(t, err)
-	assert.Equal(t, UserSessionStatusRevoked, storedSession.Status)
-	assert.Equal(t, "password_reset", storedSession.RevokedReason)
+			if source == "recovery_flow" {
+				token, err := CreatePasswordResetFlow(user.Id, user.Email)
+				require.NoError(t, err)
+				require.NoError(t, ResetUserPasswordWithFlow(t.Context(), user.Email, token, "new-password"))
+			} else {
+				require.NoError(t, ResetUserPasswordByEmail(user.Email, "new-password"))
+			}
+			var stored User
+			require.NoError(t, DB.First(&stored, user.Id).Error)
+			assert.Equal(t, int64(2), stored.AuthVersion)
+			assert.True(t, common.ValidatePasswordAndHash("new-password", stored.Password))
+			storedSession, err := GetUserSessionBySID(session.SID)
+			require.NoError(t, err)
+			assert.Equal(t, UserSessionStatusRevoked, storedSession.Status)
+			assert.Equal(t, "password_reset", storedSession.RevokedReason)
+		})
+	}
+}
+
+func TestSecurityRevocationReasonsPreserveInvalidation(t *testing.T) {
+	for _, reason := range []string{"password_reset", "admin_demote"} {
+		for _, retainedSID := range []string{"", "current"} {
+			t.Run(reason+"/retained="+retainedSID, func(t *testing.T) {
+				db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+				require.NoError(t, err)
+				sqlDB, err := db.DB()
+				require.NoError(t, err)
+				sqlDB.SetMaxOpenConns(1)
+				oldDB, oldLogDB, oldCleanupDB := DB, LOG_DB, oauthCleanupDB.Load()
+				DB, LOG_DB = db, db
+				t.Cleanup(func() {
+					DB, LOG_DB = oldDB, oldLogDB
+					oauthCleanupDB.Store(oldCleanupDB)
+					require.NoError(t, sqlDB.Close())
+				})
+				setupUserSessionTest(t)
+				require.NoError(t, db.AutoMigrate(&OAuthGrant{}, &OAuthOperation{}, &OAuthArtifact{}, &OAuthCleanupJob{}))
+				require.NoError(t, InitOAuthCleanupStore(true))
+				server := useUserCacheMiniRedis(t)
+				createUserSessionTestUser(t, 5101, 1)
+				createUserSessionTestUser(t, 5102, 1)
+				var user User
+				require.NoError(t, db.First(&user, 5101).Error)
+				require.NoError(t, populateUserCache(user))
+				stale := *user.ToBaseUser()
+				now := time.Now().Unix()
+				for _, sid := range []string{"current", "other", "foreign"} {
+					userID := 5101
+					if sid == "foreign" {
+						userID = 5102
+					}
+					require.NoError(t, CreateUserSession(newTestUserSession(sid, userID, now)))
+					grant := OAuthGrant{
+						GrantRef: OAuthGrantRef("https://issuer.example", sid), ConsentRef: OAuthGrantRef("https://issuer.example", "consent-"+sid),
+						GrantID: sid, Issuer: "https://issuer.example", ClientID: "test-client", Subject: fmt.Sprint(userID), UserID: userID,
+						OriginSID: sid, SessionVersion: 1, UserAuthVersion: 1, Scopes: "openid", PolicyHash: strings.Repeat("a", 64),
+						ConsentRequestID: "consent-" + sid, HydraLoginSessionID: "login-" + sid, State: "active", Revision: 1,
+						CreatedAt: now, ApprovedAt: now, ExpiresAt: now + 3600,
+					}
+					require.NoError(t, db.Create(&grant).Error)
+					require.NoError(t, db.Create(&OAuthOperation{
+						OperationRef: OAuthGrantRef("https://issuer.example", "op-"+sid), Issuer: grant.Issuer, UserID: userID,
+						ClientID: grant.ClientID, OriginSID: sid, GrantRef: grant.GrantRef, AuthVersion: 1, SessionVersion: 1,
+						GrantRevision: 1, Kind: "token", State: "reserved", CreatedAt: now,
+					}).Error)
+				}
+				var event *SessionRevocationEvent
+				require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+					if _, err := incrementUserAuthVersionWithTx(tx, user.Id); err != nil {
+						return err
+					}
+					var err error
+					event, err = StartSessionRevocationWithTx(tx, user.Id, retainedSID, reason)
+					return err
+				}))
+				// OAuth sources include the retained browser's grant, even when
+				// only the other local browser sessions are in this event's range.
+				var grants []OAuthGrant
+				require.NoError(t, db.Find(&grants).Error)
+				require.Len(t, grants, 3)
+				for _, grant := range grants {
+					if grant.UserID == user.Id {
+						assert.Equal(t, "revoked", grant.State)
+						assert.Equal(t, "session_revoked", grant.RevokedReason)
+						assert.Positive(t, grant.RevokedAt)
+					} else {
+						assert.Equal(t, "active", grant.State)
+						assert.Zero(t, grant.RevokedAt)
+					}
+				}
+				var operations []OAuthOperation
+				require.NoError(t, db.Find(&operations).Error)
+				require.Len(t, operations, 3)
+				for _, operation := range operations {
+					want := "cancelled"
+					if operation.UserID != user.Id {
+						want = "reserved"
+					}
+					assert.Equal(t, want, operation.State)
+				}
+				var job OAuthCleanupJob
+				require.NoError(t, db.Where("source_session_event_ref = ?", event.EventRef).First(&job).Error)
+				assert.Equal(t, "user", job.Scope)
+				assert.Empty(t, job.Value)
+				assert.Equal(t, "session_revoked", job.Reason)
+				// Model recovery after the producer's temporary fence expires.
+				// The worker must still prevent an arbitrarily delayed old cache fill.
+				server.FastForward(time.Duration(userAuthFenceTTLSeconds()+1) * time.Second)
+				require.NoError(t, CompleteSessionSecurityChange(event, true))
+				assert.Equal(t, "local_complete", event.State)
+				assert.Equal(t, reason, event.Reason)
+				assert.ErrorIs(t, writeUserCache(&stale, true), ErrUserAuthCachePending)
+				cached, err := GetUserCache(user.Id)
+				require.NoError(t, err)
+				assert.EqualValues(t, 2, cached.AuthVersion)
+				var sessions []UserSession
+				require.NoError(t, db.Order("sid").Find(&sessions).Error)
+				require.Len(t, sessions, 3)
+				var affected int64
+				for _, session := range sessions {
+					if session.UserID == user.Id && session.SID != retainedSID {
+						affected++
+						assert.Equal(t, UserSessionStatusRevoked, session.Status)
+						assert.Equal(t, reason, session.RevokedReason)
+						assert.Positive(t, session.RevokedAt)
+					} else {
+						assert.Equal(t, UserSessionStatusActive, session.Status)
+						assert.Empty(t, session.RevokedReason)
+						assert.Zero(t, session.RevokedAt)
+					}
+				}
+				assert.Equal(t, affected, event.AffectedCount)
+			})
+		}
+	}
 }

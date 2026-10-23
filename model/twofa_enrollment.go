@@ -72,6 +72,7 @@ func EnableTwoFAEnrollment(identity AuthSessionIdentity, token, code string) err
 	if err != nil {
 		return ErrTwoFACodeInvalid
 	}
+	var event *SessionRevocationEvent
 	var verificationError error
 	_, err = ConsumeAuthFlowWithAction(token, AuthFlowMatch{
 		Purpose: AuthFlowPurposeTwoFASetup, UserId: identity.UserID, SessionId: identity.SessionID,
@@ -127,8 +128,10 @@ func EnableTwoFAEnrollment(identity AuthSessionIdentity, token, code string) err
 			// Keep the challenge retryable while committing bounded factor failures.
 			return tx.Model(flow).Update("consumed_at", nil).Error
 		}
-		if _, err := IncrementUserAuthVersionWithTx(tx, identity.UserID); err != nil {
+		if _, receipt, err := AdvanceUserSecurityWithTx(tx, identity.UserID, &identity); err != nil {
 			return err
+		} else {
+			event = receipt
 		}
 		return tx.Model(&pending).Updates(map[string]any{"is_enabled": true, "failed_attempts": 0, "locked_until": nil}).Error
 	})
@@ -141,5 +144,9 @@ func EnableTwoFAEnrollment(identity AuthSessionIdentity, token, code string) err
 	if verificationError != nil {
 		return verificationError
 	}
-	return PublishUserAuthCache(identity.UserID)
+	cacheErr := PublishUserAuthCache(identity.UserID)
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
+		return err
+	}
+	return cacheErr
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
@@ -174,9 +175,12 @@ return 1`
 // fence, then persists the version in the caller's transaction. Unscoped is
 // intentional so the same fail-closed path also covers hard deletion of an
 // already soft-deleted user.
-func IncrementUserAuthVersionWithTx(tx *gorm.DB, userId int) (int64, error) {
+func incrementUserAuthVersionWithTx(tx *gorm.DB, userId int) (int64, error) {
 	if tx == nil || userId <= 0 {
 		return 0, fmt.Errorf("invalid user auth version update")
+	}
+	if err := LockOAuthUser(tx, userId); err != nil {
+		return 0, err
 	}
 	for range 3 {
 		var user User
@@ -195,30 +199,83 @@ func IncrementUserAuthVersionWithTx(tx *gorm.DB, userId int) (int64, error) {
 			return 0, result.Error
 		}
 		if result.RowsAffected == 1 {
-			if err := RevokeOAuthWithTx(tx, userId, "user", "", "security_changed"); err != nil {
-				return 0, err
-			}
 			return next, nil
 		}
 	}
 	return 0, ErrUserAuthVersionConflict
 }
 
+// IncrementUserAuthVersionWithTx preserves the legacy return signature while
+// persisting an all-sessions security intent. Synchronous business callers use
+// AdvanceUserSecurityWithTx and retain its exact event receipt instead.
+func IncrementUserAuthVersionWithTx(tx *gorm.DB, userID int) (int64, error) {
+	next, _, err := AdvanceUserSecurityWithTx(tx, userID, nil)
+	return next, err
+}
+
+// AdvanceUserSecurityWithTx pairs the credential version update and durable
+// revocation intent. retained identifies the already authorized browser only;
+// PAT identities deliberately retain no browser session. Caller commits both
+// this receipt and its credential/factor mutation in one business transaction.
+// The optional server-owned reason preserves existing reset/demotion reporting.
+func AdvanceUserSecurityWithTx(tx *gorm.DB, userID int, retained *AuthSessionIdentity, revocationReason ...string) (int64, *SessionRevocationEvent, error) {
+	if len(revocationReason) > 1 {
+		return 0, nil, ErrUserSessionInvalid
+	}
+	reason := "security_changed"
+	if len(revocationReason) == 1 {
+		reason = revocationReason[0]
+	}
+	if !slices.Contains([]string{"security_changed", "password_reset", "admin_demote"}, reason) {
+		return 0, nil, ErrUserSessionInvalid
+	}
+	if err := LockOAuthUser(tx, userID); err != nil {
+		return 0, nil, err
+	}
+	excluded := ""
+	if retained != nil {
+		if retained.UserID != userID {
+			return 0, nil, ErrUserSessionInactive
+		}
+		if err := ValidateAuthSessionWithTx(tx, *retained); err != nil {
+			return 0, nil, err
+		}
+		if _, pat := ParseAccessTokenSessionID(retained.SessionID); !pat {
+			excluded = retained.SessionID
+		}
+	}
+	next, err := incrementUserAuthVersionWithTx(tx, userID)
+	if err != nil {
+		return 0, nil, err
+	}
+	event, err := StartSessionRevocationWithTx(tx, userID, excluded, reason)
+	return next, event, err
+}
+
 // BumpUserAuthVersion is the transaction-owning variant used by password,
 // role, status and security-factor changes outside another transaction.
 func BumpUserAuthVersion(userId int) (int64, error) {
+	return bumpUserSecurityVersion(userId, nil)
+}
+
+func BumpUserAuthVersionForSession(identity AuthSessionIdentity) (int64, error) {
+	return bumpUserSecurityVersion(identity.UserID, &identity)
+}
+
+func bumpUserSecurityVersion(userID int, identity *AuthSessionIdentity) (int64, error) {
 	var next int64
+	var event *SessionRevocationEvent
 	if err := DB.Transaction(func(tx *gorm.DB) error {
 		var err error
-		next, err = IncrementUserAuthVersionWithTx(tx, userId)
+		next, event, err = AdvanceUserSecurityWithTx(tx, userID, identity)
 		return err
 	}); err != nil {
 		return 0, err
 	}
-	if err := PublishUserAuthCache(userId); err != nil {
+	if err := CompleteSessionSecurityChange(event, true); err != nil {
 		return next, err
 	}
-	return next, nil
+	return next, PublishUserAuthCache(userID)
 }
 
 // PublishUserAuthCache refreshes the current database state after a successful

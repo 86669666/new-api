@@ -347,7 +347,13 @@ func InitResources() error {
 		}
 	}
 	model.InitOptionMap()
+	if err := model.ValidateSessionOAuthHistoryBeforeMigration(); err != nil {
+		return err
+	}
 	if err := service.InitOAuthGrantStore(); err != nil {
+		return err
+	}
+	if err := model.ValidateSessionRevocationStore(); err != nil {
 		return err
 	}
 	if err := service.ValidateOAuthPublicTopology(context.Background()); err != nil {

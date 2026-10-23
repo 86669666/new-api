@@ -209,12 +209,68 @@ func TestOrganizationFixtureDSNBoundary(t *testing.T) {
 	}
 }
 
+func combinedFixtureBound(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("NEWAPI_COMBINED_RUN_ID") == "" {
+		return false
+	}
+	require.Equal(t, "g2-root-combined-matrix-01", os.Getenv("NEWAPI_COMBINED_OWNER"))
+	require.Regexp(t, `^[a-f0-9]{32}$`, os.Getenv("NEWAPI_COMBINED_RUN_ID"))
+	require.Regexp(t, `^[a-z][a-z0-9_]+$`, os.Getenv("NEWAPI_COMBINED_PHASE"))
+	return true
+}
+
+// Only fixed non-secret observations cross the reviewed test2json boundary.
+func combinedFixtureEvent(t *testing.T, event string, observation map[string]any) {
+	t.Helper()
+	if !combinedFixtureBound(t) {
+		return
+	}
+	data, err := common.Marshal(map[string]any{
+		"protocol": "combined-resource-events-v1", "run_id": os.Getenv("NEWAPI_COMBINED_RUN_ID"),
+		"owner": os.Getenv("NEWAPI_COMBINED_OWNER"), "phase": os.Getenv("NEWAPI_COMBINED_PHASE"),
+		"event": event, "observation": observation,
+	})
+	require.NoError(t, err)
+	t.Logf("NEWAPI_COMBINED %s", data)
+}
+
+func combinedFixtureDatabase(t *testing.T, channel string, db *gorm.DB) {
+	t.Helper()
+	if !combinedFixtureBound(t) {
+		return
+	}
+	kind := db.Dialector.Name()
+	query := "SELECT current_database()"
+	var identity, version string
+	if kind == "sqlite" {
+		var databases []struct{ Name, File string }
+		require.NoError(t, db.Raw("PRAGMA database_list").Scan(&databases).Error)
+		for _, database := range databases {
+			if database.Name == "main" {
+				identity = database.File
+			}
+		}
+		query = "SELECT sqlite_version()"
+	} else {
+		if kind == "mysql" {
+			query = "SELECT DATABASE()"
+		}
+		require.NoError(t, db.Raw(query).Scan(&identity).Error)
+		query = "SELECT version()"
+	}
+	require.NoError(t, db.Raw(query).Scan(&version).Error)
+	require.NotEmpty(t, identity)
+	combinedFixtureEvent(t, "database", map[string]any{"channel": channel, "engine": kind, "identity": identity, "version": version})
+}
+
 // A dedicated database is created with a collision-failing name and is dropped
 // only by the cleanup registered after that successful CREATE. SQLite is a real file.
 func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	t.Helper()
+	combined := combinedFixtureBound(t)
 	owner := os.Getenv("NEWAPI_S2_OWNED")
-	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver", "g19-tools-search", "g20-token-error-codes", "g20-token-usage", "g21-w02-clickhouse", "g20-quota-remaining-display", "g21-organization-create-rate", "g1-W03-08-client-stats", "g1-W03-09-client-config"}, owner)
+	boundedSuite := slices.Contains([]string{"g10-organization-identity", "g10-organization-task-read", "g11-organization-invitation-presentation", "g12-organization-task-batch", "g13-organization-task-export", "g14-organization-task-list-revocation", "g15-organization-task-funding-isolation", "g16-organization-capabilities", "g17-organization-wallet", "g18-site-description", "g19-organization-name-uniqueness", "g19-model-capability-metadata", "g19-oauth-userinfo", "g19-oauth-provider-bridge", "g19-client-events-receiver", "g19-tools-search", "g20-token-error-codes", "g20-token-usage", "g21-w02-clickhouse", "g20-quota-remaining-display", "g21-organization-create-rate", "g1-W03-08-client-stats", "g1-W03-09-client-config", "g2-root-combined-matrix-01"}, owner)
 	if boundedSuite {
 		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
 		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
@@ -224,12 +280,36 @@ func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	}
 	config := &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)}
 	if kind == "sqlite" {
-		p := filepath.Join(t.TempDir(), "organization.db")
+		var p string
+		p2a := owner == "g2-root-combined-matrix-01" && os.Getenv("NEWAPI_P2A_EVIDENCE_DIR") != ""
+		if p2a && !combined {
+			t.Cleanup(func() {
+				_, err := os.Stat(p)
+				require.True(t, os.IsNotExist(err), "owned SQLite file must be absent after fixture cleanup")
+				organizationP2AResourceReceipt(t, "sqlite", p, "dropped")
+			})
+		}
+		p = filepath.Join(t.TempDir(), "organization.db")
 		db, err := gorm.Open(sqlite.Open(p), config)
 		require.NoError(t, err)
 		conn, err := db.DB()
 		require.NoError(t, err)
+		if combined {
+			t.Cleanup(func() {
+				require.NoError(t, os.Remove(p), "only the successfully created exact SQLite file is removed")
+				_, err := os.Stat(p)
+				require.True(t, os.IsNotExist(err))
+				combinedFixtureEvent(t, "removed", map[string]any{"kind": "sqlite", "identity": p})
+				if p2a {
+					organizationP2AResourceReceipt(t, "sqlite", p, "dropped")
+				}
+			})
+		}
 		t.Cleanup(func() { require.NoError(t, conn.Close()) })
+		combinedFixtureEvent(t, "created", map[string]any{"kind": "sqlite", "identity": p})
+		if owner == "g2-root-combined-matrix-01" && os.Getenv("NEWAPI_P2A_EVIDENCE_DIR") != "" {
+			organizationP2AResourceReceipt(t, "sqlite", p, "created")
+		}
 		t.Log("SQLite fixture: temporary file")
 		return db, p
 	}
@@ -278,8 +358,34 @@ func organizationTestDB(t *testing.T, kind, source string) (*gorm.DB, string) {
 	ac, err := admin.DB()
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, ac.Close()) })
+	created := false
+	if combined || owner == "g2-root-combined-matrix-01" && os.Getenv("NEWAPI_P2A_EVIDENCE_DIR") != "" {
+		// Registered before CREATE/DROP: never inspect an uncreated name, and
+		// LIFO cleanup verifies absence after DROP but before admin close.
+		t.Cleanup(func() {
+			if !created {
+				return
+			}
+			query := "SELECT count(*) FROM information_schema.schemata WHERE schema_name = ?"
+			if kind == "postgres" {
+				query = "SELECT count(*) FROM pg_database WHERE datname = ?"
+			}
+			var remaining int64
+			require.NoError(t, admin.Raw(query, name).Scan(&remaining).Error)
+			require.Zero(t, remaining, "the exact created database must be absent")
+			combinedFixtureEvent(t, "removed", map[string]any{"kind": "database", "identity": name})
+			if os.Getenv("NEWAPI_P2A_EVIDENCE_DIR") != "" {
+				organizationP2AResourceReceipt(t, kind, name, "dropped")
+			}
+		})
+	}
 	require.NoError(t, admin.Exec("CREATE DATABASE "+name).Error)
+	created = true
 	t.Cleanup(func() { require.NoError(t, admin.Exec("DROP DATABASE "+name).Error) })
+	combinedFixtureEvent(t, "created", map[string]any{"kind": "database", "identity": name})
+	if owner == "g2-root-combined-matrix-01" && os.Getenv("NEWAPI_P2A_EVIDENCE_DIR") != "" {
+		organizationP2AResourceReceipt(t, kind, name, "created")
+	}
 	db, err := gorm.Open(testDial, config)
 	require.NoError(t, err)
 	conn, err := db.DB()
@@ -343,7 +449,7 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 	db, mainDSN := organizationTestDB(t, kind, os.Getenv("NEWAPI_S2_MAIN_DSN"))
 	model.DB = db
 	common.SetDatabaseTypes(common.DatabaseType(kind), common.DatabaseType(kind))
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}))
 	t.Setenv("LOG_SQL_DSN", "")
 	require.NoError(t, model.InitLogDB())
 	logKind := os.Getenv("NEWAPI_S2_LOG")
@@ -375,6 +481,11 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 		require.NoError(t, conn.Raw(q).Scan(&version).Error)
 		t.Logf("%s engine=%s version=%s", label, conn.Dialector.Name(), version)
 	}
+	channel := "main"
+	if target := os.Getenv("NEWAPI_W01_MAIN_KIND"); target != "" && target != kind {
+		channel = "bootstrap"
+	}
+	combinedFixtureDatabase(t, channel, db)
 	if os.Getenv("NEWAPI_S2_CACHE_MODE") == "redis" {
 		socket := os.Getenv("NEWAPI_S2_REDIS_SOCKET")
 		root := os.Getenv("NEWAPI_S2_RUN_ROOT")
@@ -5592,4 +5703,318 @@ func TestToolsSearchRelayHTTP(t *testing.T) {
 		assert.Equal(t, int64(1), sc.calls.Load())
 		expectAccounting(t, 0, before, 375, 1, 375)
 	})
+}
+
+// Export is explicitly opt-in. Normal go test needs no controller files.
+func organizationP2AWrite(t *testing.T, name string, value any) {
+	t.Helper()
+	dir := os.Getenv("NEWAPI_P2A_EVIDENCE_DIR")
+	if dir == "" {
+		return
+	}
+	require.Equal(t, "g2-root-combined-matrix-01", os.Getenv("NEWAPI_S2_OWNED"))
+	require.Regexp(t, `^[a-f0-9]{32}$`, os.Getenv("NEWAPI_P2A_RUN_ID"))
+	require.True(t, filepath.IsAbs(dir))
+	info, err := os.Lstat(dir)
+	require.NoError(t, err)
+	require.True(t, info.IsDir() && info.Mode().Perm() == 0700)
+	require.Equal(t, filepath.Base(name), name)
+	encoded, err := common.Marshal(value)
+	require.NoError(t, err)
+	file, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	require.NoError(t, err)
+	_, err = file.Write(encoded)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+}
+
+func organizationP2AResourceReceipt(t *testing.T, kind, name, state string) {
+	t.Helper()
+	organizationP2AWrite(t, "resource-"+state+".json", map[string]any{
+		"engine": kind, "name": name, "state": state,
+		"run_id": os.Getenv("NEWAPI_P2A_RUN_ID"),
+	})
+}
+
+// Production SetRouter, password Login, JWT middleware and organization transactions.
+// This is an API fixture, not a browser or a factor/proof acceptance test.
+func TestOrganizationMemberRemoveP2AHTTP(t *testing.T) {
+	require.Equal(t, 64, strconv.IntSize, "large user IDs require a 64-bit server")
+	f := newOrganizationHTTPFixture(t)
+	require.NoError(t, f.db.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}))
+	oldLogin, oldEncryption, oldTurnstile := common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled, common.TurnstileCheckEnabled
+	common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled, common.TurnstileCheckEnabled = true, false, false
+	t.Cleanup(func() {
+		common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled, common.TurnstileCheckEnabled = oldLogin, oldEncryption, oldTurnstile
+	})
+	const revision int64 = 9007199254740993
+	targetUserID := int64(9007199254741993)
+	const memberID int64 = 9007199254742993
+	target := model.User{Id: int(targetUserID), Username: "p2a-target", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "p2a-target"}
+	require.NoError(t, f.db.Create(&target).Error)
+	targetRow := model.OrganizationMember{ID: memberID, OrganizationID: f.orgA, UserID: target.Id, Role: model.OrganizationRoleMember, Revision: revision, JoinedAt: 1}
+	require.NoError(t, f.db.Create(&targetRow).Error)
+	org := strconv.FormatInt(f.orgA, 10)
+	path := "/api/organizations/" + org
+	password, err := common.GenerateRandomCharsKey(32)
+	require.NoError(t, err)
+	hash, err := common.Password2Hash(password)
+	require.NoError(t, err)
+	private := []string{password, hash}
+	for _, actor := range []string{"owner", "admin"} {
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users[actor].Id).Update("password", hash).Error)
+	}
+	patSecret, err := common.GenerateRandomCharsKey(43)
+	require.NoError(t, err)
+	pat := model.AccessTokenPrefix + patSecret
+	patRow := &model.UserAccessToken{Name: "p2a-session-boundary", TokenHash: model.AccessTokenFingerprint(pat), TokenHint: model.AccessTokenHint(pat)}
+	require.NoError(t, patRow.SetScopes([]string{"*"}))
+	require.NoError(t, model.CreateUserAccessToken(f.users["owner"].Id, patRow, service.AccessTokenMaxPerUser))
+	f.bearer["pat"] = pat
+	private = append(private, pat)
+
+	sequence := 0
+	request := func(t *testing.T, label, operation, actor, targetID, submitted string, headers http.Header) (int, map[string]any) {
+		t.Helper()
+		method, endpoint, body := http.MethodGet, path, ""
+		switch operation {
+		case "delete":
+			require.Empty(t, headers.Values("X-Security-Proof"))
+			require.Empty(t, headers.Values("Idempotency-Key"))
+			method, endpoint = http.MethodDelete, path+"/members/"+targetID
+			encoded, err := common.Marshal(map[string]string{"revision": submitted})
+			require.NoError(t, err)
+			body = string(encoded)
+		case "members":
+			endpoint += "/members?after_id=0&limit=20"
+		case "directory":
+			endpoint = "/api/organizations?after_id=0&limit=20"
+		}
+		status, h, b := f.request(t, method, endpoint, actor, body, headers)
+		// Only consumed response DTO fields are captured, never the response object.
+		project := func(source map[string]any, fields ...string) map[string]any {
+			out := map[string]any{}
+			for _, key := range fields {
+				if value, ok := source[key]; ok {
+					out[key] = value
+				}
+			}
+			return out
+		}
+		safe := project(b, "success", "code")
+		if data, ok := b["data"].(map[string]any); ok {
+			switch operation {
+			case "delete":
+				safe["data"] = project(data, "organization_id", "revision", "action", "event_id", "object_kind", "object_id", "generation", "status")
+			case "detail":
+				safe["data"] = project(data, "org_id", "name", "my_role", "revision", "my_member_revision")
+			case "members", "directory":
+				page := project(data, "limit", "next_after_id")
+				items := []any{}
+				for _, row := range data["items"].([]any) {
+					item, ok := row.(map[string]any)
+					require.True(t, ok)
+					if operation == "members" {
+						items = append(items, project(item, "member_id", "user_id", "username", "role", "revision"))
+					} else {
+						items = append(items, project(item, "org_id", "name", "my_role"))
+					}
+				}
+				page["items"] = items
+				safe["data"] = page
+			}
+		}
+		capture := map[string]any{"sequence": sequence, "label": label, "operation": operation, "engine": f.mainKind, "run_id": os.Getenv("NEWAPI_P2A_RUN_ID"), "organization_id": org, "member_id": strconv.FormatInt(memberID, 10), "target_user_id": targetID, "submitted_revision": submitted, "status": status, "content_type": h.Get("Content-Type"), "cache_control": h.Get("Cache-Control"), "body": safe}
+		encoded, err := common.Marshal(capture)
+		require.NoError(t, err)
+		for _, secret := range append(private, slices.Collect(maps.Values(f.bearer))...) {
+			require.False(t, secret != "" && strings.Contains(string(encoded), secret), "credential must not enter captured HTTP evidence")
+		}
+		for _, sid := range f.sids {
+			require.False(t, strings.Contains(string(encoded), sid), "session identity must not enter captured HTTP evidence")
+		}
+		organizationP2AWrite(t, fmt.Sprintf("response-%03d.json", sequence), capture)
+		sequence++
+		assert.Contains(t, h.Get("Content-Type"), "application/json")
+		assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+		assert.Empty(t, h.Values("Set-Cookie"))
+		return status, b
+	}
+	reset := func(t *testing.T) {
+		t.Helper()
+		require.NoError(t, f.db.Model(&model.Organization{}).Where("id = ?", f.orgA).Updates(map[string]any{"revision": revision, "self_disabled_at": 0, "platform_disabled_at": 0}).Error)
+		require.NoError(t, f.db.Model(&targetRow).Updates(map[string]any{"role": "member", "removed_at": 0, "revision": revision}).Error)
+		for _, actor := range []string{"owner", "admin"} {
+			require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users[actor].Id).Update("status", common.UserStatusEnabled).Error)
+			role := "member"
+			if actor == "admin" {
+				role = "admin"
+			}
+			require.NoError(t, f.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, f.users[actor].Id).Updates(map[string]any{"role": role, "removed_at": 0, "revision": revision}).Error)
+			require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids[actor]).Updates(map[string]any{"status": model.UserSessionStatusActive, "revoked_at": 0, "expires_at": time.Now().Unix() + 3600}).Error)
+		}
+	}
+	headers := http.Header{"Content-Type": {"application/json"}}
+	for _, actor := range []string{"owner", "admin"} {
+		t.Run(actor+"_password_login_delete", func(t *testing.T) {
+			reset(t)
+			encoded, err := common.Marshal(map[string]string{"username": f.users[actor].Username, "password": password})
+			require.NoError(t, err)
+			status, _, login := f.request(t, http.MethodPost, "/api/user/login", "", string(encoded), headers)
+			require.Equal(t, 200, status)
+			require.Equal(t, true, login["success"], "password login producer must succeed without a test auth bypass")
+			data, ok := login["data"].(map[string]any)
+			require.True(t, ok)
+			token, tokenOK := data["access_token"].(string)
+			require.True(t, tokenOK && token != "", "password producer must return a JWT")
+			session, sessionOK := data["session"].(map[string]any)
+			require.True(t, sessionOK)
+			sid, sidOK := session["sid"].(string)
+			require.True(t, sidOK && sid != "")
+			var persisted model.UserSession
+			require.NoError(t, f.db.Where("sid = ? AND user_id = ?", sid, f.users[actor].Id).Take(&persisted).Error)
+			assert.Equal(t, "password", persisted.LoginMethod)
+			assert.Equal(t, model.UserSessionStatusActive, persisted.Status)
+			assert.LessOrEqual(t, int64(f.users[actor].Id), int64(9007199254740991))
+			f.bearer[actor], f.sids[actor] = token, sid
+			s, b := request(t, actor+"_detail_before", "detail", actor, "", "", nil)
+			require.Equal(t, 200, s)
+			assert.Equal(t, actor, b["data"].(map[string]any)["my_role"])
+			assert.Equal(t, org, b["data"].(map[string]any)["org_id"])
+			assert.Equal(t, strconv.FormatInt(revision, 10), b["data"].(map[string]any)["revision"])
+			s, b = request(t, actor+"_members_before", "members", actor, "", "", nil)
+			require.Equal(t, 200, s)
+			targetID, rev := strconv.Itoa(target.Id), strconv.FormatInt(revision, 10)
+			found := false
+			for _, value := range b["data"].(map[string]any)["items"].([]any) {
+				row := value.(map[string]any)
+				if row["user_id"] == targetID {
+					found = true
+					assert.Equal(t, strconv.FormatInt(memberID, 10), row["member_id"])
+					assert.Equal(t, rev, row["revision"])
+				}
+			}
+			require.True(t, found, "GET must retain the exact large target/member string IDs")
+			s, b = request(t, actor+"_delete", "delete", actor, targetID, rev, headers)
+			require.Equal(t, 200, s)
+			require.Equal(t, true, b["success"])
+			receipt, ok := b["data"].(map[string]any)
+			require.True(t, ok)
+			assert.Len(t, receipt, 8)
+			assert.Equal(t, org, receipt["organization_id"])
+			assert.Equal(t, "remove", receipt["action"])
+			assert.Equal(t, "member", receipt["object_kind"])
+			assert.Equal(t, strconv.FormatInt(memberID, 10), receipt["object_id"])
+			assert.NotEqual(t, targetID, receipt["object_id"])
+			assert.Nil(t, receipt["generation"])
+			assert.Nil(t, receipt["status"])
+			for _, key := range []string{"revision", "event_id"} {
+				wire, ok := receipt[key].(string)
+				require.True(t, ok)
+				n, err := strconv.ParseInt(wire, 10, 64)
+				require.NoError(t, err)
+				assert.Equal(t, strconv.FormatInt(n, 10), wire)
+				assert.Positive(t, n)
+				if key == "revision" {
+					assert.Greater(t, n, revision)
+				}
+			}
+			var event model.OrganizationEvent
+			require.NoError(t, f.db.Where("id = ?", receipt["event_id"]).Take(&event).Error)
+			assert.Equal(t, memberID, event.ObjectID)
+			assert.Equal(t, target.Id, event.SubjectUserID)
+			assert.Equal(t, "member.remove", event.Action)
+			assert.Equal(t, revision+1, event.OrganizationRevision)
+			var removed model.OrganizationMember
+			require.NoError(t, f.db.First(&removed, memberID).Error)
+			assert.Positive(t, removed.RemovedAt)
+			assert.Equal(t, revision+1, removed.Revision)
+			s, b = request(t, actor+"_members_after", "members", actor, "", "", nil)
+			require.Equal(t, 200, s)
+			for _, item := range b["data"].(map[string]any)["items"].([]any) {
+				assert.NotEqual(t, targetID, item.(map[string]any)["user_id"])
+			}
+			s, b = request(t, actor+"_detail_after", "detail", actor, "", "", nil)
+			require.Equal(t, 200, s)
+			assert.Equal(t, receipt["revision"], b["data"].(map[string]any)["revision"])
+			s, _ = request(t, actor+"_directory_after", "directory", actor, "", "", nil)
+			require.Equal(t, 200, s)
+			s, b = request(t, actor+"_old_delete_replay", "delete", actor, targetID, rev, headers)
+			assert.Equal(t, 404, s)
+			assert.Equal(t, "ORG_NOT_FOUND", b["code"])
+		})
+	}
+	cases := []struct {
+		name, actor, target, change string
+		status                      int
+		code                        string
+	}{
+		{"ordinary_actor", "member", "target", "", 403, "ORG_FORBIDDEN"},
+		{"foreign_actor", "foreign", "target", "", 404, "ORG_NOT_FOUND"},
+		{"root_outsider", "root", "target", "", 404, "ORG_NOT_FOUND"},
+		{"no_session", "", "target", "", 401, "AUTH_UNAUTHORIZED"},
+		{"pat", "pat", "target", "", 403, "AUTH_SESSION_REQUIRED"},
+		{"self", "admin", "admin", "", 403, "ORG_FORBIDDEN"},
+		{"owner_target", "admin", "owner", "", 403, "ORG_FORBIDDEN"},
+		{"admin_target", "owner", "admin", "", 403, "SECURITY_PROOF_REQUIRED"},
+		{"actor_demoted", "admin", "target", "demoted", 403, "ORG_FORBIDDEN"},
+		{"target_promoted", "owner", "target", "promoted", 403, "SECURITY_PROOF_REQUIRED"},
+		{"old_revision", "owner", "target", "stale", 409, "ORG_STATE_CHANGED"},
+		{"removed_actor", "admin", "target", "removed", 404, "ORG_NOT_FOUND"},
+		{"disabled_actor", "admin", "target", "disabled", 401, "AUTH_SESSION_REVOKED"},
+		{"expired_source_session", "admin", "target", "expired", 401, "AUTH_SESSION_REVOKED"},
+		{"revoked_source_session", "admin", "target", "revoked", 401, "AUTH_SESSION_REVOKED"},
+		{"disabled_organization", "owner", "target", "organization_disabled", 409, "ORG_DISABLED"},
+		{"missing_target", "owner", "missing", "", 404, "ORG_NOT_FOUND"},
+		{"cross_site", "owner", "target", "cross_site", 403, "AUTH_ORIGIN_FORBIDDEN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reset(t)
+			rev := strconv.FormatInt(revision, 10)
+			targetID := strconv.Itoa(target.Id)
+			if tc.target == "missing" {
+				targetID = "9007199254741999"
+			} else if tc.target != "target" {
+				targetID = strconv.Itoa(f.users[tc.target].Id)
+			}
+			h := headers.Clone()
+			switch tc.change {
+			case "demoted":
+				require.NoError(t, f.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, f.users["admin"].Id).Updates(map[string]any{"role": "member", "revision": revision + 1}).Error)
+			case "promoted":
+				require.NoError(t, f.db.Model(&targetRow).Update("role", "admin").Error)
+			case "stale":
+				rev = strconv.FormatInt(revision-1, 10)
+			case "removed":
+				require.NoError(t, f.db.Model(&model.OrganizationMember{}).Where("organization_id = ? AND user_id = ?", f.orgA, f.users["admin"].Id).Update("removed_at", time.Now().Unix()).Error)
+			case "disabled":
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["admin"].Id).Update("status", common.UserStatusDisabled).Error)
+			case "expired":
+				require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["admin"]).Update("expires_at", time.Now().Unix()-1).Error)
+			case "revoked":
+				_, err := model.RevokeUserSession(f.users["admin"].Id, f.sids["admin"], "p2a-fixture")
+				require.NoError(t, err)
+			case "organization_disabled":
+				require.NoError(t, f.db.Model(&model.Organization{}).Where("id = ?", f.orgA).Update("self_disabled_at", 1).Error)
+			case "cross_site":
+				h.Set("Origin", "https://foreign.invalid")
+				h.Set("Sec-Fetch-Site", "cross-site")
+			}
+			var eventsBefore, eventsAfter int64
+			require.NoError(t, f.db.Model(&model.OrganizationEvent{}).Where("organization_id = ?", f.orgA).Count(&eventsBefore).Error)
+			status, body := request(t, tc.name, "delete", tc.actor, targetID, rev, h)
+			assert.Equal(t, tc.status, status)
+			assert.Equal(t, tc.code, body["code"])
+			assert.Equal(t, false, body["success"])
+			require.NoError(t, f.db.Model(&model.OrganizationEvent{}).Where("organization_id = ?", f.orgA).Count(&eventsAfter).Error)
+			assert.Equal(t, eventsBefore, eventsAfter, "denial must not commit a member event")
+			var row model.OrganizationMember
+			require.NoError(t, f.db.First(&row, memberID).Error)
+			assert.Zero(t, row.RemovedAt, "denial must not remove the ordinary target")
+			var organization model.Organization
+			require.NoError(t, f.db.First(&organization, f.orgA).Error)
+			assert.Equal(t, revision, organization.Revision)
+		})
+	}
 }

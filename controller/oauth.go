@@ -369,26 +369,37 @@ func handleOAuthBind(c *gin.Context, providerName string, provider oauth.Provide
 		common.ApiErrorT(c, "This {{provider}} account has already been bound", providerParams(provider.GetName()))
 		return false, false
 	}
+	var event *model.SessionRevocationEvent
 	_, err = model.ConsumeAuthFlowWithAction(state, match, func(tx *gorm.DB, _ *model.AuthFlow) error {
+		var err error
 		if providerName == "telegram" {
-			return model.BindTelegramForSessionWithTx(tx, identity, oauthUser.ProviderUserID)
+			event, err = model.BindTelegramForSessionWithTx(tx, identity, oauthUser.ProviderUserID)
+		} else if custom, ok := provider.(*oauth.GenericOAuthProvider); ok {
+			event, err = model.UpdateUserOAuthBindingForSessionWithTx(tx, identity, custom.GetProviderId(), oauthUser.ProviderUserID)
+		} else {
+			event, err = model.UpdateUserBindColumnForSessionWithTx(tx, identity, provider.ProviderUserIDColumn(), oauthUser.ProviderUserID)
 		}
-		if custom, ok := provider.(*oauth.GenericOAuthProvider); ok {
-			return model.UpdateUserOAuthBindingForSessionWithTx(tx, identity, custom.GetProviderId(), oauthUser.ProviderUserID)
-		}
-		return model.UpdateUserBindColumnForSessionWithTx(tx, identity, provider.ProviderUserIDColumn(), oauthUser.ProviderUserID)
+		return err
 	})
 	if err != nil {
 		writeSecurityOperationError(c, err)
 		return false, false
 	}
+	bundle, err := service.CompleteAccountBinding(identity, event)
+	if err != nil {
+		writeSecurityOperationError(c, err)
+		return false, false
+	}
+
 	user, err := model.GetUserById(identity.UserID, false)
 	if err != nil {
 		writeSecurityOperationError(c, err)
 		return true, true
 	}
 	notificationFailed := service.NotifyAccountSecurityChange(user.Email, "Login account linked: "+provider.GetName()) != nil
-	common.ApiSuccessT(c, "Binding successful", gin.H{"action": "bind", "notification_warning": notificationFailed})
+	data := authRotationData(bundle)
+	data["action"], data["notification_warning"] = "bind", notificationFailed
+	common.ApiSuccessT(c, "Binding successful", data)
 	return true, notificationFailed
 }
 

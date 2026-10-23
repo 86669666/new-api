@@ -452,7 +452,7 @@ func GetAffCode(c *gin.Context) {
 	if user.AffCode == "" {
 		user.AffCode = common.GetRandomString(4)
 		if err := user.Update(false); err != nil {
-			common.ApiError(c, err)
+			writeSessionMutationError(c, err)
 			return
 		}
 	}
@@ -708,20 +708,17 @@ func UpdateUser(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	// Authorization publication and credential-cache invalidation must run even
+	// when the credential's durable revocation remains pending. ReloadPolicy
+	// fences a failed snapshot so valid PATs cannot keep the previous allow.
+	var policyErr error
 	if authzTouched {
-		if err := authz.ReloadPolicy(); err != nil {
-			common.ApiError(c, err)
-			return
-		}
+		policyErr = authz.ReloadPolicy()
 	}
-	if updatedUser.AuthVersion > originUser.AuthVersion {
-		if _, err := model.RevokeAllUserSessions(updatedUser.Id, "admin_user_update"); err != nil {
-			common.ApiError(c, err)
-			return
-		}
-	}
-	if err := model.PublishUserAuthCache(updatedUser.Id); err != nil {
-		common.ApiError(c, err)
+	revocationErr := updatedUser.CompleteSessionRevocation()
+	cacheErr := model.PublishUserAuthCache(updatedUser.Id)
+	if err := errors.Join(policyErr, revocationErr, cacheErr); err != nil {
+		writeSecurityOperationError(c, err)
 		return
 	}
 	recordManageAuditFor(c, updatedUser.Id, "user.update", auditParams)
@@ -762,7 +759,7 @@ func AdminClearUserBinding(c *gin.Context) {
 	}
 
 	if err := user.ClearBinding(bindingType); err != nil {
-		common.ApiError(c, err)
+		writeSecurityOperationError(c, err)
 		return
 	}
 
@@ -917,7 +914,7 @@ func UpdateSelf(c *gin.Context) {
 		return
 	}
 	if err := cleanUser.Update(false); err != nil {
-		common.ApiError(c, err)
+		writeSessionMutationError(c, err)
 		return
 	}
 
@@ -947,7 +944,7 @@ func DeleteUser(c *gin.Context) {
 	}
 	revokedAccessTokens, err := model.HardDeleteUserById(id)
 	if err != nil {
-		common.ApiError(c, err)
+		writeSessionMutationError(c, err)
 		return
 	}
 	recordManageAuditFor(c, originUser.Id, "user.delete", map[string]any{
@@ -1135,7 +1132,7 @@ func ManageUser(c *gin.Context) {
 		}
 		revokedAccessTokens, err := user.Delete()
 		if err != nil {
-			common.ApiError(c, err)
+			writeSessionMutationError(c, err)
 			return
 		}
 		// 删除用户后，强制清理 Redis 中所有该用户令牌的缓存，
@@ -1186,12 +1183,16 @@ func ManageUser(c *gin.Context) {
 	}
 	if req.Action == "demote" {
 		if err := model.DB.Transaction(func(tx *gorm.DB) error {
-			if err := user.UpdateWithTx(tx, false); err != nil {
+			if err := user.UpdateWithTx(tx, false, "admin_demote"); err != nil {
 				return err
 			}
 			return authz.ClearUserAuthorizationInTx(tx, user.Id)
 		}); err != nil {
 			common.ApiError(c, err)
+			return
+		}
+		if err := user.CompleteSessionRevocation(); err != nil {
+			writeSecurityOperationError(c, err)
 			return
 		}
 		if err := authz.ReloadPolicy(); err != nil {
@@ -1202,13 +1203,9 @@ func ManageUser(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
-		if _, err := model.RevokeAllUserSessions(user.Id, "admin_demote"); err != nil {
-			common.ApiError(c, err)
-			return
-		}
 	} else {
 		if err := user.Update(false); err != nil {
-			common.ApiError(c, err)
+			writeSessionMutationError(c, err)
 			return
 		}
 	}

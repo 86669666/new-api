@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +89,9 @@ func TestWriteAuthSessionErrorMapsSessionGrowthLimits(t *testing.T) {
 			expectedStatus: http.StatusTooManyRequests,
 			expectedCode:   "AUTH_SESSION_ISSUANCE_LIMIT",
 		},
+		{name: "committed mutation pending", err: &model.SessionRevocationPendingError{EventRef: strings.Repeat("e", 64), UserID: 41, Revision: 2, AffectedCount: 7, CredentialChangeCommitted: true, ProgressKnown: true}, expectedStatus: http.StatusServiceUnavailable, expectedCode: "AUTH_SESSION_REVOCATION_PENDING"},
+		{name: "commit progress unknown", err: &model.SessionRevocationPendingError{EventRef: strings.Repeat("f", 64), UserID: 41, Revision: 1, CredentialChangeCommitted: true}, expectedStatus: http.StatusServiceUnavailable, expectedCode: "AUTH_SESSION_REVOCATION_PENDING"},
+		{name: "unattributed pending", err: model.ErrSessionRevocationPending, expectedStatus: http.StatusServiceUnavailable, expectedCode: "AUTH_SESSION_REVOCATION_PENDING"},
 	}
 
 	for _, test := range tests {
@@ -103,6 +108,30 @@ func TestWriteAuthSessionErrorMapsSessionGrowthLimits(t *testing.T) {
 			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 			assert.False(t, response.Success)
 			assert.Equal(t, test.expectedCode, response.Code)
+			if errors.Is(test.err, model.ErrSessionRevocationPending) {
+				assert.Equal(t, "1", recorder.Header().Get("Retry-After"))
+				assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+				data, ok := body["data"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, false, data["session_revocation_complete"])
+				var pending *model.SessionRevocationPendingError
+				if errors.As(test.err, &pending) {
+					assert.Equal(t, pending.CredentialChangeCommitted, data["credential_change_committed"])
+					if pending.ProgressKnown {
+						assert.Equal(t, float64(7), data["revoked_count"])
+					} else {
+						assert.NotContains(t, data, "revoked_count")
+					}
+				} else {
+					assert.NotContains(t, data, "credential_change_committed")
+				}
+				assert.NotContains(t, recorder.Body.String(), strings.Repeat("e", 64))
+				assert.NotContains(t, recorder.Body.String(), strings.Repeat("f", 64))
+				assert.NotContains(t, data, "event_ref")
+				assert.NotContains(t, data, "access_token")
+			}
 		})
 	}
 }

@@ -353,6 +353,7 @@ func migrateDB() error {
 		&OrganizationWallet{},
 		&OrganizationWalletEntry{},
 		&UserSession{},
+		&SessionRevocationEvent{},
 		&AuthFlow{},
 		&ExternalIdentityClaim{},
 		&PasskeyCredential{},

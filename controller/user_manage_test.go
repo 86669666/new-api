@@ -68,7 +68,7 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 			}
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}))
 	require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
 	versionQuery := "SELECT version()"
 	if dialect == "sqlite" {
@@ -77,6 +77,10 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 	var version string
 	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 	t.Logf("database: %s %s, separate log database: %v", dialect, version, logDB != db)
+	auditCombinedFixtureDatabase(t, "main", db)
+	if logDB != db {
+		auditCombinedFixtureDatabase(t, "log", logDB)
+	}
 	return db
 }
 
@@ -174,13 +178,6 @@ func TestManageUserDemoteAdvancesAuthVersionAndRevokesSessionsOnce(t *testing.T)
 		}).Error)
 	}
 
-	sessionUpdateCount := 0
-	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:count_demote_session_updates", func(tx *gorm.DB) {
-		if tx.Statement != nil && tx.Statement.Table == "user_sessions" {
-			sessionUpdateCount++
-		}
-	}))
-
 	identity, proof := manageUserProof(t, db, service.VerificationOperation{Scope: service.VerificationScopeAdminUserManage, Context: []byte(fmt.Sprintf(`{"user_id":%d,"action":"demote"}`, user.Id))})
 	recorder := performVerifiedManageUserRequest(t, fmt.Sprintf(`{"id":%d,"action":"demote"}`, user.Id), identity, proof)
 	assert.Equal(t, http.StatusOK, recorder.Code)
@@ -196,8 +193,26 @@ func TestManageUserDemoteAdvancesAuthVersionAndRevokesSessionsOnce(t *testing.T)
 	for _, session := range sessions {
 		assert.Equal(t, model.UserSessionStatusRevoked, session.Status)
 		assert.Equal(t, "admin_demote", session.RevokedReason)
+		assert.Positive(t, session.RevokedAt)
 	}
-	assert.Equal(t, 1, sessionUpdateCount)
+	var events []model.SessionRevocationEvent
+	require.NoError(t, db.Where("user_id = ?", user.Id).Find(&events).Error)
+	require.Len(t, events, 1)
+	assert.Equal(t, "all", events[0].Scope)
+	assert.Empty(t, events[0].ExcludedSID)
+	assert.Equal(t, "admin_demote", events[0].Reason)
+	assert.Equal(t, "local_complete", events[0].State)
+	assert.EqualValues(t, 2, events[0].AffectedCount)
+
+	operatorSession, err := model.GetUserSessionBySID(identity.SessionID)
+	require.NoError(t, err)
+	assert.Equal(t, model.UserSessionStatusActive, operatorSession.Status)
+	assert.Equal(t, identity.SessionVersion, operatorSession.Version)
+	assert.Equal(t, identity.UserAuthVersion, operatorSession.UserAuthVersion)
+	assert.Zero(t, operatorSession.RevokedAt)
+	assert.Empty(t, operatorSession.RevokedReason)
+	_, _, err = service.ValidateLoginSession(identity)
+	assert.NoError(t, err)
 }
 
 func TestManageUserDeleteReturnsImmediatelyAndUnknownActionFails(t *testing.T) {

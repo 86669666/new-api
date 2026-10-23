@@ -17,26 +17,28 @@ import (
 )
 
 const (
-	VerificationMethodTwoFA              = "2fa"
-	VerificationMethodPasskey            = "passkey"
-	VerificationMethodPassword           = "password"
-	VerificationMethodOAuth              = "oauth"
-	VerificationMethodSession            = "session"
-	VerificationScopeChannelKeyRead      = "channel.key.read"
-	VerificationScopePasskeyRegister     = "passkey.register"
-	VerificationScopePasskeyDelete       = "passkey.delete"
-	VerificationScopeTwoFASetup          = "2fa.setup"
-	VerificationScopeTwoFADisable        = "2fa.disable"
-	VerificationScopeTwoFABackupCodes    = "2fa.backup_codes.regenerate"
-	VerificationScopeLogin               = "auth.login"
-	VerificationScopeAccessTokenGenerate = "access_token.generate"
-	VerificationScopeAccessTokenRevoke   = "access_token.revoke"
-	VerificationScopeAccessTokenUpdate   = "access_token.update"
-	VerificationScopeAccountBind         = "account.binding.bind"
-	VerificationScopeAccountUnbind       = "account.binding.unbind"
-	VerificationScopePasswordSet         = "account.password.set"
-	VerificationScopePasswordChange      = "account.password.change"
-	VerificationScopeAccountDelete       = "account.delete"
+	VerificationMethodTwoFA               = "2fa"
+	VerificationMethodPasskey             = "passkey"
+	VerificationMethodPassword            = "password"
+	VerificationMethodOAuth               = "oauth"
+	VerificationMethodSession             = "session"
+	VerificationScopeChannelKeyRead       = "channel.key.read"
+	VerificationScopePasskeyRegister      = "passkey.register"
+	VerificationScopePasskeyDelete        = "passkey.delete"
+	VerificationScopeTwoFASetup           = "2fa.setup"
+	VerificationScopeTwoFADisable         = "2fa.disable"
+	VerificationScopeTwoFABackupCodes     = "2fa.backup_codes.regenerate"
+	VerificationScopeLogin                = "auth.login"
+	VerificationScopeAccessTokenGenerate  = "access_token.generate"
+	VerificationScopeAccessTokenRevoke    = "access_token.revoke"
+	VerificationScopeAccessTokenUpdate    = "access_token.update"
+	VerificationScopeAccountBind          = "account.binding.bind"
+	VerificationScopeAccountUnbind        = "account.binding.unbind"
+	VerificationScopePasswordSet          = "account.password.set"
+	VerificationScopePasswordChange       = "account.password.change"
+	VerificationScopeAccountDelete        = "account.delete"
+	VerificationScopeSessionRevoke        = "session.revoke"
+	VerificationScopeSessionsRevokeOthers = "session.revoke_others"
 	// Administrative step-up scopes bind the managed user into the proof so a
 	// proof issued for one account cannot be replayed against another.
 	VerificationScopeAdminUserCreate       = "admin.user.create"
@@ -77,6 +79,10 @@ type AccountBindingContext struct {
 	Provider string `json:"provider"`
 	Email    string `json:"email,omitempty"`
 	Code     string `json:"code,omitempty"`
+}
+
+type SessionRevokeContext struct {
+	SID string `json:"sid"`
 }
 
 type AccountUnbindingContext struct {
@@ -193,6 +199,17 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 			}
 		}
 		normalized = context
+	case VerificationScopeSessionRevoke:
+		var context SessionRevokeContext
+		if len(fields) != 1 || common.Unmarshal(operation.Context, &context) != nil || context.SID == "" || len(context.SID) > 64 || strings.TrimSpace(context.SID) != context.SID {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
+	case VerificationScopeSessionsRevokeOthers:
+		if len(fields) != 0 {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = struct{}{}
 	case VerificationScopeAccountUnbind:
 		var context AccountUnbindingContext
 		if len(fields) != 1 || common.Unmarshal(fields["provider_id"], &context.ProviderID) != nil || context.ProviderID <= 0 {
@@ -328,7 +345,7 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 	case VerificationScopePasskeyRegister, VerificationScopeTwoFASetup,
 		VerificationScopeAccessTokenGenerate, VerificationScopeAccessTokenUpdate, VerificationScopeAccessTokenRevoke,
 		VerificationScopeAccountBind, VerificationScopeAccountUnbind,
-		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
+		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete, VerificationScopeSessionRevoke, VerificationScopeSessionsRevokeOthers,
 		VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 		VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
 		VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
@@ -400,7 +417,7 @@ func GetVerificationRequirementsWithContext(ctx context.Context, identity AuthId
 	for i := range methods {
 		if methods[i].Method == VerificationMethodPassword && !common.PasswordLoginEnabled {
 			switch scope {
-			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
+			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete, VerificationScopeSessionRevoke, VerificationScopeSessionsRevokeOthers,
 				VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 				VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
 				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
