@@ -136,6 +136,86 @@ func ExceedsMaxTokensLimit(values ...*uint) bool {
 	return false
 }
 
+// ValidateOAuthDerivedTextRequest validates the selected nonstream, plain-text
+// request contract without choosing a model, channel, price or payer. Callers
+// must apply it to both the original and final selected body before admission.
+// It borrows body only during this call, never rewrites it, and preserves the
+// supplied max-token field and optional n/stream presence in the returned DTO.
+// Request byte limits remain the responsibility of the existing ingress.
+func ValidateOAuthDerivedTextRequest(body []byte) (*dto.GeneralOpenAIRequest, error) {
+	invalid := errors.New("invalid OAuth derived text request")
+	fields, err := common.DecodeRawJSONObject(body)
+	if err != nil {
+		return nil, invalid
+	}
+	for key := range fields {
+		switch key {
+		case "model", "messages", "n", "stream", "max_tokens", "max_completion_tokens":
+		default:
+			return nil, invalid
+		}
+	}
+	var model string
+	if common.Unmarshal(fields["model"], &model) != nil || strings.TrimSpace(model) == "" {
+		return nil, invalid
+	}
+	_, hasMaxTokens := fields["max_tokens"]
+	_, hasMaxCompletion := fields["max_completion_tokens"]
+	if hasMaxTokens == hasMaxCompletion {
+		return nil, invalid
+	}
+	maxField := "max_tokens"
+	if hasMaxCompletion {
+		maxField = "max_completion_tokens"
+	}
+	var maxTokens *uint
+	if common.Unmarshal(fields[maxField], &maxTokens) != nil || maxTokens == nil || *maxTokens == 0 || ExceedsMaxTokensLimit(maxTokens) {
+		return nil, invalid
+	}
+	if value, exists := fields["n"]; exists {
+		var n *int
+		if common.Unmarshal(value, &n) != nil || n == nil || *n != 1 {
+			return nil, invalid
+		}
+	}
+	if value, exists := fields["stream"]; exists {
+		var stream *bool
+		if common.Unmarshal(value, &stream) != nil || stream == nil || *stream {
+			return nil, invalid
+		}
+	}
+	var messages []common.RawMessage
+	if common.Unmarshal(fields["messages"], &messages) != nil || len(messages) == 0 {
+		return nil, invalid
+	}
+	hasUser := false
+	for _, rawMessage := range messages {
+		message, err := common.DecodeRawJSONObject(rawMessage)
+		if err != nil || len(message) != 2 {
+			return nil, invalid
+		}
+		var role, content string
+		if common.Unmarshal(message["role"], &role) != nil || common.Unmarshal(message["content"], &content) != nil || strings.TrimSpace(content) == "" {
+			return nil, invalid
+		}
+		switch role {
+		case "user":
+			hasUser = true
+		case "system", "assistant":
+		default:
+			return nil, invalid
+		}
+	}
+	if !hasUser {
+		return nil, invalid
+	}
+	var request dto.GeneralOpenAIRequest
+	if common.Unmarshal(body, &request) != nil {
+		return nil, invalid
+	}
+	return &request, nil
+}
+
 func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest, error) {
 	request := &dto.OpenAIResponsesRequest{}
 	err := common.UnmarshalBodyReusable(c, request)

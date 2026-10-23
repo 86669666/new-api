@@ -1,8 +1,11 @@
 package openai
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -19,6 +22,138 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// ReadOAuthDerivedTextResponse reads one complete, nonstream chat completion
+// without publishing any bytes or changing billing state. It owns and closes
+// resp.Body without draining it. Callers must validate the untouched usage with
+// CalculateOAuthDerivedTextQuota and confirm durable settlement before output.
+// Only one assistant text choice is supported; unknown response fields fail
+// closed. Content-Length never controls allocation or the read limit.
+func ReadOAuthDerivedTextResponse(resp *http.Response) (body, rawUsage []byte, err error) {
+	invalid := errors.New("invalid OAuth derived text response")
+	if resp == nil || resp.Body == nil {
+		return nil, nil, invalid
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			body, rawUsage, err = nil, nil, invalid
+		}
+	}()
+	if resp.StatusCode != http.StatusOK || resp.Uncompressed {
+		return nil, nil, invalid
+	}
+	contentTypes := resp.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		return nil, nil, invalid
+	}
+	mediaType, params, parseErr := mime.ParseMediaType(contentTypes[0])
+	if parseErr != nil || mediaType != "application/json" {
+		return nil, nil, invalid
+	}
+	for key, value := range params {
+		if key != "charset" || !strings.EqualFold(value, "utf-8") {
+			return nil, nil, invalid
+		}
+	}
+	encodings := resp.Header.Values("Content-Encoding")
+	if len(encodings) > 1 || len(encodings) == 1 && !strings.EqualFold(strings.TrimSpace(encodings[0]), "identity") {
+		return nil, nil, invalid
+	}
+	const limit = 8 << 20
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if readErr != nil || len(body) > limit || resp.ContentLength >= 0 && resp.ContentLength != int64(len(body)) {
+		return nil, nil, invalid
+	}
+	fields, decodeErr := common.DecodeRawJSONObject(body)
+	if decodeErr != nil {
+		return nil, nil, invalid
+	}
+	for key := range fields {
+		switch key {
+		case "id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier":
+		default:
+			return nil, nil, invalid
+		}
+	}
+	for _, key := range []string{"id", "object", "model"} {
+		var value string
+		if common.Unmarshal(fields[key], &value) != nil || value == "" || key == "object" && value != "chat.completion" {
+			return nil, nil, invalid
+		}
+	}
+	var created *int64
+	if common.Unmarshal(fields["created"], &created) != nil || created == nil || *created < 0 {
+		return nil, nil, invalid
+	}
+	for _, key := range []string{"system_fingerprint", "service_tier"} {
+		if value, exists := fields[key]; exists {
+			var text *string
+			if common.Unmarshal(value, &text) != nil {
+				return nil, nil, invalid
+			}
+		}
+	}
+	rawUsage = fields["usage"]
+	// The enclosing raw decoder already checked JSON syntax. Inspect only the
+	// value kind here: missing fields, duplicate usage members and billable
+	// details must reach the strict quota consumer without DTO normalization.
+	usage := bytes.TrimSpace(rawUsage)
+	if len(usage) == 0 || usage[0] != '{' {
+		return nil, nil, invalid
+	}
+	var choices []common.RawMessage
+	if common.Unmarshal(fields["choices"], &choices) != nil || len(choices) != 1 {
+		return nil, nil, invalid
+	}
+	choice, decodeErr := common.DecodeRawJSONObject(choices[0])
+	if decodeErr != nil {
+		return nil, nil, invalid
+	}
+	for key, value := range choice {
+		switch key {
+		case "index", "message", "finish_reason":
+		case "logprobs":
+			if !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return nil, nil, invalid
+			}
+		default:
+			return nil, nil, invalid
+		}
+	}
+	var index *int
+	var finish string
+	if common.Unmarshal(choice["index"], &index) != nil || index == nil || *index != 0 ||
+		common.Unmarshal(choice["finish_reason"], &finish) != nil || finish != "stop" && finish != "length" {
+		return nil, nil, invalid
+	}
+	message, decodeErr := common.DecodeRawJSONObject(choice["message"])
+	if decodeErr != nil {
+		return nil, nil, invalid
+	}
+	for key, value := range message {
+		switch key {
+		case "role", "content":
+		case "refusal":
+			if !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return nil, nil, invalid
+			}
+		case "annotations":
+			var annotations []common.RawMessage
+			if common.Unmarshal(value, &annotations) != nil || annotations == nil || len(annotations) != 0 {
+				return nil, nil, invalid
+			}
+		default:
+			return nil, nil, invalid
+		}
+	}
+	var role string
+	var content *string
+	if common.Unmarshal(message["role"], &role) != nil || role != "assistant" ||
+		common.Unmarshal(message["content"], &content) != nil || content == nil {
+		return nil, nil, invalid
+	}
+	return body, rawUsage, nil
+}
 
 func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
 	if data == "" {
