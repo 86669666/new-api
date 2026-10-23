@@ -830,7 +830,27 @@ def check_token_usage_series(api):
     bucket = schemas['TokenUsageBucket']
     assert set(bucket['properties']) == set(bucket['required']) == {'ts', 'quota', 'requests', 'tokens'}
     assert schemas['TokenUsageStatResult']['properties']['granularity']['enum'] == ['hour', 'day']
+    maximum = 9007199254740991
+    for schema, fields in [(log, ('created_at', 'prompt_tokens', 'completion_tokens', 'quota', 'use_time')),
+                           (bucket, ('quota', 'requests', 'tokens'))]:
+        for field in fields:
+            assert schema['properties'][field] == {
+                'type': 'integer', 'format': 'int64', 'minimum': -maximum, 'maximum': maximum}
+    for schema, field in [(bucket, 'ts'), (schemas['TokenUsageLogPage'], 'total')]:
+        assert schema['properties'][field] == {
+            'type': 'integer', 'format': 'int64', 'minimum': 0, 'maximum': maximum}
+    failure = schemas['TokenUsageQueryFailedError']
+    assert failure['additionalProperties'] is False
+    assert set(failure['required']) == set(failure['properties']) == {'success', 'message', 'code'}
+    assert failure['properties']['success'] == {'type': 'boolean', 'enum': [False]}
+    assert failure['properties']['code'] == {'type': 'string', 'enum': ['TOKEN_USAGE_QUERY_FAILED']}
+    for suffix in ('logs', 'stat'):
+        operation = api['paths']['/api/usage/token/' + suffix]['get']
+        assert {'$ref': '#/components/schemas/TokenUsageQueryFailedError'} in operation['responses']['500']['content']['application/json']['schema']['anyOf']
+        assert 'no partial data' in operation['description']
+        assert 'not clamped or rounded' in operation['description']
     return {'api_key_only': True, 'utc_sparse': True, 'data_complete': False,
+            'signed_safe_integers': True, 'numeric_failure_without_partial_data': True,
             'legacy_management_errors_preserved': True, 'live_http': False}
 
 

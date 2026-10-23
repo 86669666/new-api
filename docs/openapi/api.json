@@ -21316,7 +21316,7 @@
     "/api/usage/token/logs": {
       "get": {
         "summary": "令牌消费明细",
-        "description": "Exactly one Authorization header with case-insensitive Bearer scheme, one ASCII space and a complete visible-ASCII key (optional sk- prefix, remaining key at most 128 bytes, no hyphen or comma). Bare keys, suffixes, duplicate or comma-list credentials are rejected. Read-only token authentication: expired/exhausted tokens remain readable; disabled tokens, disabled owners and IP restrictions are denied. The complete key must exactly match the authenticated snapshot, including on case-insensitive stores. Only RelayKey is accepted; dashboard/PAT/OAuth credentials do not grant access. Every query name may occur once; unknown names and malformed encoding are rejected. Positive organization selectors are rejected before authentication. Source collection availability does not prove historical completeness: data_complete is always false; omitted buckets and empty results do not mean zero consumption. No capability flag is enabled by this contract. Reads consume rows from LOG_DB with both token_id and user_id predicates. Exact inclusive [start,end] seconds. Items project only eight public fields. Order is created_at DESC,id DESC, or the existing ClickHouse created_at/request_id order. LogConsumeEnabled=false returns 503 regardless of historical rows; DataExportEnabled does not gate logs.",
+        "description": "Exactly one Authorization header with case-insensitive Bearer scheme, one ASCII space and a complete visible-ASCII key (optional sk- prefix, remaining key at most 128 bytes, no hyphen or comma). Bare keys, suffixes, duplicate or comma-list credentials are rejected. Read-only token authentication: expired/exhausted tokens remain readable; disabled tokens, disabled owners and IP restrictions are denied. The complete key must exactly match the authenticated snapshot, including on case-insensitive stores. Only RelayKey is accepted; dashboard/PAT/OAuth credentials do not grant access. Every query name may occur once; unknown names and malformed encoding are rejected. Positive organization selectors are rejected before authentication. Source collection availability does not prove historical completeness: data_complete is always false; omitted buckets and empty results do not mean zero consumption. No capability flag is enabled by this contract. Reads consume rows from LOG_DB with both token_id and user_id predicates. Exact inclusive [start,end] seconds. Items project only eight public fields. Order is created_at DESC,id DESC, or the existing ClickHouse created_at/request_id order. LogConsumeEnabled=false returns 503 regardless of historical rows; DataExportEnabled does not gate logs. Published recorded integers preserve signed values and must lie within [-9007199254740991, 9007199254740991] (JavaScript-safe integers); total is nonnegative and bucket ts remains nonnegative. Unsafe numeric results or query/aggregate failures return 500 TOKEN_USAGE_QUERY_FAILED with no partial data; values are not clamped or rounded.",
         "tags": [
           "令牌管理"
         ],
@@ -21492,7 +21492,7 @@
             }
           },
           "500": {
-            "description": "Authentication database failure retains ManagementError; data query failure is localized TOKEN_USAGE_QUERY_FAILED without database details.",
+            "description": "Authentication database failure retains ManagementError; data query/aggregate failure or unsafe numeric publication returns localized TOKEN_USAGE_QUERY_FAILED without database details or partial data.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -21543,7 +21543,7 @@
     "/api/usage/token/stat": {
       "get": {
         "summary": "令牌按小时或天用量",
-        "description": "Exactly one Authorization header with case-insensitive Bearer scheme, one ASCII space and a complete visible-ASCII key (optional sk- prefix, remaining key at most 128 bytes, no hyphen or comma). Bare keys, suffixes, duplicate or comma-list credentials are rejected. Read-only token authentication: expired/exhausted tokens remain readable; disabled tokens, disabled owners and IP restrictions are denied. The complete key must exactly match the authenticated snapshot, including on case-insensitive stores. Only RelayKey is accepted; dashboard/PAT/OAuth credentials do not grant access. Every query name may occur once; unknown names and malformed encoding are rejected. Positive organization selectors are rejected before authentication. Source collection availability does not prove historical completeness: data_complete is always false; omitted buckets and empty results do not mean zero consumption. No capability flag is enabled by this contract. Reads persisted quota_data from the main database with both token_id and user_id predicates. Historical token_id=0 and pending/unflushed rows cannot be assigned to this key. DataExportEnabled=false or LogConsumeEnabled=false returns 503. Legacy /api/data/self behavior is unchanged.",
+        "description": "Exactly one Authorization header with case-insensitive Bearer scheme, one ASCII space and a complete visible-ASCII key (optional sk- prefix, remaining key at most 128 bytes, no hyphen or comma). Bare keys, suffixes, duplicate or comma-list credentials are rejected. Read-only token authentication: expired/exhausted tokens remain readable; disabled tokens, disabled owners and IP restrictions are denied. The complete key must exactly match the authenticated snapshot, including on case-insensitive stores. Only RelayKey is accepted; dashboard/PAT/OAuth credentials do not grant access. Every query name may occur once; unknown names and malformed encoding are rejected. Positive organization selectors are rejected before authentication. Source collection availability does not prove historical completeness: data_complete is always false; omitted buckets and empty results do not mean zero consumption. No capability flag is enabled by this contract. Reads persisted quota_data from the main database with both token_id and user_id predicates. Historical token_id=0 and pending/unflushed rows cannot be assigned to this key. DataExportEnabled=false or LogConsumeEnabled=false returns 503. Legacy /api/data/self behavior is unchanged. Published recorded integers preserve signed values and must lie within [-9007199254740991, 9007199254740991] (JavaScript-safe integers); total is nonnegative and bucket ts remains nonnegative. Unsafe numeric results or query/aggregate failures return 500 TOKEN_USAGE_QUERY_FAILED with no partial data; values are not clamped or rounded. Each selected source-hour aggregate and every intermediate daily sum must satisfy the bounds, even when a later signed adjustment would bring the final sum back into range.",
         "tags": [
           "令牌管理"
         ],
@@ -21695,7 +21695,7 @@
             }
           },
           "500": {
-            "description": "Authentication database failure retains ManagementError; data query failure is localized TOKEN_USAGE_QUERY_FAILED without database details.",
+            "description": "Authentication database failure retains ManagementError; data query/aggregate failure or unsafe numeric publication returns localized TOKEN_USAGE_QUERY_FAILED without database details or partial data.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -33807,23 +33807,33 @@
         "properties": {
           "created_at": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           },
           "prompt_tokens": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           },
           "completion_tokens": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           },
           "quota": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           },
           "use_time": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           },
           "model_name": {
             "type": "string"
@@ -33852,19 +33862,27 @@
         "properties": {
           "ts": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9007199254740991
           },
           "quota": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           },
           "requests": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           },
           "tokens": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
           }
         },
         "required": [
@@ -33887,7 +33905,8 @@
           "total": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 0,
+            "maximum": 9007199254740991
           },
           "page": {
             "type": "integer",

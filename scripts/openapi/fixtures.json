@@ -16707,5 +16707,389 @@
       "enable_data_export": false
     },
     "valid": true
+  },
+  {
+    "name": "token series numeric log signed minimum",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": -9007199254740991,
+      "model_name": "fixture",
+      "prompt_tokens": -9007199254740991,
+      "completion_tokens": -9007199254740991,
+      "quota": -9007199254740991,
+      "use_time": -9007199254740991,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series numeric bucket signed minimum",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": -9007199254740991,
+      "requests": -9007199254740991,
+      "tokens": -9007199254740991
+    },
+    "valid": true
+  },
+  {
+    "name": "token series numeric log signed zero",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 0,
+      "model_name": "fixture",
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "quota": 0,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series numeric bucket signed zero",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": 0,
+      "requests": 0,
+      "tokens": 0
+    },
+    "valid": true
+  },
+  {
+    "name": "token series numeric log signed maximum",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 9007199254740991,
+      "model_name": "fixture",
+      "prompt_tokens": 9007199254740991,
+      "completion_tokens": 9007199254740991,
+      "quota": 9007199254740991,
+      "use_time": 9007199254740991,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": true
+  },
+  {
+    "name": "token series numeric bucket signed maximum",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": 9007199254740991,
+      "requests": 9007199254740991,
+      "tokens": 9007199254740991
+    },
+    "valid": true
+  },
+  {
+    "name": "token series numeric log created_at underflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": -9007199254740992,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": 3,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log created_at overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 9007199254740992,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": 3,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log prompt_tokens underflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": -9007199254740992,
+      "completion_tokens": 2,
+      "quota": 3,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log prompt_tokens overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 9007199254740992,
+      "completion_tokens": 2,
+      "quota": 3,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log completion_tokens underflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": -9007199254740992,
+      "quota": 3,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log completion_tokens overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 9007199254740992,
+      "quota": 3,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log quota underflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": -9007199254740992,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log quota overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": 9007199254740992,
+      "use_time": 0,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log use_time underflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": 3,
+      "use_time": -9007199254740992,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric log use_time overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLog",
+    "value": {
+      "created_at": 3600,
+      "model_name": "fixture",
+      "prompt_tokens": 1,
+      "completion_tokens": 2,
+      "quota": 3,
+      "use_time": 9007199254740992,
+      "is_stream": false,
+      "group": "default"
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric bucket quota underflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": -9007199254740992,
+      "requests": 1,
+      "tokens": 3
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric bucket quota overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": 9007199254740992,
+      "requests": 1,
+      "tokens": 3
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric bucket requests underflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": 3,
+      "requests": -9007199254740992,
+      "tokens": 3
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric bucket requests overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": 3,
+      "requests": 9007199254740992,
+      "tokens": 3
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric bucket tokens underflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": 3,
+      "requests": 1,
+      "tokens": -9007199254740992
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric bucket tokens overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket",
+    "value": {
+      "ts": 3600,
+      "quota": 3,
+      "requests": 1,
+      "tokens": 9007199254740992
+    },
+    "valid": false
+  },
+  {
+    "name": "token series numeric total zero",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLogPage/properties/total",
+    "value": 0,
+    "valid": true
+  },
+  {
+    "name": "token series numeric ts zero",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket/properties/ts",
+    "value": 0,
+    "valid": true
+  },
+  {
+    "name": "token series numeric total maximum",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLogPage/properties/total",
+    "value": 9007199254740991,
+    "valid": true
+  },
+  {
+    "name": "token series numeric ts maximum",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket/properties/ts",
+    "value": 9007199254740991,
+    "valid": true
+  },
+  {
+    "name": "token series numeric total negative",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLogPage/properties/total",
+    "value": -1,
+    "valid": false
+  },
+  {
+    "name": "token series numeric ts negative",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket/properties/ts",
+    "value": -1,
+    "valid": false
+  },
+  {
+    "name": "token series numeric total overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageLogPage/properties/total",
+    "value": 9007199254740992,
+    "valid": false
+  },
+  {
+    "name": "token series numeric ts overflow",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageBucket/properties/ts",
+    "value": 9007199254740992,
+    "valid": false
+  },
+  {
+    "name": "token series numeric failure forbids partial data",
+    "document": "api",
+    "schema": "#/components/schemas/TokenUsageQueryFailedError",
+    "value": {
+      "success": false,
+      "message": "本地化错误",
+      "code": "TOKEN_USAGE_QUERY_FAILED",
+      "data": []
+    },
+    "valid": false
   }
 ]
