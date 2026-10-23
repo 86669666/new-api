@@ -397,3 +397,72 @@ export async function getOrganizationMembers(
     throw projectOrganizationRequestFailure(error, signal)
   }
 }
+
+const invitationSchema = z.object({
+  organization_id: wireIdSchema,
+  organization_name: z.string().min(1),
+  organization_revision: wireIdSchema,
+  object_id: wireIdSchema,
+  generation: wireIdSchema,
+  kind: z.literal('invitation'),
+  target_user_id: wireIdSchema,
+  from_username: z.string(),
+  role: z.enum(['member', 'admin']),
+  status: z.literal('pending'),
+  expires_at: z.number().int().min(0).max(8640000000000),
+})
+const invitationsSchema = z.object({
+  items: z.array(invitationSchema).max(20),
+  limit: z.literal(20),
+  next_after_id: wireIdSchema.nullable(),
+})
+
+export async function getMyOrganizationInvitations(
+  actorId: number,
+  sid: string,
+  afterId: string,
+  signal: AbortSignal
+) {
+  // An identity change invalidates this operation permanently, including A→B→A
+  // before React renders again. Do not revive a request under a reused SID.
+  const identityChanged = new AbortController()
+  const unsubscribe = useAuthStore.subscribe((state) => {
+    if (state.auth.user?.id !== actorId || state.auth.session?.sid !== sid) {
+      identityChanged.abort()
+    }
+  })
+  const boundSignal = AbortSignal.any([signal, identityChanged.signal])
+  try {
+    if (!Number.isSafeInteger(actorId) || actorId <= 0 || !sid) {
+      throw new Error()
+    }
+    z.union([z.literal('0'), wireIdSchema]).parse(afterId)
+    const page = invitationsSchema.parse(
+      await readOrganizationData(
+        actorId,
+        sid,
+        '/api/organization-invitations',
+        boundSignal,
+        { after_id: afterId, limit: 20 }
+      )
+    )
+    let previous = BigInt(afterId)
+    for (const invitation of page.items) {
+      if (
+        invitation.target_user_id !== String(actorId) ||
+        BigInt(invitation.object_id) <= previous
+      ) {
+        throw new Error()
+      }
+      previous = BigInt(invitation.object_id)
+    }
+    const expectedNext =
+      page.items.length === 20 ? page.items.at(-1)?.object_id : null
+    if (page.next_after_id !== expectedNext) throw new Error()
+    return page
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, boundSignal)
+  } finally {
+    unsubscribe()
+  }
+}
