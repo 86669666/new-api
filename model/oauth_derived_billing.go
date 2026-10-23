@@ -29,30 +29,33 @@ type OAuthTextFacts struct {
 	ModelRatio      float64
 	CompletionRatio float64
 	GroupRatio      float64
+	CacheRatio      float64
 	PromptEstimate  int
 	MaxCompletion   int
 }
 
 type OAuthDerivedTextCharge struct {
-	Ref               string `gorm:"type:char(64);primaryKey"`
-	Fingerprint       string `gorm:"type:char(64);not null"`
-	GrantRef          string `gorm:"type:char(64);not null"`
-	UserID            int    `gorm:"not null;index:idx_oauth_text_user_state,priority:1"`
-	TokenID           int    `gorm:"not null"`
-	PayerID           int    `gorm:"not null"`
-	SourceBindingHash string `gorm:"type:char(64);not null"`
-	TokenKeyRef       string `gorm:"type:char(64);not null"`
-	QuotaLimit        int64  `gorm:"not null"`
-	Facts             string `gorm:"type:text;not null"`
-	Reserve           int    `gorm:"not null"`
-	Actual            *int
-	Usage             string `gorm:"type:text;not null"`
-	State             string `gorm:"type:varchar(24);not null;index:idx_oauth_text_user_state,priority:2"`
-	Version           int64  `gorm:"not null"`
-	Attempt           int    `gorm:"not null"`
-	ClaimAt           int64
-	HeldReason        string `gorm:"type:varchar(32)"`
-	Publication       string `gorm:"type:varchar(24);not null"`
+	Ref                string `gorm:"type:char(64);primaryKey"`
+	Fingerprint        string `gorm:"type:char(64);not null"`
+	GrantRef           string `gorm:"type:char(64);not null"`
+	UserID             int    `gorm:"not null;index:idx_oauth_text_user_state,priority:1"`
+	TokenID            int    `gorm:"not null"`
+	PayerID            int    `gorm:"not null"`
+	SourceBindingHash  string `gorm:"type:char(64);not null"`
+	TokenKeyRef        string `gorm:"type:char(64);not null"`
+	QuotaLimit         int64  `gorm:"not null"`
+	Facts              string `gorm:"type:text;not null"`
+	Reserve            int    `gorm:"not null"`
+	Actual             *int
+	Usage              string `gorm:"type:text;not null"`
+	State              string `gorm:"type:varchar(24);not null;index:idx_oauth_text_user_state,priority:2"`
+	Version            int64  `gorm:"not null"`
+	Attempt            int    `gorm:"not null"`
+	ClaimAt            int64
+	SendDeadline       int64
+	SourceSnapshotHash string `gorm:"type:char(64);not null"`
+	HeldReason         string `gorm:"type:varchar(32)"`
+	Publication        string `gorm:"type:varchar(24);not null"`
 }
 
 // No automatic migration or production issuance registers this candidate.
@@ -62,7 +65,7 @@ func (f OAuthTextFacts) fingerprint(reserve int) (string, string, error) {
 	if !oauthDerivedDigest(f.GrantRef) || f.UserID <= 0 || f.TokenID <= 0 || f.ChannelID <= 0 || f.Model == "" || len(f.Model) > 256 || !oauthDerivedDigest(f.RouteHash) || !oauthDerivedDigest(f.BodyHash) || !oauthDerivedDigest(f.PolicyHash) || reserve < 0 || reserve > common.MaxQuota || f.PromptEstimate <= 0 || f.PromptEstimate > common.MaxQuota || f.MaxCompletion <= 0 || f.MaxCompletion > common.MaxQuota {
 		return "", "", ErrOAuthTextCharge
 	}
-	for _, v := range []float64{f.ModelRatio, f.CompletionRatio, f.GroupRatio} {
+	for _, v := range []float64{f.ModelRatio, f.CompletionRatio, f.GroupRatio, f.CacheRatio} {
 		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 			return "", "", ErrOAuthTextCharge
 		}
@@ -84,8 +87,8 @@ func (f OAuthTextFacts) fingerprint(reserve int) (string, string, error) {
 
 // withOAuthTextAdmission reuses the complete current User/session/grant/cleanup
 // prefix. Source, finite Token and charge operations all use that same tx.
-func withOAuthTextAdmission(ctx context.Context, f OAuthTextFacts, action func(*gorm.DB, *User, *Token, *OAuthDerivedTokenSource) error) error {
-	return withCurrentOAuthGrant(ctx, f.GrantRef, f.UserID, func(tx *gorm.DB, u *User, _ *UserSession, g *OAuthGrant) error {
+func withOAuthTextAdmission(ctx context.Context, f OAuthTextFacts, action func(*gorm.DB, *User, *Token, *OAuthDerivedTokenSource, *UserSession, *OAuthGrant) error) error {
+	return withCurrentOAuthGrant(ctx, f.GrantRef, f.UserID, func(tx *gorm.DB, u *User, session *UserSession, g *OAuthGrant) error {
 		now := time.Now().Unix()
 		if g.State != "active" {
 			return ErrOAuthTextCharge
@@ -107,7 +110,7 @@ func withOAuthTextAdmission(ctx context.Context, f OAuthTextFacts, action func(*
 		if source.TerminalAt != nil || source.ExpiresAt <= now || token.ExpiredTime <= now || token.Status != common.TokenStatusEnabled || source.PolicyHash != f.PolicyHash {
 			return ErrOAuthTextCharge
 		}
-		return action(tx, u, &token, &source)
+		return action(tx, u, &token, &source, session, g)
 	})
 }
 
@@ -130,10 +133,13 @@ func ReserveOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, 
 		return nil, ErrOAuthTextCharge
 	}
 	var out OAuthDerivedTextCharge
-	err = withOAuthTextAdmission(ctx, f, func(tx *gorm.DB, u *User, t *Token, source *OAuthDerivedTokenSource) error {
+	err = withOAuthTextAdmission(ctx, f, func(tx *gorm.DB, u *User, t *Token, source *OAuthDerivedTokenSource, session *UserSession, grant *OAuthGrant) error {
 		err := lockForUpdate(tx).Where("ref = ?", ref).First(&out).Error
+		if _, currentErr := oauthTextDeadline(f, u, t, source, session, grant, time.Now().Unix()); currentErr != nil {
+			return currentErr
+		}
 		if err == nil {
-			if out.Fingerprint != fp {
+			if !out.matchesAdmission(f, reserve, u, t, source, session, grant) {
 				return ErrOAuthTextCharge
 			}
 			return nil
@@ -153,7 +159,7 @@ func ReserveOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, 
 		if err := tx.Model(&Token{}).Where("id = ?", t.Id).Updates(map[string]any{"remain_quota": t.RemainQuota - reserve, "used_quota": t.UsedQuota + reserve}).Error; err != nil {
 			return err
 		}
-		out = OAuthDerivedTextCharge{Ref: ref, Fingerprint: fp, GrantRef: f.GrantRef, UserID: u.Id, PayerID: u.Id, TokenID: t.Id, SourceBindingHash: source.BindingHash, TokenKeyRef: *source.KeyRef, QuotaLimit: source.QuotaLimit, Facts: facts, Reserve: reserve, State: "reserved", Version: 1, Publication: "pending"}
+		out = OAuthDerivedTextCharge{Ref: ref, Fingerprint: fp, GrantRef: f.GrantRef, UserID: u.Id, PayerID: u.Id, TokenID: t.Id, SourceSnapshotHash: oauthTextSourceSnapshot(source, t, session, grant), SourceBindingHash: source.BindingHash, TokenKeyRef: *source.KeyRef, QuotaLimit: source.QuotaLimit, Facts: facts, Reserve: reserve, State: "reserved", Version: 1, Publication: "pending"}
 		return tx.Create(&out).Error
 	})
 	if err != nil {
@@ -162,15 +168,24 @@ func ReserveOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, 
 	return &out, nil
 }
 
-// Claim returns true only for the committed transition winner. It does not
-// promise network atomicity; a lost acknowledgement must never be resent.
-func ClaimOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, reserve int) (bool, error) {
-	_, fp, err := f.fingerprint(reserve)
-	if err != nil {
-		return false, err
+// OAuthTextSendPermit is returned only to the committed CAS winner. Transport
+// must check Deadline immediately before its one non-replayable send.
+type OAuthTextSendPermit struct {
+	Ref      string
+	Deadline int64
+}
+
+func ClaimOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, reserve int) (*OAuthTextSendPermit, error) {
+	return claimOAuthDerivedText(ctx, ref, f, reserve, time.Now)
+}
+
+// Clock is a per-operation deterministic seam, never mutable global authority.
+func claimOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, reserve int, clock func() time.Time) (*OAuthTextSendPermit, error) {
+	if _, _, err := f.fingerprint(reserve); err != nil {
+		return nil, err
 	}
-	won := false
-	err = withOAuthTextAdmission(ctx, f, func(tx *gorm.DB, u *User, _ *Token, _ *OAuthDerivedTokenSource) error {
+	var permit *OAuthTextSendPermit
+	err := withOAuthTextAdmission(ctx, f, func(tx *gorm.DB, u *User, t *Token, source *OAuthDerivedTokenSource, session *UserSession, grant *OAuthGrant) error {
 		if err := oauthTextUnresolved(tx, u.Id, ref); err != nil {
 			return err
 		}
@@ -178,30 +193,78 @@ func ClaimOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, re
 		if err := lockForUpdate(tx).Where("ref = ?", ref).First(&c).Error; err != nil {
 			return err
 		}
-		if c.Fingerprint != fp {
+		now := clock().Unix()
+		deadline, err := oauthTextDeadline(f, u, t, source, session, grant, now)
+		if err != nil {
+			return err
+		}
+		if !c.matchesAdmission(f, reserve, u, t, source, session, grant) {
 			return ErrOAuthTextCharge
 		}
 		if c.State != "reserved" {
 			return nil
 		}
-		result := tx.Model(&OAuthDerivedTextCharge{}).Where("ref = ? AND state = ? AND version = ?", ref, "reserved", c.Version).Updates(map[string]any{"state": "send_claimed", "claim_at": time.Now().Unix(), "version": c.Version + 1})
-		won = result.RowsAffected == 1
+		result := tx.Model(&OAuthDerivedTextCharge{}).Where("ref = ? AND state = ? AND version = ?", ref, "reserved", c.Version).Updates(map[string]any{"state": "send_claimed", "claim_at": now, "send_deadline": deadline, "version": c.Version + 1})
+		if result.Error == nil && result.RowsAffected == 1 {
+			permit = &OAuthTextSendPermit{Ref: ref, Deadline: deadline}
+		}
 		return result.Error
 	})
-	return won && err == nil, err
+	if err != nil {
+		return nil, err
+	}
+	if permit != nil && clock().Unix() >= permit.Deadline {
+		return nil, ErrOAuthTextCharge
+	}
+	return permit, nil
+}
+
+func oauthTextDeadline(f OAuthTextFacts, u *User, t *Token, source *OAuthDerivedTokenSource, s *UserSession, g *OAuthGrant, now int64) (int64, error) {
+	deadline := min(s.ExpiresAt, g.ExpiresAt, source.ExpiresAt, t.ExpiredTime)
+	if deadline <= now || u.Id != f.UserID || u.Status != common.UserStatusEnabled || g.State != "active" || g.UserID != u.Id || s.UserID != u.Id || g.OriginSID != s.SID || g.UserAuthVersion != u.AuthVersion || s.UserAuthVersion != u.AuthVersion || g.SessionVersion != s.Version || s.Status != UserSessionStatusActive || s.RevokedAt != 0 || g.ExpiresAt > s.ExpiresAt || g.RevokedAt != 0 || source.TerminalAt != nil || source.PolicyHash != f.PolicyHash || t.Status != common.TokenStatusEnabled {
+		return 0, ErrOAuthTextCharge
+	}
+	if err := validateOAuthDerivedTokenBinding(source, g, t, now); err != nil {
+		return 0, err
+	}
+	return deadline, nil
+}
+
+func oauthTextSourceSnapshot(s *OAuthDerivedTokenSource, t *Token, session *UserSession, g *OAuthGrant) string {
+	// Nullable success tuple has already passed the K1 binding validator.
+	b, _ := common.Marshal([]any{s.GrantRef, s.UserID, s.SchemaVersion, s.QuotaLimit, s.ExpiresAt, s.PolicyHash, s.BindingHash, s.VerifiedAt, s.ProofExpiresAt, s.PermitDeadline, s.VerifiedMethod, s.ProofFlowID, *s.TokenID, *s.KeyRef, *s.IdemHash, *s.RequestHash, *s.CreatedAt, t.ExpiredTime, session.SID, session.Version, session.UserAuthVersion, session.ExpiresAt, g.Revision, g.ExpiresAt, g.Issuer, g.GrantID, g.ClientID, g.Subject, g.OriginSID, g.Scopes, g.ConsentRef, g.CreatedAt, g.HydraLoginSessionID, g.UserAuthVersion, g.SessionVersion})
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func (c *OAuthDerivedTextCharge) matchesAdmission(f OAuthTextFacts, reserve int, u *User, t *Token, s *OAuthDerivedTokenSource, session *UserSession, g *OAuthGrant) bool {
+	facts, fp, err := f.fingerprint(reserve)
+	return err == nil && c.Fingerprint == fp && c.Facts == facts && c.Reserve == reserve && c.Attempt == 0 && c.Version > 0 && c.GrantRef == f.GrantRef && c.UserID == u.Id && c.UserID == f.UserID && c.PayerID == u.Id && c.TokenID == t.Id && c.TokenID == f.TokenID && c.SourceBindingHash == s.BindingHash && c.TokenKeyRef == *s.KeyRef && c.TokenKeyRef == OAuthDerivedTokenKeyRef(t.Key) && c.QuotaLimit == s.QuotaLimit && c.SourceSnapshotHash == oauthTextSourceSnapshot(s, t, session, g)
 }
 
 type OAuthTextUsage struct {
 	Prompt     int
 	Completion int
 	Total      int
+	Cached     int
 }
 
 // Finalize requires bounded raw usage and an amount from the existing legacy
 // calculator using persisted Facts. It never estimates missing usage or chooses
 // a new payer, and deliberately does not require a currently active grant.
 func FinalizeOAuthDerivedText(ctx context.Context, ref string, actual int, usage OAuthTextUsage) (*OAuthDerivedTextCharge, error) {
-	if DB == nil || !oauthDerivedDigest(ref) || actual < 0 || actual > common.MaxQuota || usage.Prompt <= 0 || usage.Completion < 0 || usage.Prompt > common.MaxQuota || usage.Completion > common.MaxQuota-usage.Prompt || usage.Total != usage.Prompt+usage.Completion {
+	return finalizeOAuthDerivedText(ctx, ref, actual, usage, "")
+}
+
+func FinalizeOAuthDerivedTextSnapshot(ctx context.Context, ref string, actual int, usage OAuthTextUsage, fingerprint string) (*OAuthDerivedTextCharge, error) {
+	if !oauthDerivedDigest(fingerprint) {
+		return nil, ErrOAuthTextCharge
+	}
+	return finalizeOAuthDerivedText(ctx, ref, actual, usage, fingerprint)
+}
+
+func finalizeOAuthDerivedText(ctx context.Context, ref string, actual int, usage OAuthTextUsage, fingerprint string) (*OAuthDerivedTextCharge, error) {
+	if DB == nil || !oauthDerivedDigest(ref) || actual < 0 || actual > common.MaxQuota || usage.Prompt <= 0 || usage.Completion < 0 || usage.Prompt > common.MaxQuota || usage.Completion > common.MaxQuota-usage.Prompt || usage.Total != usage.Prompt+usage.Completion || usage.Cached < 0 || usage.Cached > usage.Prompt {
 		return nil, ErrOAuthTextCharge
 	}
 	b, err := common.Marshal(usage)
@@ -231,6 +294,9 @@ func FinalizeOAuthDerivedText(ctx context.Context, ref string, actual int, usage
 		}
 		if err := lockForUpdate(tx).Where("ref = ?", ref).First(&out).Error; err != nil {
 			return err
+		}
+		if fingerprint != "" && out.Fingerprint != fingerprint {
+			return ErrOAuthTextCharge
 		}
 		if out.PayerID != seed.PayerID || out.TokenID != seed.TokenID || out.PayerID != out.UserID {
 			return ErrOAuthTextCharge
@@ -282,4 +348,24 @@ func FinalizeOAuthDerivedText(ctx context.Context, ref string, actual int, usage
 		return nil, err
 	}
 	return &out, nil
+}
+
+// ReadOAuthDerivedTextCharge retains historical authority; it does not admit spending.
+func ReadOAuthDerivedTextCharge(ctx context.Context, ref string) (*OAuthDerivedTextCharge, error) {
+	if DB == nil || !oauthDerivedDigest(ref) {
+		return nil, ErrOAuthTextCharge
+	}
+	var c OAuthDerivedTextCharge
+	if err := DB.WithContext(ctx).Where("ref = ?", ref).First(&c).Error; err != nil {
+		return nil, err
+	}
+	var f OAuthTextFacts
+	if common.UnmarshalJsonStr(c.Facts, &f) != nil {
+		return nil, ErrOAuthTextCharge
+	}
+	facts, fp, err := f.fingerprint(c.Reserve)
+	if err != nil || facts != c.Facts || fp != c.Fingerprint {
+		return nil, ErrOAuthTextCharge
+	}
+	return &c, nil
 }

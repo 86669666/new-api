@@ -81,7 +81,7 @@ func TestOAuthDerivedTextContract(t *testing.T) {
 			errs := make(chan error, 2)
 			var wg sync.WaitGroup
 			for range 2 {
-				wg.Go(func() { won, e := ClaimOAuthDerivedText(ctx, ref, f, 80); results <- won; errs <- e })
+				wg.Go(func() { won, e := ClaimOAuthDerivedText(ctx, ref, f, 80); results <- won != nil; errs <- e })
 			}
 			wg.Wait()
 			close(results)
@@ -137,7 +137,7 @@ func TestOAuthDerivedTextContract(t *testing.T) {
 		require.NoError(t, err)
 		won, err := ClaimOAuthDerivedText(ctx, ref, f, 0)
 		require.NoError(t, err)
-		assert.True(t, won)
+		assert.NotNil(t, won)
 		_, err = FinalizeOAuthDerivedText(ctx, ref, 0, OAuthTextUsage{})
 		require.Error(t, err)
 		_, err = ReserveOAuthDerivedText(ctx, strings.Repeat("d", 64), f, 1)
@@ -161,12 +161,12 @@ func TestOAuthDerivedTextHistoricalBinding(t *testing.T) {
 				require.NoError(t, db.Create(&OAuthDerivedTextCharge{Ref: strings.Repeat("f", 64), UserID: f.UserID, GrantRef: strings.Repeat("d", 64), State: "held"}).Error)
 				won, e := ClaimOAuthDerivedText(ctx, ref, f, 80)
 				require.Error(t, e)
-				assert.False(t, won)
+				assert.Nil(t, won)
 				return
 			}
 			won, err := ClaimOAuthDerivedText(ctx, ref, f, 80)
 			require.NoError(t, err)
-			require.True(t, won)
+			require.NotNil(t, won)
 			switch kind {
 			case "missing_token":
 				require.NoError(t, db.Unscoped().Delete(&Token{}, f.TokenID).Error)
@@ -200,4 +200,157 @@ func TestOAuthDerivedTextHistoricalBinding(t *testing.T) {
 			assert.Equal(t, 20, u.Quota)
 		})
 	}
+}
+
+func TestOAuthDerivedTextAdmissionSnapshot(t *testing.T) {
+	for _, kind := range []string{"source_binding", "token_key", "cap", "payer", "attempt", "cache_price"} {
+		t.Run(kind, func(t *testing.T) {
+			db, f := newOAuthTextFixture(t)
+			ctx := context.Background()
+			ref := strings.Repeat("b", 64)
+			original, err := ReserveOAuthDerivedText(ctx, ref, f, 80)
+			require.NoError(t, err)
+			var source OAuthDerivedTokenSource
+			require.NoError(t, db.First(&source, "grant_ref = ?", f.GrantRef).Error)
+			switch kind {
+			case "source_binding":
+				source.BindingHash = strings.Repeat("c", 64)
+			case "token_key":
+				key := "replacement-synthetic-key"
+				keyRef := OAuthDerivedTokenKeyRef(key)
+				source.KeyRef = &keyRef
+				require.NoError(t, db.Model(&Token{}).Where("id = ?", f.TokenID).Update("key", key).Error)
+			case "cap":
+				source.QuotaLimit = 200
+				require.NoError(t, db.Model(&Token{}).Where("id = ?", f.TokenID).Update("remain_quota", 120).Error)
+			case "payer":
+				require.NoError(t, db.Model(&OAuthDerivedTextCharge{}).Where("ref = ?", ref).Update("payer_id", f.UserID+1).Error)
+			case "attempt":
+				require.NoError(t, db.Model(&OAuthDerivedTextCharge{}).Where("ref = ?", ref).Update("attempt", 1).Error)
+			case "cache_price":
+				f.CacheRatio = .25
+			}
+			// Full Save intentionally exercises the real source validation hook.
+			require.NoError(t, db.Save(&source).Error)
+			var token Token
+			var grant OAuthGrant
+			require.NoError(t, db.First(&token, f.TokenID).Error)
+			require.NoError(t, db.First(&grant, "grant_ref = ?", f.GrantRef).Error)
+			require.NoError(t, validateOAuthDerivedTokenBinding(&source, &grant, &token, time.Now().Unix()))
+			_, err = ReserveOAuthDerivedText(ctx, ref, f, 80)
+			require.Error(t, err)
+			permit, err := ClaimOAuthDerivedText(ctx, ref, f, 80)
+			require.Error(t, err)
+			assert.Nil(t, permit)
+			var stored OAuthDerivedTextCharge
+			var user User
+			var after Token
+			require.NoError(t, db.First(&stored, "ref = ?", ref).Error)
+			require.NoError(t, db.First(&user, f.UserID).Error)
+			require.NoError(t, db.First(&after, f.TokenID).Error)
+			assert.Equal(t, 20, user.Quota)
+			assert.Equal(t, token.RemainQuota, after.RemainQuota)
+			assert.Equal(t, token.UsedQuota, after.UsedQuota)
+			assert.Equal(t, original.State, stored.State)
+			assert.Equal(t, original.Version, stored.Version)
+			assert.Nil(t, stored.Actual)
+			assert.Zero(t, stored.ClaimAt)
+		})
+	}
+}
+
+func TestOAuthDerivedTextClaimDeadline(t *testing.T) {
+	for _, kind := range []string{"after_locks", "after_commit", "valid"} {
+		t.Run(kind, func(t *testing.T) {
+			db, f := newOAuthTextFixture(t)
+			ctx := context.Background()
+			ref := strings.Repeat("b", 64)
+			_, err := ReserveOAuthDerivedText(ctx, ref, f, 80)
+			require.NoError(t, err)
+			var token Token
+			require.NoError(t, db.First(&token, f.TokenID).Error)
+			deadline := token.ExpiredTime
+			calls := 0
+			chargeRead := false
+			require.NoError(t, db.Callback().Query().After("gorm:query").Register("claim_charge_read", func(tx *gorm.DB) {
+				if tx.Statement.Table == "oauth_derived_text_charges" {
+					_, chargeRead = tx.Statement.Dest.(*OAuthDerivedTextCharge)
+				}
+			}))
+			permit, err := claimOAuthDerivedText(ctx, ref, f, 80, func() time.Time {
+				require.True(t, chargeRead, "clock must be sampled after the locked charge read")
+				calls++
+				now := deadline - 1
+				if kind == "after_locks" || kind == "after_commit" && calls == 2 {
+					now = deadline
+				}
+				return time.Unix(now, 0)
+			})
+			require.NoError(t, db.Callback().Query().Remove("claim_charge_read"))
+			if kind == "valid" {
+				require.NoError(t, err)
+				require.NotNil(t, permit)
+				assert.Equal(t, deadline, permit.Deadline)
+				assert.Equal(t, ref, permit.Ref)
+			} else {
+				require.Error(t, err)
+				assert.Nil(t, permit)
+			}
+			var stored OAuthDerivedTextCharge
+			var user User
+			require.NoError(t, db.First(&stored, "ref = ?", ref).Error)
+			require.NoError(t, db.First(&user, f.UserID).Error)
+			assert.Equal(t, 20, user.Quota)
+			assert.Nil(t, stored.Actual)
+			if kind == "after_locks" {
+				assert.Equal(t, "reserved", stored.State)
+				assert.EqualValues(t, 1, stored.Version)
+				assert.Zero(t, stored.SendDeadline)
+				assert.Equal(t, 1, calls)
+			} else {
+				assert.Equal(t, "send_claimed", stored.State)
+				assert.Equal(t, deadline, stored.SendDeadline)
+				assert.Equal(t, 2, calls)
+				replay, e := ClaimOAuthDerivedText(ctx, ref, f, 80)
+				require.NoError(t, e)
+				assert.Nil(t, replay)
+				_, e = ReserveOAuthDerivedText(ctx, strings.Repeat("c", 64), f, 1)
+				require.Error(t, e)
+			}
+		})
+	}
+}
+
+func TestOAuthDerivedTextCachedSettlement(t *testing.T) {
+	db, f := newOAuthTextFixture(t)
+	ctx := context.Background()
+	ref := strings.Repeat("b", 64)
+	f.CacheRatio = .25
+	_, err := ReserveOAuthDerivedText(ctx, ref, f, 80)
+	require.NoError(t, err)
+	permit, err := ClaimOAuthDerivedText(ctx, ref, f, 80)
+	require.NoError(t, err)
+	require.NotNil(t, permit)
+	saved, err := ReadOAuthDerivedTextCharge(ctx, ref)
+	require.NoError(t, err)
+	var facts OAuthTextFacts
+	require.NoError(t, common.UnmarshalJsonStr(saved.Facts, &facts))
+	assert.Equal(t, .25, facts.CacheRatio)
+	usage := OAuthTextUsage{Prompt: 20, Completion: 40, Total: 60, Cached: 20}
+	_, err = FinalizeOAuthDerivedTextSnapshot(ctx, ref, 45, usage, strings.Repeat("f", 64))
+	require.Error(t, err)
+	c, err := FinalizeOAuthDerivedTextSnapshot(ctx, ref, 45, usage, saved.Fingerprint)
+	require.NoError(t, err)
+	assert.Equal(t, "settled", c.State)
+	var storedUsage OAuthTextUsage
+	require.NoError(t, common.UnmarshalJsonStr(c.Usage, &storedUsage))
+	assert.Equal(t, usage, storedUsage)
+	_, err = FinalizeOAuthDerivedTextSnapshot(ctx, ref, 45, usage, saved.Fingerprint)
+	require.NoError(t, err)
+	usage.Cached = 0
+	_, err = FinalizeOAuthDerivedTextSnapshot(ctx, ref, 45, usage, saved.Fingerprint)
+	require.Error(t, err)
+	var user User
+	require.NoError(t, db.First(&user, f.UserID).Error)
+	assert.Equal(t, 55, user.Quota)
 }
