@@ -75,8 +75,7 @@ func populateUserCache(user User) error {
 }
 
 // updateUserCache refreshes non-quota user cache fields.
-// Quota is maintained by atomic quota delta paths and must not be overwritten
-// by stale user snapshots from profile/settings updates.
+// Stored Quota is advisory; public wallet reads always use committed SQL.
 func updateUserCache(user User) error {
 	if !common.RedisEnabled {
 		return nil
@@ -89,6 +88,11 @@ func GetUserCache(userId int) (*UserBase, error) {
 	// Try getting from Redis first
 	userCache, err := cacheGetUserBase(userId)
 	if err == nil {
+		quota, err := GetUserQuota(userId, true)
+		if err != nil {
+			return nil, err
+		}
+		userCache.Quota = quota
 		return userCache, nil
 	}
 
@@ -137,24 +141,19 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	return &userCache, nil
 }
 
-// Add atomic quota operations using hash fields.
-// 通过守卫式 Lua 脚本执行：哈希不存在时直接跳过（下次读取会从数据库水合），
-// 不会像裸 HINCRBY 那样创建只含 Quota 字段的残缺哈希。
+// Post-commit quota notifications invalidate the projection instead of applying
+// a delta to a possibly already hydrated SQL snapshot. Delayed notifications
+// cannot double-credit; GetUserCache/GetUserQuota still read SQL money.
 func cacheIncrUserQuota(userId int, delta int64) error {
-	if !common.RedisEnabled {
-		return nil
-	}
-	_, err := cacheApplyUserQuotaDelta(userId, delta)
-	return err
+	return invalidateUserCache(userId)
 }
 
 func cacheDecrUserQuota(userId int, delta int64) error {
 	return cacheIncrUserQuota(userId, -delta)
 }
 
-// syncCreditUserQuotaCache 在授信事务（充值/兑换等）提交后同步把增量补进缓存
-// 余额。预扣以缓存值为准（存在期间），授信不能绕过它，否则新到账的额度在
-// 缓存过期前不可用；缓存未命中无需处理，下次读取会从已提交的数据库余额水合。
+// syncCreditUserQuotaCache invalidates only after the credit commits. Cache
+// failure cannot turn an already committed credit into a retryable money error.
 func syncCreditUserQuotaCache(userId int, quota int, operation string) {
 	if quota <= 0 {
 		return

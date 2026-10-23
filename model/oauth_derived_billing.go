@@ -153,7 +153,11 @@ func withOAuthTextAdmission(ctx context.Context, f OAuthTextFacts, action func(*
 
 func oauthTextUnresolved(tx *gorm.DB, userID int, except string) error {
 	var n int64
-	if err := tx.Model(&OAuthDerivedTextCharge{}).Where("user_id = ? AND ref <> ? AND state IN ?", userID, except, []string{"send_claimed", "held"}).Count(&n).Error; err != nil {
+	query := tx.Model(&OAuthDerivedTextCharge{}).Where("user_id = ? AND state IN ?", userID, []string{"send_claimed", "held"})
+	if except != "" {
+		query = query.Where("ref <> ?", except)
+	}
+	if err := query.Count(&n).Error; err != nil {
 		return err
 	}
 	if n != 0 {

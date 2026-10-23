@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -554,9 +555,10 @@ func executeTaskSubmissionWith(
 	var result *relay.TaskSubmitResult
 	var taskErr *taskdto.TaskError
 	durable := false
+	accepted := false
 	stage := "start"
 	defer func() {
-		if !durable && relayInfo.Billing != nil {
+		if !durable && !accepted && relayInfo.Billing != nil {
 			diagnostics.refund(stage)
 			relayInfo.Billing.Refund(c)
 		}
@@ -619,7 +621,11 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		result, taskErr = submit(c, relayInfo)
-		if requestErr := c.Request.Context().Err(); requestErr != nil {
+		accepted = taskErr == nil && result != nil
+		if sender, ok := relayInfo.Billing.(interface{ WalletTaskSendClaimed() bool }); ok && sender.WalletTaskSendClaimed() && taskErr != nil {
+			taskErr.NoRetry = true
+		}
+		if requestErr := c.Request.Context().Err(); requestErr != nil && !accepted {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
 			break
@@ -663,28 +669,26 @@ func executeTaskSubmissionWith(
 		diagnostics.failed("submit", "missing_result", taskErr, false)
 		return nil, taskErr
 	}
-	if requestErr := c.Request.Context().Err(); requestErr != nil {
-		diagnostics.cancelled("before_reserve", retryParam.GetRetry()+1)
-		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+	// Successful submit is the accepted-upstream boundary. Cancellation or a
+	// later SQL error must not refund that obligation or cause another send.
+	// No fallback to Reserve: it is a future-admission operation.
+	var adjustmentErr error
+	var obligationID int64
+	if owner, ok := relayInfo.Billing.(interface{ WalletTaskObligationID() int64 }); ok {
+		obligationID = owner.WalletTaskObligationID()
 	}
-
-	// Reserve any submit-time upward billing adjustment before persistence.
-	// This keeps insertion failures fully refundable while ensuring settlement
-	// after the barrier normally has a zero positive delta.
-	if relayInfo.Billing != nil {
+	if relayInfo.Billing != nil && obligationID == 0 {
 		stage = "reserve"
 		diagnostics.reserve("reserve_start", result.Quota)
-		if reserveErr := relayInfo.Billing.Reserve(result.Quota); reserveErr != nil {
-			common.SysError(common.LogText("reserve adjusted task billing error: %s", reserveErr.Error()))
-			taskErr = service.TaskErrorWrapperLocal(errors.New("insufficient quota for adjusted task cost"), string(types.ErrorCodeInsufficientUserQuota), http.StatusForbidden)
-			diagnostics.failed("reserve", "insufficient_quota", taskErr, false)
-			return nil, taskErr
+		adjuster, ok := relayInfo.Billing.(interface{ ReserveAcceptedTask(int) error })
+		if !ok {
+			adjustmentErr = errors.New("accepted task billing adjustment unavailable")
+		} else {
+			adjustmentErr = adjuster.ReserveAcceptedTask(result.Quota)
 		}
-		diagnostics.reserve("reserve_complete", result.Quota)
-	}
-	if requestErr := c.Request.Context().Err(); requestErr != nil {
-		diagnostics.cancelled("before_insert", retryParam.GetRetry()+1)
-		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+		if adjustmentErr == nil {
+			diagnostics.reserve("reserve_complete", result.Quota)
+		}
 	}
 
 	stage = "insert"
@@ -705,6 +709,11 @@ func executeTaskSubmissionWith(
 		TieredSnapshot:  relayInfo.TieredBillingSnapshot,
 	}
 	task.Quota = result.Quota
+	if adjustmentErr != nil && relayInfo.Billing != nil {
+		// Persist only the actually tracked reservation; never advertise an
+		// unsuccessful adjustment as paid or make it refundable by the poller.
+		task.Quota = relayInfo.Billing.GetPreConsumedQuota()
+	}
 	task.Data = result.TaskData
 	if len(result.PluginState) > 0 {
 		task.PrivateData.PluginState = result.PluginState
@@ -753,22 +762,61 @@ func executeTaskSubmissionWith(
 		}
 	}
 	diagnostics.insertStart(task)
-	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
+	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
+	defer cancelPersist()
+	var insertErr error
+	if obligationID != 0 {
+		var intent model.Task
+		insertErr = model.DB.WithContext(persistCtx).First(&intent, obligationID).Error
+		if insertErr == nil {
+			task.ID, task.BillingRevision = intent.ID, intent.BillingRevision
+			task.BillingProtocol, task.BillingRef = intent.BillingProtocol, intent.BillingRef
+			transientData := task.Data
+			if len(insertOmits) != 0 {
+				task.Data = nil
+			}
+			insertErr = model.StageWalletTaskOutcome(persistCtx, task, result.Quota)
+			task.Data = transientData
+		}
+	} else {
+		insertErr = task.InsertWithContext(persistCtx, insertOmits...)
+	}
+	if insertErr != nil {
 		common.SysError(common.LogText("insert task error: %s", insertErr.Error()))
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
+		taskErr.NoRetry = true
 		diagnostics.failed("insert", "database_error", taskErr, false)
 		return nil, taskErr
 	}
 	durable = true
 	stage = "settle"
 	diagnostics.durable(task)
+	if adjustmentErr != nil {
+		common.SysError("accepted task billing adjustment failed; retained task and reservation require reconciliation")
+		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to adjust accepted task billing"), "task_billing_adjustment_failed", http.StatusInternalServerError)
+		taskErr.NoRetry = true
+		diagnostics.failed("reserve", "billing_error", taskErr, true)
+		return nil, taskErr
+	}
 	diagnostics.settleStart(task, result.Quota)
 
 	if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
 		common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
+		taskErr.NoRetry = true
 		diagnostics.failed("settle", "billing_error", taskErr, true)
 		return nil, taskErr
+	}
+	if obligationID != 0 {
+		transientData := task.Data
+		if err := model.DB.WithContext(persistCtx).First(task, obligationID).Error; err != nil {
+			taskErr = service.TaskErrorWrapperLocal(errors.New("task settlement visibility unavailable"), "task_billing_settlement_failed", http.StatusInternalServerError)
+			taskErr.NoRetry = true
+			return nil, taskErr
+		}
+		if task.PrivateData.ResultDiscarded {
+			task.Data = transientData
+		}
 	}
 	if task.Status != model.TaskStatusFailure {
 		service.MarkRequestPolicySuccess(c, nil)

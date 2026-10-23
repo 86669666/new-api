@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -83,6 +84,10 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		if task.BillingProtocol == 1 {
+			_ = model.HoldWalletTask(ctx, task.ID)
+			continue
+		}
 		fundingErr := validateTaskFundingSource(task)
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 
@@ -140,6 +145,17 @@ type TaskPollSummary struct {
 // adaptor factory has not been wired yet, to avoid a nil call during startup.
 func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) TaskPollSummary {
 	summary := TaskPollSummary{}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if pending, err := model.PendingWalletTasks(ctx, 100); err == nil {
+		for _, task := range pending {
+			if ctx.Err() != nil {
+				break
+			}
+			_ = model.ReconcileWalletTask(ctx, task.ID)
+		}
+	}
 	if GetTaskAdaptorFunc == nil {
 		return summary
 	}
@@ -175,6 +191,13 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		nullTaskIds := make([]int64, 0)
 		for _, task := range tasks {
 			upstreamID := task.GetUpstreamTaskID()
+			if task.BillingProtocol == 1 {
+				if task.PrivateData.UpstreamTaskID == "" {
+					_ = model.HoldWalletTask(ctx, task.ID)
+					continue
+				}
+				upstreamID = fmt.Sprintf("wallet-row:%d", task.ID)
+			}
 			if upstreamID == "" {
 				// 统计失败的未完成任务
 				nullTaskIds = append(nullTaskIds, task.ID)
@@ -215,6 +238,26 @@ func DispatchPlatformUpdate(ctx context.Context, platform constant.TaskPlatform,
 	}
 	if platform == constant.TaskPlatformMidjourney {
 		// MJ 轮询由其自身处理，这里预留入口
+		return
+	}
+	protocolTasks := make(map[string]*model.Task)
+	protocolChannels := make(map[int][]string)
+	legacyTasks := make(map[string]*model.Task)
+	legacyChannels := make(map[int][]string)
+	for id, task := range taskM {
+		if task.BillingProtocol == 1 {
+			protocolTasks[id] = task
+			protocolChannels[task.ChannelId] = append(protocolChannels[task.ChannelId], id)
+		} else {
+			legacyTasks[id] = task
+			legacyChannels[task.ChannelId] = append(legacyChannels[task.ChannelId], id)
+		}
+	}
+	if len(protocolTasks) != 0 {
+		_ = UpdateVideoTasks(ctx, platform, protocolChannels, protocolTasks)
+	}
+	taskM, taskChannelM = legacyTasks, legacyChannels
+	if len(taskM) == 0 {
 		return
 	}
 	adaptor := GetTaskAdaptorFunc(platform)
@@ -519,6 +562,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
 
+	if task.BillingProtocol == 1 && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		return model.HoldWalletTask(ctx, task.ID)
+	}
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
 		logger.LogWarn(ctx, common.LogText("task %s poll %s (failures=%d, http=%d): %s", task.TaskID, pollClassNotFound, task.PrivateData.PollFailures, resp.StatusCode, unrecognizedPollDetail("", responseBody)))
@@ -531,9 +577,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	taskResult := &relaycommon.TaskInfo{}
-	// try parse as New API response format
+	// Only legacy tasks accept the generic gateway envelope. Wallet protocol1
+	// observations must pass the trusted provider parser and identity checks.
 	var responseItems taskdto.TaskResponse[model.Task]
-	if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
+	if task.BillingProtocol == 0 && common.Unmarshal(responseBody, &responseItems) == nil && responseItems.IsSuccess() {
 		logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
 		t := responseItems.Data
 		taskResult.TaskID = t.TaskID
@@ -544,6 +591,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		task.Data = t.Data
 	} else if taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody); err != nil {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+	}
+
+	if task.BillingProtocol == 1 && (taskResult == nil || task.PrivateData.UpstreamTaskID == "" || taskResult.TaskID != task.PrivateData.UpstreamTaskID) {
+		return model.HoldWalletTask(ctx, task.ID)
 	}
 
 	logger.LogDebug(ctx, "updateVideoSingleTask taskResult: %+v", taskResult)
@@ -610,6 +661,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		task.Progress = taskResult.Progress
 	}
 
+	if task.BillingProtocol == 1 {
+		return settleWalletTaskObservation(ctx, adaptor, task, taskResult)
+	}
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && snap.Status != task.Status {
 		won, err := task.UpdateWithStatus(snap.Status)
@@ -697,6 +751,9 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		result, usageFacts, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, taskResult.UsageFacts)
 		if err != nil {
 			logger.LogWarn(ctx, common.LogText("task %s expression settlement failed, keeping the pre-consumed quota: %v", task.TaskID, err))
+			if task.BillingProtocol == 1 {
+				RecalculateTaskQuota(ctx, task, task.Quota, common.NewMessage("Task settlement"))
+			}
 			return true
 		}
 		if result.Clamp != nil {
@@ -778,6 +835,9 @@ func unrecognizedPollDetail(reason string, body []byte) string {
 }
 
 func recordPollFailure(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, class string, statusCode int, detail string) error {
+	if task.BillingProtocol == 1 {
+		return model.HoldWalletTask(ctx, task.ID)
+	}
 	task.PrivateData.PollFailures++
 	// TASK_POLL_MAX_FAILURES <= 0 disables the consecutive-failure cutoff, matching
 	// TASK_TIMEOUT_MINUTES semantics; the 24h sweep remains the only backstop.
@@ -812,6 +872,10 @@ func recordPollFailureForTasks(ctx context.Context, adaptor TaskPollingAdaptor, 
 }
 
 func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, reason string) error {
+	if task.BillingProtocol == 1 {
+		return model.HoldWalletTask(ctx, task.ID)
+	}
+
 	now := time.Now().Unix()
 	task.Status = model.TaskStatusFailure
 	task.Progress = taskcommon.ProgressComplete
@@ -841,4 +905,25 @@ func failTasksFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, tasks []
 		}
 	}
 	return firstErr
+}
+
+// Financial publication precedes terminal visibility. A failed delta leaves the
+// durable target pending; the next pass reconciles it without polling/resubmitting.
+func settleWalletTaskObservation(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, result *relaycommon.TaskInfo) error {
+	terminal := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	handled := false
+	if terminal {
+		handled = settleTaskBillingOnComplete(ctx, adaptor, task, result)
+	}
+	if !handled {
+		target := task.Quota
+		if task.Status == model.TaskStatusFailure {
+			target = 0
+		}
+		RecalculateTaskQuota(ctx, task, target, common.NewMessage("Task settlement"))
+	}
+	if task.BillingState == model.TaskBillingPending || terminal && task.BillingState != model.TaskBillingSettled || !terminal && task.BillingState != model.TaskBillingReady {
+		return errors.New("task financial publication pending")
+	}
+	return nil
 }

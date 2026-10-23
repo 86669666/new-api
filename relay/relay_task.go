@@ -330,8 +330,15 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		noteTaskQuotaClamp(info, clamp)
 	}
 
+	c.Set("platform", string(platform))
 	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
-	if info.Billing == nil && !info.PriceData.FreeModel {
+	if info.Billing == nil && info.PriceData.FreeModel {
+		// A free task has no funding reservation. Admit without inventing a
+		// personal-wallet payer or overriding a subscription preference.
+		if err := model.CheckUserBillingAdmission(c.Request.Context(), info.UserId); err != nil {
+			return nil, service.TaskErrorWrapper(err, "billing_admission_failed", http.StatusForbidden)
+		}
+	} else if info.Billing == nil {
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)

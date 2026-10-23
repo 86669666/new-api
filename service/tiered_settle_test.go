@@ -1,22 +1,33 @@
 package service
 
 import (
+	"context"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	kittypes "github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // Claude Sonnet-style tiered expression: standard vs long-context
@@ -341,6 +352,7 @@ func (s *recordingBillingSettler) Reserve(targetQuota int) error {
 }
 
 func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
+	requireWalletChargeStore(t)
 	const expr = `tier("base", p)`
 	billing := &recordingBillingSettler{preConsumedQuota: 50_000}
 	relayInfo := &relaycommon.RelayInfo{
@@ -369,6 +381,7 @@ func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
 }
 
 func TestPrepareTieredBillingForSelectedGroupStartsBillingAfterFreeGroup(t *testing.T) {
+	requireWalletChargeStore(t)
 	truncate(t)
 	gin.SetMode(gin.TestMode)
 
@@ -412,6 +425,7 @@ func TestPrepareTieredBillingForSelectedGroupStartsBillingAfterFreeGroup(t *test
 }
 
 func TestPrepareTieredBillingForSelectedGroupPaidToFreeKeepsFreeModelFalse(t *testing.T) {
+	requireWalletChargeStore(t)
 	const expr = `tier("base", p)`
 	billing := &recordingBillingSettler{preConsumedQuota: 50_000}
 	relayInfo := &relaycommon.RelayInfo{
@@ -441,6 +455,7 @@ func TestPrepareTieredBillingForSelectedGroupPaidToFreeKeepsFreeModelFalse(t *te
 }
 
 func TestPrepareTieredBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance(t *testing.T) {
+	requireWalletChargeStore(t)
 	truncate(t)
 
 	const userID = 701
@@ -494,6 +509,7 @@ func TestPrepareTieredBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance(t
 }
 
 func TestBillingSessionReserveWalletTopUpDecrementsBalance(t *testing.T) {
+	requireWalletChargeStore(t)
 	truncate(t)
 
 	const userID = 702
@@ -1089,6 +1105,174 @@ func TestSamePriceCacheReadsRemainInInput(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, previousCost, cost, "folding cache reads into input must preserve the charge")
 			assert.Equal(t, separateParams.Len, params.Len, "tier conditions keep the full context length")
+		})
+	}
+}
+
+// The production migration belongs to the schema owner. This is test-only
+// initialization and does not establish deployment readiness.
+func requireWalletChargeStore(t *testing.T) {
+	t.Helper()
+	require.NoError(t, model.DB.AutoMigrate(&model.OAuthDerivedTextCharge{}, &model.Task{}))
+}
+
+// Exercises the public session lifecycle on the same guarded SQL fixture as
+// the derived tests. The fixture provisions the charge store, not a migration.
+func TestBillingSessionSQLAdmission(t *testing.T) {
+	for _, kind := range []common.DatabaseType{common.DatabaseTypeSQLite, common.DatabaseTypeMySQL, common.DatabaseTypePostgreSQL} {
+		t.Run(string(kind), func(t *testing.T) {
+			for _, scenario := range []string{"arrears_retry", "arrears_retry_held", "arrears_retry_claimed", "arrears_settle", "held_refund", "image_available", "search_available", "zero_held", "trusted_held", "task_zero_held", "task_trusted_held"} {
+				t.Run(scenario, func(t *testing.T) {
+					db, facts := newOAuthDerivedTextBillingFixture(t, kind, oauthTextCASWireDialect(t, kind))
+					require.NoError(t, db.AutoMigrate(&model.Task{}))
+					t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(&model.Task{})) })
+					if addr := os.Getenv("NEWAPI_TEST_REDIS_ADDR"); addr != "" {
+						require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+						host, _, err := net.SplitHostPort(addr)
+						require.NoError(t, err)
+						require.Equal(t, "127.0.0.1", host)
+						client := redis.NewClient(&redis.Options{Addr: addr})
+						require.NoError(t, client.Ping(context.Background()).Err())
+						old, enabled := common.RDB, common.RedisEnabled
+						common.RDB, common.RedisEnabled = client, true
+						t.Cleanup(func() {
+							assert.NoError(t, client.Del(context.Background(), "user:"+strconv.Itoa(facts.UserID)).Err())
+							common.RDB, common.RedisEnabled = old, enabled
+							assert.NoError(t, client.Close())
+						})
+					} else {
+						require.NotEqual(t, "1", os.Getenv("NEWAPI_REQUIRE_DATABASES"))
+					}
+					c, _ := gin.CreateTestContext(httptest.NewRecorder())
+					c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+					info := &relaycommon.RelayInfo{UserId: facts.UserID, IsPlayground: true, ForcePreConsume: true}
+					info.UserSetting.BillingPreference = "wallet_only"
+					if scenario == "zero_held" || scenario == "trusted_held" || strings.HasPrefix(scenario, "task_") {
+						if strings.HasPrefix(scenario, "task_") {
+							task := &model.Task{TaskID: "held-admission", UserId: facts.UserID}
+							require.NoError(t, model.CreateWalletTaskObligation(context.Background(), task, 0, 0))
+							require.NoError(t, model.ClaimWalletTaskSend(context.Background(), task.ID))
+							require.NoError(t, model.HoldWalletTask(context.Background(), task.ID))
+						} else {
+							require.NoError(t, db.Create(&model.OAuthDerivedTextCharge{Ref: strings.Repeat("b", 64), UserID: facts.UserID, State: "held"}).Error)
+						}
+						quota := 0
+						if scenario == "trusted_held" || scenario == "task_trusted_held" {
+							old := operation_setting.GetQuotaSetting().TrustQuotaUSD
+							operation_setting.GetQuotaSetting().TrustQuotaUSD = 0.000001
+							t.Cleanup(func() { operation_setting.GetQuotaSetting().TrustQuotaUSD = old })
+							info.ForcePreConsume = false
+							info.TokenUnlimited = true
+							quota = 80
+						}
+						session, err := NewBillingSession(c, info, quota)
+						require.NotNil(t, err)
+						require.Nil(t, session)
+						balance, readErr := model.GetUserQuota(facts.UserID, false)
+						require.NoError(t, readErr)
+						assert.Equal(t, 100, balance)
+						return
+					}
+					session, err := NewBillingSession(c, info, 80)
+					require.Nil(t, err)
+					require.NotNil(t, session)
+					if scenario == "image_available" {
+						info.ImageRequestCount = 1
+					}
+					if scenario == "search_available" {
+						info.RelayMode = relayconstant.RelayModeToolsSearch
+					}
+					if strings.HasPrefix(scenario, "arrears_retry") {
+						require.NoError(t, session.Reserve(140))
+						if scenario != "arrears_retry" {
+							state := "held"
+							if scenario == "arrears_retry_claimed" {
+								state = "send_claimed"
+							}
+							require.NoError(t, db.Create(&model.OAuthDerivedTextCharge{Ref: strings.Repeat("b", 64), UserID: facts.UserID, State: state}).Error)
+						}
+						for _, target := range []int{140, 120, 160} {
+							wantReserved := 140
+							if scenario == "arrears_retry" {
+								require.NoError(t, session.Reserve(target), "same/lower retry must retain the existing arrears reservation")
+								wantReserved = max(140, target)
+							} else {
+								require.Error(t, session.Reserve(target), "unresolved still blocks every new retry")
+							}
+							assert.Equal(t, wantReserved, session.GetPreConsumedQuota())
+							balance, readErr := model.GetUserQuota(facts.UserID, false)
+							require.NoError(t, readErr)
+							assert.Equal(t, 100-wantReserved, balance)
+						}
+						// Historical settlement is independent of the new-admission gate.
+						require.NoError(t, session.Settle(120))
+						require.NoError(t, session.Settle(120))
+						balance, readErr := model.GetUserQuota(facts.UserID, false)
+						require.NoError(t, readErr)
+						assert.Equal(t, -20, balance)
+						return
+					}
+					if scenario == "held_refund" {
+						require.NoError(t, db.Create(&model.OAuthDerivedTextCharge{Ref: strings.Repeat("b", 64), UserID: facts.UserID, State: "held"}).Error)
+						require.Error(t, session.Reserve(140))
+						require.Error(t, session.Reserve(80))
+					} else if scenario == "arrears_settle" {
+						require.NoError(t, session.Reserve(140))
+						balance, readErr := model.GetUserQuota(facts.UserID, false)
+						require.NoError(t, readErr)
+						assert.Equal(t, -40, balance)
+						require.NoError(t, db.Create(&model.OAuthDerivedTextCharge{Ref: strings.Repeat("b", 64), UserID: facts.UserID, State: "held"}).Error)
+						require.NoError(t, session.Settle(120))
+						require.NoError(t, session.Settle(120))
+						session.Refund(c)
+						balance, readErr = model.GetUserQuota(facts.UserID, false)
+						require.NoError(t, readErr)
+						assert.Equal(t, -20, balance)
+						return
+					} else {
+						reserveErr := session.Reserve(140)
+						var apiErr *kittypes.NewAPIError
+						require.ErrorAs(t, reserveErr, &apiErr)
+						assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
+					}
+					balance, readErr := model.GetUserQuota(facts.UserID, false)
+					require.NoError(t, readErr)
+					assert.Equal(t, 20, balance)
+					done := make(chan struct{}, 1)
+					require.NoError(t, db.Callback().Update().After("gorm:commit_or_rollback_transaction").Register("test:wallet-refund", func(tx *gorm.DB) {
+						if tx.Error == nil && strings.Contains(tx.Statement.SQL.String(), "quota +") {
+							done <- struct{}{}
+						}
+					}))
+					t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("test:wallet-refund")) })
+					session.Refund(c)
+					session.Refund(c)
+					select {
+					case <-done:
+					case <-time.After(5 * time.Second):
+						t.Fatal("refund SQL did not complete")
+					}
+					balance, readErr = model.GetUserQuota(facts.UserID, false)
+					require.NoError(t, readErr)
+					assert.Equal(t, 100, balance)
+				})
+			}
+		})
+	}
+}
+
+// Re-run the original regression bodies unchanged against each real dialect.
+func TestBillingLegacySQLRegressions(t *testing.T) {
+	for _, kind := range []common.DatabaseType{common.DatabaseTypeSQLite, common.DatabaseTypeMySQL, common.DatabaseTypePostgreSQL} {
+		t.Run(string(kind), func(t *testing.T) {
+			db, _ := newOAuthDerivedTextBillingFixture(t, kind, oauthTextCASWireDialect(t, kind))
+			extra := []any{&model.Task{}, &model.Log{}, &model.Channel{}, &model.Midjourney{}, &model.TopUp{}, &model.UserSubscription{}, &model.SystemTaskLock{}, &model.SystemTask{}}
+			require.NoError(t, db.AutoMigrate(extra...))
+			t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(extra...)) })
+			require.NoError(t, db.Exec("DELETE FROM users").Error)
+			t.Run("starts_after_free", TestPrepareTieredBillingForSelectedGroupStartsBillingAfterFreeGroup)
+			t.Run("arrears", TestPrepareTieredBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance)
+			t.Run("top_up", TestBillingSessionReserveWalletTopUpDecrementsBalance)
 		})
 	}
 }

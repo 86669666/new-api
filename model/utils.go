@@ -82,6 +82,15 @@ func batchUpdate() {
 	stores := make([]map[int]int, BatchUpdateTypeCount)
 	for i := range BatchUpdateTypeCount {
 		batchUpdateLocks[i].Lock()
+		if i == BatchUpdateTypeUserQuota || i == BatchUpdateTypeTokenQuota {
+			// Never apply or discard an old financial queue during cutover.
+			// Its obligations require explicit reconciliation before activation.
+			if len(batchUpdateStores[i]) != 0 {
+				common.SysError("pending legacy financial batch requires reconciliation")
+			}
+			batchUpdateLocks[i].Unlock()
+			continue
+		}
 		stores[i] = batchUpdateStores[i]
 		batchUpdateStores[i] = make(map[int]int)
 		batchUpdateLocks[i].Unlock()
@@ -104,14 +113,10 @@ func batchUpdate() {
 		}
 	}
 
-	userQuotaStore := stores[BatchUpdateTypeUserQuota]
 	usedQuotaStore := stores[BatchUpdateTypeUsedQuota]
 	requestCountStore := stores[BatchUpdateTypeRequestCount]
 
-	userIDs := make(map[int]struct{}, len(userQuotaStore)+len(usedQuotaStore)+len(requestCountStore))
-	for key := range userQuotaStore {
-		userIDs[key] = struct{}{}
-	}
+	userIDs := make(map[int]struct{}, len(usedQuotaStore)+len(requestCountStore))
 	for key := range usedQuotaStore {
 		userIDs[key] = struct{}{}
 	}
@@ -119,7 +124,7 @@ func batchUpdate() {
 		userIDs[key] = struct{}{}
 	}
 	for key := range userIDs {
-		updateUserQuotaUsedQuotaAndRequestCount(key, userQuotaStore[key], usedQuotaStore[key], requestCountStore[key])
+		updateUserUsedQuotaAndRequestCount(key, usedQuotaStore[key], requestCountStore[key])
 	}
 	common.SysLog(common.LogText("batch update finished"))
 }

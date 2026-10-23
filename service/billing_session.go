@@ -1,14 +1,17 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
@@ -29,11 +32,14 @@ import (
 // BillingSession 封装单次请求的预扣费/结算/退款生命周期。
 // 实现 relaycommon.BillingSettler 接口。
 type BillingSession struct {
+	taskObligationID int64
+	taskSendClaimed  bool
 	relayInfo        *relaycommon.RelayInfo
 	funding          FundingSource
 	preConsumedQuota int    // 实际预扣额度（信任用户可能为 0）
 	tokenConsumed    int    // 令牌额度实际扣减量
 	extraReserved    int    // 发送前补充预扣的额度（订阅退款时需要单独回滚）
+	taskAccepted     bool   // successful task submit owns the reservation until settlement
 	trusted          bool   // 是否命中信任额度旁路
 	fundingSettled   bool   // funding.Settle 已成功，资金来源已提交
 	settled          bool   // Settle 全部完成（资金 + 令牌）
@@ -48,6 +54,15 @@ type BillingSession struct {
 func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.taskObligationID != 0 {
+		if err := model.ReconcileWalletTask(context.Background(), s.taskObligationID); err != nil {
+			return err
+		}
+		s.preConsumedQuota, s.tokenConsumed = actualQuota, actualQuota
+		s.syncRelayInfo()
+		s.settled = true
+		return nil
+	}
 	if s.settled {
 		return nil
 	}
@@ -88,6 +103,15 @@ func (s *BillingSession) Settle(actualQuota int) error {
 // Refund 退还所有预扣费，幂等安全，异步执行。
 func (s *BillingSession) Refund(c *gin.Context) {
 	s.mu.Lock()
+	if s.taskObligationID != 0 {
+		id := s.taskObligationID
+		s.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
+		defer cancel()
+		// A claimed or ambiguous send is never refundable by this path.
+		_ = model.CancelUnclaimedWalletTask(ctx, id)
+		return
+	}
 	if s.settled || s.refunded || !s.needsRefundLocked() {
 		s.mu.Unlock()
 		return
@@ -137,7 +161,7 @@ func (s *BillingSession) NeedsRefund() bool {
 }
 
 func (s *BillingSession) needsRefundLocked() bool {
-	if s.settled || s.refunded || s.fundingSettled {
+	if s.settled || s.refunded || s.fundingSettled || s.taskAccepted || s.taskSendClaimed {
 		// fundingSettled 时资金来源已提交结算，不能再退预扣费
 		return false
 	}
@@ -157,15 +181,47 @@ func (s *BillingSession) GetPreConsumedQuota() int {
 }
 
 func (s *BillingSession) Reserve(targetQuota int) error {
+	return s.reserve(targetQuota, false)
+}
+
+// ReserveAcceptedTask is only called after submit returned a successful result.
+// This records an existing obligation, not permission to send another request.
+func (s *BillingSession) ReserveAcceptedTask(targetQuota int) error {
+	return s.reserve(targetQuota, true)
+}
+
+func (s *BillingSession) reserve(targetQuota int, acceptedTask bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.taskObligationID != 0 {
+		// The accepted result must first be durably staged with its target.
+		return model.ErrTaskObligationConflict
+	}
+	if acceptedTask {
+		s.taskAccepted = true
+	}
 
 	imageRequest := false
 	if s.relayInfo != nil {
 		_, imageRequest = s.relayInfo.Request.(*dto.ImageRequest)
 		imageRequest = imageRequest || s.relayInfo.ImageRequestCount > 0
 	}
-	if s.settled || s.refunded || s.trusted && !imageRequest || targetQuota <= s.preConsumedQuota {
+	if s.settled || s.refunded {
+		return nil
+	}
+	if !acceptedTask {
+		if err := model.CheckUserBillingAdmission(context.Background(), s.relayInfo.UserId); err != nil {
+			return err
+		}
+	}
+	if (!acceptedTask && s.trusted && !imageRequest) || targetQuota <= s.preConsumedQuota {
+		// Ordinary retries retain the existing reservation even when a previous
+		// top-up entered arrears. Admission was checked above; no new money is
+		// requested here. Image/search still require available wallet quota.
+		if funding, ok := s.funding.(*WalletFunding); ok && !acceptedTask && (imageRequest || s.relayInfo.RelayMode == relayconstant.RelayModeToolsSearch) {
+			return funding.PreConsume(0)
+		}
 		return nil
 	}
 
@@ -174,7 +230,7 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 		return nil
 	}
 
-	if err := s.reserveFunding(delta, imageRequest); err != nil {
+	if err := s.reserveFunding(delta, imageRequest, acceptedTask); err != nil {
 		return err
 	}
 	if err := s.reserveToken(delta); err != nil {
@@ -208,6 +264,22 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 		logger.LogInfo(c, common.LogText("user %d has enough quota, trusted without pre-consume (funding=%s)", s.relayInfo.UserId, s.funding.Source()))
 	} else if effectiveQuota > 0 {
 		logger.LogInfo(c, common.LogText("user %d needs pre-consume %s (funding=%s)", s.relayInfo.UserId, logger.FormatQuota(effectiveQuota), s.funding.Source()))
+	}
+
+	if s.funding.Source() == BillingSourceWallet && s.relayInfo.TaskRelayInfo != nil && s.relayInfo.PublicTaskID != "" {
+		task := model.InitTask(constant.TaskPlatform(c.GetString("platform")), s.relayInfo)
+		task.PrivateData.Execution = TaskExecutionSnapshotFromContext(c)
+		tokenID := s.relayInfo.TokenId
+		if s.relayInfo.IsPlayground {
+			tokenID = 0
+		}
+		if err := model.CreateWalletTaskObligation(c.Request.Context(), task, tokenID, effectiveQuota); err != nil {
+			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+		}
+		s.taskObligationID = task.ID
+		s.preConsumedQuota, s.tokenConsumed = effectiveQuota, effectiveQuota
+		s.syncRelayInfo()
+		return nil
 	}
 
 	// ---- 1) 预扣令牌额度 ----
@@ -252,29 +324,17 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	return nil
 }
 
-func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) error {
+func (s *BillingSession) reserveFunding(delta int, imageRequest, acceptedTask bool) error {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
-		if s.relayInfo != nil && s.relayInfo.RelayMode == relayconstant.RelayModeToolsSearch {
-			// Search knows its fixed cost before dispatch. Top-ups must reserve
-			// available funds and preserve the initial amount for a full refund.
-			reserved, err := model.TryReserveUserQuota(funding.userId, delta)
-			if err != nil {
-				return types.NewError(errors.New("search wallet reservation failed"), types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
-			}
-			if !reserved {
-				quota, readErr := model.GetUserQuota(s.relayInfo.UserId, false)
-				if readErr != nil {
-					return newWalletQuotaError(s.relayInfo, s.lang, nil, "")
-				}
-				return newWalletQuotaError(s.relayInfo, s.lang, &quota, ErrInsufficientWalletQuota.Error())
+		if acceptedTask {
+			if err := model.DecreaseUserQuota(funding.userId, delta, false); err != nil {
+				return err
 			}
 			funding.consumed += delta
 			return nil
 		}
-		if requireAvailableQuota {
-			// Image quantity is known before submission, including retries and
-			// overrides. Reserve atomically instead of admitting wallet debt.
+		if imageRequest || s.relayInfo.RelayMode == relayconstant.RelayModeToolsSearch {
 			if err := funding.PreConsume(delta); err != nil {
 				if errors.Is(err, ErrInsufficientWalletQuota) {
 					quota, readErr := model.GetUserQuota(s.relayInfo.UserId, false)
@@ -287,12 +347,12 @@ func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) e
 			}
 			return nil
 		}
-		// 与结算补扣（SettleBilling 正差额 → WalletFunding.Settle）语义一致：
-		// 全额无条件扣减，余额不足的部分记为欠费（余额可为负），不中断请求，
-		// 保证日志记录的预扣额度与用户余额的实际变动始终对账一致。
-		// DecreaseUserQuota 仅在数据库错误时失败。
-		if err := model.DecreaseUserQuota(funding.userId, delta, false); err != nil {
+		reserved, err := model.TryReserveAdditionalUserQuota(funding.userId, delta)
+		if err != nil {
 			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+		}
+		if !reserved {
+			return ErrInsufficientWalletQuota
 		}
 		funding.consumed += delta
 		return nil
@@ -403,6 +463,12 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 		return nil, types.NewError(fmt.Errorf("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
 
+	// Direct task/image callers and subscription shortcuts also enter here.
+	// This admission check does not assign a funding source or move money.
+	if err := model.CheckUserBillingAdmission(c.Request.Context(), relayInfo.UserId); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	}
+
 	pref := common.NormalizeBillingPreference(relayInfo.UserSetting.BillingPreference)
 
 	// 钱包路径需要先检查用户额度
@@ -411,7 +477,7 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 		if err != nil {
 			return nil, types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
 		}
-		if userQuota <= 0 {
+		if userQuota <= 0 && !(relayInfo.TaskRelayInfo != nil && relayInfo.PublicTaskID != "" && preConsumedQuota == 0 && userQuota == 0) {
 			return nil, newWalletQuotaError(relayInfo, i18n.StatedLang(c), &userQuota,
 				i18n.T(c, i18n.MsgQuotaUserInsufficient, map[string]any{"Remaining": logger.FormatQuota(userQuota)}))
 		}
@@ -496,4 +562,90 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 		}
 		return session, nil
 	}
+}
+
+// WalletTaskObligationID identifies durable ownership, not send permission.
+func (s *BillingSession) WalletTaskObligationID() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.taskObligationID
+}
+
+func (s *BillingSession) WalletTaskSendClaimed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.taskSendClaimed
+}
+
+// SendWalletTask claims the durable intent once and uses a fresh HTTP/1 transport.
+// There is no redirect, reused connection, GetBody or HTTP/2 retry opportunity.
+func (s *BillingSession) SendWalletTask(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.taskObligationID == 0 || s.taskSendClaimed {
+		return nil, model.ErrTaskObligationConflict
+	}
+	policy := NormalizeHTTPTransportPolicy(s.relayInfo.ChannelSetting)
+	policy.Protocol, policy.Shards = dto.HTTPProtocolHTTP1, 1
+	proxyURL, _, err := common.ParseProxyURLRuntime(s.relayInfo.ChannelSetting.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	client, err := newHTTPClientFromPolicy(policy, proxyURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	transport := client.Transport.(*http.Transport)
+	transport.DisableKeepAlives = true
+	defer transport.CloseIdleConnections()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if client.Timeout == 0 {
+		client.Timeout = 2 * time.Minute
+	}
+	req.GetBody = nil
+	req.Close = true
+	// Mark locally even when the commit acknowledgement is lost. Only the SQL
+	// state can subsequently prove this intent remained unclaimed.
+	s.taskSendClaimed = true
+	selectedURL := ""
+	if req.Method == http.MethodPost {
+		selectedURL = req.URL.String()
+	}
+	if err := model.ClaimWalletTaskSend(req.Context(), s.taskObligationID, selectedURL); err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
+// FetchWalletTaskReadQuery executes the provider's documented task lookup with
+// one fresh HTTP/1 connection. Neither a plugin nor the caller supplies a client,
+// redirect policy, request body, arbitrary headers or alternate target.
+func FetchWalletTaskReadQuery(ctx context.Context, task *model.Task, key, proxy string, settings dto.ChannelSettings) (*http.Response, error) {
+	target, err := model.WalletTaskReadQueryURL(task)
+	if err != nil {
+		return nil, err
+	}
+	policy := NormalizeHTTPTransportPolicy(settings)
+	policy.Protocol, policy.Shards = dto.HTTPProtocolHTTP1, 1
+	proxyURL, _, err := common.ParseProxyURLRuntime(proxy)
+	if err != nil {
+		return nil, err
+	}
+	client, err := newHTTPClientFromPolicy(policy, proxyURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	transport := client.Transport.(*http.Transport)
+	transport.DisableKeepAlives = true
+	defer transport.CloseIdleConnections()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	client.Timeout = 30 * time.Second
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Accept", "application/json")
+	req.Close = true
+	return client.Do(req)
 }

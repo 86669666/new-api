@@ -292,6 +292,10 @@ func taskModelName(task *model.Task) string {
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
 // 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
+	if task != nil && task.BillingProtocol != 0 {
+		return false
+	} // Only a staged trusted outcome may credit protocol1.
+
 	if err := validateTaskFundingSource(task); err != nil {
 		logger.LogWarn(ctx, common.LogText("task refund refused: %s", err.Error()))
 		return false
@@ -343,42 +347,64 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 // reason 写入日志内容（例如按 token 重算或 adaptor 调整）。
 // clamps 可选：若计算 actualQuota 时发生额度饱和，将其记入日志 admin_info（仅管理员可见）。
 func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason *common.Message, clamps ...*common.QuotaClamp) {
-	if err := validateTaskFundingSource(task); err != nil {
-		logger.LogWarn(ctx, common.LogText("task difference settlement refused: %s", err.Error()))
-		return
-	}
-	if actualQuota < 0 {
+	if task == nil {
 		return
 	}
 	preConsumedQuota := task.Quota
 	quotaDelta := actualQuota - preConsumedQuota
+	if task.BillingProtocol == 1 {
+		if err := model.StageWalletTaskOutcome(ctx, task, actualQuota); err != nil {
+			task.BillingState = model.TaskBillingHeld // local failed observation; SQL state is unchanged
+			return
+		}
+		task.BillingState = model.TaskBillingPending
+		if err := model.ReconcileWalletTask(ctx, task.ID); err != nil {
+			return
+		}
+		if err := model.DB.WithContext(ctx).First(task, task.ID).Error; err != nil {
+			task.BillingState = model.TaskBillingPending
+			return
+		}
+		if quotaDelta == 0 {
+			return
+		}
+	} else {
+		if err := validateTaskFundingSource(task); err != nil {
+			logger.LogWarn(ctx, common.LogText("task difference settlement refused: %s", err.Error()))
+			return
+		}
+		if actualQuota < 0 {
+			return
+		}
 
-	if quotaDelta == 0 {
-		logger.LogInfo(ctx, common.LogText("task %s pre-consumed quota matches the actual quota (%s, %s)",
-			task.TaskID, logger.LogQuota(actualQuota), reason.Error()))
-		return
-	}
+		if quotaDelta == 0 {
+			logger.LogInfo(ctx, common.LogText("task %s pre-consumed quota matches the actual quota (%s, %s)",
+				task.TaskID, logger.LogQuota(actualQuota), reason.Error()))
+			return
+		}
 
-	logger.LogInfo(ctx, common.LogText("task %s settles the difference: delta=%s (actual %s, pre-consumed %s, %s)",
-		task.TaskID,
-		logger.LogQuota(quotaDelta),
-		logger.LogQuota(actualQuota),
-		logger.LogQuota(preConsumedQuota),
-		reason.Error(),
-	))
+		logger.LogInfo(ctx, common.LogText("task %s settles the difference: delta=%s (actual %s, pre-consumed %s, %s)",
+			task.TaskID,
+			logger.LogQuota(quotaDelta),
+			logger.LogQuota(actualQuota),
+			logger.LogQuota(preConsumedQuota),
+			reason.Error(),
+		))
 
-	// 调整资金来源
-	if err := taskAdjustFunding(task, quotaDelta); err != nil {
-		logger.LogError(ctx, common.LogText("failed to adjust funding for the difference, task %s: %s", task.TaskID, err.Error()))
-		return
-	}
+		// 调整资金来源
+		if err := taskAdjustFunding(task, quotaDelta); err != nil {
+			logger.LogError(ctx, common.LogText("failed to adjust funding for the difference, task %s: %s", task.TaskID, err.Error()))
+			return
+		}
 
-	// 调整令牌额度
-	taskAdjustTokenQuota(ctx, task, quotaDelta)
+		// 调整令牌额度
+		taskAdjustTokenQuota(ctx, task, quotaDelta)
 
-	task.Quota = actualQuota
-	if err := task.UpdateQuota(); err != nil {
-		logger.LogError(ctx, common.LogText("failed to write back the settled task quota, task %s: %s", task.TaskID, err.Error()))
+		task.Quota = actualQuota
+		if err := task.UpdateQuota(); err != nil {
+			logger.LogError(ctx, common.LogText("failed to write back the settled task quota, task %s: %s", task.TaskID, err.Error()))
+		}
+
 	}
 
 	// 提交阶段已经累计过一次请求；结算阶段只调整最终用量。

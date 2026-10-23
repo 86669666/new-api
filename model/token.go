@@ -7,7 +7,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
 )
 
@@ -383,64 +382,56 @@ func DeleteTokenById(id int, userId int) (err error) {
 	return token.Delete()
 }
 
-func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
+func IncreaseTokenQuota(id int, key string, quota int) error {
 	if quota < 0 {
 		return errors.New("quota cannot be negative")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			// 守卫式增量：哈希不存在时跳过，由下次读取从数据库水合，
-			// 绝不创建只有配额字段的残缺哈希。
-			if _, err := cacheApplyTokenQuotaDelta(tokenId, key, int64(quota)); err != nil {
-				common.SysLog(common.LogText("failed to increase token quota: %s", err.Error()))
-			}
-		})
+	if err := increaseTokenQuota(id, quota); err != nil {
+		return err
 	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeTokenQuota, tokenId, quota)
-		return nil
-	}
-	return increaseTokenQuota(tokenId, quota)
+	_ = invalidateTokenCacheForMutation(key)
+	return nil
 }
 
-func increaseTokenQuota(id int, quota int) (err error) {
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
-		map[string]any{
-			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
-			"used_quota":    gorm.Expr("used_quota - ?", quota),
-			"accessed_time": common.GetTimestamp(),
-		},
-	).Error
-	return err
-}
+func increaseTokenQuota(id int, quota int) error { return changeTokenQuotaSQL(id, quota) }
 
-func DecreaseTokenQuota(id int, key string, quota int) (err error) {
+func DecreaseTokenQuota(id int, key string, quota int) error {
 	if quota < 0 {
 		return errors.New("quota cannot be negative")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			if _, err := cacheApplyTokenQuotaDelta(id, key, int64(-quota)); err != nil {
-				common.SysLog(common.LogText("failed to decrease token quota: %s", err.Error()))
-			}
-		})
+	if err := decreaseTokenQuota(id, quota); err != nil {
+		return err
 	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeTokenQuota, id, -quota)
-		return nil
-	}
-	return decreaseTokenQuota(id, quota)
+	_ = invalidateTokenCacheForMutation(key)
+	return nil
 }
 
-func decreaseTokenQuota(id int, quota int) (err error) {
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
-		map[string]any{
-			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
-			"used_quota":    gorm.Expr("used_quota + ?", quota),
-			"accessed_time": common.GetTimestamp(),
-		},
-	).Error
-	return err
+func decreaseTokenQuota(id int, quota int) error { return changeTokenQuotaSQL(id, -quota) }
+
+// Historical deltas are SQL money. Conditional bounds serialize with task
+// transactions on the same Token row; Redis and analytics batches cannot commit it.
+func changeTokenQuotaSQL(id int, delta int) error {
+	if delta < -common.MaxWalletQuota || delta > common.MaxWalletQuota {
+		return ErrWalletQuotaLimitExceeded
+	}
+	if delta == 0 {
+		var token Token
+		return DB.Unscoped().Select("id").First(&token, id).Error
+	}
+	q := DB.Unscoped().Model(&Token{}).Where("id = ? AND remain_quota >= ? AND remain_quota <= ? AND used_quota >= ? AND used_quota <= ?", id, -common.MaxWalletQuota, common.MaxWalletQuota, -common.MaxWalletQuota, common.MaxWalletQuota)
+	if delta > 0 {
+		q = q.Where("remain_quota <= ? AND used_quota >= ?", common.MaxWalletQuota-delta, -common.MaxWalletQuota+delta)
+	} else {
+		q = q.Where("remain_quota >= ? AND used_quota <= ?", -common.MaxWalletQuota-delta, common.MaxWalletQuota+delta)
+	}
+	result := q.Updates(map[string]any{"remain_quota": gorm.Expr("remain_quota + ?", delta), "used_quota": gorm.Expr("used_quota - ?", delta), "accessed_time": common.GetTimestamp()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrWalletQuotaLimitExceeded
+	}
+	return nil
 }
 
 // CountUserTokens returns total number of tokens for the given user, used for pagination

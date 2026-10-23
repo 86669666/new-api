@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -23,6 +24,14 @@ import (
 // provide the current request body through BodyStorage or BillingRequestInput;
 // channel retries retain the resulting billing session and pricing snapshot.
 func PrepareRequestBilling(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if info == nil {
+		return types.NewError(errors.New("relay info is required"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	// Common to HTTP and every Responses WebSocket request. Check before any
+	// pricing/free/funding shortcut, without creating a charge or a session.
+	if err := model.CheckUserBillingAdmission(c.Request.Context(), info.UserId); err != nil {
+		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	}
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	meta := &types.TokenCountMeta{TokenType: types.TokenTypeTokenizer}
 	if info.Request != nil && (needSensitiveCheck || constant.CountToken) {

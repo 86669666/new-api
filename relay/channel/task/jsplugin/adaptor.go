@@ -637,6 +637,11 @@ func (a *TaskAdaptor) GetChannelName() string { return a.plugin.Meta.Name }
 func (a *TaskAdaptor) FetchMode() string      { return a.plugin.Meta.FetchMode }
 
 func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	for _, task := range tasks {
+		if task != nil && task.BillingProtocol != 0 {
+			return nil, model.ErrTaskObligationConflict
+		}
+	}
 	taskContexts := make([]map[string]any, 0, len(tasks))
 	for _, task := range tasks {
 		taskCtx, err := a.queryContext(task, key, baseURL, proxy)
@@ -657,15 +662,50 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	fetcher := a.hookFetcher(baseURL, proxy)
+	if task != nil && task.BillingProtocol != 0 {
+		if _, err := a.walletQueryEligibility(task); err != nil {
+			return nil, err
+		}
+		fetcher = denyWalletQueryHookFetch
+	}
 	ctx, err := a.queryContext(task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
 	}
-	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "buildQueryRequest", ctx)
+	descriptor, err := a.requestDescriptor(pluginruntime.WithFetcher(context.Background(), fetcher), "buildQueryRequest", ctx)
 	if err != nil {
 		return nil, err
 	}
+	if task != nil && task.BillingProtocol != 0 {
+		expected, err := a.walletQueryEligibility(task)
+		if err != nil {
+			return nil, err
+		}
+		if descriptor.URL != expected || descriptor.Method != http.MethodGet || descriptor.Body != nil || len(descriptor.BodyText) != 0 || len(descriptor.Parts) != 0 {
+			return nil, model.ErrTaskObligationConflict
+		}
+		if err := pluginruntime.ValidateRequestURL(expected, baseURL, a.plugin.Meta.AllowedHosts); err != nil {
+			return nil, err
+		}
+		// Provider credentials and headers come from the selected channel. A
+		// descriptor cannot add forwarding or alternate-auth headers.
+		return service.FetchWalletTaskReadQuery(context.Background(), task, key, proxy, a.channelSetting())
+	}
 	return a.doFetchDescriptor(baseURL, proxy, descriptor)
+}
+
+// walletQueryEligibility runs before auth resolution or a plugin hook. Only the
+// concrete provider read contract captured at submission is eligible.
+func (a *TaskAdaptor) walletQueryEligibility(task *model.Task) (string, error) {
+	if a.channelType() == constant.ChannelTypeNewAPI || (a.plugin.Meta.Auth.Type != "" && a.plugin.Meta.Auth.Type != "api_key") {
+		return "", model.ErrTaskObligationConflict
+	}
+	return model.WalletTaskReadQueryURL(task)
+}
+
+func denyWalletQueryHookFetch(context.Context, pluginruntime.FetchRequest) (pluginruntime.FetchResponse, error) {
+	return pluginruntime.FetchResponse{}, model.ErrTaskObligationConflict
 }
 
 // hookFetcher sends a driver hook's utils.fetch requests to the hosts its
@@ -771,6 +811,11 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, descriptor reques
 }
 
 func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*service.BatchTaskResult, error) {
+	for _, task := range tasks {
+		if task != nil && task.BillingProtocol != 0 {
+			return nil, model.ErrTaskObligationConflict
+		}
+	}
 	started := time.Now()
 	input := any(string(body))
 	var decoded any
@@ -862,6 +907,21 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 
 func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
 	started := time.Now()
+	fetcher := pluginruntime.Fetcher(nil)
+	verifiedTaskID := ""
+	if task != nil && task.BillingProtocol != 0 {
+		if _, err := a.walletQueryEligibility(task); err != nil {
+			return nil, err
+		}
+		var observed struct {
+			ID string `json:"id"`
+		}
+		if common.Unmarshal(body, &observed) != nil || observed.ID != task.PrivateData.UpstreamTaskID {
+			return nil, model.ErrTaskObligationConflict
+		}
+		verifiedTaskID = observed.ID
+		fetcher = denyWalletQueryHookFetch
+	}
 	input := any(string(body))
 	var decoded any
 	if common.Unmarshal(body, &decoded) == nil {
@@ -871,11 +931,14 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 	if task != nil && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
+	if fetcher == nil {
+		fetcher = a.hookFetcher(baseURL, proxy)
+	}
 	ctx, err := a.queryContext(task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(pluginruntime.WithFetcher(context.Background(), a.hookFetcher(baseURL, proxy)), "parseTaskResult", ctx, input, hookHTTPResponse(resp))
+	value, err := a.plugin.Engine.Call(pluginruntime.WithFetcher(context.Background(), fetcher), "parseTaskResult", ctx, input, hookHTTPResponse(resp))
 	if err != nil {
 		logger.LogDebug(context.Background(), "task_plugin subsystem=adaptor event=parse_task_failed plugin=%q reason=hook_failed body_bytes=%d elapsed_ms=%d", a.plugin.Meta.Key, len(body), time.Since(started).Milliseconds())
 		return nil, err
@@ -884,6 +947,12 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 	if err = convert(value, &parsed); err != nil {
 		logger.LogDebug(context.Background(), "task_plugin subsystem=adaptor event=parse_task_failed plugin=%q reason=invalid_result body_bytes=%d elapsed_ms=%d", a.plugin.Meta.Key, len(body), time.Since(started).Milliseconds())
 		return nil, err
+	}
+	// NormalizedTaskResult.taskId is optional. Only fill an omitted ID after
+	// the trusted raw response matched this durable task; a nonempty foreign
+	// normalized ID remains visible to the poller's identity rejection.
+	if verifiedTaskID != "" && parsed.TaskID == "" {
+		parsed.TaskID = verifiedTaskID
 	}
 	result := &relaycommon.TaskInfo{
 		Code:             parsed.Code,
@@ -906,7 +975,7 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 	// The raw polling response only exists at this boundary. Capture upstream
 	// units here so the host settlement path can consume them from TaskInfo.
 	if a.hasHook(context.Background(), "extractUsageOnComplete") {
-		facts, hookErr := a.plugin.Engine.Call(context.Background(), "extractUsageOnComplete", ctx, jsonValue(result), input)
+		facts, hookErr := a.plugin.Engine.Call(pluginruntime.WithFetcher(context.Background(), fetcher), "extractUsageOnComplete", ctx, jsonValue(result), input)
 		if hookErr == nil {
 			upstreamModel, _ := ctx["upstreamModel"].(string)
 			originModel, _ := ctx["model"].(string)

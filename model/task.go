@@ -49,6 +49,12 @@ const (
 const TaskRefundLegacyCutoff int64 = 1771718400 // 2026-02-22 00:00:00 UTC
 
 type Task struct {
+	BillingRef      *string `json:"-" gorm:"type:varchar(64);uniqueIndex:idx_tasks_billing_ref"`
+	BillingProtocol int     `json:"-" gorm:"not null;default:0;index:idx_tasks_billing_state,priority:1"`
+	BillingState    string  `json:"-" gorm:"type:varchar(32);not null;default:'';index:idx_tasks_billing_state,priority:2"`
+	BillingRevision int64   `json:"-" gorm:"not null;default:0"`
+	BillingProgress string  `json:"-" gorm:"type:text"`
+
 	ID        int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
 	CreatedAt int64                 `json:"created_at" gorm:"index"`
 	UpdatedAt int64                 `json:"updated_at"`
@@ -178,7 +184,7 @@ type TaskBillingContext struct {
 // ResultRetrievable reports whether retrieval surfaces (native query routes,
 // protocol retrieve endpoints, artifact projection) may serve this task.
 func (t *Task) ResultRetrievable() bool {
-	return !t.PrivateData.ResultDiscarded
+	return t != nil && !t.PrivateData.ResultDiscarded && (t.BillingProtocol == 0 || t.BillingProtocol == 1 && (t.BillingState == TaskBillingReady || t.BillingState == TaskBillingSettled))
 }
 
 // GetUpstreamTaskID 获取上游真实 task ID（用于与 provider 通信）
@@ -367,7 +373,7 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
-	err := DB.Where("progress != ?", "100%").
+	err := DB.Where("billing_protocol = 0 OR (billing_protocol = 1 AND billing_state = ?)", TaskBillingReady).Where("progress != ?", "100%").
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time").
@@ -383,7 +389,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	err = DB.Where("billing_protocol = 0 OR (billing_protocol = 1 AND billing_state = ?)", TaskBillingReady).Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -395,8 +401,13 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 // whether the async_task_poll system task needs to run; when no task is pending
 // the scheduler skips creating a row entirely.
 func HasUnfinishedSyncTasks() bool {
+	var pending int64
+	if err := DB.Model(&Task{}).Where("billing_protocol = 1 AND billing_state = ?", TaskBillingPending).Limit(1).Pluck("id", &pending).Error; err == nil && pending != 0 {
+		return true
+	}
 	var id int64
 	err := DB.Model(&Task{}).
+		Where("billing_protocol = 0 OR (billing_protocol = 1 AND billing_state = ?)", TaskBillingReady).
 		Where("progress != ?", "100%").
 		Where("status != ?", TaskStatusFailure).
 		Where("status != ?", TaskStatusSuccess).
@@ -544,12 +555,18 @@ func (t *Task) Snapshot() taskSnapshot {
 
 func (Task *Task) Update() error {
 	var err error
-	err = DB.Save(Task).Error
+	if Task.BillingProtocol != 0 {
+		return ErrTaskObligationConflict
+	}
+	err = DB.Model(Task).Where("id = ? AND billing_protocol = 0", Task.ID).Select("*").Updates(Task).Error
 	return err
 }
 
 func (t *Task) UpdateQuota() error {
-	return DB.Model(t).Update("quota", t.Quota).Error
+	if t.BillingProtocol != 0 {
+		return ErrTaskObligationConflict
+	}
+	return DB.Model(t).Where("billing_protocol = 0").Update("quota", t.Quota).Error
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
@@ -562,7 +579,10 @@ func (t *Task) UpdateQuota() error {
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
+	if t.BillingProtocol != 0 {
+		return false, ErrTaskObligationConflict
+	}
+	result := DB.Model(t).Where("billing_protocol = 0 AND status = ?", fromStatus).Select("*").Updates(t)
 	if result.Error != nil {
 		return false, result.Error
 	}
@@ -579,7 +599,7 @@ func TaskBulkUpdateByID(ids []int64, params map[string]any) error {
 		return nil
 	}
 	return DB.Model(&Task{}).
-		Where("id in (?)", ids).
+		Where("id in (?) AND billing_protocol = 0", ids).
 		Updates(params).Error
 }
 

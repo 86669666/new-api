@@ -624,7 +624,15 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	resp, err := doRequest(c, req, info)
+	var resp *http.Response
+	if sender, ok := info.Billing.(interface {
+		WalletTaskObligationID() int64
+		SendWalletTask(*http.Request) (*http.Response, error)
+	}); ok && sender.WalletTaskObligationID() != 0 {
+		resp, err = sender.SendWalletTask(req)
+	} else {
+		resp, err = doRequest(c, req, info)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}

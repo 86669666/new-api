@@ -104,6 +104,11 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	if token.Id <= 0 {
 		return nil, fmt.Errorf("token cache is incomplete")
 	}
+	var money Token
+	if err := DB.Select("id", "remain_quota", "used_quota", "unlimited_quota").Where("id = ? AND "+commonKeyCol+" = ?", token.Id, key).First(&money).Error; err != nil {
+		return nil, err
+	}
+	token.RemainQuota, token.UsedQuota, token.UnlimitedQuota = money.RemainQuota, money.UsedQuota, money.UnlimitedQuota
 	token.Key = key
 	return &token, nil
 }

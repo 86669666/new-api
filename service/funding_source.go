@@ -40,9 +40,6 @@ type WalletFunding struct {
 func (w *WalletFunding) Source() string { return BillingSourceWallet }
 
 func (w *WalletFunding) PreConsume(amount int) error {
-	if amount <= 0 {
-		return nil
-	}
 	reserved, err := model.TryReserveUserQuota(w.userId, amount)
 	if err != nil {
 		return err
@@ -50,7 +47,7 @@ func (w *WalletFunding) PreConsume(amount int) error {
 	if !reserved {
 		return ErrInsufficientWalletQuota
 	}
-	w.consumed = amount
+	w.consumed += amount
 	return nil
 }
 

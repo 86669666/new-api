@@ -1,11 +1,18 @@
 package model
 
 import (
+	"context"
+	"errors"
 	"math"
+	"net"
+	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -57,6 +64,7 @@ func getTokenFromDB(t *testing.T, id int) Token {
 
 func resetBatchUpdateTestState(t *testing.T) {
 	t.Helper()
+	require.NoError(t, DB.AutoMigrate(&OAuthDerivedTextCharge{}))
 	oldBatchEnabled := common.BatchUpdateEnabled
 	common.BatchUpdateEnabled = false
 	for i := range BatchUpdateTypeCount {
@@ -103,7 +111,7 @@ func TestTryReserveQuotaWithoutRedis(t *testing.T) {
 	assert.Equal(t, 55, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
-func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
+func TestRedisBatchReserveUsesSQLWalletAndSQLToken(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
 	useUserCacheMiniRedis(t)
@@ -113,7 +121,7 @@ func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
 	reserved, err := TryReserveUserQuota(user.Id, 8)
 	require.NoError(t, err)
 	assert.True(t, reserved)
-	assert.Equal(t, 10, getUserQuotaFromDB(t, user.Id), "batch delta is not flushed yet")
+	assert.Equal(t, 2, getUserQuotaFromDB(t, user.Id), "wallet money must commit before success even with batch enabled")
 
 	reserved, err = TryReserveUserQuota(user.Id, 3)
 	require.NoError(t, err)
@@ -129,7 +137,7 @@ func TestRedisBatchReserveNeverFallsBackToStaleDatabaseBalance(t *testing.T) {
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 3, false)
 	require.NoError(t, err)
 	assert.False(t, reserved)
-	assert.Equal(t, 9, getTokenFromDB(t, token.Id).RemainQuota)
+	assert.Equal(t, 2, getTokenFromDB(t, token.Id).RemainQuota)
 
 	batchUpdate()
 	assert.Equal(t, 2, getUserQuotaFromDB(t, user.Id))
@@ -170,7 +178,7 @@ func TestBatchUpdateAccumulatorSaturatesOverflow(t *testing.T) {
 	batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
 }
 
-func TestReserveFallsBackToDatabaseWhenRedisIsUnavailable(t *testing.T) {
+func TestReserveUsesSQLWhenRedisIsUnavailable(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
 	server := useUserCacheMiniRedis(t)
@@ -179,7 +187,7 @@ func TestReserveFallsBackToDatabaseWhenRedisIsUnavailable(t *testing.T) {
 	require.NoError(t, populateUserCache(user))
 	server.Close()
 
-	// Redis 故障时降级为数据库条件更新：服务保持可用且不会超扣。
+	// SQL remains the only wallet authority even while the projection is unavailable.
 	reserved, err := TryReserveUserQuota(user.Id, 5)
 	require.NoError(t, err)
 	assert.True(t, reserved)
@@ -215,9 +223,8 @@ func TestSynchronousReserveCompensatesCacheWhenPersistenceFails(t *testing.T) {
 	assert.False(t, reserved)
 	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
 	cachedToken, cacheErr := cacheGetTokenByKey(token.Key)
-	require.NoError(t, cacheErr)
-	assert.Equal(t, 12, cachedToken.RemainQuota)
-	assert.Zero(t, cachedToken.UsedQuota)
+	require.Error(t, cacheErr)
+	assert.Nil(t, cachedToken, "deleted SQL token cannot be authorized from stale cache")
 }
 
 func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.T) {
@@ -230,17 +237,15 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 	require.NoError(t, err)
 	stale := *loaded
 
-	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
-	require.NoError(t, err)
-	require.Equal(t, cacheQuotaOK, result)
+	require.NoError(t, common.RDB.HSet(context.Background(), getTokenCacheKey(token.Key), "RemainQuota", 30, "UsedQuota", 70).Err())
 
-	// 已存在的哈希只刷新 TTL：数据库快照不得覆盖已被原子预扣的余额。
+	// Redis may retain a legacy delta, but callers must observe committed SQL money.
 	code, err := cacheInitToken(stale)
 	require.NoError(t, err)
 	assert.Equal(t, 2, code)
 	cached, err := cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)
-	assert.Equal(t, 30, cached.RemainQuota)
+	assert.Equal(t, 100, cached.RemainQuota)
 
 	// 变更期间：fence 删除缓存并拦截并发读者手中的过期快照。
 	require.NoError(t, invalidateTokenCacheForMutation(token.Key))
@@ -258,4 +263,262 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 	cached, err = cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)
 	assert.Equal(t, 100, cached.RemainQuota)
+}
+
+// Real databases use the existing guarded OAuth fixture; Redis is either the
+// dedicated local CI service or the existing in-process fixture for local runs.
+func newSQLWalletFixture(t *testing.T, database common.DatabaseType) (*gorm.DB, OAuthTextFacts) {
+	t.Helper()
+	db, facts := newOAuthTextDatabaseFixture(t, database, oauthTextAuthorityDialect(t, database))
+	require.NoError(t, db.AutoMigrate(&Task{}))
+	t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(&Task{})) })
+	resetBatchUpdateTestState(t)
+	addr := os.Getenv("NEWAPI_TEST_REDIS_ADDR")
+	if addr == "" {
+		require.NotEqual(t, "1", os.Getenv("NEWAPI_REQUIRE_DATABASES"), "real Redis is required for the matrix")
+		useUserCacheMiniRedis(t)
+		return db, facts
+	}
+	require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+	host, port, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1", host)
+	require.NotEmpty(t, port)
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	require.NoError(t, client.Ping(context.Background()).Err())
+	old, enabled := common.RDB, common.RedisEnabled
+	common.RDB, common.RedisEnabled = client, true
+	t.Cleanup(func() {
+		assert.NoError(t, client.Del(context.Background(), getUserCacheKey(facts.UserID)).Err())
+		common.RDB, common.RedisEnabled = old, enabled
+		assert.NoError(t, client.Close())
+	})
+	return db, facts
+}
+
+func TestSQLWalletAuthority(t *testing.T) {
+	for _, database := range []common.DatabaseType{common.DatabaseTypeSQLite, common.DatabaseTypeMySQL, common.DatabaseTypePostgreSQL} {
+		t.Run(string(database), func(t *testing.T) {
+			for _, scenario := range []string{"stale_projection", "financial_batch", "concurrent_reserve", "concurrent_derived_reserve", "zero", "send_claimed", "held", "historical_finalize", "delta_sql_failure", "gate_read_failure", "missing_store", "missing_user", "bounded_delta", "additional_arrears", "additional_held", "additional_boundary"} {
+				t.Run(scenario, func(t *testing.T) {
+					db, facts := newSQLWalletFixture(t, database)
+					ctx := context.Background()
+					ref := strings.Repeat("b", 64)
+					var user User
+					require.NoError(t, db.First(&user, facts.UserID).Error)
+					require.NoError(t, populateUserCache(user))
+					switch scenario {
+					case "additional_arrears":
+						ok, err := TryReserveAdditionalUserQuota(user.Id, 140)
+						require.NoError(t, err)
+						require.True(t, ok)
+						assert.Equal(t, -40, getUserQuotaFromDB(t, user.Id))
+					case "additional_held":
+						require.NoError(t, db.Create(&OAuthDerivedTextCharge{Ref: ref, UserID: user.Id, State: "held"}).Error)
+						for _, amount := range []int{0, 140} {
+							ok, err := TryReserveAdditionalUserQuota(user.Id, amount)
+							require.Error(t, err)
+							assert.False(t, ok)
+						}
+						assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+					case "additional_boundary":
+						require.NoError(t, db.Model(&User{}).Where("id = ?", user.Id).UpdateColumn("quota", -common.MaxWalletQuota+1).Error)
+						ok, err := TryReserveAdditionalUserQuota(user.Id, 2)
+						require.ErrorIs(t, err, ErrWalletQuotaLimitExceeded)
+						assert.False(t, ok)
+						ok, err = TryReserveAdditionalUserQuota(user.Id, 1)
+						require.NoError(t, err)
+						require.True(t, ok)
+						assert.Equal(t, -common.MaxWalletQuota, getUserQuotaFromDB(t, user.Id))
+					case "stale_projection":
+						ok, err := TryReserveUserQuota(user.Id, 80)
+						require.NoError(t, err)
+						require.True(t, ok)
+						// A pre-debit hydration arrives after commit/invalidation.
+						require.NoError(t, populateUserCache(user))
+						quota, err := GetUserQuota(user.Id, false)
+						require.NoError(t, err)
+						assert.Equal(t, 20, quota)
+						cached, err := GetUserCache(user.Id)
+						require.NoError(t, err)
+						assert.Equal(t, 20, cached.Quota)
+						ok, err = TryReserveUserQuota(user.Id, 21)
+						require.NoError(t, err)
+						assert.False(t, ok)
+						require.NoError(t, IncreaseUserQuota(user.Id, 10, false))
+						_, err = GetUserCache(user.Id) // hydrated from the credited SQL row
+						require.NoError(t, err)
+						require.NoError(t, cacheIncrUserQuota(user.Id, 10)) // delayed credit notification
+						cached, err = GetUserCache(user.Id)
+						require.NoError(t, err)
+						assert.Equal(t, 30, cached.Quota, "notification must not apply credit twice")
+						assert.Equal(t, 30, getUserQuotaFromDB(t, user.Id))
+					case "financial_batch":
+						common.BatchUpdateEnabled = true
+						ok, err := TryReserveUserQuota(user.Id, 80)
+						require.NoError(t, err)
+						require.True(t, ok)
+						require.NoError(t, IncreaseUserQuota(user.Id, 10, false))
+						require.NoError(t, DecreaseUserQuota(user.Id, 5, false))
+						assert.Equal(t, 25, getUserQuotaFromDB(t, user.Id))
+						assert.Empty(t, batchUpdateStores[BatchUpdateTypeUserQuota])
+						UpdateUserUsedQuotaAndRequestCount(user.Id, 80)
+						batchUpdate()
+						// An old process's deferred money is not analytics and cannot
+						// be blindly applied after SQL-authoritative admission.
+						addNewRecord(BatchUpdateTypeUserQuota, user.Id, -70)
+						batchUpdate()
+						require.NoError(t, db.First(&user, user.Id).Error)
+						assert.Equal(t, 25, user.Quota)
+						assert.Equal(t, 80, user.UsedQuota)
+						assert.Equal(t, 1, user.RequestCount)
+						assert.Equal(t, -70, batchUpdateStores[BatchUpdateTypeUserQuota][user.Id], "old obligation retained for reconciliation")
+					case "concurrent_reserve", "concurrent_derived_reserve":
+						sqlDB, err := db.DB()
+						require.NoError(t, err)
+						sqlDB.SetMaxOpenConns(2)
+						start := make(chan struct{})
+						type result struct {
+							won     bool
+							err     error
+							derived bool
+						}
+						results := make(chan result, 2)
+						var wg sync.WaitGroup
+						for i := range 2 {
+							wg.Go(func() {
+								<-start
+								if i == 1 && scenario == "concurrent_derived_reserve" {
+									charge, err := ReserveOAuthDerivedText(ctx, ref, facts, 80)
+									results <- result{charge != nil, err, true}
+								} else {
+									ok, err := TryReserveUserQuota(user.Id, 60)
+									results <- result{ok, err, false}
+								}
+							})
+						}
+						close(start)
+						wg.Wait()
+						close(results)
+						wins, balance, tokenRemain := 0, 100, 100
+						for got := range results {
+							if got.won {
+								require.NoError(t, got.err)
+								wins++
+								balance -= 60
+								if got.derived {
+									balance -= 20
+									tokenRemain -= 80
+								}
+							} else if got.err != nil {
+								// SQLite may reject the competing writer; it must not
+								// report success or leave any financial effect.
+								if database == common.DatabaseTypeSQLite && !errors.Is(got.err, ErrOAuthTextCharge) {
+									require.Contains(t, got.err.Error(), "database is locked")
+								} else {
+									require.True(t, got.derived)
+									require.ErrorIs(t, got.err, ErrOAuthTextCharge)
+								}
+							}
+						}
+						assert.Equal(t, 1, wins)
+						assert.Equal(t, balance, getUserQuotaFromDB(t, user.Id))
+						assert.Equal(t, tokenRemain, getTokenFromDB(t, facts.TokenID).RemainQuota)
+					case "zero":
+						ok, err := TryReserveUserQuota(user.Id, 0)
+						require.NoError(t, err)
+						assert.True(t, ok)
+						assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+						// Ordinary admission has no receipt to exclude, including
+						// a malformed empty-ref row already present in the store.
+						require.NoError(t, db.Create(&OAuthDerivedTextCharge{UserID: user.Id, State: "held"}).Error)
+						ok, err = TryReserveUserQuota(user.Id, 0)
+						assert.ErrorIs(t, err, ErrOAuthTextCharge)
+						assert.False(t, ok)
+					case "send_claimed", "held", "historical_finalize":
+						charge, err := ReserveOAuthDerivedText(ctx, ref, facts, 80)
+						require.NoError(t, err)
+						permit, err := ClaimOAuthDerivedText(ctx, ref, facts, 80)
+						require.NoError(t, err)
+						require.NotNil(t, permit)
+						if scenario == "held" {
+							charge, err = FinalizeOAuthDerivedTextSnapshot(ctx, ref, 110, OAuthTextUsage{Prompt: 20, Completion: 90, Total: 110}, charge.Fingerprint)
+							require.NoError(t, err)
+							require.Equal(t, "held", charge.State)
+						}
+						for _, amount := range []int{0, 1} {
+							ok, err := TryReserveUserQuota(user.Id, amount)
+							assert.ErrorIs(t, err, ErrOAuthTextCharge)
+							assert.False(t, ok)
+							ok, err = TryReserveAdditionalUserQuota(user.Id, amount)
+							assert.ErrorIs(t, err, ErrOAuthTextCharge)
+							assert.False(t, ok)
+						}
+						assert.Equal(t, 20, getUserQuotaFromDB(t, user.Id))
+						if scenario == "historical_finalize" {
+							require.NoError(t, db.Model(&OAuthGrant{}).Where("grant_ref = ?", facts.GrantRef).Update("state", "revoked").Error)
+							// Historical legacy delta/refund is allowed despite gate.
+							require.NoError(t, DecreaseUserQuota(user.Id, 5, false))
+							require.NoError(t, IncreaseUserQuota(user.Id, 5, false))
+							for range 2 {
+								charge, err = FinalizeOAuthDerivedTextSnapshot(ctx, ref, 60, OAuthTextUsage{Prompt: 20, Completion: 40, Total: 60}, charge.Fingerprint)
+								require.NoError(t, err)
+								assert.Equal(t, "settled", charge.State)
+								assert.Equal(t, facts.UserID, charge.PayerID)
+								assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
+							}
+							assert.Equal(t, 40, getTokenFromDB(t, facts.TokenID).RemainQuota)
+						}
+					case "delta_sql_failure":
+						failure := errors.New("controlled wallet SQL failure")
+						require.NoError(t, db.Callback().Update().Before("gorm:update").Register("wallet_failure", func(tx *gorm.DB) { tx.AddError(failure) }))
+						err1 := IncreaseUserQuota(user.Id, 10, false)
+						err2 := DecreaseUserQuota(user.Id, 10, false)
+						ok, err3 := TryReserveUserQuota(user.Id, 10)
+						require.NoError(t, db.Callback().Update().Remove("wallet_failure"))
+						assert.ErrorIs(t, err1, failure)
+						assert.ErrorIs(t, err2, failure)
+						assert.ErrorIs(t, err3, failure)
+						assert.False(t, ok)
+						assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+						cached, err := cacheGetUserBase(user.Id)
+						require.NoError(t, err)
+						assert.Equal(t, 100, cached.Quota)
+					case "gate_read_failure", "missing_store":
+						if scenario == "missing_store" {
+							require.NoError(t, db.Migrator().DropTable(&OAuthDerivedTextCharge{}))
+						} else {
+							require.NoError(t, db.Callback().Query().Before("gorm:query").Register("gate_failure", func(tx *gorm.DB) {
+								if tx.Statement.Table == "oauth_derived_text_charges" {
+									tx.AddError(errors.New("controlled charge visibility failure"))
+								}
+							}))
+						}
+						for _, amount := range []int{0, 10} {
+							ok, err := TryReserveUserQuota(user.Id, amount)
+							assert.Error(t, err)
+							assert.False(t, ok)
+							ok, err = TryReserveAdditionalUserQuota(user.Id, amount)
+							assert.Error(t, err)
+							assert.False(t, ok)
+						}
+						assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+					case "missing_user":
+						require.NoError(t, db.Delete(&user).Error)
+						ok, err := TryReserveUserQuota(user.Id, 0)
+						assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+						assert.False(t, ok)
+						assert.ErrorIs(t, DecreaseUserQuota(user.Id, 1, false), gorm.ErrRecordNotFound)
+					case "bounded_delta":
+						require.NoError(t, db.Model(&User{}).Where("id = ?", user.Id).Update("quota", common.MaxWalletQuota).Error)
+						assert.ErrorIs(t, IncreaseUserQuota(user.Id, 1, false), ErrWalletQuotaLimitExceeded)
+						assert.Equal(t, common.MaxWalletQuota, getUserQuotaFromDB(t, user.Id))
+						require.NoError(t, db.Model(&User{}).Where("id = ?", user.Id).Update("quota", -common.MaxWalletQuota).Error)
+						assert.ErrorIs(t, DecreaseUserQuota(user.Id, 1, false), ErrWalletQuotaLimitExceeded)
+						assert.Equal(t, -common.MaxWalletQuota, getUserQuotaFromDB(t, user.Id))
+					}
+				})
+			}
+		})
+	}
 }
