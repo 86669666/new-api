@@ -640,6 +640,10 @@ func sameOAuthProviderSet(a, b []string) bool {
 }
 
 func validOAuthProviderRedirect(raw, registered string) bool {
+	// url.Parse discards an empty fragment delimiter, which OAuth forbids too.
+	if strings.Contains(raw, "#") || strings.Contains(registered, "#") {
+		return false
+	}
 	u, err := url.Parse(raw)
 	v, regErr := url.Parse(registered)
 	if err != nil || regErr != nil || u.User != nil || v.User != nil || u.Fragment != "" || v.Fragment != "" || u.Opaque != "" || v.Opaque != "" {
