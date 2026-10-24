@@ -30,6 +30,8 @@ DIALECT_TESTS = {
     'controller': ('TestOAuthDerivedSelectedHTTP',),
 }
 PRODUCER_TEST = 'TestOAuthBootstrapProducer'
+PG_IMAGE = 'sha256:ba9938eb70de48e82a511ea812eef26cc1399b0b072d6f2f7dc22a977e783401'
+PG_SELECTOR = '^TestSessionRevocationS1Namespace$'
 
 
 def digest(path):
@@ -44,6 +46,10 @@ def command(argv, **kwargs):
 def prepare(args):
     if sys.platform != 'linux':
         raise ValueError('trusted provenance test runner requires Linux')
+    if args.tier == 'postgres':
+        if args.package not in (None, ['./router']) or args.run not in ('.', PG_SELECTOR):
+            raise ValueError('PG-only tier requires the exact Namespace test inventory')
+        args.package, args.run = ['./router'], PG_SELECTOR
     repo = Path(__file__).resolve().parents[2]
     bundle = Path(args.bundle).absolute()
     if bundle == repo or repo in bundle.parents:
@@ -83,10 +89,13 @@ def prepare(args):
             if (bundle / binary).exists():
                 entries.append({'binary': binary, 'cwd': str(Path(module) / rel), 'run': args.run})
     shutil.copyfile(__file__, bundle / 'runner.py')
-    metadata = {'entries': entries, 'files': {str(p.relative_to(bundle)): digest(p) for p in sorted(bundle.rglob('*')) if p.is_file()}}
+    metadata = {'tier': args.tier, 'entries': entries, 'files': {str(p.relative_to(bundle)): digest(p) for p in sorted(bundle.rglob('*')) if p.is_file()}}
     (bundle / 'manifest.json').write_text(json.dumps(metadata, sort_keys=True))
     if args.prepare_only:
         print(json.dumps({'bundle': str(bundle), 'producer_sha256': digest(bundle / 'new-api'), 'packages': len(entries)}))
+        return
+    if args.tier == 'postgres':
+        postgres_container(bundle)
         return
     # The invoking developer is the installer authority, never the service UID.
     command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork',
@@ -110,7 +119,7 @@ def client(sock, action="fresh"):
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(120)
         conn.connect(sock)
-        if action not in ('fresh', 'redis'):
+        if action not in ('fresh', 'redis') and not re.fullmatch(r'pg:[0-9a-f]{32}', action):
             raise ValueError('unsupported installer request')
         _, peer_uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if peer_uid != 0:
@@ -124,15 +133,20 @@ def client(sock, action="fresh"):
                 break
             data += part
         result = json.loads(data)
-        if action == 'fresh' and (set(result) != {'Engine', 'DSN', 'Journal'} or result['Engine'] != 'sqlite'):
-            raise ValueError('invalid installer response')
+        if action == 'fresh':
+            fields = {'Engine', 'DSN', 'Journal'}
+            if result.get('Engine') == 'postgres':
+                fields.add('ResourceReceipt')
+            if set(result) != fields or result['Engine'] not in ('sqlite', 'postgres'):
+                raise ValueError('invalid installer response')
         sys.stdout.write(json.dumps(result))
 
 
 class Installer:
-    def __init__(self, root, uid, redis_resource=None):
+    def __init__(self, root, uid, redis_resource=None, pg_resource=None):
         self.root, self.uid = root, uid
         self.redis_resource = redis_resource
+        self.pg_resource = pg_resource
         self.stopped = threading.Event()
         self.server = socket.socket(socket.AF_UNIX)
         self.server.bind(str(root / 'installer.sock'))
@@ -161,7 +175,13 @@ class Installer:
                         self.redis_resource.verify()
                         conn.sendall(json.dumps(self.redis_resource.receipt).encode())
                         continue
+                    if re.fullmatch(rb'pg:[0-9a-f]{32}\n', request) and self.pg_resource is not None:
+                        conn.sendall(json.dumps(self.pg_resource.qualify(request[3:-1].decode())).encode())
+                        continue
                     if request != b'fresh\n':
+                        continue
+                    if self.pg_resource is not None:
+                        conn.sendall(json.dumps(self.pg_resource.birth()).encode())
                         continue
                     ident = secrets.token_hex(16)
                     data = self.root / ('data-' + ident)
@@ -177,7 +197,7 @@ class Installer:
                     os.chmod(target, 0o600)
                     os.chown(data, self.uid, self.uid)
                     conn.sendall(json.dumps({'Engine': 'sqlite', 'DSN': str(target), 'Journal': str(journal)}).encode())
-                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
                     # Producer failure is a client failure, never a seal fallback.
                     continue
 
@@ -379,7 +399,259 @@ class OwnedRedis:
                           'redis_log_sha256': digest(self.root / 'redis.log') if self.log else None,
                           'cleanup': 'owned Redis process stopped and listener absent'}), flush=True)
 
-def trusted_run(bundle):
+class OwnedPostgres:
+    """Fixed PG-only substrate; root provisions, daemon and service cannot."""
+    def __init__(self, root, uid):
+        self.root, self.uid = root, uid
+        self.daemon_uid = pwd.getpwnam('postgres').pw_uid
+        if self.daemon_uid in (0, uid):
+            raise ValueError('PG daemon principal must be independent')
+        self.bin = Path('/usr/lib/postgresql/15/bin')
+        self.socket_dir = root / 'pg-socket'
+        self.socket_path = self.socket_dir / '.s.PGSQL.5432'
+        self.process = self.log = self.identity = None
+        self.password = secrets.token_hex(32)
+        self.births = {}
+        self.commands = []
+
+    def sql(self, database, statement):
+        if not re.fullmatch(r'[a-z][a-z0-9_]{0,47}', database):
+            raise ValueError('invalid installer database')
+        q = subprocess.run([str(self.bin / 'psql'), '-X', '-qAt', '-v', 'ON_ERROR_STOP=1',
+                            '-h', str(self.socket_dir), '-U', 'bootstrap', '-d', database],
+                           input=statement.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env={'PATH': '/usr/bin:/bin', 'PGPASSWORD': self.password}, timeout=30)
+        self.commands.append({'operation': 'installer SQL', 'exit': q.returncode,
+                              'stderr_sha256': hashlib.sha256(q.stderr).hexdigest()})
+        if q.returncode:
+            raise RuntimeError('PG installer SQL failed; output retained only as digest')
+        return q.stdout.decode().strip()
+
+    def verify(self):
+        if self.process is None or self.process.poll() is not None:
+            raise RuntimeError('owned PG exited')
+        # Container /proc is mounted in this PID namespace. Bind via peer PID,
+        # exact parentage, executable and listener FD, not SQL self-report.
+        proc = Path('/proc') / str(self.process.pid)
+        status = dict(line.split(':', 1) for line in (proc / 'status').read_text().splitlines() if ':' in line)
+        if (int(status['NSpid'].split()[-1]) != self.process.pid or
+                int(status['PPid']) != os.getpid() or
+                any(int(v) != self.daemon_uid for v in status['Uid'].split())):
+            raise RuntimeError('PG process namespace/ownership mismatch')
+        exe, expected = (proc / 'exe').stat(), (self.bin / 'postgres').stat()
+        if (exe.st_dev, exe.st_ino) != (expected.st_dev, expected.st_ino):
+            raise RuntimeError('PG executable mismatch')
+        st = self.socket_dir.lstat()
+        if st.st_uid != self.daemon_uid or st.st_mode & 0o022 or not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError('PG socket directory ownership mismatch')
+        socket_stat = self.socket_path.lstat()
+        if not stat.S_ISSOCK(socket_stat.st_mode) or socket_stat.st_uid != self.daemon_uid:
+            raise RuntimeError('PG endpoint not owned socket')
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(2)
+            conn.connect(str(self.socket_path))
+            peer = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if peer[:2] != (self.process.pid, self.daemon_uid):
+                raise RuntimeError('PG endpoint peer mismatch')
+        rows = [line.split() for line in Path('/proc/net/unix').read_text().splitlines()[1:]]
+        rows = [row for row in rows if len(row) == 8 and row[7] == str(self.socket_path) and row[3] == '00010000']
+        fds = set()
+        for fd in (proc / 'fd').iterdir():
+            try:
+                fds.add(os.readlink(fd))
+            except FileNotFoundError:
+                continue
+        if len(rows) != 1 or 'socket:[' + rows[0][6] + ']' not in fds:
+            raise RuntimeError('PG listener is not owned by child')
+        identity = {'pid': self.process.pid, 'daemon_uid': self.daemon_uid,
+                    'start_time': (proc / 'stat').read_text().rsplit(')', 1)[1].split()[19],
+                    'socket_inode': rows[0][6], 'socket_file_inode': socket_stat.st_ino,
+                    'directory_inode': st.st_ino, 'exe_inode': exe.st_ino, 'exe_device': exe.st_dev,
+                    'pid_namespace': os.readlink(proc / 'ns/pid'), 'net_namespace': os.readlink(proc / 'ns/net')}
+        if self.identity is not None and self.identity != identity:
+            raise RuntimeError('PG resource replaced')
+        self.identity = identity
+        return identity
+
+    def start(self):
+        for name in ('postgres', 'initdb', 'psql'):
+            p = self.bin / name
+            st = p.stat()
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+                raise ValueError('untrusted PG dependency')
+        data = self.root / 'pg-data'
+        for path in (data, self.socket_dir):
+            path.mkdir(mode=0o700 if path == data else 0o755)
+            os.chown(path, self.daemon_uid, self.daemon_uid)
+        password_file = self.root / 'pg-initial-password'
+        fd = os.open(password_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.fchown(fd, self.daemon_uid, self.daemon_uid)
+            os.write(fd, (self.password+'\n').encode())
+        finally:
+            os.close(fd)
+        try:
+            q = subprocess.run([str(self.bin / 'initdb'), '-D', str(data), '--username=bootstrap',
+                                '--auth=scram-sha-256', '--pwfile='+str(password_file), '--no-locale', '--encoding=UTF8'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               preexec_fn=lambda: demote(self.daemon_uid), env={'PATH': '/usr/bin:/bin'}, timeout=30)
+        finally:
+            password_file.unlink()
+        self.commands.append({'operation': 'initdb', 'exit': q.returncode, 'output_sha256': hashlib.sha256(q.stdout+q.stderr).hexdigest(), 'error': q.stderr.decode(errors='replace').replace(self.password, '[redacted]') if q.returncode else None})
+        if q.returncode:
+            raise RuntimeError('PG initdb failed')
+        self.log = (self.root / 'postgres.log').open('xb')
+        self.process = subprocess.Popen([str(self.bin / 'postgres'), '-D', str(data),
+                                         '-c', 'listen_addresses=', '-c', 'unix_socket_directories='+str(self.socket_dir),
+                                         '-c', 'unix_socket_permissions=0777', '-c', 'shared_buffers=16MB',
+                                         '-c', 'max_connections=30', '-c', 'log_statement=none',
+                                         '-c', 'log_min_error_statement=panic'],
+                                        stdout=self.log, stderr=subprocess.STDOUT, env={'PATH': '/usr/bin:/bin'},
+                                        preexec_fn=lambda: demote(self.daemon_uid))
+        deadline = time.monotonic()+10
+        while not self.socket_path.exists():
+            if self.process.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError('PG startup failed')
+            time.sleep(0.02)
+        self.verify()
+        self.version = self.sql('postgres', 'SHOW server_version;')
+        self.sql('postgres', 'REVOKE CONNECT ON DATABASE postgres FROM PUBLIC; REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;')
+        return {'NEWAPI_BOOTSTRAP_ENGINE': 'postgres', 'NEWAPI_S2_MAIN': 'postgres',
+                'NEWAPI_W01_MAIN_KIND': 'postgres', 'NEWAPI_BOOTSTRAP_TIER': 'postgres'}
+
+    def birth(self):
+        self.verify()
+        ident = secrets.token_hex(16)
+        database, role, restricted = 'birth_'+ident, 'svc_'+ident, 'limited_'+ident
+        journal = self.root / 'journals' / (ident+'.json')
+        # URL syntax is the permanent product CLI contract. Password only in env.
+        admin = 'postgresql://bootstrap:'+self.password+'@/postgres?host='+str(self.socket_dir)+'&sslmode=disable'
+        q = subprocess.run([str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'postgres',
+                            '--target', database, '--journal', str(journal)],
+                           env={'PATH': '/usr/bin:/bin', 'GOMAXPROCS': '2', 'BOOTSTRAP_ADMIN_DSN': admin},
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        self.commands.append({'operation': 'permanent CLI fresh', 'database': database, 'exit': q.returncode,
+                              'output_sha256': hashlib.sha256(q.stdout+q.stderr).hexdigest(), 'journal_phase': json.loads(journal.read_text()).get('phase') if journal.exists() else None, 'error': (q.stdout+q.stderr).decode(errors='replace').replace(self.password, '[redacted]') if q.returncode else None})
+        if q.returncode:
+            self.commands.append({'operation': 'birth failure boundary',
+                                  'lock_exists': Path(str(journal)+'.lock').exists(),
+                                  'protected_ancestors': [{'path': str(p), 'uid': p.stat().st_uid, 'mode': oct(p.stat().st_mode & 0o777)} for p in (journal.parent, self.root, Path('/run'), Path('/'))],
+                                  'admin_superuser': self.sql('postgres', 'SELECT rolsuper FROM pg_roles WHERE rolname=current_user;'),
+                                  'pg_error_categories': [category for category in ('password authentication failed', 'role does not exist', 'database does not exist', 'no pg_hba.conf entry', 'unsupported frontend protocol', 'invalid startup packet') if category in (self.root/'postgres.log').read_text()]})
+            raise RuntimeError('permanent PG birth failed')
+        j = json.loads(journal.read_text())
+        if j['phase'] != 'READY' or j['target'] != database or j['engine'] != 'postgres':
+            raise RuntimeError('PG birth journal mismatch')
+        password = secrets.token_hex(32)
+        self.sql(database, f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}'; CREATE ROLE {restricted} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; GRANT {restricted} TO {role}; REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE,CREATE ON SCHEMA public TO {role}; CREATE SCHEMA app; GRANT USAGE,CREATE ON SCHEMA app TO {role}; GRANT USAGE ON SCHEMA app TO {restricted};")
+        # Exactly the existing organization fixture's mutable tables. History and
+        # birth identity stay installer-owned and SELECT-only for the service.
+        mutable = ('users','user_sessions','session_revocation_events','user_access_tokens','options','tokens','tasks','logs',
+                   'casbin_rule','authz_roles','organizations','organization_members','organization_invitations',
+                   'organization_ownership_transfers','organization_events','organization_creation_requests',
+                   'organization_wallets','organization_wallet_entries','oauth_grants','o_auth_operations',
+                   'o_auth_artifacts','o_auth_cleanup_jobs')
+        existing = set(self.sql(database, "SELECT tablename FROM pg_tables WHERE schemaname='public';").splitlines())
+        for table in mutable:
+            if table in existing:
+                self.sql(database, f'GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE public.{table} TO {role};')
+        for table in ('oauth_derived_token_sources','oauth_derived_token_history','oauth_derived_token_bootstrap_identity'):
+            self.sql(database, f'GRANT SELECT ON TABLE public.{table} TO {role};')
+        self.sql(database, f'GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}; ALTER TABLE public.users OWNER TO {role}; ALTER TABLE public.session_revocation_events OWNER TO {role}; GRANT SELECT,UPDATE ON public.users TO {restricted}; GRANT SELECT,INSERT,UPDATE ON public.session_revocation_events TO {restricted};')
+        self.sql('postgres', f'GRANT CONNECT ON DATABASE {database} TO {role}; ALTER DATABASE {database} CONNECTION LIMIT 20;')
+        receipt = {'id': ident, 'database': database, 'role': role, 'restricted_role': restricted, 'schema': 'app',
+                   'socket_dir': str(self.socket_dir), 'port': 5432, 'service_uid': self.uid,
+                   'journal': str(journal), 'journal_sha256': digest(journal), 'kernel': self.verify(), 'version': self.version}
+        path = self.root / ('pg-resource-'+ident+'.json')
+        path.write_text(json.dumps(receipt, sort_keys=True));path.chmod(0o644)
+        self.births[ident] = receipt
+        return {'Engine': 'postgres', 'DSN': 'postgresql://'+role+':'+password+'@/'+database+'?host='+str(self.socket_dir)+'&sslmode=disable',
+                'Journal': str(journal), 'ResourceReceipt': str(path)}
+
+    def qualify(self, ident):
+        self.verify()
+        receipt = self.births[ident]
+        if digest(receipt['journal']) != receipt['journal_sha256']:
+            raise RuntimeError('PG journal changed')
+        return receipt
+
+    def close(self):
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.send_signal(2)  # PostgreSQL fast shutdown, owns only this child.
+                self.process.wait(timeout=15)
+            if self.socket_path.exists():
+                raise RuntimeError('PG socket survived process exit')
+        if self.log:
+            self.log.close()
+        print(json.dumps({'pg_version': getattr(self, 'version', None), 'kernel': self.identity,
+                          'births': list(self.births.values()), 'commands': self.commands,
+                          'pg_exit': self.process.returncode if self.process else None,
+                          'cleanup': 'owned PG child stopped; socket absent'}), flush=True)
+
+
+def postgres_container(bundle):
+    # Host controller alone operates Docker. No socket, host mount, privileged
+    # flag, SYS_ADMIN, sudo/ip or nested namespace tools enter the container.
+    nonce = secrets.token_hex(12)
+    image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', PG_IMAGE]))[0]
+    if image['Id'] != PG_IMAGE:
+        raise ValueError('pinned PG image mismatch')
+    argv = ['docker', 'create', '--pull=never', '--name', 'newapi-pg-'+nonce,
+            '--label', 'newapi.bootstrap.owner='+nonce, '--network=none', '--read-only',
+            '--security-opt', 'no-new-privileges', '--memory=2g', '--memory-swap=2g', '--pids-limit=128',
+            '--cap-drop=ALL', '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER',
+            '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL', '--cap-add=SYS_PTRACE',
+            '--tmpfs', '/run:rw,exec,nosuid,nodev,size=4g,mode=0755',
+            '--tmpfs', '/var/lib/postgresql/data:rw,noexec,nosuid,nodev,size=1m,mode=0700',
+            '--entrypoint', '/bin/sh', PG_IMAGE, '-c', 'exec sleep 600']
+    cid = subprocess.check_output(argv, text=True).strip()
+    try:
+        info = json.loads(subprocess.check_output(['docker','inspect',cid]))[0]
+        if any(x['Type']=='volume' for x in info['Mounts']):
+            raise ValueError('unexpected PG volume')
+        command(['docker','start',cid])
+        command(['docker','exec',cid,'mkdir','/run/input'])
+        archive = subprocess.Popen(['tar', '-C', str(bundle), '-cf', '-', '.'], stdout=subprocess.PIPE)
+        try:
+            command(['docker','exec','-i',cid,'tar','-xf','-','-C','/run/input'], stdin=archive.stdout)
+        finally:
+            archive.stdout.close()
+            if archive.wait() != 0:
+                raise RuntimeError('bundle streaming failed')
+        remote_hash = subprocess.check_output(['docker','exec',cid,'sha256sum','/run/input/runner.py'], text=True).split()[0]
+        if remote_hash != digest(bundle / 'runner.py'):
+            raise RuntimeError('container runner hash mismatch')
+        # Detached execution keeps the authoritative result inside the owned
+        # container; a Docker attach EOF cannot be mistaken for test completion.
+        command(['docker','exec','-d',cid,'/bin/sh','-c',
+                 'python3 /run/input/runner.py _run /run/input postgres > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
+        deadline = time.monotonic() + 300
+        while True:
+            receipt = subprocess.run(['docker','exec',cid,'cat','/run/result.exit'], capture_output=True, text=True)
+            if re.fullmatch(r'[0-9]+\s*', receipt.stdout):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError('PG execution result deadline exceeded')
+            time.sleep(0.2)
+        output = subprocess.check_output(['docker','exec',cid,'cat','/run/result.log']).decode(errors='replace')
+        print(output, end='', flush=True)
+        print(json.dumps({'container_execution_exit': int(receipt.stdout)}), flush=True)
+        if int(receipt.stdout) or '--- PASS: TestSessionRevocationS1Namespace/restricted_false' not in output or '--- PASS: TestSessionRevocationS1Namespace/restricted_true' not in output:
+            raise RuntimeError('container PG execution missing required result')
+    finally:
+        info = json.loads(subprocess.check_output(['docker','inspect',cid]))[0]
+        if info['Config']['Labels'].get('newapi.bootstrap.owner') != nonce or info['Image'] != PG_IMAGE:
+            raise RuntimeError('container cleanup ownership mismatch')
+        command(['docker','stop','--time','20',cid])
+        command(['docker','rm','-v',cid])
+        remaining = subprocess.check_output(['docker','ps','-a','--no-trunc','--filter','id='+cid,'--format','{{.ID}}']).strip()
+        if remaining:
+            raise RuntimeError('owned PG container remains')
+        print(json.dumps({'image': PG_IMAGE, 'cid': cid, 'cleanup': 'owned PG container removed; no volumes'}), flush=True)
+
+
+def trusted_run(bundle, tier="sqlite"):
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise ValueError('installer requires Linux root; use the normal prepare entry')
     bundle = Path(bundle).resolve(strict=True)
@@ -395,11 +667,30 @@ def trusted_run(bundle):
     for required in ('new-api', 'runner.py'):
         if required not in metadata['files']:
             raise ValueError('missing producer input')
+    if tier not in ('sqlite', 'postgres') or metadata.get('tier', 'sqlite') != tier:
+        raise ValueError('resource tier mismatch')
+    if tier == 'postgres' and (len(metadata['entries']) != 1 or metadata['entries'][0]['cwd'] != 'router' or metadata['entries'][0]['run'] != PG_SELECTOR):
+        raise ValueError('PG mandatory inventory mismatch')
+    if tier == 'postgres':
+        # Direct-root is only the fixed container path, never a host PG launch.
+        rootfs = os.statvfs('/')
+        mounts = [line.split() for line in Path('/proc/mounts').read_text().splitlines()]
+        run_mounts = [row for row in mounts if row[1] == '/run']
+        caps = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+        if (not rootfs.f_flag & os.ST_RDONLY or
+                Path('/proc/1/comm').read_text().strip() != 'sleep' or
+                len(run_mounts) != 1 or run_mounts[0][2] != 'tmpfs' or
+                not {'nosuid', 'nodev'}.issubset(set(run_mounts[0][3].split(','))) or
+                'noexec' in run_mounts[0][3].split(',') or
+                os.statvfs('/run').f_blocks * os.statvfs('/run').f_frsize > 4 * 1024**3 or
+                int(caps['CapBnd'].strip(), 16) & (1 << 21) or caps['NoNewPrivs'].strip() != '1'):
+            raise ValueError('PG direct-root requires the constrained private container')
     root = Path(tempfile.mkdtemp(prefix='newapi-bootstrap-tests-', dir='/run'))
     root.chmod(0o755)
     root_stat = root.stat()
     installer = None
     redis_resource = None
+    pg_resource = None
     thread = None
     status = 1
     try:
@@ -441,14 +732,18 @@ def trusted_run(bundle):
         launcher.write_text('#!/bin/sh\nexec /usr/bin/python3 ' + str(root / 'bundle/runner.py') + ' client ' + str(root / 'installer.sock') + ' "$@"\n')
         launcher.chmod(0o755)
         env = {'PATH': '/usr/bin:/bin', 'HOME': str(root / 'tmp'), 'TMPDIR': str(root / 'tmp'), 'NEWAPI_TEST_PROFILE': 'isolated-ci', 'NEWAPI_BOOTSTRAP_CLIENT': str(launcher), 'NEWAPI_BOOTSTRAP_ENGINE': 'sqlite'}
-        if any(entry['cwd'] == 'router' for entry in metadata['entries']):
+        if tier == 'postgres':
+            pg_resource = OwnedPostgres(root, uid)
+            env.update(pg_resource.start())
+            env['GOMAXPROCS'] = '2'
+        elif any(entry['cwd'] == 'router' for entry in metadata['entries']):
             redis_resource = OwnedRedis(root, uid)
             env.update(redis_resource.start())
         # Root-only negative producer tests execute separately, not skipped away.
         for entry in metadata['entries']:
             if entry['cwd'] == 'model':
                 command([str(root / 'bundle' / entry['binary']), '-test.run=^' + PRODUCER_TEST + '$', '-test.v'], cwd=root / 'bundle/source/model', env=dict(env, NEWAPI_BOOTSTRAP_ROOT_TEST_DIR=str(root / 'producer-tests')))
-        installer = Installer(root, uid, redis_resource)
+        installer = Installer(root, uid, redis_resource, pg_resource)
         thread = threading.Thread(target=installer.serve)
         thread.start()
         for entry in metadata['entries']:
@@ -461,7 +756,16 @@ def trusted_run(bundle):
             argv = [str(root / 'bundle' / binary), '-test.v', '-test.count=1', '-test.run=' + entry['run'], '-test.skip=' + skip]
             if redis_resource:
                 redis_resource.verify()
-            command(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid))
+            if pg_resource:
+                pg_resource.verify()
+                result = subprocess.run(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+                output = result.stdout.decode(errors='replace')
+                print(output, end='', flush=True)
+                if result.returncode or any('--- PASS: TestSessionRevocationS1Namespace/restricted_'+case not in output for case in ('false', 'true')) or '--- SKIP:' in output:
+                    raise RuntimeError('mandatory PG Namespace qualification failed')
+                pg_resource.verify()
+            else:
+                command(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid))
             if redis_resource:
                 redis_resource.verify()
             for name in special:
@@ -486,6 +790,8 @@ def trusted_run(bundle):
             print(json.dumps({'producer_sha256': digest(root / 'bundle/new-api'), 'fixture_receipts': installer.receipts, 'service_uid': uid, 'status': status}), flush=True)
         if redis_resource:
             redis_resource.close()
+        if pg_resource:
+            pg_resource.close()
         # Exact inode/device and root ownership: never clean an adopted directory.
         current = root.lstat()
         if (current.st_dev, current.st_ino, current.st_uid) != (root_stat.st_dev, root_stat.st_ino, 0) or not stat.S_ISDIR(current.st_mode):
@@ -498,10 +804,11 @@ def main():
     if len(sys.argv) in (3, 4) and sys.argv[1] == 'client':
         client(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'fresh')
         return
-    if len(sys.argv) == 3 and sys.argv[1] == '_run':
-        trusted_run(sys.argv[2])
+    if len(sys.argv) in (3, 4) and sys.argv[1] == '_run':
+        trusted_run(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'sqlite')
         return
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--tier', choices=('sqlite', 'postgres'), default='sqlite', help='separate required resource tier; no PG-to-SQLite fallback')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--prepare-only', action='store_true', help='prepare for an isolated root container instead of local sudo')
     parser.add_argument('--package', action='append', help='bounded root-package check; default retains all three Go modules')

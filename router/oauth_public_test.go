@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -46,6 +47,8 @@ import (
 	"github.com/go-redis/redis/v8"
 	sqlmysql "github.com/go-sql-driver/mysql"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -1310,6 +1313,14 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 func oauthPublicDatabase(t *testing.T, f *organizationHTTPFixture) {
 	t.Helper()
 	kind := os.Getenv("NEWAPI_W01_MAIN_KIND")
+	if os.Getenv("NEWAPI_BOOTSTRAP_TIER") == "postgres" {
+		require.Equal(t, "postgres", kind)
+		require.Equal(t, "postgres", f.db.Dialector.Name())
+		require.Equal(t, os.Getenv("SQL_DSN"), f.mainDSN)
+		require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+		combinedFixtureDatabase(t, "main", f.db)
+		return // The born DB already contains these actors; never copy to another DB.
+	}
 	if kind == "" || kind == "sqlite" {
 		var version string
 		require.NoError(t, f.db.Raw("SELECT sqlite_version()").Scan(&version).Error)
@@ -3005,12 +3016,22 @@ func TestSessionRevocationS1Namespace(t *testing.T) {
 			oauthPublicDatabase(t, f)
 			require.NoError(t, model.InitOAuthCleanupStore(false))
 			require.NoError(t, f.db.AutoMigrate(&model.OAuthGrant{}, &model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}))
-			require.NoError(t, f.db.Exec("CREATE SCHEMA app").Error)
+			role := "w01s104_" + strings.ToLower(strings.ReplaceAll(common.NewRequestId(), "-", ""))
+			if os.Getenv("NEWAPI_BOOTSTRAP_TIER") == "postgres" {
+				var receipt struct {
+					RestrictedRole string `json:"restricted_role"`
+				}
+				raw, err := os.ReadFile(os.Getenv("NEWAPI_BOOTSTRAP_PG_RECEIPT"))
+				require.NoError(t, err)
+				require.NoError(t, common.Unmarshal(raw, &receipt))
+				role = receipt.RestrictedRole // Created/granted by the trusted installer.
+			} else {
+				require.NoError(t, f.db.Exec("CREATE SCHEMA app").Error)
+			}
 			require.NoError(t, f.db.Exec("ALTER TABLE public.users SET SCHEMA app").Error)
 			require.NoError(t, f.db.Exec("ALTER TABLE public.session_revocation_events SET SCHEMA app").Error)
-			role := "w01s104_" + strings.ToLower(strings.ReplaceAll(common.NewRequestId(), "-", ""))
 			require.Regexp(t, `^[a-z][a-z0-9_]+$`, role)
-			if restricted {
+			if restricted && os.Getenv("NEWAPI_BOOTSTRAP_TIER") != "postgres" {
 				require.NoError(t, f.db.Exec("CREATE ROLE "+role+" NOLOGIN").Error)
 				t.Logf("W01-04 owned role=%s", role)
 				t.Cleanup(func() {
@@ -4308,7 +4329,7 @@ func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
 	require.NotEmpty(t, client, "a separate trusted installer is required for provenance fixtures")
 	raw, err := exec.Command(client).Output()
 	require.NoError(t, err, "permanent bootstrap fixture producer failed")
-	var birth struct{ Engine, DSN, Journal string }
+	var birth struct{ Engine, DSN, Journal, ResourceReceipt string }
 	require.NoError(t, common.Unmarshal(raw, &birth))
 	require.NotEmpty(t, birth.Journal)
 	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", birth.Journal)
@@ -4320,7 +4341,96 @@ func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
 	case "mysql":
 		dialect = mysql.Open(birth.DSN)
 	case "postgres":
-		dialect = postgres.Open(birth.DSN)
+		require.Equal(t, "postgres", os.Getenv("NEWAPI_BOOTSTRAP_TIER"))
+		var receipt struct {
+			ID             string `json:"id"`
+			Database       string `json:"database"`
+			Role           string `json:"role"`
+			RestrictedRole string `json:"restricted_role"`
+			SocketDir      string `json:"socket_dir"`
+			Port           uint16 `json:"port"`
+			ServiceUID     int    `json:"service_uid"`
+			Journal        string `json:"journal"`
+			JournalHash    string `json:"journal_sha256"`
+		}
+		root := filepath.Dir(filepath.Dir(birth.Journal))
+		require.Equal(t, filepath.Join(root, "client"), client)
+		for _, file := range []string{client, birth.Journal, birth.ResourceReceipt} {
+			for path := file; ; path = filepath.Dir(path) {
+				info, err := os.Lstat(path)
+				require.NoError(t, err)
+				require.Zero(t, info.Mode()&os.ModeSymlink)
+				require.Zero(t, info.Mode().Perm()&0o022)
+				owner := reflect.Indirect(reflect.ValueOf(info.Sys())).FieldByName("Uid")
+				require.True(t, owner.IsValid())
+				require.Zero(t, owner.Uint())
+				if path == "/" {
+					break
+				}
+			}
+		}
+		resource, err := os.ReadFile(birth.ResourceReceipt)
+		require.NoError(t, err)
+		require.NoError(t, common.Unmarshal(resource, &receipt))
+		require.Regexp(t, `^[0-9a-f]{32}$`, receipt.ID)
+		require.Equal(t, filepath.Join(root, "pg-resource-"+receipt.ID+".json"), birth.ResourceReceipt)
+		require.Equal(t, filepath.Join(root, "journals", receipt.ID+".json"), birth.Journal)
+		require.Equal(t, birth.Journal, receipt.Journal)
+		require.Equal(t, os.Getuid(), receipt.ServiceUID)
+		require.NotZero(t, receipt.ServiceUID)
+		require.Equal(t, filepath.Join(root, "pg-socket"), receipt.SocketDir)
+		require.EqualValues(t, 5432, receipt.Port)
+		journal, err := os.ReadFile(birth.Journal)
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(journal)), receipt.JournalHash)
+		current, err := exec.Command(client, "pg:"+receipt.ID).Output()
+		require.NoError(t, err, "current PG kernel/journal qualification required")
+		require.JSONEq(t, string(resource), string(current))
+		parsed, err := url.Parse(birth.DSN)
+		require.NoError(t, err)
+		require.Equal(t, "postgresql", parsed.Scheme)
+		require.Empty(t, parsed.Host)
+		require.Empty(t, parsed.Fragment)
+		require.Equal(t, "/"+receipt.Database, parsed.Path)
+		require.Equal(t, receipt.Role, parsed.User.Username())
+		require.Equal(t, url.Values{"host": {receipt.SocketDir}, "sslmode": {"disable"}}, parsed.Query())
+		for _, key := range []string{"PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGSERVICE", "PGSERVICEFILE", "PGOPTIONS"} {
+			require.Empty(t, os.Getenv(key), key)
+		}
+		config, err := pgx.ParseConfig(birth.DSN)
+		require.NoError(t, err)
+		require.Equal(t, receipt.SocketDir, config.Host)
+		require.Equal(t, receipt.Port, config.Port)
+		require.Equal(t, receipt.Database, config.Database)
+		require.Equal(t, receipt.Role, config.User)
+		require.Nil(t, config.TLSConfig)
+		require.Empty(t, config.Fallbacks)
+		require.Empty(t, config.RuntimeParams)
+		connection := stdlib.OpenDB(*config)
+		t.Cleanup(func() { require.NoError(t, connection.Close()) })
+		var database, user string
+		require.NoError(t, connection.QueryRow("SELECT current_database(), current_user").Scan(&database, &user))
+		require.Equal(t, receipt.Database, database)
+		require.Equal(t, receipt.Role, user)
+		var elevated, canAdmin bool
+		require.NoError(t, connection.QueryRow("SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls FROM pg_roles WHERE rolname=current_user").Scan(&elevated))
+		require.False(t, elevated)
+		require.NoError(t, connection.QueryRow("SELECT admin_option FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND roleid=(SELECT oid FROM pg_roles WHERE rolname=$1)", receipt.RestrictedRole).Scan(&canAdmin))
+		require.False(t, canAdmin)
+		_, err = connection.Exec("CREATE ROLE forbidden_fixture_role NOLOGIN")
+		require.Error(t, err, "service cannot manage roles")
+		for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity"} {
+			_, err = connection.Exec("DELETE FROM public." + table + " WHERE false")
+			require.Error(t, err, "history/identity must remain installer-owned and read-only")
+		}
+		foreign := config.Copy()
+		foreign.Database = "postgres"
+		foreignDB := stdlib.OpenDB(*foreign)
+		require.Error(t, foreignDB.PingContext(t.Context()), "service cannot connect to maintenance database")
+		require.NoError(t, foreignDB.Close())
+		require.Error(t, os.Chmod(birth.Journal, 0o666), "service cannot mutate protected journal")
+		t.Setenv("NEWAPI_BOOTSTRAP_PG_RECEIPT", birth.ResourceReceipt)
+		dialect = postgres.New(postgres.Config{Conn: connection, PreferSimpleProtocol: true})
 	default:
 		t.Fatalf("unsupported trusted fixture engine %q", birth.Engine)
 	}

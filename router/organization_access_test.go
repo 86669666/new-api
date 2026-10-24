@@ -465,7 +465,32 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 	}
 	model.DB = db
 	common.SetDatabaseTypes(common.DatabaseType(kind), common.DatabaseType(kind))
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}))
+	if os.Getenv("NEWAPI_BOOTSTRAP_TIER") == "postgres" {
+		for _, value := range []any{&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}} {
+			require.True(t, db.Migrator().HasTable(value), "formal producer must create required schema")
+		}
+		validationErr := model.ValidateOAuthDerivedTokenStore(t.Context())
+		if validationErr != nil {
+			// Only schema metadata is logged; never SQL text, credentials or rows.
+			for _, table := range []string{"oauth_derived_token_sources", "oauth_derived_token_history", "oauth_derived_token_bootstrap_identity"} {
+				columns, columnErr := db.Migrator().ColumnTypes(table)
+				t.Logf("PG provenance metadata table=%s column_error_type=%T", table, columnErr)
+				for _, column := range columns {
+					if column.Name() == "id" || column.Name() == "key_ref" {
+						primary, known := column.PrimaryKey()
+						t.Logf("PG provenance column=%s primary=%t known=%t", column.Name(), primary, known)
+					}
+				}
+				var primaryCount, visibleConstraints int64
+				require.NoError(t, db.Raw("SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid=to_regclass(?) AND contype='p'", "public."+table).Scan(&primaryCount).Error)
+				require.NoError(t, db.Raw("SELECT count(*) FROM information_schema.table_constraints WHERE table_schema='public' AND table_name=? AND constraint_type='PRIMARY KEY'", table).Scan(&visibleConstraints).Error)
+				t.Logf("PG provenance catalog_primary=%d visible_primary=%d", primaryCount, visibleConstraints)
+			}
+		}
+		require.NoError(t, validationErr)
+	} else {
+		require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}))
+	}
 	t.Setenv("LOG_SQL_DSN", "")
 	require.NoError(t, model.InitLogDB())
 	logKind := os.Getenv("NEWAPI_S2_LOG")
