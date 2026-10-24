@@ -1439,10 +1439,24 @@ class AdmissionFixture:
         for label,uid in (('wrong_peer_uid',self.service_uid+1),('same_uid_wrong_process',self.service_uid)):
             # This fork has no service-written code and sends only the already
             # fixed CHECK. Even a valid capability cannot replace peer identity.
+            inherited=[int(fd.name) for fd in Path('/proc/self/fd').iterdir()]
             child=os.fork()
             if child==0:
                 try:
+                    os.setsid()
+                    libc=ctypes.CDLL(None,use_errno=True)
+                    if libc.prctl(4,0,0,0,0):os._exit(1)
+                    # No installer listener, journal, database, barrier or log
+                    # descriptor may survive into a service-UID probe.
+                    for fd in inherited:
+                        try:os.close(fd)
+                        except OSError:pass
                     demote(uid)
+                    if libc.prctl(4,0,0,0,0) or libc.prctl(3,0,0,0,0)!=0:os._exit(1)
+                    for fd in list(Path('/proc/self/fd').iterdir()):
+                        try:os.readlink(fd)
+                        except FileNotFoundError:continue
+                        os._exit(1)
                     with socket.socket(socket.AF_UNIX) as conn:
                         conn.settimeout(5);conn.connect(str(self.socket))
                         frame=json.dumps({'version':1,'operation':'CHECK','binding':self.binding,'capability':self.config['Capability']}).encode()
@@ -1458,9 +1472,16 @@ class AdmissionFixture:
                         if data and json.loads(data)['operation_result']['status']!='REJECTED':os._exit(1)
                     os._exit(0)
                 except BaseException:os._exit(1)
-            _,status=os.waitpid(child,0)
+            import select
+            pidfd=os.pidfd_open(child)
+            try:
+                if not select.select([pidfd],[],[],8)[0]:
+                    os.kill(child,9);os.waitpid(child,0)
+                    raise RuntimeError('peer probe exit timeout')
+                _,status=os.waitpid(child,0)
+            finally:os.close(pidfd)
             if status:raise RuntimeError('peer rejection failed')
-            checks.append({'case':label,'exit':status})
+            checks.append({'case':label,'exit':status,'inherited_fds_closed_before_demotion':True,'nondumpable':True,'bounded_pidfd_wait':True})
         if b'"event":"model_enter"' in (self.root/'control/broker.log').read_bytes():
             raise RuntimeError('rejected control called model')
         if self.snapshot()!=self.before:raise RuntimeError('startup controls modified protected state')
