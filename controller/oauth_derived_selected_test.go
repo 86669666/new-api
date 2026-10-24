@@ -744,7 +744,9 @@ func runOAuthCacheAdmissionControls(t *testing.T, db, observer *gorm.DB) {
 		{"high_cache_low_sql", 5, 1000000, 10, 403, 0, false},
 		{"fake_unlimited", 5, 1000000, 10, 403, 0, false},
 		{"sql_unlimited", 0, 1, 10, 200, 0, true},
-		{"zero", 1000, 0, 0, 200, 0, false},
+		// Strict authentication rejects exhausted observations even for a free request.
+		{"zero", 1000, 0, 0, 401, 0, false},
+		{"zero_unexhausted", 1000, 1, 0, 200, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			user := model.User{Username: "cachepolicy_" + tc.name, AffCode: "cp_" + tc.name, Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default", Quota: 1000, Setting: `{"billing_preference":"wallet_only"}`}
@@ -841,7 +843,11 @@ func runOAuthCacheAdmissionControls(t *testing.T, db, observer *gorm.DB) {
 			assert.Equal(t, tc.status, w.Code, w.Body.String())
 			if tc.status == 401 {
 				assert.Zero(t, calls)
-				assert.Contains(t, w.Body.String(), "token_invalid")
+				if tc.name == "zero" {
+					assert.Contains(t, w.Body.String(), "token_exhausted")
+				} else {
+					assert.Contains(t, w.Body.String(), "token_invalid")
+				}
 			} else {
 				assert.Equal(t, 1, calls)
 			}
@@ -857,7 +863,7 @@ func runOAuthCacheAdmissionControls(t *testing.T, db, observer *gorm.DB) {
 			require.NoError(t, observer.First(&payer, user.Id).Error)
 			assert.Equal(t, 1000-spent, payer.Quota)
 			assert.Equal(t, user.AuthVersion, payer.AuthVersion)
-			if tc.name == "below_admission" || tc.status == 401 {
+			if tc.name == "below_admission" || tc.status == 401 || tc.requestQuota == 0 {
 				assert.Zero(t, moneyAttempts.Load(), "veto must precede any attempted money update")
 			}
 			if tc.status != 200 {
