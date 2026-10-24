@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build once, then run Go tests with a Linux trusted SQLite fixture producer.
+"""Build once, then schedule Go tests across trusted required resource tiers.
 
 The default retains every root (except the embed-only main), relaykit and
- tokenkit package. External-engine subtests remain a separate database tier;
-this entry runs their SQLite variants, never reports those as a three-DB pass.
+tokenkit package. Required PG tests run in fixed isolated resource tiers;
+optional external-engine matrices are not represented as a three-DB pass.
 No database history is authored here: only the same-source gateway CLI seals.
 """
 import argparse
@@ -49,6 +49,8 @@ def command(argv, **kwargs):
 def prepare(args):
     if sys.platform != 'linux':
         raise ValueError('trusted provenance test runner requires Linux')
+    if args.tier == 'all' and (args.package or args.run != '.'):
+        raise ValueError('bounded selectors require an explicit resource --tier')
     if args.tier in ('postgres', 'postgres-redis'):
         selector = PG_SELECTOR if args.tier == 'postgres' else JOINT_SELECTOR
         if args.package not in (None, ['./router']) or args.run not in ('.', selector):
@@ -94,17 +96,190 @@ def prepare(args):
                 entries.append({'binary': binary, 'cwd': str(Path(module) / rel), 'run': args.run})
     shutil.copyfile(__file__, bundle / 'runner.py')
     metadata = {'tier': args.tier, 'entries': entries, 'files': {str(p.relative_to(bundle)): digest(p) for p in sorted(bundle.rglob('*')) if p.is_file()}}
+    if args.tier == 'all':
+        metadata['inventory'] = compiled_inventory(bundle, entries)
+        metadata['partitions'] = resource_partitions(entries, metadata['inventory'])
     (bundle / 'manifest.json').write_text(json.dumps(metadata, sort_keys=True))
     if args.prepare_only:
         print(json.dumps({'bundle': str(bundle), 'producer_sha256': digest(bundle / 'new-api'), 'packages': len(entries)}))
         return
-    if args.tier in ('postgres', 'postgres-redis'):
-        postgres_container(bundle, args.tier)
+    execute_prepared(bundle, args.tier)
+
+
+def compiled_inventory(bundle, entries):
+    inventory = {}
+    for entry in entries:
+        binary = entry['binary']
+        if binary in inventory or not re.fullmatch(r'test-[0-9]+', binary):
+            raise ValueError('duplicate or invalid package binary')
+        cwd = Path(entry['cwd'])
+        if cwd.is_absolute() or '..' in cwd.parts:
+            raise ValueError('inventory directory escape')
+        output = subprocess.check_output([str(bundle / binary), '-test.list=.'],
+                                         cwd=bundle / 'source' / entry['cwd'], text=True)
+        names = [line for line in output.splitlines()
+                 if re.fullmatch(r'(?:Test|Example|Fuzz)\w*', line)]
+        if len(names) != len(set(names)):
+            raise ValueError('duplicate compiled test name')
+        inventory[binary] = names
+    return inventory
+
+
+def resource_partitions(entries, inventory):
+    # Exact names, not prefix exclusions. Test.list freezes the compiled set;
+    # each (binary, top-level test) belongs to exactly one required partition.
+    if set(inventory) != {entry['binary'] for entry in entries}:
+        raise ValueError('inventory package mismatch')
+    routers = [e for e in entries if e['cwd'] == 'router']
+    if len(routers) != 1 or any(e['run'] != '.' for e in entries):
+        raise ValueError('default inventory requires one complete router package')
+    router = routers[0]
+    required = {'postgres': PG_SELECTOR[1:-1], 'postgres-redis': JOINT_SELECTOR[1:-1]}
+    if not set(required.values()).issubset(inventory[router['binary']]):
+        raise ValueError('required compiled test missing')
+    partitions = {'sqlite': [], 'postgres': [], 'postgres-redis': []}
+    assigned = []
+    for entry in entries:
+        names = inventory[entry['binary']]
+        if len(names) != len(set(names)):
+            raise ValueError('duplicate inventory member')
+        ordinary = [n for n in names if entry != router or n not in required.values()]
+        run = entry['run'] if entry != router else '^(' + '|'.join(re.escape(n) for n in ordinary) + ')$'
+        if entry == router and not ordinary:
+            raise ValueError('empty ordinary router partition')
+        partitions['sqlite'].append(dict(entry, run=run))
+        assigned.extend((entry['binary'], n) for n in ordinary)
+    for tier, name in required.items():
+        partitions[tier] = [dict(router, run='^'+name+'$')]
+        assigned.append((router['binary'], name))
+    expected = {(b, n) for b, names in inventory.items() for n in names}
+    if len(assigned) != len(set(assigned)) or set(assigned) != expected:
+        raise ValueError('resource partitions overlap or omit tests')
+    return partitions
+
+
+def verified_manifest(bundle):
+    if bundle.is_symlink() or not bundle.is_dir():
+        raise ValueError('invalid prepared bundle')
+    metadata = json.loads((bundle / 'manifest.json').read_text())
+    if not isinstance(metadata.get('files'), dict) or not isinstance(metadata.get('entries'), list):
+        raise ValueError('invalid prepared metadata')
+    for entry in metadata['entries']:
+        cwd = Path(entry['cwd'])
+        if (not re.fullmatch(r'test-[0-9]+', entry['binary']) or entry['binary'] not in metadata['files'] or
+                cwd.is_absolute() or '..' in cwd.parts or not isinstance(entry['run'], str)):
+            raise ValueError('invalid prepared entry')
+    if 'new-api' not in metadata['files'] or 'source/scripts/ci/bootstrap_test_runner.py' not in metadata['files']:
+        raise ValueError('missing prepared producer/source')
+    for name, expected in metadata['files'].items():
+        rel = Path(name)
+        src = bundle / rel
+        if (rel.is_absolute() or '..' in rel.parts or
+                any(p.is_symlink() for p in [src, *src.parents]) or not src.is_file() or digest(src) != expected):
+            raise ValueError('prepared input hash/path mismatch')
+    if metadata['files'].get('runner.py') != digest(Path(__file__)):
+        raise ValueError('prepared runner mismatch')
+    return metadata
+
+
+def required_leaves(tier):
+    if tier == 'postgres':
+        return ['TestSessionRevocationS1Namespace/restricted_'+v for v in ('false', 'true')]
+    if tier == 'postgres-redis':
+        return ['TestSessionRevocationS1RealRedis/'+v for v in JOINT_CASES]
+    return []
+
+
+def validate_required_output(tier, output, exit_code):
+    events = re.findall(r'^\s*--- (PASS|FAIL|SKIP): (\S+) \(', output, re.M)
+    required = required_leaves(tier)
+    if (exit_code or any(status != 'PASS' for status, _ in events) or
+            any(events.count(('PASS', name)) != 1 for name in required)):
+        raise RuntimeError('required resource test failed, skipped or missing')
+    return required
+
+
+def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
+    receipts = []
+    for line in output.splitlines():
+        if line.startswith('BOOTSTRAP_TIER_RESULT '):
+            receipts.append(json.loads(line.removeprefix('BOOTSTRAP_TIER_RESULT ')))
+    expected = {'tier': metadata['tier'], 'invocation': metadata['invocation'],
+                'manifest_sha256': manifest_hash, 'producer_sha256': metadata['files']['new-api'],
+                'runner_sha256': metadata['files']['runner.py'], 'entries': metadata['entries'],
+                'required_leaves': required_leaves(metadata['tier']), 'exit': 0, 'cleanup': True}
+    if exit_code or receipts != [expected]:
+        raise RuntimeError('missing, duplicate or mismatched current tier receipt')
+    if metadata['tier'] != 'sqlite':
+        validate_required_output(metadata['tier'], output, exit_code)
+    return expected
+
+
+def dispatch_tier(bundle, tier):
+    metadata = verified_manifest(bundle)
+    if tier not in ('sqlite', 'postgres', 'postgres-redis') or metadata['tier'] != tier:
+        raise ValueError('dispatch tier mismatch')
+    if tier != 'sqlite':
+        postgres_container(bundle, tier)
         return
-    # The invoking developer is the installer authority, never the service UID.
+    # Docker remains in the host controller, never this private net namespace.
     command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork',
              'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && ip link set lo up && exec "$@"',
-             'bootstrap-tests', sys.executable, str(Path(__file__).resolve()), '_run', str(bundle)])
+             'bootstrap-tests', sys.executable, str(bundle / 'runner.py'), '_run', str(bundle)])
+
+
+def execute_prepared(bundle, tier):
+    bundle = Path(bundle).absolute()
+    metadata = verified_manifest(bundle)
+    if metadata['tier'] != tier:
+        raise ValueError('prepared resource tier mismatch')
+    if tier != 'all':
+        dispatch_tier(bundle, tier)
+        return
+    if {n for n in metadata['files'] if re.fullmatch(r'test-[0-9]+', n)} != {e['binary'] for e in metadata['entries']}:
+        raise ValueError('default compiled package omitted')
+    inventory = compiled_inventory(bundle, metadata['entries'])
+    plan = resource_partitions(metadata['entries'], inventory)
+    if inventory != metadata.get('inventory') or plan != metadata.get('partitions'):
+        raise ValueError('compiled inventory or partition changed')
+    # Every invocation gets new receipts. Retain logs and input views for audit;
+    # hardlinks are read-only reuse, never overwritten or chmod-ed.
+    execution = Path(tempfile.mkdtemp(prefix='execution-', dir=bundle))
+    invocation = secrets.token_hex(32)
+    summary = {'scope': 'default-full', 'invocation': invocation,
+               'manifest_sha256': digest(bundle / 'manifest.json'), 'tiers': [], 'exit': 1,
+               'unexecuted': ['postgres', 'postgres-redis', 'sqlite']}
+    try:
+        for resource in list(summary['unexecuted']):
+            child = execution / resource
+            child.mkdir(mode=0o700)
+            entries = plan[resource]
+            selected = {e['binary'] for e in entries}
+            files = {name: value for name, value in metadata['files'].items()
+                     if not re.fullmatch(r'test-[0-9]+', name) or name in selected}
+            for name in files:
+                target = child / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.link(bundle / name, target)
+            sub = {'tier': resource, 'entries': entries, 'files': files, 'invocation': invocation}
+            (child / 'manifest.json').write_text(json.dumps(sub, sort_keys=True))
+            log = execution / (resource+'.log')
+            argv = [sys.executable, str(child / 'runner.py'), '_dispatch', str(child), resource]
+            print(json.dumps({'tier_start': resource, 'log': str(log), 'argv': argv}), flush=True)
+            with log.open('xb') as stream:
+                result = subprocess.run(argv, stdout=stream, stderr=subprocess.STDOUT)
+            output = log.read_text(errors='replace')
+            print(output, end='', flush=True)
+            record = {'tier': resource, 'exit': result.returncode, 'log': str(log), 'log_sha256': digest(log)}
+            summary['tiers'].append(record)
+            summary['unexecuted'].remove(resource)
+            record['receipt'] = validate_tier_receipt(sub, digest(child / 'manifest.json'), output, result.returncode)
+        if {r['tier'] for r in summary['tiers']} != set(plan):
+            raise RuntimeError('required tier omitted')
+        summary['exit'] = 0
+    finally:
+        (execution / 'result.json').write_text(json.dumps(summary, sort_keys=True))
+        print('BOOTSTRAP_DEFAULT_RESULT '+json.dumps(summary, sort_keys=True), flush=True)
 
 
 def demote(uid):
@@ -850,9 +1025,7 @@ def postgres_container(bundle, tier='postgres'):
         output = subprocess.check_output(['docker','exec',cid,'cat','/run/result.log']).decode(errors='replace')
         print(output, end='', flush=True)
         print(json.dumps({'container_execution_exit': int(receipt.stdout)}), flush=True)
-        required = ['TestSessionRevocationS1Namespace/restricted_'+v for v in ('false', 'true')] if tier == 'postgres' else ['TestSessionRevocationS1RealRedis/'+v for v in JOINT_CASES]
-        if int(receipt.stdout) or any('--- PASS: '+name not in output for name in required) or '--- SKIP:' in output:
-            raise RuntimeError('container PG execution missing required result')
+        validate_required_output(tier, output, int(receipt.stdout))
     finally:
         info = json.loads(subprocess.check_output(['docker','inspect',cid]))[0]
         if info['Config']['Labels'].get('newapi.bootstrap.owner') != nonce or info['Image'] != image_id:
@@ -909,6 +1082,7 @@ def trusted_run(bundle, tier="sqlite"):
     pg_resource = None
     thread = None
     status = 1
+    completed = []
     try:
         # Snapshot and verify before any execution; no service writes to tools.
         for name, expected in metadata['files'].items():
@@ -962,7 +1136,9 @@ def trusted_run(bundle, tier="sqlite"):
         # Root-only negative producer tests execute separately, not skipped away.
         for entry in metadata['entries']:
             if entry['cwd'] == 'model':
+                print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='producer')), flush=True)
                 command([str(root / 'bundle' / entry['binary']), '-test.run=^' + PRODUCER_TEST + '$', '-test.v'], cwd=root / 'bundle/source/model', env=dict(env, NEWAPI_BOOTSTRAP_ROOT_TEST_DIR=str(root / 'producer-tests')))
+                print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry, phase='producer', exit=0)), flush=True)
         installer = Installer(root, uid, redis_resource, pg_resource)
         thread = threading.Thread(target=installer.serve)
         thread.start()
@@ -974,6 +1150,7 @@ def trusted_run(bundle, tier="sqlite"):
             special = DIALECT_TESTS.get(str(cwd), ())
             skip = '|'.join(('^' + PRODUCER_TEST + '$', *('^' + n + '$' for n in special)))
             argv = [str(root / 'bundle' / binary), '-test.v', '-test.count=1', '-test.run=' + entry['run'], '-test.skip=' + skip]
+            print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='ordinary')), flush=True)
             if redis_resource:
                 redis_resource.verify()
             if pg_resource:
@@ -981,20 +1158,22 @@ def trusted_run(bundle, tier="sqlite"):
                 result = subprocess.run(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
                 output = result.stdout.decode(errors='replace')
                 print(output, end='', flush=True)
-                required = ['TestSessionRevocationS1Namespace/restricted_'+v for v in ('false', 'true')] if tier == 'postgres' else ['TestSessionRevocationS1RealRedis/'+v for v in JOINT_CASES]
-                if result.returncode or any('--- PASS: '+name not in output for name in required) or '--- SKIP:' in output:
-                    raise RuntimeError('mandatory PG Namespace qualification failed')
+                validate_required_output(tier, output, result.returncode)
                 pg_resource.verify()
             else:
                 command(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid))
             if redis_resource:
                 redis_resource.verify()
+            print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry, phase='ordinary', exit=0)), flush=True)
             for name in special:
                 # Go's regexp syntax is not Python's; ask the test binary whether
                 # the requested top-level selector includes this dialect test.
                 listing = subprocess.check_output([str(root / 'bundle' / binary), '-test.list=' + entry['run'].split('/')[0]], env=env, preexec_fn=lambda: demote(uid), text=True)
                 if name in listing.splitlines():
+                    print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='sqlite-dialect', run='^'+name+'$/sqlite')), flush=True)
                     command([str(root / 'bundle' / binary), '-test.v', '-test.count=1', '-test.run=^' + name + '$/sqlite'], cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid))
+                    print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry, phase='sqlite-dialect', exit=0)), flush=True)
+            completed.append(entry)
         # Explicitly prove protected anchor ownership from the actual service UID.
         journals = list((root / 'journals').glob('*.json'))
         if journals:
@@ -1020,6 +1199,15 @@ def trusted_run(bundle, tier="sqlite"):
         shutil.rmtree(root)
         print(json.dumps({'cleanup': 'removed owned ephemeral run', 'run': str(root), 'exit': status}), flush=True)
 
+    if 'invocation' in metadata:
+        if completed != metadata['entries'] or not re.fullmatch(r'[0-9a-f]{64}', metadata['invocation']):
+            raise RuntimeError('incomplete tier execution')
+        print('BOOTSTRAP_TIER_RESULT '+json.dumps({
+            'tier': tier, 'invocation': metadata['invocation'],
+            'manifest_sha256': digest(bundle / 'manifest.json'),
+            'producer_sha256': metadata['files']['new-api'], 'runner_sha256': metadata['files']['runner.py'],
+            'entries': completed, 'required_leaves': required_leaves(tier), 'exit': status, 'cleanup': True}, sort_keys=True), flush=True)
+
 
 def main():
     if len(sys.argv) in (3, 4) and sys.argv[1] == 'client':
@@ -1028,13 +1216,23 @@ def main():
     if len(sys.argv) in (3, 4) and sys.argv[1] == '_run':
         trusted_run(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'sqlite')
         return
+    if len(sys.argv) == 4 and sys.argv[1] == '_dispatch':
+        dispatch_tier(Path(sys.argv[2]), sys.argv[3])
+        return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('sqlite', 'postgres', 'postgres-redis'), default='sqlite', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis'), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
+    parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')
     parser.add_argument('--prepare-only', action='store_true', help='prepare for an isolated root container instead of local sudo')
     parser.add_argument('--package', action='append', help='bounded root-package check; default retains all three Go modules')
     parser.add_argument('--run', default='.', help='Go test selector; defaults to every test')
-    prepare(parser.parse_args())
+    args = parser.parse_args()
+    if args.execute_prepared:
+        if args.prepare_only or args.package or args.run != '.':
+            parser.error('--execute-prepared cannot change compiled selectors')
+        execute_prepared(args.bundle, args.tier)
+    else:
+        prepare(args)
 
 
 if __name__ == '__main__':
