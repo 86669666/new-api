@@ -47,6 +47,8 @@ def command(argv, **kwargs):
 
 
 def prepare(args):
+    if args.tier == "admission":
+        return prepare_admission(args)
     if sys.platform != 'linux':
         raise ValueError('trusted provenance test runner requires Linux')
     if args.tier == 'all' and (args.package or args.run != '.'):
@@ -217,8 +219,15 @@ def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
 
 def dispatch_tier(bundle, tier):
     metadata = verified_manifest(bundle)
-    if tier not in ('sqlite', 'postgres', 'postgres-redis') or metadata['tier'] != tier:
+    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission') or metadata['tier'] != tier:
         raise ValueError('dispatch tier mismatch')
+    if tier == 'admission':
+        available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
+        if available < 4*1024**3:raise RuntimeError('admission needs 1GiB tmpfs plus 3GiB process margin')
+        if sum((bundle/name).stat().st_size for name in metadata['files']) > 768*1024**2:
+            raise RuntimeError('admission bundle exceeds private tmpfs safety budget')
+        command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork', 'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=1G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && exec "$@"', 'admission-tests', sys.executable, str(bundle/'runner.py'), '_admission_run', str(bundle)])
+        return
     if tier != 'sqlite':
         postgres_container(bundle, tier)
         return
@@ -1209,7 +1218,465 @@ def trusted_run(bundle, tier="sqlite"):
             'entries': completed, 'required_leaves': required_leaves(tier), 'exit': status, 'cleanup': True}, sort_keys=True), flush=True)
 
 
+# Explicit fixed-actor read tier; existing default resource scheduling is unchanged.
+ADMISSION_CASES = ('allowed', 'held', 'send_claimed', 'task_held', 'task_send_claimed',
+                   'notfound', 'storeerror', 'deadline', 'inflight', 'model_first', 'unrelated', 'shutdown')
+ADMISSION_SELECTOR = '^TestAdmission(Unit|Live)$'
+
+
+def prepare_admission(args):
+    if sys.platform != 'linux' or args.package or args.run != '.' or not args.admission_assets:
+        raise ValueError('admission requires Linux, exact inventory and real --admission-assets')
+    repo = Path(__file__).resolve().parents[2]
+    bundle = Path(args.bundle).absolute()
+    if bundle == repo or repo in bundle.parents:
+        raise ValueError('bundle must be outside checkout')
+    assets = Path(args.admission_assets).resolve(strict=True)
+    if not (assets / 'index.html').is_file():
+        raise ValueError('real embed assets missing')
+    bundle.mkdir(mode=0o700, parents=True, exist_ok=False)
+    source = bundle / 'source'
+    source.mkdir()
+    names = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=repo).decode().split('\0')
+    for name in filter(None, names):
+        src, dst = repo/name, source/name
+        if src.is_symlink() or not src.is_file():
+            raise ValueError('nonregular source')
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        dst.chmod(0o755 if src.stat().st_mode & 0o111 else 0o644)
+    if any(p.is_symlink() for p in assets.rglob('*')):
+        raise ValueError('asset symlink')
+    shutil.copytree(assets, source/'web/dist')
+    env = dict(os.environ, GOWORK='off')
+    command(['go', 'build', '-mod=readonly', '-p=2', '-o', str(bundle/'new-api'), '.'], cwd=source, env=env)
+    command(['go', 'build', '-mod=readonly', '-p=2', '-o', str(bundle/'admission-broker'), './cmd/admission-broker'], cwd=source, env=env)
+    command(['go', 'test', '-c', '-mod=readonly', '-p=2', '-o', str(bundle/'test-0'), './internal/admissionbroker'], cwd=source, env=env)
+    shutil.copyfile(__file__, bundle/'runner.py')
+    metadata = {'tier': 'admission', 'entries': [{'binary': 'test-0', 'cwd': 'internal/admissionbroker', 'run': ADMISSION_SELECTOR}],
+                'files': {str(p.relative_to(bundle)): digest(p) for p in sorted(bundle.rglob('*')) if p.is_file()}}
+    (bundle/'manifest.json').write_text(json.dumps(metadata, sort_keys=True))
+    print(json.dumps({'scope': 'explicit-admission-only', 'manifest_sha256': digest(bundle/'manifest.json'), 'packages': 1}), flush=True)
+    if not args.prepare_only:
+        execute_prepared(bundle, 'admission')
+
+
+def admission_identity(process, uid, executable, listener=None):
+    # Fixed fork observer, same UID as target but nondumpable; no external code,
+    # PID, path or command accepted from the service qualification packet.
+    start = daemon_process_identity(process, uid)
+    namespaces = {n: os.readlink('/proc/self/ns/'+n) for n in ('pid', 'mnt', 'net')}
+    expected_hash, expected_stat = digest(executable), executable.stat()
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    parent.settimeout(3)
+    inherited = [int(p.name) for p in Path('/proc/self/fd').iterdir()]
+    observer = os.fork()
+    if observer == 0:
+        try:
+            parent.close()
+            os.setsid()
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.prctl(4, 0, 0, 0, 0) or Path('/proc/sys/fs/suid_dumpable').read_text().strip() != '0': os._exit(1)
+            demote(uid)
+            if libc.prctl(4, 0, 0, 0, 0) or libc.prctl(3, 0, 0, 0, 0) != 0: os._exit(1)
+            for fd in inherited:
+                if fd != child.fileno():
+                    try: os.close(fd)
+                    except OSError: pass
+            proc = Path('/proc')/str(process.pid)
+            stat_before = (proc/'stat').read_text().rsplit(')', 1)[1].split()[19]
+            actual = (proc/'exe').stat()
+            if ((actual.st_dev, actual.st_ino) != (expected_stat.st_dev, expected_stat.st_ino) or
+                    digest(proc/'exe') != expected_hash or stat_before != start or
+                    {n: os.readlink(proc/'ns'/n) for n in namespaces} != namespaces): os._exit(1)
+            if listener:
+                fds = {os.readlink(fd) for fd in (proc/'fd').iterdir()}
+                if 'socket:['+listener+']' not in fds: os._exit(1)
+            if (proc/'stat').read_text().rsplit(')', 1)[1].split()[19] != start: os._exit(1)
+            child.sendall(json.dumps({'PID': process.pid, 'UID': uid, 'StartTime': start,
+                'ExeSHA256': expected_hash, 'PIDNamespace': namespaces['pid'],
+                'MountNamespace': namespaces['mnt'], 'NetworkNamespace': namespaces['net'],
+                'SocketInode': listener or ''}).encode())
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+    child.close()
+    try:
+        packet, _, flags, _ = parent.recvmsg(4096)
+        if flags & socket.MSG_TRUNC or not packet or parent.recv(1):
+            raise ValueError('observer packet invalid')
+        _, status = os.waitpid(observer, 0)
+        observer = None
+        if status or daemon_process_identity(process, uid) != start:
+            raise ValueError('observer identity changed')
+        return json.loads(packet)
+    finally:
+        parent.close()
+        if observer:
+            try: os.kill(observer, 9)
+            except ProcessLookupError: pass
+            os.waitpid(observer, 0)
+
+
+class AdmissionFixture:
+    def __init__(self, root, metadata, service, service_uid, broker_uid, case):
+        import sqlite3
+        self.root, self.metadata, self.service = root, metadata, service
+        self.service_uid, self.broker_uid = service_uid, broker_uid
+        self.case, self.process = case, None
+        self.closed = False
+        self.lock = None
+        self.event_buffer = b''
+        self.event_r = self.ack_w = None
+        self.stopped = threading.Event()
+        self.assigned = threading.Event()
+        self.thread = None
+        root.mkdir(mode=0o755)
+        self.identity = root.stat()
+        for name, gid, mode in [('data', broker_uid, 0o750), ('socket', broker_uid, 0o771), ('control', 0, 0o755)]:
+            p = root/name; p.mkdir(); os.chown(p, 0, gid); p.chmod(mode)
+        self.db, self.journal = root/'data/main.db', root/'control/birth.json'
+        producer = root.parent/'bundle/new-api'
+        birth = subprocess.run([str(producer), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(self.db), '--journal', str(self.journal)],
+                               env={'PATH':'/usr/bin:/bin'}, capture_output=True, timeout=90)
+        print(json.dumps({'admission_birth': case, 'exit': birth.returncode, 'output_sha256': hashlib.sha256(birth.stdout+birth.stderr).hexdigest()}), flush=True)
+        if birth.returncode or json.loads(self.journal.read_text())['phase'] != 'READY':
+            raise ValueError('permanent birth failed')
+        os.chown(self.db, 0, broker_uid); self.db.chmod(0o660); (root/'data').chmod(0o770)
+        os.chown(self.journal,0,broker_uid);self.journal.chmod(0o640)
+        conn = sqlite3.connect(self.db)
+        conn.execute('PRAGMA journal_mode=WAL')
+        if case != 'notfound':
+            conn.execute("INSERT INTO users(id,username,password,quota,used_quota,auth_version) VALUES(1,'admission-synthetic','',100,0,1)")
+        if case in ('held', 'send_claimed'):
+            fields = conn.execute('PRAGMA table_info(oauth_derived_text_charges)').fetchall()
+            values = {r[1]: (0 if 'int' in r[2].lower() else '') for r in fields if r[3]}
+            values.update(ref='c'*64, user_id=1, state=case)
+            cols = list(values)
+            conn.execute('INSERT INTO oauth_derived_text_charges('+','.join('"'+c+'"' for c in cols)+') VALUES('+','.join('?' for c in cols)+')', list(values.values()))
+        if case in ('task_held', 'task_send_claimed'):
+            conn.execute('INSERT INTO tasks(user_id,billing_protocol,billing_state) VALUES(1,1,?)', (case[5:],))
+        if case == 'storeerror': conn.execute('DROP TABLE oauth_derived_text_charges')
+        conn.commit(); conn.close()
+        self.before = self.snapshot()
+        self.binding = secrets.token_hex(32)
+        self.socket = root/'socket/broker.sock'
+        self.authority = socket.socket(socket.AF_UNIX)
+        self.authority.bind(str(root/'control/authority.sock')); os.chmod(root/'control/authority.sock', 0o666)
+        self.authority.listen(8); self.authority.settimeout(0.2)
+        worker = case in ('inflight', 'model_first', 'unrelated', 'shutdown')
+        self.executable = root.parent/'bundle'/('test-0' if worker else 'admission-broker')
+        st = self.db.stat()
+        self.config = {'Version':1, 'Actor':1, 'Database':str(self.db), 'Journal':str(self.journal), 'JournalSHA256':digest(self.journal),
+            'Socket':str(self.socket), 'Authority':str(root/'control/authority.sock'), 'Binding':self.binding,
+            'Capability':secrets.token_hex(32), 'ManifestSHA256':digest(root.parent/'bundle/manifest.json'),
+            'BrokerSHA256':digest(self.executable), 'ServiceSHA256':digest(root.parent/'bundle/test-0'),
+            'BrokerUID':broker_uid, 'ServiceUID':service_uid, 'DatabaseDevice':st.st_dev, 'DatabaseInode':st.st_ino}
+        for name, uid in [('broker.json',broker_uid),('service.json',service_uid)]:
+            path=root/'control'/name;path.write_text(json.dumps(self.config));os.chown(path,0,uid);path.chmod(0o640)
+        self.thread = threading.Thread(target=self.qualifications)
+        self.thread.start()
+        env = {'PATH':'/usr/bin:/bin','SQL_MAX_OPEN_CONNS':'1','SQL_MAX_IDLE_CONNS':'1'}
+        argv = [str(self.executable),str(root/'control/broker.json')]
+        if worker:
+            env.update(ADMISSION_WORKER_CONFIG=str(root/'control/broker.json'), ADMISSION_WORKER_CASE=case)
+            argv=[str(self.executable),'-test.run=^TestAdmissionWorker$','-test.v']
+        self.log=(root/'control/broker.log').open('w+b')
+        pass_fds=()
+        if worker:
+            self.event_r,event_w=os.pipe();ack_r,self.ack_w=os.pipe()
+            env.update(ADMISSION_EVENT_FD=str(event_w),ADMISSION_ACK_FD=str(ack_r))
+            pass_fds=(event_w,ack_r)
+        self.process=subprocess.Popen(argv,env=env,preexec_fn=lambda:demote(broker_uid),stdout=subprocess.PIPE,stderr=self.log,pass_fds=pass_fds)
+        if worker:
+            os.close(event_w);os.close(ack_r)
+        self.assigned.set()
+        import select
+        ready=b'';until=time.monotonic()+15
+        while not any(line==b'READY' for line in ready.splitlines()):
+            left=until-time.monotonic()
+            if left<=0 or not select.select([self.process.stdout],[],[],left)[0]:raise RuntimeError('broker readiness timeout')
+            part=os.read(self.process.stdout.fileno(),1024)
+            if not part:raise RuntimeError('broker exited before readiness')
+            ready+=part
+            if len(ready)>4096:raise RuntimeError('broker startup output limit')
+        self.log.write(ready);self.log.flush()
+        if case in ('deadline','inflight'):
+            self.lock=sqlite3.connect(self.db)
+            self.lock.execute('BEGIN IMMEDIATE')
+        self.initial_kernel=admission_identity(self.process,broker_uid,self.executable,self.listener_inode())
+        print(json.dumps({'admission_kernel_binding':case,'broker':self.initial_kernel,'service':admission_identity(service,service_uid,root.parent/'bundle/test-0'),'database_device':st.st_dev,'database_inode':st.st_ino,'journal_sha256':self.config['JournalSHA256']}),flush=True)
+        if case=='allowed':self.startup_negatives()
+
+    def startup_negatives(self):
+        # Fixed launcher tests only. The service cannot choose a mutation or
+        # supply a pathname, UID, SQL statement, seed or executable here.
+        checks=[]
+        for label in ('wrong_hash','wrong_uid','missing_journal','journal_hash','database_inode','writable_config','symlink_config','missing_authority'):
+            cfg=dict(self.config);uid=self.broker_uid
+            cfg['Socket']=str(self.root/'socket'/'negative.sock')
+            if label=='wrong_hash':cfg['BrokerSHA256']='0'*64
+            if label=='wrong_uid':uid=self.service_uid
+            if label=='missing_journal':cfg['Journal']=str(self.root/'control'/'absent')
+            if label=='journal_hash':cfg['JournalSHA256']='0'*64
+            if label=='database_inode':cfg['DatabaseInode']+=1
+            if label=='missing_authority':cfg['Authority']=str(self.root/'control'/'absent.sock')
+            path=self.root/'control'/'negative.json'
+            path.write_text(json.dumps(cfg));os.chown(path,0,uid);path.chmod(0o660 if label=='writable_config' else 0o640)
+            argument=path
+            if label=='symlink_config':
+                argument=self.root/'control'/'negative-link.json';argument.symlink_to(path)
+            probe=subprocess.run([str(self.executable),str(argument)],env={'PATH':'/usr/bin:/bin'},preexec_fn=lambda:demote(uid),capture_output=True,timeout=12)
+            if not probe.returncode or b'READY' in probe.stdout or (self.root/'socket'/'negative.sock').exists():
+                raise RuntimeError('startup rejection/cleanup failed')
+            checks.append({'case':label,'exit':probe.returncode,'output_sha256':hashlib.sha256(probe.stdout+probe.stderr).hexdigest(),'endpoint_removed':True})
+            if argument!=path:argument.unlink()
+            path.unlink()
+        for label,exe,inode in (('wrong_kernel_exe',self.root.parent/'bundle/new-api',self.listener_inode()),('wrong_kernel_listener',self.executable,'0')):
+            try:admission_identity(self.process,self.broker_uid,exe,inode)
+            except (ValueError,RuntimeError,OSError):checks.append({'case':label,'rejected':True})
+            else:raise RuntimeError('kernel mismatch accepted')
+        for label,uid in (('wrong_peer_uid',self.service_uid+1),('same_uid_wrong_process',self.service_uid)):
+            # This fork has no service-written code and sends only the already
+            # fixed CHECK. Even a valid capability cannot replace peer identity.
+            child=os.fork()
+            if child==0:
+                try:
+                    demote(uid)
+                    with socket.socket(socket.AF_UNIX) as conn:
+                        conn.settimeout(5);conn.connect(str(self.socket))
+                        frame=json.dumps({'version':1,'operation':'CHECK','binding':self.binding,'capability':self.config['Capability']}).encode()
+                        try:conn.sendall(frame);conn.shutdown(socket.SHUT_WR)
+                        except (BrokenPipeError,ConnectionResetError):pass
+                        data=b''
+                        try:
+                            while len(data)<4096:
+                                part=conn.recv(4096-len(data))
+                                if not part:break
+                                data+=part
+                        except ConnectionResetError:pass
+                        if data and json.loads(data)['operation_result']['status']!='REJECTED':os._exit(1)
+                    os._exit(0)
+                except BaseException:os._exit(1)
+            _,status=os.waitpid(child,0)
+            if status:raise RuntimeError('peer rejection failed')
+            checks.append({'case':label,'exit':status})
+        if b'"event":"model_enter"' in (self.root/'control/broker.log').read_bytes():
+            raise RuntimeError('rejected control called model')
+        if self.snapshot()!=self.before:raise RuntimeError('startup controls modified protected state')
+        print(json.dumps({'admission_startup_negatives':checks,'actual_model_calls':0,'state_unchanged':True}),flush=True)
+
+    def listener_inode(self):
+        rows=[r.split() for r in Path('/proc/net/unix').read_text().splitlines()[1:]]
+        matches=[r[6] for r in rows if len(r)==8 and r[7]==str(self.socket) and r[3]=='00010000']
+        if len(matches)!=1:raise ValueError('listener missing')
+        return matches[0]
+
+    def wait_event(self, expected):
+        import select
+        until=time.monotonic()+12
+        while True:
+            while b'\n' in self.event_buffer:
+                line,self.event_buffer=self.event_buffer.split(b'\n',1)
+                if line.decode()==expected:return
+                raise ValueError('unexpected fixed barrier event')
+            left=until-time.monotonic()
+            if left<=0 or not select.select([self.event_r],[],[],left)[0]:raise RuntimeError('barrier timeout')
+            part=os.read(self.event_r,1024)
+            if not part:raise RuntimeError('barrier EOF')
+            self.event_buffer+=part
+            if len(self.event_buffer)>4096:raise ValueError('barrier limit')
+
+    def result(self):
+        if self.event_r is not None:self.wait_event('TERMINAL')
+        self.log.flush()
+        raw=self.root.joinpath('control/broker.log').read_bytes()
+        events=[]
+        for line in raw.splitlines():
+            try:value=json.loads(line)
+            except ValueError:continue
+            if isinstance(value,dict) and 'event' in value:events.append(value)
+        returns=[e['result'] for e in events if e['event']=='model_return']
+        calls=sum(e['event']=='model_enter' for e in events)
+        if len(returns)!=1 or calls!=1:raise RuntimeError('actual call inventory')
+        if self.lock:self.lock.rollback();self.lock.close();self.lock=None
+        now=admission_identity(self.process,self.broker_uid,self.executable,self.listener_inode())
+        if now!=self.initial_kernel:raise RuntimeError('post request kernel identity changed')
+        unchanged=self.snapshot()==self.before and digest(self.journal)==self.config['JournalSHA256']
+        if not unchanged:raise RuntimeError('admission modified state')
+        return {'Operation':returns[0]['operation_result'],'Context':returns[0]['context_status'],'Calls':calls,'Unchanged':unchanged}
+
+    def snapshot(self):
+        import sqlite3
+        conn=sqlite3.connect(self.db); data={}
+        for table in ('users','oauth_derived_token_sources','oauth_derived_token_history','oauth_derived_token_bootstrap_identity','oauth_derived_text_charges','tasks'):
+            exists=conn.execute('SELECT 1 FROM sqlite_master WHERE name=? AND type=?',(table,'table')).fetchone()
+            data[table]=conn.execute('SELECT * FROM '+table+' ORDER BY 1').fetchall() if exists else None
+        conn.close()
+        return hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()
+
+    def qualifications(self):
+        while not self.stopped.is_set():
+            try: conn,_=self.authority.accept()
+            except socket.timeout: continue
+            except OSError: return
+            with conn:
+                try:
+                    conn.settimeout(3)
+                    pid,uid,_=struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+                    data=b''
+                    while len(data)<=512:
+                        part=conn.recv(513-len(data))
+                        if not part:break
+                        data+=part
+                    q=json.loads(data)
+                    if set(q)!={'version','role','binding','challenge'} or q['version']!=1 or q['role'] not in ('broker','service') or q['binding']!=self.binding or not re.fullmatch('[0-9a-f]{64}',q['challenge']):raise ValueError('qualification request')
+                    if not self.assigned.wait(3):raise ValueError('unassigned child')
+                    if (pid,uid) not in ((self.service.pid,self.service_uid),(self.process.pid,self.broker_uid)):raise ValueError('qualification peer')
+                    role=q['role'];process=self.process if role=='broker' else self.service;roleuid=self.broker_uid if role=='broker' else self.service_uid
+                    exe=self.executable if role=='broker' else self.root.parent/'bundle/test-0'
+                    listener=None
+                    if role=='broker':
+                        rows=[r.split() for r in Path('/proc/net/unix').read_text().splitlines()[1:]]
+                        matches=[r[6] for r in rows if len(r)==8 and r[7]==str(self.socket) and r[3]=='00010000']
+                        if len(matches)!=1:raise ValueError('listener missing')
+                        listener=matches[0]
+                    result=admission_identity(process,roleuid,exe,listener)
+                    result.update(OK=True,Challenge=q['challenge'],Binding=self.binding,ManifestSHA256=self.config['ManifestSHA256'])
+                    conn.sendall(json.dumps(result).encode())
+                except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError):
+                    continue
+
+    def close(self):
+        if self.closed:return
+        self.closed=True
+        errors=[]
+        if self.lock:self.lock.rollback();self.lock.close();self.lock=None
+        if self.ack_w is not None and self.case!='shutdown':
+            try:os.write(self.ack_w,b'1')
+            except OSError:pass
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:self.process.wait(timeout=12)
+            except subprocess.TimeoutExpired:
+                self.process.kill();self.process.wait();errors.append('drain timeout')
+        self.stopped.set()
+        if self.thread:self.thread.join(timeout=5)
+        self.authority.close()
+        if self.thread and self.thread.is_alive():errors.append('authority did not stop')
+        for fd in (self.event_r,self.ack_w):
+            if fd is not None:os.close(fd)
+        if self.process and self.process.stdout:
+            tail=self.process.stdout.read(65537);self.log.write(tail);self.process.stdout.close()
+        self.log.flush();self.log.seek(0);raw=self.log.read(65537);self.log.close()
+        unchanged=self.snapshot()==self.before and digest(self.journal)==self.config['JournalSHA256']
+        print(json.dumps({'admission_case':self.case,'broker_exit':self.process.returncode,'broker_log':raw[:65536].decode(errors='replace'),'log_truncated':len(raw)>65536,'state_unchanged':unchanged}),flush=True)
+        if self.case=='shutdown':
+            events=[json.loads(line) for line in raw.splitlines() if line.startswith(b'{"event":')]
+            calls=sum(e['event']=='model_enter' for e in events)
+            terminal=any(e['event']=='terminal' for e in events)
+            if self.process.returncode!=1 or b'ADMISSION_SHUTDOWN_TIMEOUT' not in raw or terminal or calls!=1 or not unchanged or errors:
+                raise RuntimeError('shutdown timeout did not fail closed')
+            return {'Exit':1,'Calls':calls,'NoTerminal':True,'Unchanged':True}
+        if self.process.returncode or not unchanged or errors:raise RuntimeError('broker exit/state/cleanup failure')
+        return {'Closed':True}
+
+
+def trusted_admission(bundle):
+    if os.geteuid()!=0 or os.getpid()!=1:
+        raise ValueError('private root PID1 controller required')
+    # Root /proc is mounted inside the new PID namespace; no host PID aliases.
+    if Path('/proc/self/status').read_text().split('NSpid:',1)[1].splitlines()[0].split()!=['1']:
+        raise ValueError('private proc required')
+    bundle=Path(bundle).resolve(strict=True);metadata=verified_manifest(bundle)
+    expected=[{'binary':'test-0','cwd':'internal/admissionbroker','run':ADMISSION_SELECTOR}]
+    if metadata['tier']!='admission' or metadata['entries']!=expected or 'admission-broker' not in metadata['files']:raise ValueError('admission inventory mismatch')
+    root=Path(tempfile.mkdtemp(prefix='admission-tests-',dir='/run'));root.chmod(0o755);owned=root.stat()
+    fixtures={};service=None;status=1;failure=[];thread=None;control=None;stop=threading.Event()
+    try:
+        for name,value in metadata['files'].items():
+            src=bundle/name;dst=root/'bundle'/name;dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dst);dst.chmod(0o755 if src.stat().st_mode&0o111 else 0o644)
+            if digest(dst)!=value:raise ValueError('admission copy hash')
+        (root/'bundle/manifest.json').write_text(json.dumps(metadata,sort_keys=True))
+        service_uid=30000000+secrets.randbelow(10000000);broker_uid=service_uid+10000001
+        for uid in (service_uid,broker_uid):
+            try:pwd.getpwuid(uid);raise ValueError('existing UID')
+            except KeyError:pass
+            for proc in Path('/proc').iterdir():
+                if proc.name.isdecimal():
+                    try:values=(proc/'status').read_text().split('Uid:',1)[1].splitlines()[0].split()
+                    except (OSError,IndexError):continue
+                    if str(uid) in values:raise ValueError('active UID collision')
+        control=socket.socket(socket.AF_UNIX);control.bind(str(root/'fixtures.sock'));os.chmod(root/'fixtures.sock',0o666);control.listen(8);control.settimeout(0.2)
+        assigned=threading.Event();seen=set();finished=set()
+        def serve_fixtures():
+            while not stop.is_set():
+                try:conn,_=control.accept()
+                except socket.timeout:continue
+                except OSError:return
+                with conn:
+                    try:
+                        conn.settimeout(90);pid,uid,_=struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+                        if not assigned.wait(3) or (pid,uid)!=(service.pid,service_uid):raise ValueError('fixture peer')
+                        request=bytearray()
+                        while len(request)<=128:
+                            part=conn.recv(129-len(request))
+                            if not part:break
+                            request.extend(part)
+                        if len(request)>128:raise ValueError('fixture frame')
+                        action,case=request.decode().removesuffix('\n').split(':')
+                        if case not in ADMISSION_CASES:raise ValueError('fixture case')
+                        admission_identity(service,service_uid,root/'bundle/test-0')
+                        if action=='new' and case not in seen:
+                            seen.add(case)
+                            fixture=AdmissionFixture.__new__(AdmissionFixture)
+                            fixtures[case]=fixture
+                            fixture.__init__(root/case,metadata,service,service_uid,broker_uid,case)
+                            response={'Config':str(fixture.root/'control/service.json'),'BrokerPID':fixture.process.pid}
+                        elif action=='entry' and case in ('inflight','model_first','unrelated','shutdown'):
+                            fixtures[case].wait_event('MODEL_DONE' if case=='model_first' else 'SQL_ENTRY');response={'Ready':True}
+                        elif action=='release' and case in ('model_first','unrelated'):
+                            os.write(fixtures[case].ack_w,b'1');response={'Released':True}
+                        elif action=='result':response=fixtures[case].result()
+                        elif action=='finish' and case not in finished:
+                            response=fixtures[case].close();finished.add(case)
+                        else:raise ValueError('fixture action/replay')
+                        conn.sendall(json.dumps(response).encode())
+                    except BaseException as error:
+                        failure.append(type(error).__name__)
+                        print(json.dumps({'admission_control_failure':type(error).__name__,'action':locals().get('action','unknown'),'case':locals().get('case','unknown')}),flush=True)
+        thread=threading.Thread(target=serve_fixtures);thread.start()
+        env={'PATH':'/usr/bin:/bin','TMPDIR':str(root/'service-tmp'),'ADMISSION_FIXTURE_SOCKET':str(root/'fixtures.sock')}
+        (root/'service-tmp').mkdir();os.chown(root/'service-tmp',service_uid,service_uid);(root/'service-tmp').chmod(0o700)
+        service=subprocess.Popen([str(root/'bundle/test-0'),'-test.v','-test.count=1','-test.run='+ADMISSION_SELECTOR],env=env,preexec_fn=lambda:demote(service_uid),cwd=root/'bundle/source/internal/admissionbroker',stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        assigned.set();output,_=service.communicate(timeout=180);print(output.decode(errors='replace'),end='',flush=True)
+        if service.returncode:raise RuntimeError('admission tests failed')
+        events=re.findall(r'^\s*--- (PASS|FAIL|SKIP): (\S+) \(',output.decode(errors='replace'),re.M)
+        required=['TestAdmissionLive/'+case for case in ADMISSION_CASES]+['TestAdmissionUnit','TestAdmissionLive']
+        if any(v!='PASS' for v,_ in events) or any(events.count(('PASS',n))!=1 for n in required):raise RuntimeError('admission skipped/missing result')
+        if failure or set(ADMISSION_CASES)!=seen or finished!=seen:raise RuntimeError('incomplete admission fixture inventory')
+        status=0
+    finally:
+        stop.set()
+        if service and service.poll() is None:service.kill();service.wait()
+        if control:control.close()
+        if thread:thread.join(timeout=95)
+        for fixture in fixtures.values():
+            try:fixture.close()
+            except Exception as error:
+                status=1;print(json.dumps({'admission_cleanup_failure':type(error).__name__}),flush=True)
+        if thread and thread.is_alive():raise RuntimeError('fixture controller did not join')
+        now=root.stat()
+        if (now.st_dev,now.st_ino,now.st_uid)!=(owned.st_dev,owned.st_ino,0):raise RuntimeError('admission cleanup ownership')
+        shutil.rmtree(root)
+        print('ADMISSION_RESULT '+json.dumps({'manifest_sha256':digest(bundle/'manifest.json'),'runner_sha256':metadata['files']['runner.py'],'status':status,'cleanup':True,'scope':'explicit-admission-only'}),flush=True)
+    if status:raise RuntimeError('admission cleanup failed')
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == '_admission_run':
+        trusted_admission(sys.argv[2])
+        return
     if len(sys.argv) in (3, 4) and sys.argv[1] == 'client':
         client(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'fresh')
         return
@@ -1220,7 +1687,8 @@ def main():
         dispatch_tier(Path(sys.argv[2]), sys.argv[3])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis'), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission'), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')
     parser.add_argument('--prepare-only', action='store_true', help='prepare for an isolated root container instead of local sudo')
