@@ -23,6 +23,7 @@ import {
 } from '@/components/page-transition'
 import { MyOrganizationsCard } from '@/features/organizations/my-organizations-card'
 import { OrganizationInvitationsCard } from '@/features/organizations/organization-invitations-card'
+import { OrganizationTransfersCard } from '@/features/organizations/organization-transfers-card'
 import { useStatus } from '@/hooks/use-status'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -63,6 +64,7 @@ export function Profile() {
                 />
                 <MyOrganizationsCard />
                 <OrganizationInvitationsCard />
+                <OrganizationTransfersCard />
                 <LanguagePreferencesCard
                   profile={profile}
                   onProfileUpdate={refreshProfile}
