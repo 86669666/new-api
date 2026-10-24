@@ -4331,13 +4331,90 @@ func TestOAuthDerivedK1aHandlerBoundary(t *testing.T) {
 	}
 }
 
+// oauthBootstrapDiagnostics keeps stderr separate from the secret birth response.
+// Dropped diagnostic bytes never fail the child process or change its exit status.
+type oauthBootstrapDiagnostics struct {
+	data      []byte
+	truncated bool
+}
+
+func (d *oauthBootstrapDiagnostics) Write(p []byte) (int, error) {
+	n := min(len(p), 8192-len(d.data))
+	d.data = append(d.data, p[:n]...)
+	d.truncated = d.truncated || n != len(p)
+	return len(p), nil
+}
+
+func (d *oauthBootstrapDiagnostics) log(t *testing.T, label string, elapsed time.Duration, err error) {
+	t.Helper()
+	exitCode := 0
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		exitCode = exitError.ExitCode()
+	} else if err != nil {
+		exitCode = -1
+	}
+	t.Logf("bootstrap fixture=%s client_exit=%d elapsed_ms=%d diagnostics_truncated=%t", label, exitCode, elapsed.Milliseconds(), d.truncated)
+	for i, line := range strings.Split(string(d.data), "\n") {
+		if i >= 16 {
+			t.Log("bootstrap diagnostics=event_limit")
+			break
+		}
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Version     int    `json:"bootstrap_observation"`
+			Side        string `json:"side"`
+			Phase       string `json:"phase"`
+			Label       string `json:"label"`
+			RequestID   string `json:"request_id"`
+			Outcome     string `json:"outcome"`
+			Category    string `json:"category"`
+			Errno       *int   `json:"errno"`
+			ElapsedMS   int64  `json:"elapsed_ms"`
+			MonotonicNS int64  `json:"monotonic_ns"`
+		}
+		if common.Unmarshal([]byte(line), &event) != nil || event.Version != 1 || event.Side != "client" ||
+			!slices.Contains([]string{"oauth_birth", "organization_task_read", "unspecified"}, event.Label) ||
+			!slices.Contains([]string{"begin", "connect", "peer_check", "request_write", "response_read", "decode", "stdout_write", "complete"}, event.Phase) ||
+			!slices.Contains([]string{"progress", "success", "error"}, event.Outcome) ||
+			!slices.Contains([]string{"none", "cli_timeout", "socket_timeout", "connection_reset", "broken_pipe", "connection_refused", "not_found", "permission", "json_decode", "os_error", "validation", "key_error", "runtime_error", "other"}, event.Category) ||
+			event.ElapsedMS < 0 || event.ElapsedMS > 86400000 || event.MonotonicNS < 0 ||
+			(event.Errno != nil && (*event.Errno < 0 || *event.Errno > 4095)) {
+			t.Log("bootstrap diagnostics=unclassified_redacted")
+			continue
+		}
+		pid, parseErr := strconv.Atoi(strings.TrimPrefix(event.RequestID, "pid-"))
+		if parseErr != nil || pid <= 0 || event.RequestID != "pid-"+strconv.Itoa(pid) {
+			t.Log("bootstrap diagnostics=invalid_request_id")
+			continue
+		}
+		errno := 0
+		if event.Errno != nil {
+			errno = *event.Errno
+		}
+		t.Logf("bootstrap request_id=pid-%d fixture=%s phase=%s outcome=%s category=%s errno=%d elapsed_ms=%d monotonic_ns=%d", pid, event.Label, event.Phase, event.Outcome, event.Category, errno, event.ElapsedMS, event.MonotonicNS)
+	}
+}
+
 // oauthBirthFixture obtains a new namespace from an external trusted installer.
 // Tests run as the service principal; neither this helper nor the client seals it.
 func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
 	t.Helper()
 	client := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT")
 	require.NotEmpty(t, client, "a separate trusted installer is required for provenance fixtures")
-	raw, err := exec.Command(client).Output()
+	label := "oauth_birth"
+	if strings.HasPrefix(t.Name(), "TestOrganizationTaskReadLifecycle/") {
+		label = "organization_task_read"
+	}
+	cmd := exec.Command(client)
+	cmd.Env = append(os.Environ(), "NEWAPI_BOOTSTRAP_DIAGNOSTIC_LABEL="+label)
+	var diagnostic oauthBootstrapDiagnostics
+	cmd.Stderr = &diagnostic
+	started := time.Now()
+	raw, err := cmd.Output()
+	diagnostic.log(t, label, time.Since(started), err)
 	require.NoError(t, err, "permanent bootstrap fixture producer failed")
 	var birth struct{ Engine, DSN, Journal, ResourceReceipt string }
 	require.NoError(t, common.Unmarshal(raw, &birth))

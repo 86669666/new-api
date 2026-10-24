@@ -341,33 +341,83 @@ def demote(uid):
         raise OSError(ctypes.get_errno(), 'no_new_privs failed')
 
 
+def bootstrap_observation(side, phase, started, peer_pid, *, label='unspecified',
+                          outcome='progress', error=None, cli_exit=None):
+    """Best-effort bounded diagnostics, never exception text or birth payloads."""
+    try:
+        categories = ((subprocess.TimeoutExpired, 'cli_timeout'), (TimeoutError, 'socket_timeout'),
+                      (ConnectionResetError, 'connection_reset'), (BrokenPipeError, 'broken_pipe'),
+                      (ConnectionRefusedError, 'connection_refused'), (FileNotFoundError, 'not_found'),
+                      (PermissionError, 'permission'), (json.JSONDecodeError, 'json_decode'),
+                      (OSError, 'os_error'), (ValueError, 'validation'),
+                      (KeyError, 'key_error'), (RuntimeError, 'runtime_error'))
+        category = 'none' if error is None else next((name for kind, name in categories if isinstance(error, kind)), 'other')
+        phases = ('begin', 'connect', 'peer_check', 'request_write', 'response_read', 'decode',
+                  'stdout_write', 'request_read', 'resource_check', 'data_create', 'cli_begin',
+                  'cli_return', 'file_owner', 'file_mode', 'directory_owner', 'reply_write', 'complete')
+        if side not in ('client', 'installer') or phase not in phases:
+            return
+        label = label if label in ('oauth_birth', 'organization_task_read', 'fresh', 'redis', 'pg') else 'unspecified'
+        errno = getattr(error, 'errno', None)
+        row = {'bootstrap_observation': 1, 'side': side, 'phase': phase, 'label': label,
+               'request_id': 'pid-'+str(peer_pid if isinstance(peer_pid, int) and 0 < peer_pid < 2**31 else 0),
+               'monotonic_ns': time.monotonic_ns(),
+               'elapsed_ms': min(86400000, max(0, int((time.monotonic()-started)*1000))),
+               'outcome': outcome if outcome in ('progress', 'success', 'rejected', 'error', 'cli_nonzero') else 'error',
+               'category': category, 'errno': errno if isinstance(errno, int) and 0 <= errno <= 4095 else None,
+               'cli_exit': cli_exit if isinstance(cli_exit, int) and -255 <= cli_exit <= 255 else None}
+        data = (json.dumps(row, separators=(',', ':'))+'\n').encode()
+        if len(data) <= 768:
+            os.write(2 if side == 'client' else 1, data)
+    except Exception:
+        # A closed/broken diagnostic sink cannot change the operation's result.
+        pass
+
+
 def client(sock, action="fresh"):
-    if os.geteuid() == 0:
-        raise ValueError('fixture client must be the service principal')
-    with socket.socket(socket.AF_UNIX) as conn:
-        conn.settimeout(120)
-        conn.connect(sock)
-        if action not in ('fresh', 'redis') and not re.fullmatch(r'pg:[0-9a-f]{32}', action):
-            raise ValueError('unsupported installer request')
-        _, peer_uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if peer_uid != 0:
-            raise ValueError('installer peer must be root')
-        conn.sendall((action + '\n').encode())
-        conn.shutdown(socket.SHUT_WR)
-        data = b''
-        while len(data) <= 8192:
-            part = conn.recv(8192)
-            if not part:
-                break
-            data += part
-        result = json.loads(data)
-        if action == 'fresh':
-            fields = {'Engine', 'DSN', 'Journal'}
-            if result.get('Engine') == 'postgres':
-                fields.add('ResourceReceipt')
-            if set(result) != fields or result['Engine'] not in ('sqlite', 'postgres'):
-                raise ValueError('invalid installer response')
-        sys.stdout.write(json.dumps(result))
+    started = time.monotonic()
+    pid, phase = os.getpid(), 'begin'
+    label = os.environ.get('NEWAPI_BOOTSTRAP_DIAGNOSTIC_LABEL', 'unspecified')
+    bootstrap_observation('client', phase, started, pid, label=label)
+    try:
+        if os.geteuid() == 0:
+            raise ValueError('fixture client must be the service principal')
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(120)
+            phase = 'connect'
+            conn.connect(sock)
+            if action not in ('fresh', 'redis') and not re.fullmatch(r'pg:[0-9a-f]{32}', action):
+                raise ValueError('unsupported installer request')
+            phase = 'peer_check'
+            _, peer_uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if peer_uid != 0:
+                raise ValueError('installer peer must be root')
+            phase = 'request_write'
+            conn.sendall((action + '\n').encode())
+            conn.shutdown(socket.SHUT_WR)
+            data = b''
+            phase = 'response_read'
+            while len(data) <= 8192:
+                part = conn.recv(8192)
+                if not part:
+                    break
+                data += part
+            phase = 'decode'
+            result = json.loads(data)
+            if action == 'fresh':
+                fields = {'Engine', 'DSN', 'Journal'}
+                if result.get('Engine') == 'postgres':
+                    fields.add('ResourceReceipt')
+                if set(result) != fields or result['Engine'] not in ('sqlite', 'postgres'):
+                    raise ValueError('invalid installer response')
+            phase = 'stdout_write'
+            sys.stdout.write(json.dumps(result))
+        bootstrap_observation('client', 'complete', started, pid, label=label, outcome='success')
+    except Exception as error:
+        bootstrap_observation('client', phase, started, pid, label=label, outcome='error', error=error)
+        # Unhandled client exceptions historically exit1. Preserve it, without
+        # the raw traceback (which may embed a DSN or a response payload).
+        raise SystemExit(1) from None
 
 
 class Installer:
@@ -389,45 +439,82 @@ class Installer:
                 conn, _ = self.server.accept()
             except socket.timeout:
                 continue
+            started = time.monotonic()
+            pid, phase, label = 0, 'peer_check', 'unspecified'
+            outcome, failure, cli_exit = 'rejected', None, None
             with conn:
-                conn.settimeout(5)
-                _, peer_uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                if peer_uid != self.uid:
-                    continue
-                # No client-controlled path, command, environment or namespace.
                 try:
-                    request = conn.recv(64)
-                    if conn.recv(1) != b'':
+                    conn.settimeout(5)
+                    pid, peer_uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                    if peer_uid != self.uid:
                         continue
-                    if request == b'redis\n' and self.redis_resource is not None:
-                        self.redis_resource.verify()
-                        conn.sendall(json.dumps(self.redis_resource.receipt).encode())
+                    # No client-controlled path, command, environment or namespace.
+                    try:
+                        phase = 'request_read'
+                        request = conn.recv(64)
+                        if conn.recv(1) != b'':
+                            continue
+                        if request == b'redis\n' and self.redis_resource is not None:
+                            label, phase = 'redis', 'resource_check'
+                            self.redis_resource.verify()
+                            phase = 'reply_write'
+                            conn.sendall(json.dumps(self.redis_resource.receipt).encode())
+                            outcome = 'success'
+                            continue
+                        if re.fullmatch(rb'pg:[0-9a-f]{32}\n', request) and self.pg_resource is not None:
+                            label, phase = 'pg', 'resource_check'
+                            reply = self.pg_resource.qualify(request[3:-1].decode())
+                            phase = 'reply_write'
+                            conn.sendall(json.dumps(reply).encode())
+                            outcome = 'success'
+                            continue
+                        if request != b'fresh\n':
+                            continue
+                        label = 'fresh'
+                        if self.pg_resource is not None:
+                            phase = 'cli_begin'
+                            bootstrap_observation('installer', phase, started, pid, label=label)
+                            reply = self.pg_resource.birth()
+                            phase = 'reply_write'
+                            conn.sendall(json.dumps(reply).encode())
+                            outcome = 'success'
+                            continue
+                        phase = 'data_create'
+                        ident = secrets.token_hex(16)
+                        data = self.root / ('data-' + ident)
+                        data.mkdir(mode=0o755)
+                        target = data / 'new.db'
+                        journal = self.root / 'journals' / (ident + '.json')
+                        argv = [str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(target), '--journal', str(journal)]
+                        phase = 'cli_begin'
+                        bootstrap_observation('installer', phase, started, pid, label=label)
+                        proc = subprocess.run(argv, env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+                        cli_exit = proc.returncode
+                        phase = 'cli_return'
+                        bootstrap_observation('installer', phase, started, pid, label=label, cli_exit=cli_exit)
+                        self.receipts.append({'argv': argv, 'exit': proc.returncode, 'output_sha256': hashlib.sha256(proc.stdout).hexdigest(), 'peer_uid': peer_uid})
+                        if proc.returncode:
+                            outcome = 'cli_nonzero'
+                            continue
+                        phase = 'file_owner'
+                        os.chown(target, self.uid, self.uid)
+                        phase = 'file_mode'
+                        os.chmod(target, 0o600)
+                        phase = 'directory_owner'
+                        os.chown(data, self.uid, self.uid)
+                        phase = 'reply_write'
+                        conn.sendall(json.dumps({'Engine': 'sqlite', 'DSN': str(target), 'Journal': str(journal)}).encode())
+                        outcome = 'success'
+                    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+                        failure, outcome = error, 'error'
                         continue
-                    if re.fullmatch(rb'pg:[0-9a-f]{32}\n', request) and self.pg_resource is not None:
-                        conn.sendall(json.dumps(self.pg_resource.qualify(request[3:-1].decode())).encode())
-                        continue
-                    if request != b'fresh\n':
-                        continue
-                    if self.pg_resource is not None:
-                        conn.sendall(json.dumps(self.pg_resource.birth()).encode())
-                        continue
-                    ident = secrets.token_hex(16)
-                    data = self.root / ('data-' + ident)
-                    data.mkdir(mode=0o755)
-                    target = data / 'new.db'
-                    journal = self.root / 'journals' / (ident + '.json')
-                    argv = [str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(target), '--journal', str(journal)]
-                    proc = subprocess.run(argv, env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
-                    self.receipts.append({'argv': argv, 'exit': proc.returncode, 'output_sha256': hashlib.sha256(proc.stdout).hexdigest(), 'peer_uid': peer_uid})
-                    if proc.returncode:
-                        continue
-                    os.chown(target, self.uid, self.uid)
-                    os.chmod(target, 0o600)
-                    os.chown(data, self.uid, self.uid)
-                    conn.sendall(json.dumps({'Engine': 'sqlite', 'DSN': str(target), 'Journal': str(journal)}).encode())
-                except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
-                    # Producer failure is a client failure, never a seal fallback.
-                    continue
+                except Exception as error:
+                    # Preserve formerly uncaught peer/socket failures as failures.
+                    failure, outcome = error, 'error'
+                    raise
+                finally:
+                    bootstrap_observation('installer', phase, started, pid, label=label,
+                                          outcome=outcome, error=failure, cli_exit=cli_exit)
 
 
 
