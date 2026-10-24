@@ -779,6 +779,21 @@ func newOrganizationTokenCacheFixture(t *testing.T) *organizationHTTPFixture {
 	require.Equal(t, strconv.Itoa(receipt.Port), values["tcp_port"])
 	require.Regexp(t, `^[0-9a-f]{40}$`, receipt.RunID)
 	require.NoError(t, client.Ping(t.Context()).Err())
+	// The protected receipt is historical. Ask its actual root installer to
+	// re-bind the current listener inode to the owned child/executable now.
+	// The fixed client verifies SO_PEERCRED; no request can select a command/path.
+	launcher := filepath.Join(root, "client")
+	require.Equal(t, launcher, os.Getenv("NEWAPI_BOOTSTRAP_CLIENT"))
+	launcherInfo, err := os.Lstat(launcher)
+	require.NoError(t, err)
+	require.True(t, launcherInfo.Mode().IsRegular())
+	require.Zero(t, launcherInfo.Mode().Perm()&0o022)
+	launcherOwner := reflect.Indirect(reflect.ValueOf(launcherInfo.Sys())).FieldByName("Uid")
+	require.True(t, launcherOwner.IsValid())
+	require.Zero(t, launcherOwner.Uint())
+	current, err := exec.CommandContext(t.Context(), launcher, "redis").Output()
+	require.NoError(t, err, "live installer Redis kernel qualification required")
+	require.JSONEq(t, string(raw), string(current))
 	return f
 }
 

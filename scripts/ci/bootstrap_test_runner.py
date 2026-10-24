@@ -104,13 +104,18 @@ def demote(uid):
         raise OSError(ctypes.get_errno(), 'no_new_privs failed')
 
 
-def client(sock):
+def client(sock, action="fresh"):
     if os.geteuid() == 0:
         raise ValueError('fixture client must be the service principal')
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(120)
         conn.connect(sock)
-        conn.sendall(b'fresh\n')
+        if action not in ('fresh', 'redis'):
+            raise ValueError('unsupported installer request')
+        _, peer_uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if peer_uid != 0:
+            raise ValueError('installer peer must be root')
+        conn.sendall((action + '\n').encode())
         conn.shutdown(socket.SHUT_WR)
         data = b''
         while len(data) <= 8192:
@@ -119,14 +124,15 @@ def client(sock):
                 break
             data += part
         result = json.loads(data)
-        if set(result) != {'Engine', 'DSN', 'Journal'} or result['Engine'] != 'sqlite':
+        if action == 'fresh' and (set(result) != {'Engine', 'DSN', 'Journal'} or result['Engine'] != 'sqlite'):
             raise ValueError('invalid installer response')
         sys.stdout.write(json.dumps(result))
 
 
 class Installer:
-    def __init__(self, root, uid):
+    def __init__(self, root, uid, redis_resource=None):
         self.root, self.uid = root, uid
+        self.redis_resource = redis_resource
         self.stopped = threading.Event()
         self.server = socket.socket(socket.AF_UNIX)
         self.server.bind(str(root / 'installer.sock'))
@@ -149,7 +155,13 @@ class Installer:
                 # No client-controlled path, command, environment or namespace.
                 try:
                     request = conn.recv(64)
-                    if request != b'fresh\n' or conn.recv(1) != b'':
+                    if conn.recv(1) != b'':
+                        continue
+                    if request == b'redis\n' and self.redis_resource is not None:
+                        self.redis_resource.verify()
+                        conn.sendall(json.dumps(self.redis_resource.receipt).encode())
+                        continue
+                    if request != b'fresh\n':
                         continue
                     ident = secrets.token_hex(16)
                     data = self.root / ('data-' + ident)
@@ -165,7 +177,7 @@ class Installer:
                     os.chmod(target, 0o600)
                     os.chown(data, self.uid, self.uid)
                     conn.sendall(json.dumps({'Engine': 'sqlite', 'DSN': str(target), 'Journal': str(journal)}).encode())
-                except (OSError, ValueError, subprocess.SubprocessError):
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                     # Producer failure is a client failure, never a seal fallback.
                     continue
 
@@ -179,6 +191,8 @@ class OwnedRedis:
         self.log = None
         self.receipt = None
         self.address = None
+        self.kernel_identity = None
+        self.executable = None
 
     def request(self, *parts):
         # Bounded RESP2 for fixed installer commands only; no shell or client RPC.
@@ -208,11 +222,62 @@ class OwnedRedis:
                     return body.decode()
                 raise ValueError('unexpected Redis response class')
 
+    def kernel_binding(self):
+        # /proc can still be mounted for the host PID namespace. Resolve only
+        # our kernel-listed children; never treat namespace-local Popen.pid as
+        # a /proc directory number. NSpid's last component is our child PID.
+        children = set()
+        for task in Path('/proc/self/task').iterdir():
+            children.update((task / 'children').read_text().split())
+        matches = []
+        for child in children:
+            proc = Path('/proc') / child
+            try:
+                status = dict(line.split(':', 1) for line in (proc / 'status').read_text().splitlines() if ':' in line)
+                if (int(status['NSpid'].split()[-1]) == self.process.pid and
+                        os.readlink(proc / 'ns/pid') == os.readlink('/proc/self/ns/pid')):
+                    matches.append((proc, status))
+            except FileNotFoundError:
+                continue
+        if len(matches) != 1:
+            raise RuntimeError('Redis child proc binding unavailable')
+        proc, status = matches[0]
+        if (any(int(uid) != self.uid for uid in status['Uid'].split()) or
+                os.readlink(proc / 'ns/net') != os.readlink('/proc/self/ns/net')):
+            raise RuntimeError('Redis child namespace/UID mismatch')
+        exe = (proc / 'exe').stat()
+        expected_exe = self.executable.stat()
+        if (exe.st_dev, exe.st_ino) != (expected_exe.st_dev, expected_exe.st_ino):
+            raise RuntimeError('Redis child executable mismatch')
+        # stat comm may contain spaces or parentheses; fields after final ')' start at 3.
+        start_time = (proc / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+        expected = '0100007F:' + format(self.address[1], '04X')
+        rows = [line.split() for line in Path('/proc/net/tcp').read_text().splitlines()[1:]]
+        rows = [row for row in rows if row[1] == expected and row[3] == '0A']
+        if len(rows) != 1 or int(rows[0][7]) != self.uid:
+            raise RuntimeError('Redis loopback listener ownership mismatch')
+        inode = rows[0][9]
+        descriptors = set()
+        for fd in (proc / 'fd').iterdir():
+            try:
+                descriptors.add(os.readlink(fd))
+            except FileNotFoundError:
+                continue
+        if 'socket:[' + inode + ']' not in descriptors:
+            raise RuntimeError('Redis listener is not owned by child')
+        identity = {'proc_pid': int(proc.name), 'start_time': start_time,
+                    'socket_inode': inode, 'exe_device': exe.st_dev, 'exe_inode': exe.st_ino,
+                    'pid_namespace': os.readlink(proc / 'ns/pid')}
+        if self.kernel_identity is not None and identity != self.kernel_identity:
+            raise RuntimeError('Redis kernel identity changed')
+        return identity
+
     def verify(self):
         if self.process is None or self.process.poll() is not None:
             raise RuntimeError('owned Redis exited')
         if self.request('PING') != 'PONG':
             raise RuntimeError('owned Redis PING failed')
+        identity = self.kernel_binding()
         info = dict(line.split(':', 1) for line in self.request('INFO', 'server').splitlines()
                     if ':' in line and not line.startswith('#'))
         if (info.get('process_id') != str(self.process.pid) or
@@ -222,11 +287,9 @@ class OwnedRedis:
         if self.receipt and (info['run_id'] != self.receipt['run_id'] or
                              info['redis_version'] != self.receipt['version']):
             raise RuntimeError('Redis resource replaced')
-        listeners = [line.split() for line in Path('/proc/net/tcp').read_text().splitlines()[1:]]
-        expected = '0100007F:' + format(self.address[1], '04X')
-        rows = [row for row in listeners if row[1] == expected and row[3] == '0A']
-        if len(rows) != 1 or int(rows[0][7]) != self.uid:
-            raise RuntimeError('Redis loopback listener ownership mismatch')
+        if self.kernel_binding() != identity:
+            raise RuntimeError('Redis listener changed during qualification')
+        self.kernel_identity = identity
         return info
 
     def start(self):
@@ -236,6 +299,7 @@ class OwnedRedis:
         binary = Path('/usr/bin/redis-server')
         # Fixed system dependency; fail before handing off an endpoint if absent.
         resolved = binary.resolve(strict=True)
+        self.executable = resolved
         info = resolved.stat()
         if info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode):
             raise ValueError('untrusted Redis executable')
@@ -252,7 +316,9 @@ class OwnedRedis:
         self.log = (self.root / 'redis.log').open('xb')
         argv = [str(binary), '--bind', '127.0.0.1', '--port', str(self.address[1]),
                 '--protected-mode', 'yes', '--save', '', '--appendonly', 'no',
-                '--daemonize', 'no', '--dir', str(data), '--loglevel', 'warning']
+                '--daemonize', 'no', '--dir', str(data), '--loglevel', 'warning',
+                '--user', 'default', 'on', 'nopass', '~*', '&*', '+@all', '-@admin',
+                '-save', '-bgsave', '-bgrewriteaof', '-replicaof', '-slaveof']
         self.process = subprocess.Popen(argv, env={'PATH': '/usr/bin:/bin'},
                                         stdout=self.log, stderr=subprocess.STDOUT,
                                         preexec_fn=lambda: demote(self.uid))
@@ -278,7 +344,7 @@ class OwnedRedis:
                         'port': self.address[1], 'pid': self.process.pid, 'service_uid': self.uid,
                         'run_id': info['run_id'], 'version': info['redis_version'],
                         'net_namespace': os.readlink('/proc/self/ns/net'),
-                        'binary_sha256': digest(resolved), 'persistence': False,
+                        'binary_sha256': digest(resolved), 'kernel_identity': self.kernel_identity, 'persistence': False,
                         'key_lifecycle': 'EXISTS0/SET-NX/GET/DEL1/EXISTS0'}
         receipt = self.root / 'redis-resource.json'
         with receipt.open('x') as stream:
@@ -372,7 +438,7 @@ def trusted_run(bundle):
             (root / name).mkdir(mode=0o755)
         os.chown(root / 'tmp', uid, uid)
         launcher = root / 'client'
-        launcher.write_text('#!/bin/sh\nexec /usr/bin/python3 ' + str(root / 'bundle/runner.py') + ' client ' + str(root / 'installer.sock') + '\n')
+        launcher.write_text('#!/bin/sh\nexec /usr/bin/python3 ' + str(root / 'bundle/runner.py') + ' client ' + str(root / 'installer.sock') + ' "$@"\n')
         launcher.chmod(0o755)
         env = {'PATH': '/usr/bin:/bin', 'HOME': str(root / 'tmp'), 'TMPDIR': str(root / 'tmp'), 'NEWAPI_TEST_PROFILE': 'isolated-ci', 'NEWAPI_BOOTSTRAP_CLIENT': str(launcher), 'NEWAPI_BOOTSTRAP_ENGINE': 'sqlite'}
         if any(entry['cwd'] == 'router' for entry in metadata['entries']):
@@ -382,7 +448,7 @@ def trusted_run(bundle):
         for entry in metadata['entries']:
             if entry['cwd'] == 'model':
                 command([str(root / 'bundle' / entry['binary']), '-test.run=^' + PRODUCER_TEST + '$', '-test.v'], cwd=root / 'bundle/source/model', env=dict(env, NEWAPI_BOOTSTRAP_ROOT_TEST_DIR=str(root / 'producer-tests')))
-        installer = Installer(root, uid)
+        installer = Installer(root, uid, redis_resource)
         thread = threading.Thread(target=installer.serve)
         thread.start()
         for entry in metadata['entries']:
@@ -429,8 +495,8 @@ def trusted_run(bundle):
 
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == 'client':
-        client(sys.argv[2])
+    if len(sys.argv) in (3, 4) and sys.argv[1] == 'client':
+        client(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'fresh')
         return
     if len(sys.argv) == 3 and sys.argv[1] == '_run':
         trusted_run(sys.argv[2])
