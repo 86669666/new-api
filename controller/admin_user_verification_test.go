@@ -20,6 +20,7 @@ import (
 func setupAdminUserTest(t *testing.T) (*model.User, service.AuthIdentity, *model.User) {
 	t.Helper()
 	operator, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Organization{}, &model.OrganizationMember{}))
 	require.NoError(t, model.DB.Model(operator).Update("role", common.RoleRootUser).Error)
 	require.NoError(t, model.PublishUserAuthCache(operator.Id))
 	password, err := common.Password2Hash("managed-password")

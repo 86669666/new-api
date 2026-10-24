@@ -56,7 +56,13 @@ func setupAccessTokenAudit(t *testing.T, additionalModels ...any) (*model.User, 
 	}
 	// The audit writer uses its fixed table name, so isolate the whole database
 	// rather than adding a table prefix. Remote fixtures require loopback DSNs.
-	db, _ := newAuditTestDatabase(t, string(dialect), dsn)
+	var db *gorm.DB
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+		db, _ = oauthBirthFixture(t)
+		require.Equal(t, string(dialect), db.Dialector.Name(), "trusted producer must match requested audit dialect")
+	} else {
+		db, _ = newAuditTestDatabase(t, string(dialect), dsn)
+	}
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)

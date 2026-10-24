@@ -15,6 +15,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -348,14 +349,40 @@ func TestModelPricingConversionDatabaseMatrix(t *testing.T) {
 				}
 			})
 			t.Run("media_prices_and_request_adjustments", func(t *testing.T) {
-				for _, quantity := range []string{"129", "-1", "0.5", "18446744073709551615"} {
-					recorder := httptest.NewRecorder()
-					ctx, _ := gin.CreateTestContext(recorder)
-					ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"z-image","parameters":{"n":`+quantity+`}}`))
-					ctx.Request.Header.Set("Content-Type", "application/json")
-					Relay(ctx, types.RelayFormatOpenAIImage)
-					assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-				}
+				t.Run("authenticated_malformed_quantities", func(t *testing.T) {
+					previousDB, previousLogDB := model.DB, model.LOG_DB
+					birthDB, _ := oauthBirthFixture(t)
+					require.Equal(t, db.Dialector.Name(), birthDB.Dialector.Name())
+					model.DB, model.LOG_DB = birthDB, birthDB
+					t.Cleanup(func() { model.DB, model.LOG_DB = previousDB, previousLogDB })
+					user := model.User{Username: "media-validator", AffCode: "media-validator", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, Group: "default", Quota: 1000000, AuthVersion: 1}
+					require.NoError(t, birthDB.Create(&user).Error)
+					token := model.Token{UserId: user.Id, Key: strings.Repeat("a", 48), Name: "media-validator", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000000}
+					require.NoError(t, token.Insert())
+					route := gin.New()
+					reached := 0
+					route.POST("/v1/images/generations", middleware.TokenAuth(), func(ctx *gin.Context) {
+						kind, userID, tokenID := middleware.OAuthTokenPrincipal(ctx)
+						require.Equal(t, model.OAuthDerivedTokenManualProven, kind)
+						require.Equal(t, user.Id, userID)
+						require.Equal(t, token.Id, tokenID)
+						reached++
+						Relay(ctx, types.RelayFormatOpenAIImage)
+					})
+					for _, quantity := range []string{"129", "-1", "0.5", "18446744073709551615"} {
+						recorder := httptest.NewRecorder()
+						request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"z-image","parameters":{"n":`+quantity+`}}`))
+						request.Header.Set("Content-Type", "application/json")
+						request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+						route.ServeHTTP(recorder, request)
+						assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+					}
+					assert.Equal(t, 4, reached)
+					missing := httptest.NewRecorder()
+					route.ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{}`)))
+					assert.Equal(t, http.StatusUnauthorized, missing.Code)
+					assert.Equal(t, 4, reached, "missing credential must not reach Relay")
+				})
 				conflicting, err := model.PreviewModelPricingConversion("gemini-2.5-flash-conflict", model.PricingValues{"ModelRatio": 0.15, "AudioRatio": 10.0})
 				require.NoError(t, err)
 				assert.Contains(t, conflicting.UnsupportedReason, "Gemini and OpenAI audio prices differ")
