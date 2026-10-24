@@ -633,10 +633,10 @@ func testOrganizationConcurrency(t *testing.T, f *organizationFixture) {
 				d = f.authorize(6, "platform_disable", d)
 				winning = func() error { return SetOrganizationPlatformDisabled(f.identities[6], d) }
 			case "proof_wait_expiry", "invitation_wait_expiry":
-				holder, err := CreateOrganization(f.identities[0], "Independent holder birth")
+				holder, err := CreateOrganization(f.identities[0], "Independent holder birth "+race)
 				require.NoError(t, err)
 				rename := f.command(holder.ID)
-				rename.Name = "independent lock holder"
+				rename.Name = "independent lock holder " + race
 				winning = func() error { return RenameOrganization(f.identities[0], rename) }
 				if race == "proof_wait_expiry" {
 					d := f.command(o.ID)
@@ -701,7 +701,16 @@ func testOrganizationConcurrency(t *testing.T, f *organizationFixture) {
 			organizationNow = func() time.Time { return time.Unix(clock.Load(), 0) }
 			winner, loser := make(chan error, 1), make(chan error, 1)
 			go func() { winner <- winning() }()
-			<-entered
+			select {
+			case <-entered:
+			case err := <-winner:
+				close(release)
+				organizationNow = time.Now
+				DB.ConnPool = originalPool
+				DB.Statement.ConnPool = originalStatementPool
+				require.NoError(t, DB.Callback().Create().Remove("organization-event-barrier"))
+				require.FailNow(t, "winner completed before event barrier", "race=%s error=%v", race, err)
+			}
 			go func() { loser <- losing() }()
 			<-pool.attempted
 			if race == "lock_wait_expiry" {
