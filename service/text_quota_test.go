@@ -77,9 +77,27 @@ func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
 			}
 			oldDB, oldLogDB := model.DB, model.LOG_DB
 			oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
-			model.DB, model.LOG_DB = db, logDB
+			// InitLogDB's shared-DB branch initializes the dialect identifiers without
+			// opening a connection or migrating when this node is not master. Keep
+			// the independently opened log database for the accounting assertions.
+			require.Equal(t, oldMainType, oldLogType, "fixture restoration requires the existing paired database dialects")
+			oldMaster := common.IsMasterNode
+			t.Setenv("LOG_SQL_DSN", "") // Never consume an inherited deployment DSN.
+			common.IsMasterNode = false
+			t.Cleanup(func() {
+				defer func() {
+					model.DB, model.LOG_DB = oldDB, oldLogDB
+					common.SetDatabaseTypes(oldMainType, oldLogType)
+					common.IsMasterNode = oldMaster
+				}()
+				model.DB = oldDB
+				common.SetDatabaseTypes(oldMainType, oldLogType)
+				require.NoError(t, model.InitLogDB())
+			})
+			model.DB = db
 			common.SetDatabaseTypes(dialect.name, dialect.name)
-			t.Cleanup(func() { model.DB, model.LOG_DB = oldDB, oldLogDB; common.SetDatabaseTypes(oldMainType, oldLogType) })
+			require.NoError(t, model.InitLogDB())
+			model.LOG_DB = logDB
 			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.OAuthDerivedTextCharge{}, &model.Task{}))
 			require.NoError(t, logDB.AutoMigrate(&model.Log{}))
 			versionQuery := "select version()"
