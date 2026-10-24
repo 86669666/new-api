@@ -82,7 +82,7 @@ func organizationDatabase(t *testing.T, dialect string) *organizationFixture {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(6)
 	sqlDB.SetMaxIdleConns(6)
-	tables := []any{&Option{}, &User{}, &UserSession{}, &AuthFlow{}, &UserAccessToken{}, &ExternalIdentityClaim{}, &Token{}, &PasskeyCredential{}, &TwoFA{}, &TwoFABackupCode{}, &UserOAuthBinding{}, &Organization{}, &OrganizationMember{}, &OrganizationInvitation{}, &OrganizationOwnershipTransfer{}, &OrganizationEvent{}, &OrganizationWallet{}, &OrganizationWalletEntry{}}
+	tables := []any{&SessionRevocationEvent{}, &Option{}, &User{}, &UserSession{}, &AuthFlow{}, &UserAccessToken{}, &ExternalIdentityClaim{}, &Token{}, &PasskeyCredential{}, &TwoFA{}, &TwoFABackupCode{}, &UserOAuthBinding{}, &Organization{}, &OrganizationMember{}, &OrganizationInvitation{}, &OrganizationOwnershipTransfer{}, &OrganizationEvent{}, &OrganizationWallet{}, &OrganizationWalletEntry{}}
 	owned := dialect == "sqlite"
 	t.Cleanup(func() {
 		if dialect != "sqlite" && owned {
@@ -633,7 +633,8 @@ func testOrganizationConcurrency(t *testing.T, f *organizationFixture) {
 				d = f.authorize(6, "platform_disable", d)
 				winning = func() error { return SetOrganizationPlatformDisabled(f.identities[6], d) }
 			case "proof_wait_expiry", "invitation_wait_expiry":
-				holder := f.org(0)
+				holder, err := CreateOrganization(f.identities[0], "Independent holder birth")
+				require.NoError(t, err)
 				rename := f.command(holder.ID)
 				rename.Name = "independent lock holder"
 				winning = func() error { return RenameOrganization(f.identities[0], rename) }
