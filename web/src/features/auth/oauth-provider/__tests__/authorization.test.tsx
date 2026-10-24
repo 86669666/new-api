@@ -1264,6 +1264,7 @@ describe('explicit recorded-history consent', () => {
           offline: false,
           balance: false,
           usage: true,
+          tokens: false,
         }
       )
       expect(JSON.parse(String(requests[0].data)).selected_scopes).toEqual([
@@ -1271,4 +1272,158 @@ describe('explicit recorded-history consent', () => {
       ])
     }
   )
+})
+
+describe('explicit current-authorization metadata consent', () => {
+  it.each(['unselected', 'selected', 'unticked', 'denied'])(
+    'metadata choice %s grants only explicit requested metadata access',
+    async (choice) => {
+      const user = userEvent.setup()
+      providerHTTP.defaults.adapter = async (config) => {
+        requests.push(config)
+        const value = preview('consent')
+        value.requested_scopes = ['profile', 'tokens:read']
+        value.allowed_scopes = [...value.requested_scopes]
+        return response(
+          config,
+          config.url?.endsWith('/preview')
+            ? value
+            : {
+                redirect_to:
+                  'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+              }
+        )
+      }
+      await mountPage('consent')
+      const usage = await screen.findByRole('checkbox', {
+        name: 'API key metadata (optional)',
+      })
+      expect(usage).not.toBeChecked()
+      expect(usage).toHaveAccessibleDescription(/this authorization only/)
+      expect(usage).toHaveAccessibleDescription(
+        /does not create API keys or reveal secret keys/
+      )
+      if (choice !== 'unselected') {
+        usage.focus()
+        await user.keyboard(' ')
+        expect(usage).toBeChecked()
+      }
+      if (choice === 'unticked') await user.click(usage)
+      await user.click(
+        screen.getByRole('button', {
+          name: choice === 'denied' ? 'Deny' : 'Approve',
+        })
+      )
+      await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+      expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual(
+        choice === 'denied'
+          ? []
+          : ['profile', ...(choice === 'selected' ? ['tokens:read'] : [])]
+      )
+      expect(requests).toHaveLength(2)
+    }
+  )
+
+  it('does not offer requested metadata when registration excludes it', async () => {
+    providerHTTP.defaults.adapter = async (config) => {
+      requests.push(config)
+      const value = preview('consent')
+      value.requested_scopes = ['profile', 'tokens:read']
+      value.allowed_scopes = ['profile']
+      return response(
+        config,
+        config.url?.endsWith('/preview')
+          ? value
+          : {
+              redirect_to:
+                'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+            }
+      )
+    }
+    await mountPage('consent')
+    await screen.findByRole('button', { name: 'Approve' })
+    expect(
+      screen.queryByRole('checkbox', {
+        name: 'API key metadata (optional)',
+      })
+    ).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+    expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual([
+      'profile',
+    ])
+  })
+
+  it('rejects a metadata allowance that was never requested', async () => {
+    providerHTTP.defaults.adapter = async (config) => {
+      requests.push(config)
+      const value = preview('consent')
+      value.requested_scopes = ['profile', 'email']
+      value.allowed_scopes.push('tokens:read')
+      return response(config, value)
+    }
+    await mountPage('consent')
+    await screen.findByText('Authorization could not be completed.')
+    expect(
+      screen.queryByRole('button', { name: 'Approve' })
+    ).not.toBeInTheDocument()
+    expect(requests).toHaveLength(1)
+  })
+
+  it.each(['requested', 'allowed'] as const)(
+    'a removed %s metadata scope cannot be sent by a stale checked decision',
+    async (removed) => {
+      window.history.replaceState(null, '', '/oauth/provider/consent')
+      const identity = currentAuthorizationIdentity()
+      expect(identity).not.toBeNull()
+      if (!identity) throw new Error('fixture_identity_missing')
+      const value = preview('consent')
+      value.requested_scopes =
+        removed === 'requested' ? ['profile'] : ['profile', 'tokens:read']
+      value.allowed_scopes =
+        removed === 'allowed' ? ['profile'] : ['profile', 'tokens:read']
+      await requestAuthorization(
+        identity,
+        'consent',
+        new AbortController().signal,
+        capability,
+        {
+          preview: value,
+          approve: true,
+          email: false,
+          offline: false,
+          balance: false,
+          usage: false,
+          tokens: true,
+        }
+      )
+      expect(JSON.parse(String(requests[0].data)).selected_scopes).toEqual([
+        'profile',
+      ])
+    }
+  )
+})
+
+describe('metadata consent lifecycle', () => {
+  it('resets the optional selection for a new ceremony', async () => {
+    providerHTTP.defaults.adapter = async (config) => {
+      const value = preview('consent')
+      value.requested_scopes = ['profile', 'tokens:read']
+      value.allowed_scopes = [...value.requested_scopes]
+      return response(config, value)
+    }
+    const first = await mountPage('consent')
+    const checkbox = await screen.findByRole('checkbox', {
+      name: 'API key metadata (optional)',
+    })
+    await userEvent.click(checkbox)
+    expect(checkbox).toBeChecked()
+    first.unmount()
+    await mountPage('consent')
+    expect(
+      await screen.findByRole('checkbox', {
+        name: 'API key metadata (optional)',
+      })
+    ).not.toBeChecked()
+  })
 })

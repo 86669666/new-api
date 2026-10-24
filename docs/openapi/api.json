@@ -25457,6 +25457,214 @@
           }
         }
       }
+    },
+    "/api/v1/oauth/tokens": {
+      "get": {
+        "operationId": "getOAuthDerivedTokenMetadata",
+        "summary": "Read metadata for the current OAuth grant",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Default-off public OAuth only. Requires separately selected tokens:read, unchecked and reset on every new consent preview; profile remains mandatory. Only requested and registered scopes can be approved. Existing grants and refreshes never acquire this scope. Reads only the exact current issuer, user, client and grant binding; never searches other grants, manual keys or secret fields. A new read-only grant returns an empty data array because no key/source producer is enabled. GET never creates, reveals or changes a key, source, permit, history or wallet. tokens:write remains unsupported; POST is rejected and has no producer. Only the exact GET path is accepted: no query (including empty ?), body, organization selector or method override. JWT, PAT, relay key, cookie, refresh or bridge-only credentials cannot authenticate. Before publishing, live identity, consent scopes, grant revision, session, cleanup fence, source projection and expiry are checked again; database/provenance uncertainty discards prepared data. This is a request-level observation, not an atomic issuer/database snapshot. No fallback or redirects; reserved path suffix/query data are redacted from access logs. Privacy headers precede authentication and rate limiting. status oauth.enabled and client_features.oauth remain false. Empty metadata is not evidence of key issuance or relay authorization.",
+        "security": [
+          {
+            "OAuthResourceBearer": []
+          }
+        ],
+        "x-required-scopes": [
+          "tokens:read"
+        ],
+        "x-query-policy": "forbidden",
+        "x-organization-selection": "any selector presence rejected",
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "200": {
+            "description": "Current-grant metadata only; empty for new read-only grants.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthDerivedTokenMetadataResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Query, body, organization selector, method override, non-GET method or noncanonical reserved path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthBalanceInvalidRequest"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Inactive or invalid public access token, user, grant, or source session. Legacy bridge-only mode is rejected.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"invalid_token\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInvalidToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing exact tokens:read scope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"insufficient_scope\", scope=\"tokens:read\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInsufficientScope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Global API rate limit; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Global API limiter storage failure; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Issuer, database, bootstrap anchor/history/source or numeric uncertainty; no data or fallback.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthResourceUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -33427,7 +33635,7 @@
           },
           "selected_scopes": {
             "type": "array",
-            "maxItems": 6,
+            "maxItems": 7,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -33437,7 +33645,8 @@
                 "email",
                 "offline_access",
                 "balance:read",
-                "usage:read"
+                "usage:read",
+                "tokens:read"
               ]
             }
           }
@@ -33459,7 +33668,8 @@
                       "email",
                       "offline_access",
                       "balance:read",
-                      "usage:read"
+                      "usage:read",
+                      "tokens:read"
                     ]
                   }
                 }
@@ -33532,7 +33742,7 @@
           },
           "allowed_scopes": {
             "type": "array",
-            "maxItems": 6,
+            "maxItems": 7,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -33542,7 +33752,8 @@
                 "email",
                 "offline_access",
                 "balance:read",
-                "usage:read"
+                "usage:read",
+                "tokens:read"
               ]
             },
             "minItems": 1
@@ -34604,8 +34815,8 @@
           },
           "scopes_supported": {
             "type": "array",
-            "minItems": 6,
-            "maxItems": 6,
+            "minItems": 7,
+            "maxItems": 7,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -34615,7 +34826,8 @@
                 "email",
                 "offline_access",
                 "balance:read",
-                "usage:read"
+                "usage:read",
+                "tokens:read"
               ]
             }
           },
@@ -36081,6 +36293,90 @@
           }
         },
         "additionalProperties": false
+      },
+      "OAuthDerivedTokenMetadataResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "message",
+          "data",
+          "quota_per_unit"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              ""
+            ]
+          },
+          "data": {
+            "type": "array",
+            "maxItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/OAuthDerivedTokenMetadata"
+            }
+          },
+          "quota_per_unit": {
+            "type": "number",
+            "exclusiveMinimum": true,
+            "minimum": 0
+          }
+        },
+        "description": "Metadata-only projection, never a usable secret or send authorization. A newly consented read-only grant has data: []."
+      },
+      "OAuthDerivedTokenMetadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "token_id",
+          "status",
+          "quota_limit",
+          "remaining_quota",
+          "used_quota",
+          "expires_at"
+        ],
+        "properties": {
+          "token_id": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "exhausted",
+              "expired",
+              "disabled",
+              "deleted",
+              "revoked"
+            ]
+          },
+          "quota_limit": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "remaining_quota": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "used_quota": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
       }
     },
     "responses": {
@@ -36928,7 +37224,7 @@
       "OAuthResourceBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected. Account usage additionally requires public grant mode and the separately selected usage:read scope; existing profile/balance grants and their refreshes never acquire it."
+        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected. Account usage additionally requires public grant mode and the separately selected usage:read scope; existing profile/balance grants and their refreshes never acquire it. Current-grant key metadata additionally requires separately selected tokens:read in public grant mode; GET creates no key and returns no secret. Existing grants and refreshes never gain it; tokens:write remains unsupported."
       },
       "ClientEventsBearer": {
         "type": "http",

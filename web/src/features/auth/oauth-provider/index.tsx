@@ -225,6 +225,41 @@ export function ProviderAuthorizationPage(props: {
                 </div>
               </div>
             )}
+            {state.preview.allowed_scopes.includes('tokens:read') && (
+              <div className='space-y-2'>
+                <div className='flex items-center gap-2'>
+                  <Checkbox
+                    id='provider-tokens'
+                    checked={authorization.tokens}
+                    aria-describedby='provider-tokens-description'
+                    onCheckedChange={(checked) =>
+                      authorization.setTokens(checked === true)
+                    }
+                  />
+                  <Label htmlFor='provider-tokens'>
+                    {t('API key metadata (optional)')}
+                  </Label>
+                </div>
+                <div
+                  id='provider-tokens-description'
+                  className='text-muted-foreground space-y-1 text-sm'
+                >
+                  <p>
+                    {t(
+                      'Allow this client to read API key metadata for this authorization only.'
+                    )}
+                  </p>
+                  <p>
+                    {t('This does not create API keys or reveal secret keys.')}
+                  </p>
+                  <p>
+                    {t(
+                      'Access lasts up to seven days and ends when this sign-in session ends.'
+                    )}
+                  </p>
+                </div>
+              </div>
+            )}
           </fieldset>
         )}
         <div className='flex flex-wrap gap-3'>

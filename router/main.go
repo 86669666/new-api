@@ -63,6 +63,7 @@ func SetRouter(router *gin.Engine, assets WebAssets) {
 	}
 	router.Use(middleware.OAuthBalanceBoundary)
 	router.Use(middleware.OAuthUsageBoundary)
+	router.Use(middleware.OAuthTokensBoundary)
 	router.Use(middleware.OrganizationSelectionBoundary())
 	SetApiRouter(router)
 	SetOAuthResourceRouter(router, service.CurrentOAuthUserInfoResource())

@@ -575,6 +575,85 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		assert.Empty(t, withoutOffline.Refresh)
 	})
 
+	t.Run("explicit_tokens_read_empty_and_refresh", func(t *testing.T) {
+		c.t = t
+		// The permanent CLI must have born this very database. The test never adopts
+		// a copied actor database or writes a source/history to manufacture metadata.
+		require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+		clientURL := input.Admin + "/admin/clients/" + url.PathEscape(c.clientID)
+		status, _, raw := c.request("GET", clientURL, "", "", "")
+		require.Equal(t, 200, status)
+		var registration map[string]any
+		require.NoError(t, common.Unmarshal(raw, &registration))
+		original, e := common.Marshal(registration)
+		require.NoError(t, e)
+		defer func() {
+			status, _, _ = c.request("PUT", clientURL, "application/json", string(original), "")
+			require.Equal(t, 200, status)
+		}()
+		registered := strings.Fields(registration["scope"].(string))
+		if !slices.Contains(registered, "tokens:read") {
+			registered = append(registered, "tokens:read")
+		}
+		registration["scope"] = strings.Join(registered, " ")
+		updated, e := common.Marshal(registration)
+		require.NoError(t, e)
+		status, _, _ = c.request("PUT", clientURL, "application/json", string(updated), "")
+		require.Equal(t, 200, status)
+		journal, e := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+		require.NoError(t, e)
+		for _, selected := range []bool{false, true} {
+			t.Run(strconv.FormatBool(selected), func(t *testing.T) {
+				c.t = t
+				scopes := []string{"openid", "profile", "offline_access"}
+				if selected {
+					scopes = append(scopes, "tokens:read")
+				}
+				status, grant := c.exchange(c.code("openid profile offline_access tokens:read", scopes...))
+				require.Equal(t, 200, status)
+				for _, refresh := range []bool{false, true} {
+					if refresh {
+						var next oauthHydraGrant
+						status, next = c.refresh(grant)
+						require.Equal(t, 200, status)
+						grant = next
+					}
+					want := 403
+					if selected {
+						want = 200
+					}
+					body := c.tokenMetadata(grant.Access, want)
+					if selected {
+						assert.Equal(t, []any{}, body["data"])
+					}
+					c.tokenMetadata(grant.Refresh, 401)
+				}
+				// Supplying a scope on refresh never upgrades an omitted permission.
+				form := url.Values{"client_id": {c.clientID}, "grant_type": {"refresh_token"}, "refresh_token": {grant.Refresh}, "scope": {"tokens:read"}}
+				status, _, _ = c.request("POST", input.Issuer+"oauth2/token", "application/x-www-form-urlencoded", form.Encode(), "")
+				assert.Equal(t, 400, status)
+			})
+		}
+		c.t = t
+		var sources int64
+		require.NoError(t, f.db.Model(&model.OAuthDerivedTokenSource{}).Count(&sources).Error)
+		assert.Zero(t, sources)
+		after, e := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+		require.NoError(t, e)
+		assert.Equal(t, journal, after)
+		status, _, raw = c.request("GET", input.Issuer+".well-known/openid-configuration", "", "", "")
+		require.Equal(t, 200, status)
+		var metadata struct {
+			Scopes []string `json:"scopes_supported"`
+		}
+		require.NoError(t, common.Unmarshal(raw, &metadata))
+		assert.Contains(t, metadata.Scopes, "tokens:read")
+		assert.NotContains(t, metadata.Scopes, "tokens:write")
+		status, headers, _ := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", "{}", "")
+		assert.Equal(t, 400, status)
+		assert.Empty(t, headers.Get("Location"))
+	})
+
 	t.Run("explicit_usage_scope_and_old_grant_refresh", func(t *testing.T) {
 		c.t = t
 		oauthPublicUsageDatabase(t, f)
@@ -760,8 +839,8 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		var binding map[string]any
 		require.NoError(t, common.UnmarshalJsonStr(flow.Payload, &binding))
 		policy := binding["policy_hash"].(string)
-		require.Contains(t, policy, ":public-v3:")
-		legacyPolicy := strings.Split(policy, ":public-v3:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
+		require.Contains(t, policy, ":public-v4:")
+		legacyPolicy := strings.Split(policy, ":public-v4:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
 		legacyPolicyHash := fmt.Sprintf("%x", sha256.Sum256([]byte(legacyPolicy)))
 
 		// Reconstructed pre-upgrade local fixture: real Hydra issued this
@@ -4530,4 +4609,234 @@ func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
 	require.NoError(t, db.Table("tokens").Count(&rows).Error)
 	require.Zero(t, rows, "producer must return a fresh namespace without token writers")
 	return db, birth.DSN
+}
+
+func TestOAuthTokensNamespacePrivacy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.RedirectTrailingSlash, engine.RedirectFixedPath = false, false
+	var logs bytes.Buffer
+	old := gin.DefaultWriter
+	gin.DefaultWriter = &logs
+	t.Cleanup(func() { gin.DefaultWriter = old })
+	middleware.SetUpLogger(engine)
+	engine.Use(middleware.OAuthTokensBoundary)
+	SetOAuthResourceRouter(engine, nil)
+	engine.NoRoute(func(c *gin.Context) { c.String(200, "frontend") })
+	for _, tc := range []struct {
+		method, path, body, header string
+		status                     int
+	}{
+		{"GET", "/api/v1/oauth/tokens", "", "", 401},
+		{"GET", "/api/v1/oauth/tokens?", "", "", 400},
+		{"GET", "/api/v1/oauth/tokens?access_token=TOKENS_QUERY_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/tokens/TOKENS_PATH_CANARY", "", "", 400},
+		{"GET", "/api/v1/oauth/tokens/", "", "", 400},
+		{"GET", "/api/v1/oauth/%74okens", "", "", 400},
+		{"GET", "/api/v1/oauth/%252574okens/TOKENS_PATH_CANARY", "", "", 400},
+		{"GET", "/api//v1/oauth/tokens", "", "", 400},
+		{"GET", "/API/V1/OAUTH/TOKENS", "", "", 400},
+		{"POST", "/api/v1/oauth/tokens", "", "", 400},
+		{"HEAD", "/api/v1/oauth/tokens", "", "", 400},
+		{"GET", "/api/v1/oauth/tokens", "{}", "", 400},
+		{"GET", "/api/v1/oauth/tokens", "", "X-Organization-Id", 400},
+		{"GET", "/api/v1/oauth/tokens", "", "X-HTTP-Method-Override", 400},
+	} {
+		t.Run(tc.method+tc.path+tc.body+tc.header, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			if tc.header != "" {
+				req.Header[tc.header] = []string{""}
+			}
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			assert.Equal(t, tc.status, w.Code)
+			assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+			assert.Equal(t, "no-referrer", w.Header().Get("Referrer-Policy"))
+			assert.Empty(t, w.Header().Get("Location"))
+			assert.NotContains(t, w.Body.String(), "frontend")
+			assert.NotContains(t, w.Body.String(), "TOKENS_")
+		})
+	}
+	assert.NotContains(t, logs.String(), "TOKENS_QUERY_CANARY")
+	assert.NotContains(t, logs.String(), "TOKENS_PATH_CANARY")
+}
+
+// This HTTP consumer fixture uses the real CLI-born store and actual model
+// checks. TLS introspection is synthetic; only the separate Hydra test proves
+// public code/PKCE/consent/refresh issuance. No source or key is issued here.
+func TestOAuthTokensConsumerHTTP(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	// Bootstrap owns provenance; the existing grant-store startup initializes
+	// only its ordinary grant/cleanup schema, as in adjacent OAuth fixtures.
+	master := common.IsMasterNode
+	common.IsMasterNode = !f.db.Migrator().HasTable(&model.OAuthGrant{})
+	err := model.InitOAuthGrantStore(true)
+	common.IsMasterNode = master
+	require.NoError(t, err)
+	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+	random := make([]byte, 32)
+	_, err = rand.Read(random)
+	require.NoError(t, err)
+	scopes := []string{"profile", "tokens:read"}
+	encoded, err := common.Marshal(scopes)
+	require.NoError(t, err)
+	grant := &model.OAuthGrant{GrantID: base64.RawURLEncoding.EncodeToString(random), Issuer: "https://gateway.example/", ClientID: "metadata-client", Subject: strconv.Itoa(f.users["owner"].Id), UserID: f.users["owner"].Id, ConsentRequestID: "metadata-consent", HydraLoginSessionID: "metadata-login", OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1, Scopes: string(encoded), PolicyHash: strings.Repeat("a", 64)}
+	require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+	require.NoError(t, model.ApproveOAuthGrant(t.Context(), grant))
+	_, err = model.AuthorizeOAuthGrant(t.Context(), model.OAuthGrantAuthorization{Issuer: grant.Issuer, GrantID: grant.GrantID, ClientID: grant.ClientID, Subject: grant.Subject, UserID: grant.UserID, AuthVersion: 1, GrantExpiresAt: grant.ExpiresAt, TokenExpiresAt: time.Now().Unix() + 600, Scopes: scopes, Activate: true})
+	require.NoError(t, err)
+	require.NoError(t, f.db.Where("grant_ref = ?", grant.GrantRef).First(grant).Error)
+	claims := map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": grant.Issuer, "aud": []string{"metadata"}, "client_id": grant.ClientID, "sub": grant.Subject, "exp": time.Now().Unix() + 600, "scope": "profile tokens:read", "ext": map[string]any{"newapi_auth_version": "1", "newapi_grant_id": grant.GrantID, "newapi_grant_expires_at": strconv.FormatInt(grant.ExpiresAt, 10)}}
+	var calls atomic.Int32
+	var mutate func()
+	admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 3 && mutate != nil {
+			mutate()
+		}
+		b, e := common.Marshal(claims)
+		if e != nil {
+			w.WriteHeader(500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(b)
+	}))
+	t.Cleanup(admin.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(admin.Certificate())
+	resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: admin.URL + "/admin/oauth2/introspect", Issuer: grant.Issuer, Audience: "metadata", ClientIDs: []string{grant.ClientID}}, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: admin.URL, AuthorizationURL: grant.Issuer + "oauth2/auth"}, resource)
+	require.NoError(t, err)
+	engine := gin.New()
+	engine.Use(middleware.OAuthTokensBoundary)
+	SetOAuthResourceRouter(engine, resource)
+	request := func() *httptest.ResponseRecorder {
+		calls.Store(0)
+		r := httptest.NewRequest("GET", "/api/v1/oauth/tokens", nil)
+		r.Header.Set("Authorization", "Bearer synthetic-metadata")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, r)
+		return w
+	}
+	t.Run("bridge_only_rejected", func(t *testing.T) { assert.Equal(t, 401, request().Code) })
+	_, err = service.NewOAuthPublic(service.OAuthPublicConfig{Enabled: true, BaseURL: "https://private-hydra.example"}, bridge)
+	require.NoError(t, err)
+	journal, err := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+	require.NoError(t, err)
+	var history model.OAuthDerivedTokenHistory
+	require.NoError(t, f.db.First(&history).Error)
+	var identity model.OAuthDerivedTokenBootstrapIdentity
+	require.NoError(t, f.db.First(&identity).Error)
+	var userBefore model.User
+	require.NoError(t, f.db.First(&userBefore, grant.UserID).Error)
+	var tokensBefore []model.Token
+	require.NoError(t, f.db.Order("id").Find(&tokensBefore).Error)
+	require.NotEmpty(t, tokensBefore, "the shared fixture includes an unrelated manual key")
+	beforeBytes, err := common.Marshal(tokensBefore)
+	require.NoError(t, err)
+	t.Run("empty_current_grant_no_writes", func(t *testing.T) {
+		w := request()
+		require.Equal(t, 200, w.Code, w.Body.String())
+		assert.JSONEq(t, fmt.Sprintf(`{"success":true,"message":"","data":[],"quota_per_unit":%g}`, common.QuotaPerUnit), w.Body.String())
+		assert.EqualValues(t, 3, calls.Load())
+		var sources int64
+		require.NoError(t, f.db.Model(&model.OAuthDerivedTokenSource{}).Count(&sources).Error)
+		assert.Zero(t, sources)
+		var tokensAfter []model.Token
+		require.NoError(t, f.db.Order("id").Find(&tokensAfter).Error)
+		afterBytes, err := common.Marshal(tokensAfter)
+		require.NoError(t, err)
+		assert.Equal(t, sha256.Sum256(beforeBytes), sha256.Sum256(afterBytes), "existing manual key and all quota fields remain unchanged and undisclosed")
+		var after model.User
+		require.NoError(t, f.db.First(&after, grant.UserID).Error)
+		assert.Equal(t, userBefore, after)
+		var afterHistory model.OAuthDerivedTokenHistory
+		require.NoError(t, f.db.First(&afterHistory).Error)
+		assert.Equal(t, history, afterHistory)
+		var afterIdentity model.OAuthDerivedTokenBootstrapIdentity
+		require.NoError(t, f.db.First(&afterIdentity).Error)
+		assert.Equal(t, identity, afterIdentity)
+		afterJournal, e := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+		require.NoError(t, e)
+		assert.Equal(t, journal, afterJournal)
+	})
+	for _, tc := range []struct {
+		name, key string
+		value     any
+	}{
+		{"wrong_client", "client_id", "other-client"}, {"wrong_actor", "sub", strconv.Itoa(f.users["foreign"].Id)},
+		{"wrong_audience", "aud", []string{"other"}}, {"wrong_issuer", "iss", "https://other.example/"},
+		{"refresh_bearer", "token_use", "refresh_token"}, {"expired", "exp", int64(1)}, {"future", "nbf", time.Now().Unix() + 3600}, {"write_scope_not_supported", "scope", "profile tokens:read tokens:write"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old, exists := claims[tc.key]
+			claims[tc.key] = tc.value
+			defer func() {
+				if exists {
+					claims[tc.key] = old
+				} else {
+					delete(claims, tc.key)
+				}
+			}()
+			w := request()
+			assert.Equal(t, 401, w.Code)
+			assert.NotContains(t, w.Body.String(), "data")
+		})
+	}
+	t.Run("old_grant_missing_read_scope", func(t *testing.T) {
+		claims["scope"] = "profile"
+		require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", `["profile"]`).Error)
+		defer func() {
+			claims["scope"] = "profile tokens:read"
+			require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", string(encoded)).Error)
+		}()
+		w := request()
+		assert.Equal(t, 403, w.Code)
+		assert.Equal(t, `Bearer error="insufficient_scope", scope="tokens:read"`, w.Header().Get("WWW-Authenticate"))
+	})
+	t.Run("post_encoding_revocation_discards_empty_success", func(t *testing.T) {
+		mutate = func() { require.NoError(t, f.db.Model(grant).UpdateColumn("state", "revoked").Error) }
+		defer func() { mutate = nil; require.NoError(t, f.db.Model(grant).UpdateColumn("state", "active").Error) }()
+		w := request()
+		assert.Equal(t, 401, w.Code)
+		assert.NotContains(t, w.Body.String(), "data")
+	})
+	t.Run("missing_store_is_not_empty", func(t *testing.T) {
+		name := "tokens-metadata-store-error"
+		require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(name, func(tx *gorm.DB) {
+			if tx.Statement.Table == "oauth_derived_token_sources" {
+				tx.AddError(errors.New("synthetic store unavailable"))
+			}
+		}))
+		defer func() { require.NoError(t, f.db.Callback().Query().Remove(name)) }()
+		w := request()
+		assert.Equal(t, 503, w.Code)
+		assert.NotContains(t, w.Body.String(), "data")
+	})
+}
+
+// tokenMetadata checks the metadata envelope without treating it as a usage feed.
+func (c *oauthHydraClient) tokenMetadata(token string, want int) map[string]any {
+	c.t.Helper()
+	status, headers, raw := c.request("GET", c.input.Issuer+"api/v1/oauth/tokens", "", "", token)
+	require.Equal(c.t, want, status)
+	assert.Contains(c.t, headers.Get("Cache-Control"), "no-store")
+	assert.Equal(c.t, "no-referrer", headers.Get("Referrer-Policy"))
+	assert.Empty(c.t, headers.Get("Location"))
+	var body map[string]any
+	require.NoError(c.t, common.Unmarshal(raw, &body))
+	if want != 200 {
+		assert.NotContains(c.t, body, "data")
+		if want == 403 {
+			assert.Equal(c.t, `Bearer error="insufficient_scope", scope="tokens:read"`, headers.Get("WWW-Authenticate"))
+		}
+		return body
+	}
+	assert.ElementsMatch(c.t, []string{"success", "message", "data", "quota_per_unit"}, slices.Collect(maps.Keys(body)))
+	assert.Equal(c.t, true, body["success"])
+	assert.Equal(c.t, "", body["message"])
+	assert.Equal(c.t, common.QuotaPerUnit, body["quota_per_unit"])
+	return body
 }

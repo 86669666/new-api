@@ -33,6 +33,10 @@ func OAuthUsageAuth(resource *service.OAuthUserInfoResource) gin.HandlerFunc {
 	return oauthResourceAuth(resource, "usage:read")
 }
 
+func OAuthTokensAuth(resource *service.OAuthUserInfoResource) gin.HandlerFunc {
+	return oauthResourceAuth(resource, "tokens:read")
+}
+
 func oauthResourceAuth(resource *service.OAuthUserInfoResource, scope string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		query, err := url.ParseQuery(c.Request.URL.RawQuery)
@@ -89,6 +93,12 @@ func oauthResourceAuth(resource *service.OAuthUserInfoResource, scope string) gi
 				return
 			}
 		}
+		if scope == "tokens:read" {
+			if err := access.RequireDerivedTokenReadScope(); err != nil {
+				WriteOAuthResourceError(c, err, scope)
+				return
+			}
+		}
 		c.Set(oauthUserInfoAccessKey, access)
 		c.Next()
 	}
@@ -108,7 +118,7 @@ func WriteOAuthResourceError(c *gin.Context, err error, requiredScope ...string)
 	} else if errors.Is(err, service.ErrOAuthInsufficientScope) {
 		status, code = http.StatusForbidden, "insufficient_scope"
 		scope := "profile"
-		if len(requiredScope) == 1 && (requiredScope[0] == "balance:read" || requiredScope[0] == "usage:read") {
+		if len(requiredScope) == 1 && (requiredScope[0] == "balance:read" || requiredScope[0] == "usage:read" || requiredScope[0] == "tokens:read") {
 			scope = requiredScope[0]
 		}
 		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+scope+`"`)
@@ -167,6 +177,15 @@ func OAuthBalanceBoundary(c *gin.Context) {
 // before routing and by the logger, so neither fallback nor a log can disclose
 // credentials attached to the reserved namespace.
 func OAuthUsagePath(path string) bool {
+	return oauthResourceNamespace(path, "/api/v1/oauth/usage")
+}
+
+// OAuthTokensPath recognizes reserved variants without changing the request URL.
+func OAuthTokensPath(path string) bool {
+	return oauthResourceNamespace(path, "/api/v1/oauth/tokens")
+}
+
+func oauthResourceNamespace(path, namespace string) bool {
 	// Fold valid escapes as bytes arrive, including newly formed nested escapes.
 	// Each fold removes two bytes, so work is linear in the original path length.
 	// Invalid suffixes stay literal and cannot hide an already decoded prefix.
@@ -187,7 +206,7 @@ func OAuthUsagePath(path string) bool {
 		}
 	}
 	collapsed := "/" + strings.Join(strings.FieldsFunc(string(decoded), func(r rune) bool { return r == '/' }), "/")
-	return strings.EqualFold(collapsed, "/api/v1/oauth/usage") || strings.HasPrefix(strings.ToLower(collapsed), "/api/v1/oauth/usage/")
+	return strings.EqualFold(collapsed, namespace) || strings.HasPrefix(strings.ToLower(collapsed), namespace+"/")
 }
 
 // OAuthUsageBoundary reserves the namespace even when the resource is disabled.
@@ -230,6 +249,40 @@ func OAuthUsageBoundary(c *gin.Context) {
 	}
 	if c.FullPath() == "" {
 		WriteOAuthResourceError(c, service.ErrOAuthInvalidToken, "usage:read")
+		return
+	}
+	c.Next()
+}
+
+// OAuthTokensBoundary reserves metadata reads even when public OAuth is off.
+// Selectors, request bodies and method overrides never change the current grant.
+func OAuthTokensBoundary(c *gin.Context) {
+	if !OAuthTokensPath(c.Request.URL.EscapedPath()) {
+		c.Next()
+		return
+	}
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("Referrer-Policy", "no-referrer")
+	invalid := c.Request.Method != http.MethodGet || c.Request.URL.EscapedPath() != "/api/v1/oauth/tokens" || c.Request.URL.RawQuery != "" || c.Request.URL.ForceQuery || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0
+	for key := range c.Request.Header {
+		switch strings.ToLower(key) {
+		case "x-organization-id", "x-http-method-override", "x-method-override", "x-http-method":
+			invalid = true
+		}
+	}
+	if c.Request.Body != nil {
+		var one [1]byte
+		n, err := io.ReadFull(c.Request.Body, one[:])
+		if n != 0 || err != nil && err != io.EOF {
+			invalid = true
+		}
+	}
+	if invalid {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+	if c.FullPath() == "" {
+		WriteOAuthResourceError(c, service.ErrOAuthInvalidToken, "tokens:read")
 		return
 	}
 	c.Next()
