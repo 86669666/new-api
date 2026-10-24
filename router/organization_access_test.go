@@ -465,7 +465,7 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 	}
 	model.DB = db
 	common.SetDatabaseTypes(common.DatabaseType(kind), common.DatabaseType(kind))
-	if os.Getenv("NEWAPI_BOOTSTRAP_TIER") == "postgres" {
+	if tier := os.Getenv("NEWAPI_BOOTSTRAP_TIER"); tier == "postgres" || tier == "postgres-redis" {
 		for _, value := range []any{&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}} {
 			require.True(t, db.Migrator().HasTable(value), "formal producer must create required schema")
 		}
@@ -748,6 +748,13 @@ func newOrganizationTokenCacheFixture(t *testing.T) *organizationHTTPFixture {
 	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") == "" {
 		return f
 	}
+	organizationTrustedRedis(t)
+	return f
+}
+
+// Both official resource tiers requalify the current listener, not just a receipt.
+func organizationTrustedRedis(t *testing.T) {
+	t.Helper()
 	receiptPath := os.Getenv("NEWAPI_BOOTSTRAP_REDIS_RECEIPT")
 	root := filepath.Dir(filepath.Dir(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL")))
 	require.Equal(t, filepath.Join(root, "redis-resource.json"), receiptPath)
@@ -819,7 +826,6 @@ func newOrganizationTokenCacheFixture(t *testing.T) *organizationHTTPFixture {
 	current, err := exec.CommandContext(t.Context(), launcher, "redis").Output()
 	require.NoError(t, err, "live installer Redis kernel qualification required")
 	require.JSONEq(t, string(raw), string(current))
-	return f
 }
 
 func TestRelayTokenCachedErrorCodesHTTP(t *testing.T) {

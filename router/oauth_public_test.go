@@ -1313,7 +1313,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 func oauthPublicDatabase(t *testing.T, f *organizationHTTPFixture) {
 	t.Helper()
 	kind := os.Getenv("NEWAPI_W01_MAIN_KIND")
-	if os.Getenv("NEWAPI_BOOTSTRAP_TIER") == "postgres" {
+	if tier := os.Getenv("NEWAPI_BOOTSTRAP_TIER"); tier == "postgres" || tier == "postgres-redis" {
 		require.Equal(t, "postgres", kind)
 		require.Equal(t, "postgres", f.db.Dialector.Name())
 		require.Equal(t, os.Getenv("SQL_DSN"), f.mainDSN)
@@ -3073,7 +3073,13 @@ func sessionRevocationRepairFixture(t *testing.T) *organizationHTTPFixture {
 	t.Helper()
 	f := newOrganizationHTTPFixture(t)
 	oauthPublicDatabase(t, f)
-	require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Option{}, &model.UserAccessToken{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}, &model.ExternalIdentityClaim{}, &model.CasbinRule{}, &model.AuthzRole{}))
+	if os.Getenv("NEWAPI_BOOTSTRAP_TIER") == "postgres-redis" {
+		for _, value := range []any{&model.AuthFlow{}, &model.Option{}, &model.UserAccessToken{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}, &model.ExternalIdentityClaim{}, &model.CasbinRule{}, &model.AuthzRole{}} {
+			require.NoError(t, f.db.Limit(0).Find(value).Error, "formal producer must create the S1 fixture schema")
+		}
+	} else {
+		require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Option{}, &model.UserAccessToken{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}, &model.ExternalIdentityClaim{}, &model.CasbinRule{}, &model.AuthzRole{}))
+	}
 	common.IsMasterNode = true
 	require.NoError(t, model.InitOAuthGrantStore(true))
 	require.NoError(t, authz.Init(f.db))
@@ -3486,6 +3492,10 @@ func TestSessionRevocationS1RealRedis(t *testing.T) {
 	for _, scenario := range []string{"deny_wrong_type", "outbox_rollback", "late_active_fill", "credential_rollback"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := sessionRevocationRepairFixture(t)
+			if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+				organizationTrustedRedis(t)
+				defer organizationTrustedRedis(t)
+			}
 			endpoint := os.Getenv("NEWAPI_W01_REDIS_ADDR")
 			host, port, err := net.SplitHostPort(endpoint)
 			require.NoError(t, err)
@@ -4341,7 +4351,7 @@ func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
 	case "mysql":
 		dialect = mysql.Open(birth.DSN)
 	case "postgres":
-		require.Equal(t, "postgres", os.Getenv("NEWAPI_BOOTSTRAP_TIER"))
+		require.Contains(t, []string{"postgres", "postgres-redis"}, os.Getenv("NEWAPI_BOOTSTRAP_TIER"))
 		var receipt struct {
 			ID             string `json:"id"`
 			Database       string `json:"database"`
