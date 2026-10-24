@@ -131,7 +131,9 @@ func TestAdmissionUnit(t *testing.T) {
 		stop() // joined, owned descriptors closed, idempotent stop.
 		afterFDs, e := os.ReadDir("/proc/self/fd")
 		require.NoError(t, e)
-		assert.Len(t, afterFDs, len(beforeFDs))
+		// The client was deliberately closed to produce HUP; every monitor fd
+		// must additionally be gone, leaving exactly that one-fd decrease.
+		assert.Len(t, afterFDs, len(beforeFDs)-1)
 	})
 	t.Run("duplicate_and_trailing_frame", func(t *testing.T) {
 		for _, b := range []string{`{"version":1,"version":1}`, `{"version":1} {}`} {

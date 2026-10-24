@@ -1588,6 +1588,16 @@ def trusted_admission(bundle):
     # Root /proc is mounted inside the new PID namespace; no host PID aliases.
     if Path('/proc/self/status').read_text().split('NSpid:',1)[1].splitlines()[0].split()!=['1']:
         raise ValueError('private proc required')
+    mounts=[line.split() for line in Path('/proc/mounts').read_text().splitlines()]
+    run_mounts=[row for row in mounts if row[1]=='/run']
+    root_mounts=[line.split() for line in Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4]=='/']
+    if (len(run_mounts)!=1 or run_mounts[0][2]!='tmpfs' or
+            not {'nosuid','nodev'}.issubset(set(run_mounts[0][3].split(','))) or
+            'noexec' in run_mounts[0][3].split(',') or
+            os.statvfs('/run').f_blocks*os.statvfs('/run').f_frsize>1024**3 or
+            [name for _,name in socket.if_nameindex()]!=['lo'] or
+            any(any(item.startswith('shared:') for item in row[6:]) for row in root_mounts)):
+        raise ValueError('private executable bounded run mount/net required')
     bundle=Path(bundle).resolve(strict=True);metadata=verified_manifest(bundle)
     expected=[{'binary':'test-0','cwd':'internal/admissionbroker','run':ADMISSION_SELECTOR}]
     if metadata['tier']!='admission' or metadata['entries']!=expected or 'admission-broker' not in metadata['files']:raise ValueError('admission inventory mismatch')
