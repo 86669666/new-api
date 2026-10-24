@@ -1024,11 +1024,12 @@ func TestOrganizationCreationIdempotency(t *testing.T) {
 			require.NoError(t, err)
 			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOrganizationCreationIdempotency$", "-test.count=1")
-			cmd.Env = append(os.Environ(), "NEWAPI_ORGANIZATION_CREATE_CHILD="+mode)
+			cmd.Env = append(os.Environ(), "NEWAPI_ORGANIZATION_CREATE_CHILD="+mode, "NEWAPI_ORGANIZATION_CHILD_SQLITE_DSN="+c.mainDSN)
 			cmd.ExtraFiles = []*os.File{inR, outW}
 			var output bytes.Buffer
 			cmd.Stdout = &output
 			cmd.Stderr = &output
+			wait := organizationChildWait(t, cmd, cancel, inR, inW, outR, outW)
 			require.NoError(t, cmd.Start())
 			inR.Close()
 			outW.Close()
@@ -1039,11 +1040,11 @@ func TestOrganizationCreationIdempotency(t *testing.T) {
 				Status int
 				Body   map[string]any
 			}
-			require.NoError(t, common.DecodeJson(outR, &result))
+			organizationChildDecode(t, outR, &result, cancel, wait, &output, input)
 			outR.Close()
-			err = cmd.Wait()
+			err = wait()
 			cancel()
-			require.NoError(t, err, output.String())
+			require.NoError(t, err, organizationChildDiagnostic(output.String(), input))
 			if mode == "commit" {
 				require.Equal(t, 201, result.Status)
 				require.Nil(t, result.Body)
@@ -1076,7 +1077,17 @@ func organizationCreationProcess(t *testing.T, mode string) {
 		path, err := filepath.EvalSymlinks(config.DSN)
 		require.NoError(t, err)
 		require.Equal(t, root, filepath.Dir(path))
-		require.Equal(t, "organization.db", filepath.Base(path))
+		if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+			// Bind to the exact birth returned to the parent, not any new.db.
+			require.NotEmpty(t, os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+			require.NotEmpty(t, os.Getenv("NEWAPI_ORGANIZATION_CHILD_SQLITE_DSN"))
+			born, err := filepath.EvalSymlinks(os.Getenv("NEWAPI_ORGANIZATION_CHILD_SQLITE_DSN"))
+			require.NoError(t, err)
+			require.Equal(t, born, path)
+			require.Equal(t, "new.db", filepath.Base(path))
+		} else {
+			require.Equal(t, "organization.db", filepath.Base(path))
+		}
 		dialector = sqlite.Open(path + "?_pragma=busy_timeout(10000)&_txlock=immediate")
 	case "mysql", "postgres":
 		require.NoError(t, organizationFixtureDSN(config.Kind, config.DSN, config.Port))
@@ -1518,11 +1529,12 @@ func TestOrganizationLimitsPublication(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOrganizationLimitsPublication$", "-test.count=1")
-		cmd.Env = append(os.Environ(), "NEWAPI_ORGANIZATION_LIMITS_CHILD=read")
+		cmd.Env = append(os.Environ(), "NEWAPI_ORGANIZATION_LIMITS_CHILD=read", "NEWAPI_ORGANIZATION_CHILD_SQLITE_DSN="+f.mainDSN)
 		cmd.ExtraFiles = []*os.File{inR, outW}
 		var logs bytes.Buffer
 		cmd.Stdout = &logs
 		cmd.Stderr = &logs
+		wait := organizationChildWait(t, cmd, cancel, inR, inW, outR, outW)
 		require.NoError(t, cmd.Start())
 		inR.Close()
 		outW.Close()
@@ -1532,15 +1544,56 @@ func TestOrganizationLimitsPublication(t *testing.T) {
 		_, err = inW.Write(append(raw, '\n'))
 		require.NoError(t, err)
 		var first map[string]any
-		require.NoError(t, common.DecodeJson(outR, &first))
+		organizationChildDecode(t, outR, &first, cancel, wait, &logs, input)
 		assert.Equal(t, map[string]any{"max_organizations_created": float64(0), "max_organizations_joined": float64(0)}, first["data"])
 		status, _, b := f.request(t, "PUT", write, "root", pair, headers)
 		require.Equal(t, 200, status, b)
 		_, err = inW.Write([]byte{1})
 		require.NoError(t, err)
 		var second map[string]any
-		require.NoError(t, common.DecodeJson(outR, &second))
+		organizationChildDecode(t, outR, &second, cancel, wait, &logs, input)
 		assert.Equal(t, map[string]any{"max_organizations_created": float64(2), "max_organizations_joined": float64(3)}, second["data"])
-		require.NoError(t, cmd.Wait(), logs.String())
+		require.NoError(t, wait(), organizationChildDiagnostic(logs.String(), input))
 	})
+}
+
+// Reap only this fixture's child even when a pipe/assertion fails before Wait.
+func organizationChildWait(t *testing.T, cmd *exec.Cmd, cancel context.CancelFunc, pipes ...*os.File) func() error {
+	t.Helper()
+	var once sync.Once
+	var err error
+	wait := func() error {
+		once.Do(func() {
+			if cmd.Process != nil {
+				err = cmd.Wait()
+			}
+		})
+		return err
+	}
+	t.Cleanup(func() {
+		cancel()
+		for _, pipe := range pipes {
+			_ = pipe.Close()
+		}
+		_ = wait()
+	})
+	return wait
+}
+
+func organizationChildDiagnostic(output string, input organizationBudgetProcessInput) string {
+	for _, secret := range []string{input.Bearer, input.SessionSecret, input.DSN} {
+		if secret != "" {
+			output = strings.ReplaceAll(output, secret, "[redacted]")
+		}
+	}
+	return output
+}
+
+func organizationChildDecode(t *testing.T, reader io.Reader, result any, cancel context.CancelFunc, wait func() error, output *bytes.Buffer, input organizationBudgetProcessInput) {
+	t.Helper()
+	if err := common.DecodeJson(reader, result); err != nil {
+		cancel()
+		exit := wait() // Wait also joins stdout/stderr copies before reading the buffer.
+		t.Fatalf("organization child pipe failed: %v; exit: %v; diagnostic: %s", err, exit, organizationChildDiagnostic(output.String(), input))
+	}
 }

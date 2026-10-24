@@ -7,6 +7,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -15,27 +16,32 @@ import (
 
 func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	require.NoError(t, i18n.Init())
 
+	previousSQLitePath := common.SQLitePath
 	previousDB := model.DB
 	previousDatabaseType := common.MainDatabaseType()
 	previousLogDatabaseType := common.LogDatabaseType()
-	previousSQLitePath := common.SQLitePath
 	previousMasterNode := common.IsMasterNode
 	previousRedisEnabled := common.RedisEnabled
-	common.SQLitePath = t.TempDir() + "/router-video.db"
+	database, dsn := oauthBirthFixture(t)
+	common.SetDatabaseTypes(common.DatabaseType(database.Dialector.Name()), previousLogDatabaseType)
 	common.IsMasterNode = false
 	common.RedisEnabled = false
-	t.Setenv("SQL_DSN", "")
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}, &model.Option{}))
+	if database.Dialector.Name() == "sqlite" {
+		common.SQLitePath = dsn
+		t.Setenv("SQL_DSN", "")
+	}
 	require.NoError(t, model.InitDB())
-	database := model.DB
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}))
+	initializedDB := model.DB
 	t.Cleanup(func() {
-		sqlDB, closeErr := database.DB()
-		require.NoError(t, closeErr)
-		require.NoError(t, sqlDB.Close())
+		pool, err := initializedDB.DB()
+		require.NoError(t, err)
+		require.NoError(t, pool.Close())
+		common.SQLitePath = previousSQLitePath
 		model.DB = previousDB
 		common.SetDatabaseTypes(previousDatabaseType, previousLogDatabaseType)
-		common.SQLitePath = previousSQLitePath
 		common.IsMasterNode = previousMasterNode
 		common.RedisEnabled = previousRedisEnabled
 	})
@@ -49,7 +55,7 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 		Group:       "default",
 		AuthVersion: 1,
 	}).Error)
-	require.NoError(t, database.Create(&model.Token{
+	require.NoError(t, (&model.Token{
 		Id:             1,
 		UserId:         91,
 		Key:            "jimengfetch",
@@ -57,7 +63,7 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 		Name:           "jimeng fetch",
 		ExpiredTime:    -1,
 		UnlimitedQuota: true,
-	}).Error)
+	}).Insert())
 	require.NoError(t, database.Create(&model.Channel{
 		Id:     17,
 		Type:   constant.ChannelTypeJimeng,

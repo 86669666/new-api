@@ -1,14 +1,12 @@
 package router
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -25,13 +23,13 @@ func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 		Quota:    100,
 	}
 	require.NoError(t, model.DB.Create(&user).Error)
-	require.NoError(t, model.DB.Create(&model.Token{
+	require.NoError(t, (&model.Token{
 		UserId:         user.Id,
 		Key:            "modelstestkey",
 		Status:         common.TokenStatusEnabled,
 		ExpiredTime:    -1,
 		UnlimitedQuota: true,
-	}).Error)
+	}).Insert())
 
 	engine := gin.New()
 	SetRelayRouter(engine)
@@ -93,34 +91,34 @@ func setupRelayRouterTestDB(t *testing.T) {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
+	require.NoError(t, i18n.Init())
+	originalSQLitePath := common.SQLitePath
+	originalDB, originalLogDB := model.DB, model.LOG_DB
 	originalIsMasterNode := common.IsMasterNode
 	originalRedisEnabled := common.RedisEnabled
-	originalSQLitePath := common.SQLitePath
 	originalMainDatabaseType := common.MainDatabaseType()
 	originalLogDatabaseType := common.LogDatabaseType()
-	originalSQLDSN, hadSQLDSN := os.LookupEnv("SQL_DSN")
-
+	database, dsn := oauthBirthFixture(t)
+	common.SetDatabaseTypes(common.DatabaseType(database.Dialector.Name()), common.DatabaseType(database.Dialector.Name()))
 	common.IsMasterNode = false
 	common.RedisEnabled = false
-	common.SQLitePath = fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
-	require.NoError(t, os.Setenv("SQL_DSN", "local"))
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}, &model.Option{}))
+	if database.Dialector.Name() == "sqlite" {
+		common.SQLitePath = dsn
+		t.Setenv("SQL_DSN", "")
+	}
 	require.NoError(t, model.InitDB())
-	model.LOG_DB = model.DB
-	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}))
+	initializedDB := model.DB
+	model.LOG_DB = initializedDB
 
 	t.Cleanup(func() {
-		if sqlDB, err := model.DB.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
+		pool, err := initializedDB.DB()
+		require.NoError(t, err)
+		require.NoError(t, pool.Close())
+		common.SQLitePath = originalSQLitePath
+		model.DB, model.LOG_DB = originalDB, originalLogDB
 		common.IsMasterNode = originalIsMasterNode
 		common.RedisEnabled = originalRedisEnabled
-		common.SQLitePath = originalSQLitePath
 		common.SetDatabaseTypes(originalMainDatabaseType, originalLogDatabaseType)
-		if hadSQLDSN {
-			require.NoError(t, os.Setenv("SQL_DSN", originalSQLDSN))
-		} else {
-			require.NoError(t, os.Unsetenv("SQL_DSN"))
-		}
 	})
 }
