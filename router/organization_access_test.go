@@ -3611,6 +3611,14 @@ func TestOrganizationSelectionProductionRoutes(t *testing.T) {
 	allow["POST /api/organizations/:org_id/authorization-context"] = true
 	allow["POST /api/platform/organizations/:org_id/authorization-context"] = true
 	pathlessS3 := map[string]bool{"POST /api/organizations": true, "GET /api/organization-invitations": true, "GET /api/organization-ownership-transfers": true, "GET /api/verify/methods": true, "POST /api/verify": true, "POST /api/user/passkey/verify/begin": true, "POST /api/user/passkey/verify/finish": true}
+	pathlessS3["GET /api/organizations/limits"] = true
+	pathlessS3["PUT /api/option/organization_limits"] = true
+	walletRoutes := map[string]bool{
+		"GET /api/organizations/:org_id/wallet":                                      true,
+		"GET /api/platform/organizations/:org_id/wallet":                             true,
+		"POST /api/platform/organizations/:org_id/wallet/credits":                    true,
+		"POST /api/platform/organizations/:org_id/wallet/credits/:credit_id/reverse": true,
+	}
 	// Personal resource routes with an organization view enter their own
 	// authentication chain instead of the unsupported-selector rejection.
 	organizationView := map[string]bool{"GET /api/task/self": true}
@@ -3636,8 +3644,33 @@ func TestOrganizationSelectionProductionRoutes(t *testing.T) {
 		path := param.ReplaceAllString(route.Path, "s2-canary")
 		t.Run(key, func(t *testing.T) {
 			before := queries.Load()
+			beforeWrites := writes.Load()
 			s, h, d := f.request(t, route.Method, path+"?org_id=1", "", "", nil)
+			if route.Path == "/oauth/provider/login" || route.Path == "/oauth/provider/consent" || route.Path == "/oauth/provider/login/*trailing" || route.Path == "/oauth/provider/consent/*trailing" {
+				wantStatus, wantError := http.StatusBadRequest, "invalid_request"
+				if !strings.HasSuffix(route.Path, "/*trailing") && (route.Method == http.MethodGet || route.Method == http.MethodHead) {
+					// This fixture has no stock embedded assets: canonical pages fail closed.
+					wantStatus, wantError = http.StatusServiceUnavailable, "temporarily_unavailable"
+				}
+				assert.Equal(t, wantStatus, s)
+				assert.Equal(t, "private, no-store", h.Get("Cache-Control"))
+				assert.Equal(t, "no-referrer", h.Get("Referrer-Policy"))
+				assert.Equal(t, "frame-ancestors 'none'", h.Get("Content-Security-Policy"))
+				assert.Equal(t, "DENY", h.Get("X-Frame-Options"))
+				assert.Empty(t, h.Get("Location"))
+				assert.Equal(t, before, queries.Load())
+				assert.Equal(t, beforeWrites, writes.Load())
+				if route.Method == http.MethodHead {
+					assert.Empty(t, d)
+				} else {
+					assert.Equal(t, wantError, d["error"])
+				}
+				return
+			}
 			wantStatus := 403
+			if walletRoutes[key] {
+				wantStatus = 400
+			}
 			if pathlessS3[key] {
 				wantStatus = 400
 			}
@@ -3653,6 +3686,9 @@ func TestOrganizationSelectionProductionRoutes(t *testing.T) {
 			}
 			if strings.HasPrefix(path, "/api/") || path == "/api" {
 				wantCode := "ORG_RESOURCE_UNSUPPORTED"
+				if walletRoutes[key] {
+					wantCode = "ORG_SELECTOR_INVALID"
+				}
 				if pathlessS3[key] {
 					wantCode = "ORG_SELECTOR_NOT_ALLOWED"
 				}
@@ -3872,11 +3908,29 @@ func TestOrganizationRateLimitContract(t *testing.T) {
 	SetRouter(e, WebAssets{IndexPage: []byte("fallback")})
 	srv := httptest.NewServer(e)
 	defer srv.Close()
+	// Exhaust the shared loopback bucket without clearing any global state.
+	// The isolated client below must still receive its own first admission.
 	for i := range 2 {
 		req, err := http.NewRequest("GET", srv.URL+"/api/organization-context", nil)
 		require.NoError(t, err)
 		req.Header.Set("Authorization", "Bearer "+f.bearer["owner"])
 		resp, err := srv.Client().Do(req)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		require.NoError(t, err)
+		if i == 1 {
+			require.Equal(t, http.StatusTooManyRequests, resp.StatusCode, "shared loopback bucket is occupied")
+		}
+	}
+	transport := &http.Transport{DialContext: (&net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.35")}}).DialContext}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	for i := range 2 {
+		req, err := http.NewRequest("GET", srv.URL+"/api/organization-context", nil)
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer "+f.bearer["owner"])
+		resp, err := client.Do(req)
 		require.NoError(t, err)
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -3899,7 +3953,7 @@ func TestOrganizationRateLimitContract(t *testing.T) {
 		common.RDB = nil
 		req, err := http.NewRequest("GET", srv.URL+"/api/organization-context", nil)
 		require.NoError(t, err)
-		resp, err := srv.Client().Do(req)
+		resp, err := client.Do(req)
 		common.RDB = old
 		require.NoError(t, err)
 		body, err := io.ReadAll(resp.Body)

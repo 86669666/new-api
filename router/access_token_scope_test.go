@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -67,6 +69,16 @@ var accessTokenExemptRoutes = []string{
 	"GET /api/subscription/epay/return",
 	"POST /api/subscription/epay/return",
 
+	// Dedicated relay-key owners, never dashboard PAT routes.
+	"POST /api/events",
+	"POST /api/events/",
+	"GET /api/usage/token/logs",
+	"GET /api/usage/token/stat",
+	// Exact provider slash rejection routes, checked below.
+	"POST /api/oauth/provider/login/",
+	"POST /api/oauth/provider/login/preview/",
+	"POST /api/oauth/provider/consent/",
+	"POST /api/oauth/provider/consent/preview/",
 	// API key authentication (TokenAuthReadOnly).
 	"GET /api/usage/token/",
 	"GET /api/log/token",
@@ -86,6 +98,11 @@ func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
 	// A permission route that is also in the static table panics here.
 	require.NotPanics(t, func() {
 		SetApiRouter(engine)
+		// Zero-value bridge reserves routes without configuring an upstream or activation.
+		bridge := &service.OAuthProviderBridge{}
+		require.Nil(t, bridge.Public())
+		require.False(t, bridge.RevocationEnabled())
+		SetOAuthProviderRouter(engine, bridge)
 		SetDashboardRouter(engine)
 		SetRelayRouter(engine)
 		SetTaskPluginProtocolRouter(engine)
@@ -97,6 +114,15 @@ func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
 
 func TestAccessTokenRouteRulesCoverEveryDashboardRoute(t *testing.T) {
 	engine := newAccessTokenScopeTestEngine(t)
+	for _, phase := range []string{"login", "consent"} {
+		for _, suffix := range []string{"/", "/preview/"} {
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/oauth/provider/"+phase+suffix, nil))
+			assert.Equal(t, http.StatusBadRequest, response.Code)
+			assert.Empty(t, response.Header().Get("Location"))
+			assert.Equal(t, "private, no-store", response.Header().Get("Cache-Control"))
+		}
+	}
 	exempt := map[string]bool{}
 	for _, key := range accessTokenExemptRoutes {
 		exempt[key] = true
