@@ -32,6 +32,7 @@ import (
 // BillingSession 封装单次请求的预扣费/结算/退款生命周期。
 // 实现 relaycommon.BillingSettler 接口。
 type BillingSession struct {
+	cacheAdmission   model.TokenCacheAdmissionObservation
 	taskObligationID int64
 	taskSendClaimed  bool
 	relayInfo        *relaycommon.RelayInfo
@@ -256,6 +257,19 @@ func (s *BillingSession) reserve(targetQuota int, acceptedTask bool) error {
 // 任一步骤失败时原子回滚已完成的步骤。
 func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIError {
 	effectiveQuota := quota
+	if quota > 0 && !s.relayInfo.IsPlayground && s.relayInfo.TokenId > 0 {
+		observation, err := model.ReadTokenCacheAdmissionObservation(s.relayInfo.TokenId, s.relayInfo.TokenKey)
+		if err == nil && observation.Rejects(quota) {
+			err = model.ErrTokenExhausted
+		}
+		if errors.Is(err, model.ErrTokenCacheIdentity) {
+			return types.NewErrorWithStatusCode(model.ErrTokenInvalid, types.ErrorCode("token_invalid"), http.StatusUnauthorized, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+		}
+		if err != nil {
+			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+		}
+		s.cacheAdmission = observation
+	}
 
 	// ---- 信任额度旁路 ----
 	if s.shouldTrust(c) {
@@ -405,7 +419,7 @@ func (s *BillingSession) shouldTrust(c *gin.Context) bool {
 	}
 
 	trustQuota := operation_setting.GetQuotaSetting().TrustQuotaUSD * common.QuotaPerUnit
-	if trustQuota <= 0 || math.IsNaN(trustQuota) || math.IsInf(trustQuota, 0) {
+	if trustQuota <= 0 || math.IsNaN(trustQuota) || math.IsInf(trustQuota, 0) || s.cacheAdmission.BlocksTrust(trustQuota) {
 		return false
 	}
 

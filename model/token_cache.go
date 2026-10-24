@@ -2,7 +2,10 @@ package model
 
 import (
 	"context"
+	"crypto/subtle"
+	"errors"
 	"fmt"
+	"gorm.io/gorm"
 	"strconv"
 	"time"
 
@@ -49,9 +52,8 @@ func invalidateTokenCacheForMutation(key string) error {
 
 // cacheInitToken publishes a database snapshot only when no mutation fence is
 // active and the hash is cold. An existing hash only gets its TTL refreshed:
-// its RemainQuota may already be ahead of this snapshot because atomic
-// pre-consume decrements Redis first, so a snapshot must never overwrite any
-// field of a live hash.
+// a live low observation may conservatively veto new admission. SQL alone
+// owns money; refreshing a projection must not erase that observation.
 // 返回值：0=被 fence 拦截，1=完成初始化，2=哈希已存在，仅刷新 TTL。
 func cacheInitToken(token Token) (int, error) {
 	if !common.RedisEnabled {
@@ -92,23 +94,79 @@ return 1`
 	).Int()
 }
 
-// cacheGetTokenByKey 从缓存读取 token；不完整的哈希（如仅有配额字段）会被拒绝。
-func cacheGetTokenByKey(key string) (*Token, error) {
+// ErrTokenCacheIdentity denotes an observed cache hit contradicting SQL identity.
+// It must never be treated as a miss and repaired by admitting this request.
+var ErrTokenCacheIdentity = errors.New("token cache identity conflict")
+var errTokenCacheUnavailable = errors.New("token cache observation unavailable")
+
+// TokenCacheAdmissionObservation is negative-only, nonpersistent evidence.
+// Only a SQL-bound cache read can populate it; the zero value grants nothing.
+type TokenCacheAdmissionObservation struct {
+	finite    bool
+	remaining int
+}
+
+func (o TokenCacheAdmissionObservation) Rejects(quota int) bool {
+	return quota > 0 && o.finite && o.remaining < quota
+}
+
+func (o TokenCacheAdmissionObservation) BlocksTrust(threshold float64) bool {
+	return o.finite && float64(o.remaining) <= threshold
+}
+
+func validatedTokenCache(key string) (*Token, TokenCacheAdmissionObservation, error) {
+	var observation TokenCacheAdmissionObservation
 	if !common.RedisEnabled {
-		return nil, fmt.Errorf("redis is not enabled")
+		return nil, observation, errTokenCacheUnavailable
+	}
+	fields, err := common.RDB.HGetAll(context.Background(), getTokenCacheKey(key)).Result()
+	if err != nil || len(fields) == 0 {
+		return nil, observation, errTokenCacheUnavailable
+	}
+	id, idErr := strconv.Atoi(fields["Id"])
+	owner, ownerErr := strconv.Atoi(fields["UserId"])
+	if idErr != nil || ownerErr != nil || id <= 0 || owner <= 0 {
+		return nil, observation, ErrTokenCacheIdentity
 	}
 	var token Token
-	if err := common.RedisHGetObj(getTokenCacheKey(key), &token); err != nil {
-		return nil, err
+	if err := DB.Where("id = ?", id).First(&token).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, observation, ErrTokenCacheIdentity
+		}
+		return nil, observation, fmt.Errorf("%w: %v", ErrDatabase, err)
 	}
-	if token.Id <= 0 {
-		return nil, fmt.Errorf("token cache is incomplete")
+	if token.UserId != owner || subtle.ConstantTimeCompare([]byte(token.Key), []byte(key)) != 1 {
+		return nil, observation, ErrTokenCacheIdentity
 	}
-	var money Token
-	if err := DB.Select("id", "remain_quota", "used_quota", "unlimited_quota").Where("id = ? AND "+commonKeyCol+" = ?", token.Id, key).First(&money).Error; err != nil {
-		return nil, err
+	// Never accept a stored raw key in a mismatched slot, even though normal
+	// projections deliberately omit that credential.
+	if cachedKey, present := fields["Key"]; present && cachedKey != key {
+		return nil, observation, ErrTokenCacheIdentity
 	}
-	token.RemainQuota, token.UsedQuota, token.UnlimitedQuota = money.RemainQuota, money.UsedQuota, money.UnlimitedQuota
-	token.Key = key
-	return &token, nil
+	if remaining, err := strconv.Atoi(fields["RemainQuota"]); err == nil && !token.UnlimitedQuota {
+		observation = TokenCacheAdmissionObservation{finite: true, remaining: remaining}
+	}
+	return &token, observation, nil
+}
+
+func cacheGetTokenByKey(key string) (*Token, error) {
+	token, _, err := validatedTokenCache(key)
+	return token, err
+}
+
+// ReadTokenCacheAdmissionObservation does not reserve, refund, or publish money.
+// Misses/Redis outages contribute no veto. SQL errors and observed identity
+// conflicts remain errors, never an invented zero balance or a positive grant.
+func ReadTokenCacheAdmissionObservation(tokenID int, key string) (TokenCacheAdmissionObservation, error) {
+	token, observation, err := validatedTokenCache(key)
+	if errors.Is(err, errTokenCacheUnavailable) {
+		return TokenCacheAdmissionObservation{}, nil
+	}
+	if err != nil {
+		return TokenCacheAdmissionObservation{}, err
+	}
+	if token.Id != tokenID {
+		return TokenCacheAdmissionObservation{}, ErrTokenCacheIdentity
+	}
+	return observation, nil
 }

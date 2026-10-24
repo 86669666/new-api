@@ -771,9 +771,8 @@ func TokenAuth() func(c *gin.Context) {
 				return
 			}
 			if err == nil {
-				// SQL owns identity and restrictions, but token quota has not
-				// cut over to SQL. Preserve the validated legacy snapshot's
-				// monetary quantities, including concurrent Redis reservations.
+				// SQL owns identity, restrictions and monetary quantities.
+				// A separately verified cache observation can only veto new admission.
 				sqlToken.RemainQuota, sqlToken.UsedQuota = token.RemainQuota, token.UsedQuota
 				token = &sqlToken
 			}

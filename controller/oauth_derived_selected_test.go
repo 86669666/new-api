@@ -269,11 +269,7 @@ func TestOAuthDerivedSelectedHTTP(t *testing.T) {
 						t.Cleanup(func() { require.NoError(t, db.AutoMigrate(&model.OAuthDerivedTokenSource{})) })
 					}
 					if strings.Contains(tc.name, "cache_") {
-						cache := miniredis.RunT(t)
-						oldRDB := common.RDB
-						common.RDB = redis.NewClient(&redis.Options{Addr: cache.Addr()})
-						common.RedisEnabled = true
-						t.Cleanup(func() { require.NoError(t, common.RDB.Close()); common.RDB = oldRDB; common.RedisEnabled = false })
+						installOAuthSelectedTokenCache(t, token, 100)
 						// This is the real cache decoder's identity input, not a fake TokenAuth.
 						require.NoError(t, common.RDB.HSet(context.Background(), "token:"+common.GenerateHMAC(token.Key), map[string]any{"Id": token.Id + 100000, "UserId": user.Id + 100000, "Status": common.TokenStatusEnabled, "ExpiredTime": now + 300, "RemainQuota": 100}).Err())
 					}
@@ -527,6 +523,7 @@ func runOAuthSelectedCompatibility(t *testing.T, db, observer *gorm.DB) {
 		require.NoError(t, observer.First(&payer, user.Id).Error)
 		assert.Equal(t, 10000000, payer.Quota)
 	})
+	t.Run("cache_admission_controls", func(t *testing.T) { runOAuthCacheAdmissionControls(t, db, observer) })
 	for _, name := range []string{"manual_success", "playground_success", "playground_expired", "playground_revoked", "playground_invalid", "playground_PAT", "playground_spoof", "playground_derived_token", "generic_missing_principal"} {
 		t.Run(name, func(t *testing.T) {
 			user := model.User{Username: name, AffCode: name, Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default", Quota: 100000, Setting: `{"billing_preference":"wallet_only"}`}
@@ -671,11 +668,25 @@ func runOAuthSelectedCompatibility(t *testing.T, db, observer *gorm.DB) {
 
 func installOAuthSelectedTokenCache(t *testing.T, token model.Token, remain int) {
 	t.Helper()
-	cache := miniredis.RunT(t)
+	addr := os.Getenv("NEWAPI_TEST_REDIS_ADDR")
+	if addr == "" {
+		addr = miniredis.RunT(t).Addr()
+	} else {
+		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+		host, _, err := net.SplitHostPort(addr)
+		require.NoError(t, err)
+		require.Equal(t, "127.0.0.1", host)
+	}
 	oldRDB, oldEnabled := common.RDB, common.RedisEnabled
-	common.RDB = redis.NewClient(&redis.Options{Addr: cache.Addr()})
+	common.RDB = redis.NewClient(&redis.Options{Addr: addr, MaxRetries: -1})
 	common.RedisEnabled = true
-	t.Cleanup(func() { require.NoError(t, common.RDB.Close()); common.RDB, common.RedisEnabled = oldRDB, oldEnabled })
+	client := common.RDB
+	require.NoError(t, client.Ping(t.Context()).Err())
+	t.Cleanup(func() {
+		require.NoError(t, client.Del(context.Background(), "token:"+common.GenerateHMAC(token.Key), "token:fence:"+common.GenerateHMAC(token.Key)).Err())
+		require.NoError(t, client.Close())
+		common.RDB, common.RedisEnabled = oldRDB, oldEnabled
+	})
 	require.NoError(t, common.RDB.HSet(context.Background(), "token:"+common.GenerateHMAC(token.Key), map[string]any{"Id": token.Id, "UserId": token.UserId, "Status": common.TokenStatusEnabled, "ExpiredTime": time.Now().Unix() + 300, "RemainQuota": remain, "UsedQuota": 0}).Err())
 }
 
@@ -712,4 +723,148 @@ func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
 	require.NoError(t, db.Table("tokens").Count(&rows).Error)
 	require.Zero(t, rows, "producer must return a fresh namespace without token writers")
 	return db, birth.DSN
+}
+
+// Exercise the formal TokenAuth -> BillingSession boundary with independent
+// SQL money and Redis observations, including actual miss/transport failures.
+func runOAuthCacheAdmissionControls(t *testing.T, db, observer *gorm.DB) {
+	for _, tc := range []struct {
+		name                                                 string
+		sqlQuota, cacheQuota, requestQuota, status, reserved int
+		unlimited                                            bool
+	}{
+		{"owner_conflict", 1000, 1000, 10, 401, 0, false},
+		{"key_id_conflict", 1000, 1000, 10, 401, 0, false},
+		{"key_member_conflict", 1000, 1000, 10, 401, 0, false},
+		{"deleted_sql", 1000, 1000, 10, 401, 0, false},
+		{"miss", 1000, 1000, 10, 200, 0, false},
+		{"unreachable", 1000, 1000, 10, 200, 0, false},
+		{"trust_only", 1000, 50, 10, 200, 10, false},
+		{"below_admission", 1000, 1, 10, 403, 0, false},
+		{"high_cache_low_sql", 5, 1000000, 10, 403, 0, false},
+		{"fake_unlimited", 5, 1000000, 10, 403, 0, false},
+		{"sql_unlimited", 0, 1, 10, 200, 0, true},
+		{"zero", 1000, 0, 0, 200, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := model.User{Username: "cachepolicy_" + tc.name, AffCode: "cp_" + tc.name, Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default", Quota: 1000, Setting: `{"billing_preference":"wallet_only"}`}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: "cachepolicy" + tc.name, Status: common.TokenStatusEnabled, ExpiredTime: time.Now().Unix() + 300, RemainQuota: tc.sqlQuota, UnlimitedQuota: tc.unlimited}
+			require.NoError(t, db.Create(&token).Error)
+			installOAuthSelectedTokenCache(t, token, tc.cacheQuota)
+			realCache := common.RDB
+			key := "token:" + common.GenerateHMAC(token.Key)
+			require.NoError(t, realCache.HSet(t.Context(), key, "UsedQuota", 777).Err())
+			switch tc.name {
+			case "owner_conflict":
+				require.NoError(t, realCache.HSet(t.Context(), key, "UserId", user.Id+10000).Err())
+			case "key_id_conflict":
+				other := model.Token{UserId: user.Id, Key: "different_request_key", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000}
+				require.NoError(t, db.Create(&other).Error)
+				require.NoError(t, realCache.HSet(t.Context(), key, "Id", other.Id).Err())
+			case "key_member_conflict":
+				require.NoError(t, realCache.HSet(t.Context(), key, "Key", "other_key").Err())
+			case "deleted_sql":
+				require.NoError(t, db.Delete(&token).Error)
+			case "fake_unlimited":
+				require.NoError(t, realCache.HSet(t.Context(), key, "UnlimitedQuota", true).Err())
+			case "miss":
+				require.NoError(t, realCache.Del(t.Context(), key).Err())
+			case "unreachable":
+				unreachable := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0", MaxRetries: -1, DialTimeout: time.Second})
+				common.RDB = unreachable
+				t.Cleanup(func() { require.NoError(t, unreachable.Close()); common.RDB = realCache })
+			}
+			oldTrust := operation_setting.GetQuotaSetting().TrustQuotaUSD
+			operation_setting.GetQuotaSetting().TrustQuotaUSD = 100 / common.QuotaPerUnit
+			t.Cleanup(func() { operation_setting.GetQuotaSetting().TrustQuotaUSD = oldTrust })
+			var moneyAttempts atomic.Int64
+			callback := "cache_admission_" + tc.name
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "tokens" || tx.Statement.Table == "users" {
+					// SQLite admission takes its existing user lock through an
+					// auth_version no-op. Count monetary updates, not that lock.
+					if fields, ok := tx.Statement.Dest.(map[string]any); ok {
+						for _, name := range []string{"quota", "remain_quota", "used_quota"} {
+							if _, money := fields[name]; money {
+								moneyAttempts.Add(1)
+								break
+							}
+						}
+					}
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove(callback)) })
+			calls := 0
+			engine := gin.New()
+			engine.POST("/v1/chat/completions", middleware.TokenAuth(), func(c *gin.Context) {
+				calls++
+				general, err := model.GetTokenByKey(token.Key, false)
+				require.NoError(t, err)
+				assert.Equal(t, tc.sqlQuota, general.RemainQuota)
+				assert.Zero(t, general.UsedQuota)
+				assert.Equal(t, tc.unlimited, general.UnlimitedQuota)
+				observation, err := model.ReadTokenCacheAdmissionObservation(token.Id, token.Key)
+				require.NoError(t, err)
+				if tc.name == "below_admission" {
+					assert.True(t, observation.Rejects(10))
+				}
+				info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, TokenUnlimited: c.GetBool("token_unlimited_quota")}
+				info.UserSetting.BillingPreference = "wallet_only"
+				session, apiErr := service.NewBillingSession(c, info, tc.requestQuota)
+				if tc.status == 403 {
+					require.Nil(t, session)
+					require.NotNil(t, apiErr)
+					assert.Equal(t, types.ErrorCodePreConsumeTokenQuotaFailed, apiErr.GetErrorCode())
+					assert.Equal(t, 403, apiErr.StatusCode)
+					c.Status(apiErr.StatusCode)
+					return
+				}
+				require.Nil(t, apiErr)
+				require.NotNil(t, session)
+				assert.Equal(t, tc.reserved, session.GetPreConsumedQuota())
+				var current model.Token
+				require.NoError(t, observer.First(&current, token.Id).Error)
+				assert.Equal(t, tc.sqlQuota-tc.reserved, current.RemainQuota)
+				if tc.name == "trust_only" {
+					// The low observation may veto only NEW admission, never historical settle.
+					require.NoError(t, realCache.HSet(t.Context(), key, "Id", token.Id, "UserId", user.Id, "RemainQuota", 0).Err())
+					require.NoError(t, session.Settle(20))
+					require.NoError(t, session.Settle(20))
+				}
+				c.Status(200)
+			})
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			req.Header.Set("Authorization", "Bearer sk-"+token.Key)
+			engine.ServeHTTP(w, req)
+			assert.Equal(t, tc.status, w.Code, w.Body.String())
+			if tc.status == 401 {
+				assert.Zero(t, calls)
+				assert.Contains(t, w.Body.String(), "token_invalid")
+			} else {
+				assert.Equal(t, 1, calls)
+			}
+			spent := tc.reserved
+			if tc.name == "trust_only" {
+				spent = 20
+			}
+			var stored model.Token
+			require.NoError(t, observer.Unscoped().First(&stored, token.Id).Error)
+			assert.Equal(t, tc.sqlQuota-spent, stored.RemainQuota)
+			assert.Equal(t, spent, stored.UsedQuota)
+			var payer model.User
+			require.NoError(t, observer.First(&payer, user.Id).Error)
+			assert.Equal(t, 1000-spent, payer.Quota)
+			assert.Equal(t, user.AuthVersion, payer.AuthVersion)
+			if tc.name == "below_admission" || tc.status == 401 {
+				assert.Zero(t, moneyAttempts.Load(), "veto must precede any attempted money update")
+			}
+			if tc.status != 200 {
+				remaining, err := realCache.HGet(t.Context(), key, "RemainQuota").Int()
+				require.NoError(t, err)
+				assert.Equal(t, tc.cacheQuota, remaining)
+			}
+		})
+	}
 }

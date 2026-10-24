@@ -258,7 +258,7 @@ func ValidateUserToken(key string) (token *Token, err error) {
 		return token, nil
 	}
 	common.SysLog(common.LogText("ValidateUserToken: failed to get token: %s", err.Error()))
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, ErrTokenCacheIdentity) {
 		return nil, ErrTokenInvalid
 	}
 	return nil, fmt.Errorf("%w: %v", ErrDatabase, err)
@@ -291,7 +291,10 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		if err == nil {
 			return token, nil
 		}
-		// Don't return error - fall through to DB
+		if !errors.Is(err, errTokenCacheUnavailable) {
+			return nil, err
+		}
+		// A genuine miss or Redis outage may fall through to canonical SQL.
 	}
 	token = &Token{}
 	if err = DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
@@ -299,7 +302,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	}
 	if common.RedisEnabled {
 		// 冷缓存时用数据库快照初始化；已存在的哈希只刷新 TTL，
-		// 避免快照覆盖 Redis 中已被原子预扣的余额。初始化失败不影响本次读取。
+		// 保留已有负向准入观测；SQL 独立负责金融扣退。初始化失败不影响本次读取。
 		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
 			common.SysLog(common.LogText("failed to init token cache: %s", cacheErr.Error()))
 		}
