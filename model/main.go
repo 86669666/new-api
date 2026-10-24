@@ -184,6 +184,20 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error)
 }
 
 func InitDB() (err error) {
+	// An explicitly anchored SQLite database must be checked before the ORM
+	// can recreate a missing file. Unanchored legacy databases stay unready.
+	if path := os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"); path != "" {
+		j, e := readOAuthBirthJournal(path, true)
+		if e != nil {
+			return errOAuthBootstrap
+		}
+		if j.Engine == "sqlite" {
+			binding, e := oauthSQLiteBinding(common.SQLitePath)
+			if e != nil || binding != j.Binding || common.SQLitePath != j.Target {
+				return errOAuthBootstrap
+			}
+		}
+	}
 	db, dbType, err := chooseDB("SQL_DSN", false)
 	if err == nil {
 		common.SetMainDatabaseType(dbType)
@@ -195,6 +209,11 @@ func InitDB() (err error) {
 			db = db.Debug()
 		}
 		DB = db
+		if os.Getenv("OAUTH_BOOTSTRAP_JOURNAL") != "" {
+			if err := validateOAuthDerivedTokenAnchor(DB); err != nil {
+				return err
+			}
+		}
 		// MySQL charset/collation startup check: ensure Chinese-capable charset
 		if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
 			if err := checkMySQLChineseSupport(DB); err != nil {
@@ -355,6 +374,9 @@ func migrateDB() error {
 		&UserSession{},
 		&SessionRevocationEvent{},
 		&OAuthDerivedTextCharge{},
+		&OAuthDerivedTokenSource{},
+		&OAuthDerivedTokenHistory{},
+		&OAuthDerivedTokenBootstrapIdentity{},
 		&AuthFlow{},
 		&ExternalIdentityClaim{},
 		&PasskeyCredential{},

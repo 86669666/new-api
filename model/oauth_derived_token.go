@@ -17,7 +17,7 @@ var ErrOAuthDerivedTokenUnknown = errors.New("OAuth derived-token provenance is 
 
 // OAuthDerivedTokenSource retains both an unused first-create permission and,
 // once created, its immutable token provenance. It is never soft deleted.
-// K1a has no production writer, migration, bootstrap or issuance registration.
+// Fresh bootstrap establishes history; issuance remains unregistered and closed.
 type OAuthDerivedTokenSource struct {
 	GrantRef       string  `json:"-" gorm:"type:char(64);primaryKey;not null;uniqueIndex:uq_oauth_derived_grant_idem,priority:1"`
 	UserID         int     `json:"-" gorm:"not null;index:idx_oauth_derived_user_created,priority:1"`
@@ -122,8 +122,8 @@ func ValidateOAuthDerivedTokenStore(ctx context.Context) error {
 	return validateOAuthDerivedTokenStore(DB.WithContext(ctx), time.Now().Unix())
 }
 
-func validateOAuthDerivedTokenStore(db *gorm.DB, now int64) error {
-	for _, value := range []any{&OAuthDerivedTokenSource{}, &OAuthDerivedTokenHistory{}} {
+func validateOAuthDerivedTokenSchema(db *gorm.DB) error {
+	for _, value := range []any{&OAuthDerivedTokenSource{}, &OAuthDerivedTokenHistory{}, &OAuthDerivedTokenBootstrapIdentity{}} {
 		statement := &gorm.Statement{DB: db}
 		if err := statement.Parse(value); err != nil {
 			return ErrOAuthDerivedTokenUnknown
@@ -173,6 +173,16 @@ func validateOAuthDerivedTokenStore(db *gorm.DB, now int64) error {
 				return ErrOAuthDerivedTokenUnknown
 			}
 		}
+	}
+	return nil
+}
+
+func validateOAuthDerivedTokenStore(db *gorm.DB, now int64) error {
+	if err := validateOAuthDerivedTokenSchema(db); err != nil {
+		return err
+	}
+	if err := validateOAuthDerivedTokenAnchor(db); err != nil {
+		return err
 	}
 	var history []OAuthDerivedTokenHistory
 	if err := db.Limit(2).Find(&history).Error; err != nil || len(history) != 1 {
