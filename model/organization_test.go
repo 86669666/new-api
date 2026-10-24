@@ -82,7 +82,7 @@ func organizationDatabase(t *testing.T, dialect string) *organizationFixture {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(6)
 	sqlDB.SetMaxIdleConns(6)
-	tables := []any{&User{}, &UserSession{}, &AuthFlow{}, &UserAccessToken{}, &ExternalIdentityClaim{}, &Token{}, &PasskeyCredential{}, &TwoFA{}, &TwoFABackupCode{}, &UserOAuthBinding{}, &Organization{}, &OrganizationMember{}, &OrganizationInvitation{}, &OrganizationOwnershipTransfer{}, &OrganizationEvent{}, &OrganizationWallet{}, &OrganizationWalletEntry{}}
+	tables := []any{&Option{}, &User{}, &UserSession{}, &AuthFlow{}, &UserAccessToken{}, &ExternalIdentityClaim{}, &Token{}, &PasskeyCredential{}, &TwoFA{}, &TwoFABackupCode{}, &UserOAuthBinding{}, &Organization{}, &OrganizationMember{}, &OrganizationInvitation{}, &OrganizationOwnershipTransfer{}, &OrganizationEvent{}, &OrganizationWallet{}, &OrganizationWalletEntry{}}
 	owned := dialect == "sqlite"
 	t.Cleanup(func() {
 		if dialect != "sqlite" && owned {
