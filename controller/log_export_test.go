@@ -525,6 +525,68 @@ func TestUserQuotaDataSeriesContract(t *testing.T) {
 
 // These handler tests reuse the existing identity fixture; they do not bypass or
 // claim to exercise the route's authentication middleware.
+func TestUserLogInvalidFilterContract(t *testing.T) {
+	previousMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(previousMode) })
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Ping(), "validation errors are not database outages")
+	for _, tc := range []struct{ name, pattern, message string }{
+		{"consecutive", "%%", "The search pattern cannot contain consecutive % wildcards"},
+		{"too_many", "aa%bb%cc%dd", "The search pattern can contain at most 2 % wildcards"},
+		{"too_short", "%a", "Fuzzy search keywords must be at least 2 characters long"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/api/log/self?"+url.Values{"model_name": {tc.pattern}}.Encode(), nil)
+			ctx.Set("id", 1)
+			ctx.Set("auth_identity", service.AuthIdentity{UserID: 1})
+			ctx.Set("role", common.RoleCommonUser)
+			GetUserLogs(ctx)
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			assert.Equal(t, map[string]any{"success": false, "message": tc.message, "message_key": tc.message}, body,
+				"preserve the legacy validation response, without database code or data")
+		})
+	}
+}
+
+func TestUserLogFindFailureContract(t *testing.T) {
+	previousMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(previousMode) })
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	now := time.Now().Unix()
+	require.NoError(t, db.Create(&model.Log{UserId: 1, CreatedAt: now, RequestId: "bad-quota"}).Error)
+	require.NoError(t, db.Create(&model.Log{UserId: 1, CreatedAt: now, RequestId: "valid-row", Quota: 10}).Error)
+	// SQLite permits corrupt integer storage. COUNT succeeds, but reading the
+	// rows into the real model fails after encountering the valid newer row.
+	require.NoError(t, db.Model(&model.Log{}).Where("request_id = ?", "bad-quota").Update("quota", "not-an-integer").Error)
+	var count int64
+	require.NoError(t, db.Model(&model.Log{}).Count(&count).Error)
+	require.EqualValues(t, 2, count)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/log/self", nil)
+	ctx.Set("id", 1)
+	ctx.Set("auth_identity", service.AuthIdentity{UserID: 1})
+	ctx.Set("role", common.RoleCommonUser)
+	GetUserLogs(ctx)
+	var body map[string]any
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Equal(t, map[string]any{"success": false, "code": "LOG_QUERY_FAILED", "message": "Failed to query logs", "message_key": "Failed to query logs"}, body,
+		"a failed Find must not publish partially read rows")
+}
+
 func TestPersonalUsageQueryFailures(t *testing.T) {
 	previousMode := gin.Mode()
 	gin.SetMode(gin.TestMode)

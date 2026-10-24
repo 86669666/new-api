@@ -17213,5 +17213,78 @@
       "message_key": "Failed to query statistics"
     },
     "valid": false
+  },
+  {
+    "name": "personal log legacy invalid filter 1",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/200/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "The search pattern cannot contain consecutive % wildcards",
+      "message_key": "The search pattern cannot contain consecutive % wildcards"
+    },
+    "valid": true
+  },
+  {
+    "name": "personal log legacy invalid filter 2",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/200/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "The search pattern can contain at most 2 % wildcards",
+      "message_key": "The search pattern can contain at most 2 % wildcards"
+    },
+    "valid": true
+  },
+  {
+    "name": "personal log legacy invalid filter 3",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/200/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Fuzzy search keywords must be at least 2 characters long",
+      "message_key": "Fuzzy search keywords must be at least 2 characters long"
+    },
+    "valid": true
+  },
+  {
+    "name": "personal log validation must not become SQL error",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/200/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Failed to query logs",
+      "message_key": "Failed to query logs",
+      "code": "LOG_QUERY_FAILED"
+    },
+    "valid": false
+  },
+  {
+    "name": "personal log validation must not publish data",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/200/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "The search pattern cannot contain consecutive % wildcards",
+      "message_key": "The search pattern cannot contain consecutive % wildcards",
+      "data": []
+    },
+    "valid": false
+  },
+  {
+    "name": "personal log empty successful page",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/200/content/application~1json/schema",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": {
+        "page": 1,
+        "page_size": 10,
+        "total": 0,
+        "items": []
+      }
+    },
+    "valid": true
   }
 ]

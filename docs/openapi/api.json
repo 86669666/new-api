@@ -10324,7 +10324,7 @@
       "get": {
         "summary": "获取个人日志",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限）\nPersonal log pagination accepts page only when the parsed URL has no p key. Presence of p (including bare p, p=, malformed or repeated values) always wins; duplicate p/page values use the first. Empty, syntax-invalid or zero page numbers default to 1; legacy negative and platform-int overflow behavior is unchanged. Page size uses page_size, then ps, then size, then configured ItemsPerPage when the selected size is zero or fails its initial parse. Nonzero negative sizes retain legacy behavior; positive sizes are capped at 100. Pagination parsing introduces no new parameter validation errors or response fields. This alias does not apply to administrator logs, export, statistics or other endpoints. Ordinary users below the administrator role are subject to log_setting.max_range_days (default 365). The existing start_timestamp/end_timestamp range calculation uses the earlier of now and a nonzero end; a missing start defaults to that end minus the allowed range. Exactly the allowed span is accepted; a greater span returns HTTP400 LOG_RANGE_TOO_WIDE after personal owner validation and the ordinary-user role check. This failure retains success:false, message, message_key and message_params.days without data. Administrators retain their existing self-log range exemption. Invalid/conflicting organization selectors remain separate HTTP400 failures before authentication; timestamp validation is unchanged. Database query failure returns HTTP500 LOG_QUERY_FAILED with a fixed safe message and message_key, without data or partial results. HTTP200 denotes success:true; authentication and range errors retain their existing contracts.",
+        "description": "🔐 需要登录（User权限）\nPersonal log pagination accepts page only when the parsed URL has no p key. Presence of p (including bare p, p=, malformed or repeated values) always wins; duplicate p/page values use the first. Empty, syntax-invalid or zero page numbers default to 1; legacy negative and platform-int overflow behavior is unchanged. Page size uses page_size, then ps, then size, then configured ItemsPerPage when the selected size is zero or fails its initial parse. Nonzero negative sizes retain legacy behavior; positive sizes are capped at 100. Pagination parsing introduces no new parameter validation errors or response fields. This alias does not apply to administrator logs, export, statistics or other endpoints. Ordinary users below the administrator role are subject to log_setting.max_range_days (default 365). The existing start_timestamp/end_timestamp range calculation uses the earlier of now and a nonzero end; a missing start defaults to that end minus the allowed range. Exactly the allowed span is accepted; a greater span returns HTTP400 LOG_RANGE_TOO_WIDE after personal owner validation and the ordinary-user role check. This failure retains success:false, message, message_key and message_params.days without data. Administrators retain their existing self-log range exemption. Invalid/conflicting organization selectors remain separate HTTP400 failures before authentication; timestamp validation is unchanged. Database query failure returns HTTP500 LOG_QUERY_FAILED with a fixed safe message and message_key, without data or partial results. This guarantee is limited to database query failures; authentication and range errors retain their existing contracts. Pre-query invalid-filter validation retains legacy HTTP200 success:false with its original safe message and message_key, without code or data; clients must inspect success before consuming results.",
         "tags": [
           "日志"
         ],
@@ -10388,8 +10388,97 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful query only (success:true); existing response shape and empty-result behavior are unchanged.",
-            "headers": {}
+            "description": "Existing successful log page, or legacy pre-query invalid-filter validation (success:false with the original safe message/message_key, no code or data). Actual Count/Find failures use HTTP500 LOG_QUERY_FAILED.",
+            "headers": {},
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "success",
+                        "message",
+                        "data"
+                      ],
+                      "properties": {
+                        "success": {
+                          "type": "boolean",
+                          "enum": [
+                            true
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "enum": [
+                            ""
+                          ]
+                        },
+                        "data": {
+                          "type": "object"
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "success",
+                        "message",
+                        "message_key"
+                      ],
+                      "properties": {
+                        "success": {
+                          "type": "boolean",
+                          "enum": [
+                            false
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "enum": [
+                            "The search pattern cannot contain consecutive % wildcards",
+                            "The search pattern can contain at most 2 % wildcards",
+                            "Fuzzy search keywords must be at least 2 characters long"
+                          ]
+                        },
+                        "message_key": {
+                          "type": "string",
+                          "enum": [
+                            "The search pattern cannot contain consecutive % wildcards",
+                            "The search pattern can contain at most 2 % wildcards",
+                            "Fuzzy search keywords must be at least 2 characters long"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                },
+                "examples": {
+                  "invalid_filter_1": {
+                    "value": {
+                      "success": false,
+                      "message": "The search pattern cannot contain consecutive % wildcards",
+                      "message_key": "The search pattern cannot contain consecutive % wildcards"
+                    }
+                  },
+                  "invalid_filter_2": {
+                    "value": {
+                      "success": false,
+                      "message": "The search pattern can contain at most 2 % wildcards",
+                      "message_key": "The search pattern can contain at most 2 % wildcards"
+                    }
+                  },
+                  "invalid_filter_3": {
+                    "value": {
+                      "success": false,
+                      "message": "Fuzzy search keywords must be at least 2 characters long",
+                      "message_key": "Fuzzy search keywords must be at least 2 characters long"
+                    }
+                  }
+                }
+              }
+            }
           },
           "401": {
             "description": "Missing/invalid authentication",
@@ -10801,7 +10890,7 @@
       "get": {
         "summary": "获取个人额度数据",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限） Existing personal hourly quota series, grouped by authenticated user, username, model and stored bucket timestamp. Normal collection writes hour-start Unix seconds; filtering is inclusive on these stored bucket timestamps, with no sorting, zero-fill or day aggregation guarantee. DataExportEnabled gates new collection and periodic cache saving, not historical reads. Successful responses also expose granularity=hour, quota_per_unit, fixed data_complete=false and current enable_data_export. The current collection flag is a separate non-atomic configuration snapshot; it does not establish completeness of any historical range or prove zero usage. Quota remains a raw integer; quota_per_unit and existing display settings are separate from a complete currency presentation. The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. The range helper uses min(now,end) only for limit calculation and returns an adjusted start. The original parsed end, including 0 for missing or syntax-invalid input, is still passed to SQL; missing end does not become now. Existing parsing, data rows and success metadata are unchanged. Database query failure returns HTTP500 USAGE_QUERY_FAILED with a fixed safe message and message_key, without data or partial results. HTTP200 denotes success:true; authentication and range errors retain their existing contracts.",
+        "description": "🔐 需要登录（User权限） Existing personal hourly quota series, grouped by authenticated user, username, model and stored bucket timestamp. Normal collection writes hour-start Unix seconds; filtering is inclusive on these stored bucket timestamps, with no sorting, zero-fill or day aggregation guarantee. DataExportEnabled gates new collection and periodic cache saving, not historical reads. Successful responses also expose granularity=hour, quota_per_unit, fixed data_complete=false and current enable_data_export. The current collection flag is a separate non-atomic configuration snapshot; it does not establish completeness of any historical range or prove zero usage. Quota remains a raw integer; quota_per_unit and existing display settings are separate from a complete currency presentation. The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. The range helper uses min(now,end) only for limit calculation and returns an adjusted start. The original parsed end, including 0 for missing or syntax-invalid input, is still passed to SQL; missing end does not become now. Existing parsing, data rows and success metadata are unchanged. Database query failure returns HTTP500 USAGE_QUERY_FAILED with a fixed safe message and message_key, without data or partial results. This guarantee is limited to database query failures; authentication and range errors retain their existing contracts.",
         "tags": [
           "数据统计"
         ],

@@ -501,7 +501,7 @@ def check_personal_query_errors(api):
              '/api/data/self': ('USAGE_QUERY_FAILED', 'Failed to query statistics')}
     for path, (code, message) in codes.items():
         operation = api['paths'][path]['get']
-        assert 'HTTP200 denotes success:true' in operation['description']
+        assert 'guarantee is limited to database query failures' in operation['description']
         response = operation['responses']['500']['content']['application/json']
         assert response['schema'] == {
             'type': 'object', 'additionalProperties': False,
@@ -514,7 +514,23 @@ def check_personal_query_errors(api):
             },
         }
         validate_value(api, response['schema'], response['example'])
-    return {'scope': list(codes), 'database_error_status': 500,
+    log = api['paths']['/api/log/self']['get']
+    assert 'legacy HTTP200 success:false' in log['description']
+    media = log['responses']['200']['content']['application/json']
+    success, validation = media['schema']['anyOf']
+    assert success['properties']['success'] == {'type': 'boolean', 'enum': [True]}
+    assert validation['additionalProperties'] is False
+    assert validation['required'] == ['success', 'message', 'message_key']
+    assert validation['properties']['success'] == {'type': 'boolean', 'enum': [False]}
+    messages = ['The search pattern cannot contain consecutive % wildcards',
+                'The search pattern can contain at most 2 % wildcards',
+                'Fuzzy search keywords must be at least 2 characters long']
+    for field in ('message', 'message_key'):
+        assert validation['properties'][field] == {'type': 'string', 'enum': messages}
+    assert len(media['examples']) == 3
+    for example in media['examples'].values():
+        validate_value(api, media['schema'], example['value'])
+    return {'scope': list(codes), 'database_error_status': 500, 'log_filter_validation_status': 200,
             'no_partial_data': True, 'safe_messages': True, 'live_http': False}
 
 

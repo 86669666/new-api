@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -90,7 +91,11 @@ func GetUserLogs(c *gin.Context) {
 	}
 	logs, total, err := model.GetUserLogs(userID, filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
-		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Failed to query logs"), gin.H{"code": "LOG_QUERY_FAILED"})
+		if errors.Is(err, model.ErrUserLogQueryFailed) {
+			common.ApiErrorStatus(c, http.StatusInternalServerError, err, gin.H{"code": "LOG_QUERY_FAILED"})
+		} else {
+			common.ApiError(c, err)
+		}
 		return
 	}
 	pageInfo.SetTotal(int(total))
