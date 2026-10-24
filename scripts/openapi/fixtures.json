@@ -12692,14 +12692,14 @@
     "valid": true
   },
   {
-    "name": "personal hourly quota series legacy HTTP200 error",
+    "name": "personal hourly quota series rejects legacy HTTP200 error",
     "document": "api",
     "schema": "#/components/schemas/PersonalQuotaDataResult",
     "value": {
       "success": false,
       "message": "fixture database error"
     },
-    "valid": true
+    "valid": false
   },
   {
     "name": "personal hourly quota series missing data",
@@ -17089,6 +17089,128 @@
       "message": "本地化错误",
       "code": "TOKEN_USAGE_QUERY_FAILED",
       "data": []
+    },
+    "valid": false
+  },
+  {
+    "name": "LOG_QUERY_FAILED safe query error",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "LOG_QUERY_FAILED",
+      "message": "Failed to query logs",
+      "message_key": "Failed to query logs"
+    },
+    "valid": true
+  },
+  {
+    "name": "LOG_QUERY_FAILED partial data rejected",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "LOG_QUERY_FAILED",
+      "message": "Failed to query logs",
+      "message_key": "Failed to query logs",
+      "data": []
+    },
+    "valid": false
+  },
+  {
+    "name": "LOG_QUERY_FAILED success rejected",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": true,
+      "code": "LOG_QUERY_FAILED",
+      "message": "Failed to query logs",
+      "message_key": "Failed to query logs"
+    },
+    "valid": false
+  },
+  {
+    "name": "LOG_QUERY_FAILED wrong code rejected",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "TOKEN_USAGE_QUERY_FAILED",
+      "message": "Failed to query logs",
+      "message_key": "Failed to query logs"
+    },
+    "valid": false
+  },
+  {
+    "name": "LOG_QUERY_FAILED SQL detail rejected",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "LOG_QUERY_FAILED",
+      "message": "sql: database is closed",
+      "message_key": "Failed to query logs"
+    },
+    "valid": false
+  },
+  {
+    "name": "USAGE_QUERY_FAILED safe query error",
+    "document": "api",
+    "schema": "#/paths/~1api~1data~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "USAGE_QUERY_FAILED",
+      "message": "Failed to query statistics",
+      "message_key": "Failed to query statistics"
+    },
+    "valid": true
+  },
+  {
+    "name": "USAGE_QUERY_FAILED partial data rejected",
+    "document": "api",
+    "schema": "#/paths/~1api~1data~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "USAGE_QUERY_FAILED",
+      "message": "Failed to query statistics",
+      "message_key": "Failed to query statistics",
+      "data": []
+    },
+    "valid": false
+  },
+  {
+    "name": "USAGE_QUERY_FAILED success rejected",
+    "document": "api",
+    "schema": "#/paths/~1api~1data~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": true,
+      "code": "USAGE_QUERY_FAILED",
+      "message": "Failed to query statistics",
+      "message_key": "Failed to query statistics"
+    },
+    "valid": false
+  },
+  {
+    "name": "USAGE_QUERY_FAILED wrong code rejected",
+    "document": "api",
+    "schema": "#/paths/~1api~1data~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "TOKEN_USAGE_QUERY_FAILED",
+      "message": "Failed to query statistics",
+      "message_key": "Failed to query statistics"
+    },
+    "valid": false
+  },
+  {
+    "name": "USAGE_QUERY_FAILED SQL detail rejected",
+    "document": "api",
+    "schema": "#/paths/~1api~1data~1self/get/responses/500/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "USAGE_QUERY_FAILED",
+      "message": "sql: database is closed",
+      "message_key": "Failed to query statistics"
     },
     "valid": false
   }

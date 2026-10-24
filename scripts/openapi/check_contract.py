@@ -496,6 +496,28 @@ def check_personal_log_range_error(api):
             'code': 'LOG_RANGE_TOO_WIDE', 'selector_400_preserved': True, 'structured_message_preserved': True}
 
 
+def check_personal_query_errors(api):
+    codes = {'/api/log/self': ('LOG_QUERY_FAILED', 'Failed to query logs'),
+             '/api/data/self': ('USAGE_QUERY_FAILED', 'Failed to query statistics')}
+    for path, (code, message) in codes.items():
+        operation = api['paths'][path]['get']
+        assert 'HTTP200 denotes success:true' in operation['description']
+        response = operation['responses']['500']['content']['application/json']
+        assert response['schema'] == {
+            'type': 'object', 'additionalProperties': False,
+            'required': ['success', 'code', 'message', 'message_key'],
+            'properties': {
+                'success': {'type': 'boolean', 'enum': [False]},
+                'code': {'type': 'string', 'enum': [code]},
+                'message': {'type': 'string', 'enum': [message]},
+                'message_key': {'type': 'string', 'enum': [message]},
+            },
+        }
+        validate_value(api, response['schema'], response['example'])
+    return {'scope': list(codes), 'database_error_status': 500,
+            'no_partial_data': True, 'safe_messages': True, 'live_http': False}
+
+
 def check_personal_quota_series(api):
     operation = api['paths']['/api/data/self']['get']
     parameters = operation['parameters'][2:]
@@ -514,9 +536,8 @@ def check_personal_quota_series(api):
         '$ref': '#/components/schemas/PersonalQuotaDataResult'}
     schemas = api['components']['schemas']
     result = schemas['PersonalQuotaDataResult']
-    assert {key: value for key, value in result.items() if key != 'description'} == {'anyOf': [
+    assert {key: value for key, value in result.items() if key != 'description'} == {'allOf': [
         {'$ref': '#/components/schemas/PersonalQuotaDataSuccess'},
-        {'$ref': '#/components/schemas/ManagementError'},
     ]}
     success = schemas['PersonalQuotaDataSuccess']
     assert success['type'] == 'object' and 'additionalProperties' not in success
@@ -547,7 +568,7 @@ def check_personal_quota_series(api):
         assert {key: value for key, value in field.items() if key != 'description'} == expected
     assert 'placeholder' in point['description']
     return {'scope': 'GET /api/data/self existing hourly series', 'query_parameters': [p['name'] for p in parameters],
-            'legacy_200_error_preserved': True, 'empty_array_and_nullable_compatibility': True,
+            'database_error_status': 500, 'empty_array_and_nullable_compatibility': True,
             'collection_disabled_keeps_history': True, 'success_metadata': ['granularity', 'quota_per_unit', 'data_complete', 'enable_data_export'],
             'historical_completeness': False, 'live_http': False}
 
@@ -1546,6 +1567,7 @@ def main():
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['personal_log_range_error'] = check_personal_log_range_error(api)
     results['personal_quota_series'] = check_personal_quota_series(api)
+    results['personal_query_errors'] = check_personal_query_errors(api)
     results['oauth_userinfo'] = check_oauth_userinfo(api, source_root)
     results['oauth_balance'] = check_oauth_balance(api, source_root)
     results['oauth_provider'] = check_oauth_provider(api, source_root)

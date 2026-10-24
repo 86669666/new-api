@@ -523,6 +523,75 @@ func TestUserQuotaDataSeriesContract(t *testing.T) {
 	})
 }
 
+// These handler tests reuse the existing identity fixture; they do not bypass or
+// claim to exercise the route's authentication middleware.
+func TestPersonalUsageQueryFailures(t *testing.T) {
+	previousMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(previousMode) })
+	for _, tc := range []struct {
+		name, path, code, message string
+		handler                   gin.HandlerFunc
+	}{
+		{"logs", "/api/log/self", "LOG_QUERY_FAILED", "Failed to query logs", GetUserLogs},
+		{"usage", "/api/data/self", "USAGE_QUERY_FAILED", "Failed to query statistics", GetUserQuotaDates},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, _ := newAuditTestDatabase(t, "sqlite", "")
+			useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Log{}, &model.QuotaData{}))
+			end := time.Now().Unix() - 3600
+			seedExportLogs(t, db, db, end)
+			require.NoError(t, db.Create(&model.QuotaData{UserID: 1, Username: "alice", ModelName: "owned", CreatedAt: end, Quota: 12}).Error)
+			previousExport := common.DataExportEnabled
+			common.DataExportEnabled = false
+			t.Cleanup(func() { common.DataExportEnabled = previousExport })
+			// A valid empty result is still a successful query, including when
+			// collection is disabled. Another user's stored rows stay private.
+			empty := httptest.NewRecorder()
+			emptyCtx, _ := gin.CreateTestContext(empty)
+			emptyCtx.Request = httptest.NewRequest(http.MethodGet, fmt.Sprintf("%s?start_timestamp=%d&end_timestamp=%d", tc.path, end-7200, end), nil)
+			emptyCtx.Set("id", 3)
+			emptyCtx.Set("auth_identity", service.AuthIdentity{UserID: 3})
+			emptyCtx.Set("role", common.RoleCommonUser)
+			tc.handler(emptyCtx)
+			var emptyBody map[string]any
+			require.NoError(t, common.Unmarshal(empty.Body.Bytes(), &emptyBody))
+			require.Equal(t, http.StatusOK, empty.Code)
+			require.Equal(t, true, emptyBody["success"])
+			assert.NotContains(t, emptyBody, "code")
+			if tc.name == "logs" {
+				page, ok := emptyBody["data"].(map[string]any)
+				require.True(t, ok)
+				assert.EqualValues(t, 0, page["total"])
+				assert.Empty(t, page["items"])
+			} else {
+				assert.Equal(t, []any{}, emptyBody["data"])
+			}
+
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			require.NoError(t, sqlDB.Close())
+			for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser} {
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodGet, fmt.Sprintf("%s?start_timestamp=%d&end_timestamp=%d", tc.path, end-7200, end), nil)
+				ctx.Set("id", 1)
+				ctx.Set("auth_identity", service.AuthIdentity{UserID: 1})
+				ctx.Set("role", role)
+				tc.handler(ctx)
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+				assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+				assert.Equal(t, map[string]any{
+					"success": false, "code": tc.code,
+					"message": tc.message, "message_key": tc.message,
+				}, body, "no data, partial rows, metadata or SQL details on query failure")
+			}
+		})
+	}
+}
+
 func TestLogExportRules(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, _ := newAuditTestDatabase(t, "sqlite", "")

@@ -71,7 +71,7 @@ func GetUserQuotaDates(c *gin.Context) {
 	}
 	dates, err := model.GetQuotaDataByUserId(userId, startTimestamp, endTimestamp)
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Failed to query statistics"), gin.H{"code": "USAGE_QUERY_FAILED"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{

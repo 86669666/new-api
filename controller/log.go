@@ -90,7 +90,7 @@ func GetUserLogs(c *gin.Context) {
 	}
 	logs, total, err := model.GetUserLogs(userID, filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Failed to query logs"), gin.H{"code": "LOG_QUERY_FAILED"})
 		return
 	}
 	pageInfo.SetTotal(int(total))
