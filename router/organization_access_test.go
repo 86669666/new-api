@@ -649,8 +649,7 @@ func (tx *clientEventsUncertainTx) Commit() error {
 func (tx *clientEventsUncertainTx) Rollback() error { return tx.ConnPool.(gorm.TxCommitter).Rollback() }
 
 func TestRelayTokenErrorCodesHTTP(t *testing.T) {
-	require.Equal(t, "g20-token-error-codes", os.Getenv("NEWAPI_S2_OWNED"))
-	f := newOrganizationHTTPFixture(t)
+	f := newOrganizationProfileFixture(t, "g20-token-error-codes")
 	now := time.Now().Unix()
 	for index, tc := range []struct {
 		name       string
@@ -2502,8 +2501,7 @@ func TestOAuthUserInfoHTTP(t *testing.T) {
 // Explicit administrator facts enrich already visible rows, never their pricing
 // or authorization. The owned runner invokes this one root on each real dialect.
 func TestModelCapabilityMetadataHTTP(t *testing.T) {
-	require.Equal(t, "g19-model-capability-metadata", os.Getenv("NEWAPI_S2_OWNED"))
-	f := newOrganizationHTTPFixture(t)
+	f := newOrganizationProfileFixture(t, "g19-model-capability-metadata")
 	require.NoError(t, f.db.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Channel{}, &model.Ability{}, &model.PasskeyCredential{}))
 	common.OptionMapRWMutex.Lock()
 	previousOptions := common.OptionMap
@@ -2918,16 +2916,25 @@ func TestModelCapabilityMetadataHTTP(t *testing.T) {
 func TestSiteDescriptionHTTP(t *testing.T) {
 	if mode := os.Getenv("NEWAPI_SITE_DESCRIPTION_NODE"); mode != "" {
 		require.Contains(t, []string{"compete", "reopen", "closed"}, mode)
-		require.Equal(t, "g18-site-description", os.Getenv("NEWAPI_S2_OWNED"))
-		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
-		require.Equal(t, "none", os.Getenv("NEWAPI_S2_CACHE_MODE"))
 		kind, dsn := os.Getenv("NEWAPI_S2_MAIN"), os.Getenv("NEWAPI_SITE_DESCRIPTION_DSN")
-		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
-		require.Equal(t, kind, os.Getenv("NEWAPI_S2_LOG"))
+		trusted := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != ""
+		if trusted {
+			kind = os.Getenv("NEWAPI_SITE_DESCRIPTION_ENGINE")
+			require.Equal(t, "sqlite", kind)
+			organizationTrustedSQLitePath(t, dsn, os.Getenv("NEWAPI_SITE_DESCRIPTION_ROOT"))
+		} else {
+			require.Equal(t, "g18-site-description", os.Getenv("NEWAPI_S2_OWNED"))
+			require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+			require.Equal(t, "none", os.Getenv("NEWAPI_S2_CACHE_MODE"))
+			require.Contains(t, []string{"sqlite", "mysql", "postgres"}, kind)
+			require.Equal(t, kind, os.Getenv("NEWAPI_S2_LOG"))
+		}
 		var dial gorm.Dialector
 		if kind == "sqlite" {
 			require.True(t, filepath.IsAbs(dsn))
-			require.Equal(t, "organization.db", filepath.Base(dsn))
+			if !trusted {
+				require.Equal(t, "organization.db", filepath.Base(dsn))
+			}
 			info, err := os.Lstat(dsn)
 			require.NoError(t, err)
 			require.True(t, info.Mode().IsRegular())
@@ -2951,6 +2958,9 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 		conn, err := db.DB()
 		require.NoError(t, err)
 		model.DB = db
+		if trusted {
+			require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+		}
 		if mode == "closed" {
 			require.NoError(t, conn.Close())
 			require.Error(t, model.InitSiteInstanceID())
@@ -2979,7 +2989,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 		return
 	}
 
-	f := newOrganizationHTTPFixture(t)
+	f := newOrganizationProfileFixture(t, "g18-site-description")
 	oldAddress, oldGithub := system_setting.ServerAddress, common.GitHubOAuthEnabled
 	common.OptionMapRWMutex.Lock()
 	oldOptions := common.OptionMap
@@ -3005,7 +3015,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		n := &node{cancel: cancel, mode: mode}
 		n.cmd = exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSiteDescriptionHTTP$", "-test.timeout=25s")
-		n.cmd.Env = append(os.Environ(), "NEWAPI_SITE_DESCRIPTION_NODE="+mode, "NEWAPI_SITE_DESCRIPTION_DSN="+f.mainDSN)
+		n.cmd.Env = append(os.Environ(), "NEWAPI_SITE_DESCRIPTION_NODE="+mode, "NEWAPI_SITE_DESCRIPTION_DSN="+f.mainDSN, "NEWAPI_SITE_DESCRIPTION_ENGINE="+f.mainKind, "NEWAPI_SITE_DESCRIPTION_ROOT="+filepath.Dir(f.mainDSN))
 		n.cmd.Stdout, n.cmd.Stderr = &n.output, &n.output
 		var readyWriter, releaseReader *os.File
 		if mode == "compete" {
@@ -3040,7 +3050,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 		t.Helper()
 		err := n.cmd.Wait()
 		n.waited = true
-		require.NoError(t, err, "independent initializer failed: %s", n.output.String())
+		require.NoError(t, err, "independent initializer failed: %s", organizationChildDiagnostic(n.output.String(), organizationBudgetProcessInput{DSN: f.mainDSN, SessionSecret: common.SessionSecret}))
 		if n.mode == "closed" {
 			return ""
 		}
@@ -3054,7 +3064,12 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 		nodes := []*node{startNode(t, "compete"), startNode(t, "compete")}
 		for _, n := range nodes {
 			_, err := io.ReadFull(n.ready, make([]byte, 1))
-			require.NoError(t, err, "both processes must finish their absent read before either inserts")
+			if err != nil {
+				n.cancel()
+				exit := n.cmd.Wait()
+				n.waited = true
+				t.Fatalf("absent-read barrier failed: %v; child exit: %v; diagnostic: %s", err, exit, organizationChildDiagnostic(n.output.String(), organizationBudgetProcessInput{DSN: f.mainDSN, SessionSecret: common.SessionSecret}))
+			}
 		}
 		for _, n := range nodes {
 			_, err := n.release.Write([]byte{1})
@@ -3079,6 +3094,8 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 	})
 
 	t.Run("reserved_option_and_failures", func(t *testing.T) {
+		// This sibling establishes its own real prerequisite; an earlier failed race stays failed.
+		require.NoError(t, model.InitSiteInstanceID())
 		id := model.SiteInstanceID()
 		require.NotEmpty(t, id)
 		require.NoError(t, f.db.Create(&model.Option{Key: "SiteUnrelatedOption", Value: "unchanged"}).Error)
@@ -4993,11 +5010,10 @@ func (b *toolsSearchRequestBoundary) RoundTrip(req *http.Request) (*http.Respons
 }
 
 func TestToolsSearchRelayHTTP(t *testing.T) {
-	require.Equal(t, "g19-tools-search", os.Getenv("NEWAPI_S2_OWNED"))
 	if service.GetHttpClient() == nil {
 		service.InitHttpClient()
 	}
-	f := newOrganizationHTTPFixture(t)
+	f := newOrganizationProfileFixture(t, "g19-tools-search")
 	common.OptionMapRWMutex.Lock()
 	previousOptions := common.OptionMap
 	common.OptionMap = map[string]string{}
@@ -6082,6 +6098,441 @@ func TestOrganizationMemberRemoveP2AHTTP(t *testing.T) {
 			var organization model.Organization
 			require.NoError(t, f.db.First(&organization, f.orgA).Error)
 			assert.Equal(t, revision, organization.Revision)
+		})
+	}
+}
+
+// A named legacy runner and a genuine protected birth are separate fixture routes.
+func newOrganizationProfileFixture(t *testing.T, owner string) *organizationHTTPFixture {
+	t.Helper()
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") == "" {
+		require.Equal(t, owner, os.Getenv("NEWAPI_S2_OWNED"))
+		require.Contains(t, []string{"sqlite", "mysql", "postgres"}, os.Getenv("NEWAPI_S2_MAIN"))
+		return newOrganizationHTTPFixture(t)
+	}
+	require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+	require.Equal(t, "sqlite", os.Getenv("NEWAPI_BOOTSTRAP_ENGINE"))
+	require.Contains(t, []string{"", "sqlite"}, os.Getenv("NEWAPI_S2_MAIN"))
+	require.Contains(t, []string{"", "sqlite"}, os.Getenv("NEWAPI_S2_LOG"))
+	require.Contains(t, []string{"", "none"}, os.Getenv("NEWAPI_S2_CACHE_MODE"))
+	require.Empty(t, os.Getenv("NEWAPI_S2_MAIN_DSN"))
+	require.Empty(t, os.Getenv("NEWAPI_S2_LOG_DSN"))
+	// Calls oauthBirthFixture: actual client handshake, permanent CLI and owned SQL.
+	f := newOrganizationHTTPFixture(t)
+	require.Equal(t, "sqlite", f.mainKind)
+	organizationTrustedSQLitePath(t, f.mainDSN, filepath.Dir(f.mainDSN))
+	// This checks protected journal ownership, live DB binding and the real seal.
+	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+	return f
+}
+
+func organizationTrustedSQLitePath(t *testing.T, dsn, ownedRoot string) {
+	t.Helper()
+	require.NotEmpty(t, os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+	require.True(t, filepath.IsAbs(dsn))
+	require.True(t, filepath.IsAbs(ownedRoot))
+	root, err := filepath.EvalSymlinks(ownedRoot)
+	require.NoError(t, err)
+	path, err := filepath.EvalSymlinks(dsn)
+	require.NoError(t, err)
+	require.Equal(t, dsn, path)
+	require.Equal(t, root, filepath.Dir(path))
+	require.Equal(t, "new.db", filepath.Base(path))
+	info, err := os.Lstat(path)
+	require.NoError(t, err)
+	require.True(t, info.Mode().IsRegular())
+}
+
+// The installer supplies a genuinely born namespace on each engine. These tests
+// exercise stale observations against an independent SQL connection, not a mock.
+func TestTokenExpiryCompareAndSet(t *testing.T) {
+	db, dsn := oauthBirthFixture(t)
+	oldDB, oldRedis := model.DB, common.RedisEnabled
+	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB, common.RedisEnabled = db, false
+	common.SetDatabaseTypes(common.DatabaseType(db.Dialector.Name()), oldLog)
+	t.Cleanup(func() {
+		model.DB, common.RedisEnabled = oldDB, oldRedis
+		common.SetDatabaseTypes(oldMain, oldLog)
+	})
+	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+	var dial gorm.Dialector
+	switch db.Dialector.Name() {
+	case "sqlite":
+		dial = sqlite.Open(dsn)
+	case "mysql":
+		dial = mysql.Open(dsn)
+	case "postgres":
+		dial = postgres.Open(dsn)
+	default:
+		t.Fatal("unsupported owned test engine")
+	}
+	other, err := gorm.Open(dial, &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, err)
+	conn, err := other.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	versionQuery := "SELECT version()"
+	if db.Dialector.Name() == "sqlite" {
+		versionQuery = "SELECT sqlite_version()"
+	}
+	var version string
+	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+	t.Logf("expiry CAS engine=%s version=%s", db.Dialector.Name(), version)
+	now := time.Now().Unix()
+	for _, name := range []string{"unchanged", "renew", "never_expire", "disable", "soft_delete", "hard_delete", "owner_changed", "key_changed", "key_case_changed", "key_space_changed", "expiry_changed", "cas_before_renew", "cas_before_disable", "double_expiry"} {
+		t.Run(name, func(t *testing.T) {
+			observed := model.Token{UserId: 71, Key: "case" + common.NewRequestId(), Status: common.TokenStatusEnabled, ExpiredTime: now - 60,
+				RemainQuota: 91, UsedQuota: 13, AccessedTime: 42, CreatedTime: 21, Name: "expiry-cas"}
+			require.NoError(t, db.Create(&observed).Error)
+			var before model.Token
+			require.NoError(t, other.First(&before, observed.Id).Error)
+			type result struct {
+				changed bool
+				err     error
+			}
+			results := make(chan result, 2)
+			ready, release := make(chan struct{}, 2), make(chan struct{})
+			var released sync.Once
+			unblock := func() { released.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			const hook = "test:expiry-cas-barrier"
+			require.NoError(t, db.Callback().Update().Before("gorm:begin_transaction").Register(hook, func(tx *gorm.DB) {
+				ready <- struct{}{}
+				select {
+				case <-release:
+				case <-tx.Statement.Context.Done():
+					tx.AddError(tx.Statement.Context.Err())
+				}
+			}))
+			t.Cleanup(func() { db.Callback().Update().Remove(hook) })
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			workers := 1
+			if name == "double_expiry" {
+				workers = 2
+			}
+			for range workers {
+				go func() {
+					changed, err := model.ExpireTokenIfUnchanged(ctx, observed, now)
+					results <- result{changed, err}
+				}()
+			}
+			for range workers {
+				select {
+				case <-ready:
+				case <-ctx.Done():
+					t.Fatal("expiry worker did not reach SQL barrier")
+				}
+			}
+			mutation := other.Model(&model.Token{}).Where("id = ?", observed.Id)
+			switch name {
+			case "renew":
+				require.NoError(t, mutation.Update("expired_time", now+3600).Error)
+			case "never_expire":
+				require.NoError(t, mutation.Update("expired_time", -1).Error)
+			case "disable":
+				require.NoError(t, mutation.Update("status", common.TokenStatusDisabled).Error)
+			case "soft_delete":
+				require.NoError(t, other.Delete(&model.Token{}, observed.Id).Error)
+			case "hard_delete":
+				require.NoError(t, other.Unscoped().Delete(&model.Token{}, observed.Id).Error)
+			case "owner_changed":
+				require.NoError(t, mutation.Update("user_id", 72).Error)
+			case "key_changed":
+				require.NoError(t, mutation.Update("key", common.NewRequestId()).Error)
+			case "key_case_changed":
+				require.NoError(t, mutation.Update("key", strings.ToUpper(observed.Key)).Error)
+			case "key_space_changed":
+				require.NoError(t, mutation.Update("key", observed.Key+" ").Error)
+			case "expiry_changed":
+				require.NoError(t, mutation.Update("expired_time", now-30).Error)
+			}
+			var expected model.Token
+			if name != "hard_delete" {
+				require.NoError(t, other.Unscoped().First(&expected, observed.Id).Error)
+			}
+			unblock()
+			changes := 0
+			for range workers {
+				select {
+				case got := <-results:
+					require.NoError(t, got.err)
+					if got.changed {
+						changes++
+					}
+				case <-ctx.Done():
+					t.Fatal("expiry CAS did not finish")
+				}
+			}
+			shouldChange := slices.Contains([]string{"unchanged", "cas_before_renew", "cas_before_disable", "double_expiry"}, name)
+			if shouldChange {
+				assert.Equal(t, 1, changes)
+				expected.Status = common.TokenStatusExpired
+			} else {
+				assert.Zero(t, changes)
+			}
+			if name == "cas_before_renew" {
+				require.NoError(t, mutation.Updates(map[string]any{"expired_time": now + 3600, "status": common.TokenStatusEnabled}).Error)
+				expected.ExpiredTime, expected.Status = now+3600, common.TokenStatusEnabled
+			} else if name == "cas_before_disable" {
+				require.NoError(t, mutation.Update("status", common.TokenStatusDisabled).Error)
+				expected.Status = common.TokenStatusDisabled
+			}
+			var actual model.Token
+			err = other.Unscoped().First(&actual, observed.Id).Error
+			if name == "hard_delete" {
+				require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, expected, actual, "every column except the intended status/competitor mutation is unchanged")
+			assert.Equal(t, before.RemainQuota, actual.RemainQuota)
+			assert.Equal(t, before.UsedQuota, actual.UsedQuota)
+			assert.Equal(t, before.AccessedTime, actual.AccessedTime)
+		})
+	}
+}
+
+func TestTokenAuthFailureBoundariesHTTP(t *testing.T) {
+	f := newOrganizationProfileFixture(t, "g20-token-error-codes")
+	key := "boundary" + common.NewRequestId()
+	token := model.Token{UserId: f.users["owner"].Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 500}
+	require.NoError(t, f.db.Create(&token).Error)
+	const secret = "sql-fault-sensitive-canary"
+	for _, tc := range []struct {
+		name  string
+		query int
+		fault error
+		want  int
+		code  string
+	}{
+		{"wrapped_not_found", 1, fmt.Errorf("wrapped: %w", gorm.ErrRecordNotFound), 401, "token_invalid"},
+		{"fresh_operation", 1, errors.New(secret), 500, ""},
+		{"fresh_cancel", 1, context.Canceled, 500, ""},
+		{"fresh_deadline", 1, context.DeadlineExceeded, 500, ""},
+		{"cache_precheck_deleted", 3, fmt.Errorf("wrapped: %w", gorm.ErrRecordNotFound), 401, "token_invalid"},
+		{"cache_precheck_operation", 3, errors.New(secret), 500, ""},
+		{"source_unavailable", 0, errors.New(secret), 503, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var queries, injected atomic.Int32
+			const hook = "test:token-auth-error-classification"
+			require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(hook, func(tx *gorm.DB) {
+				if tc.query == 0 && tx.Statement.Table == "oauth_derived_token_sources" || tx.Statement.Table == "tokens" && queries.Add(1) == int32(tc.query) {
+					injected.Add(1)
+					tx.AddError(tc.fault)
+				}
+			}))
+			t.Cleanup(func() { f.db.Callback().Query().Remove(hook) })
+			status, _, body := f.request(t, http.MethodGet, "/v1/models", "sk-"+key, "", nil)
+			assert.Equal(t, tc.want, status)
+			require.EqualValues(t, 1, injected.Load(), "fault must reach the intended lookup boundary")
+			errorBody, ok := body["error"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, tc.code, errorBody["code"])
+			assert.Equal(t, "new_api_error", errorBody["type"])
+			raw, err := common.Marshal(body)
+			require.NoError(t, err)
+			assert.NotContains(t, string(raw), secret)
+			assert.NotContains(t, string(raw), key)
+			assert.NotContains(t, f.logs.snapshot(), secret)
+			assert.NotContains(t, f.logs.snapshot(), key)
+		})
+	}
+	t.Run("nil_store_and_empty_credential", func(t *testing.T) {
+		model.DB = nil
+		t.Cleanup(func() { model.DB = f.db })
+		for _, tc := range []struct {
+			credential string
+			want       int
+			code       string
+		}{{"sk-" + key, 500, ""}, {"", 401, "token_invalid"}} {
+			status, _, body := f.request(t, http.MethodGet, "/v1/models", tc.credential, "", nil)
+			assert.Equal(t, tc.want, status)
+			e, ok := body["error"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, tc.code, e["code"])
+		}
+	})
+	t.Run("expiry_update_failure_still_denies", func(t *testing.T) {
+		require.NoError(t, f.db.Model(&token).Update("expired_time", time.Now().Unix()-60).Error)
+		var attempts atomic.Int32
+		const hook = "test:expiry-update-error"
+		require.NoError(t, f.db.Callback().Update().Before("gorm:update").Register(hook, func(tx *gorm.DB) {
+			if tx.Statement.Table == "tokens" {
+				attempts.Add(1)
+				tx.AddError(errors.New(secret))
+			}
+		}))
+		t.Cleanup(func() { f.db.Callback().Update().Remove(hook) })
+		status, _, body := f.request(t, http.MethodGet, "/v1/models", "sk-"+key, "", nil)
+		assert.Equal(t, 401, status)
+		assert.Equal(t, "token_expired", body["error"].(map[string]any)["code"])
+		assert.EqualValues(t, 1, attempts.Load())
+		_, err := model.ValidateUserToken(key)
+		require.ErrorIs(t, err, model.ErrTokenExpired)
+		assert.EqualValues(t, 2, attempts.Load(), "legacy expiry uses the same guarded transition")
+		var actual model.Token
+		require.NoError(t, f.db.First(&actual, token.Id).Error)
+		assert.Equal(t, common.TokenStatusEnabled, actual.Status)
+		assert.Equal(t, 500, actual.RemainQuota)
+		assert.NotContains(t, f.logs.snapshot(), secret)
+	})
+}
+
+func TestTokenAuthRedisFailureBoundariesHTTP(t *testing.T) {
+	f := newOrganizationProfileFixture(t, "g20-token-error-codes")
+	address := os.Getenv("NEWAPI_TOKEN_STATE_REDIS_ADDR")
+	host, port, err := net.SplitHostPort(address)
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1", host)
+	require.Equal(t, os.Getenv("NEWAPI_TOKEN_STATE_REDIS_PORT"), port)
+	client := redis.NewClient(&redis.Options{Addr: address, MaxRetries: -1})
+	info, err := client.Info(t.Context(), "server").Result()
+	require.NoError(t, err)
+	require.Contains(t, info, "redis_version:")
+	require.NotContains(t, strings.ToLower(info), "miniredis")
+	oldRedis, oldClient := common.RedisEnabled, common.RDB
+	common.RedisEnabled, common.RDB = true, client
+	t.Cleanup(func() { common.RedisEnabled, common.RDB = oldRedis, oldClient; _ = client.Close() })
+	for _, name := range []string{"miss", "identity_conflict", "cached_row_deleted", "cached_sql_operation", "redis_outage"} {
+		t.Run(name, func(t *testing.T) {
+			key := "redisboundary" + common.NewRequestId()
+			token := model.Token{UserId: f.users["owner"].Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 500}
+			require.NoError(t, f.db.Create(&token).Error)
+			cacheKey := "token:" + common.GenerateHMAC(key)
+			if name != "miss" && name != "redis_outage" {
+				_, err := model.GetTokenByKey(key, true)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, client.Exists(t.Context(), cacheKey).Val())
+			}
+			want, code := 200, ""
+			if name == "identity_conflict" {
+				require.NoError(t, client.HSet(t.Context(), cacheKey, "UserId", token.UserId+1).Err())
+				want, code = 401, "token_invalid"
+			}
+			var injected atomic.Int32
+			if name == "cached_row_deleted" || name == "cached_sql_operation" {
+				var queries atomic.Int32
+				const hook = "test:cached-canonical-error"
+				require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(hook, func(tx *gorm.DB) {
+					if tx.Statement.Table == "tokens" && queries.Add(1) == 3 {
+						injected.Add(1)
+						if name == "cached_row_deleted" {
+							tx.AddError(fmt.Errorf("deleted: %w", gorm.ErrRecordNotFound))
+						} else {
+							tx.AddError(errors.New("redis-sql-sensitive-canary"))
+						}
+					}
+				}))
+				t.Cleanup(func() { f.db.Callback().Query().Remove(hook) })
+				want, code = 401, "token_invalid"
+				if name == "cached_sql_operation" {
+					want, code = 500, ""
+				}
+			}
+			if name == "redis_outage" {
+				require.NoError(t, client.Close())
+			}
+			status, _, body := f.request(t, http.MethodGet, "/v1/models", "sk-"+key, "", nil)
+			assert.Equal(t, want, status)
+			if want != 200 {
+				e, ok := body["error"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, code, e["code"])
+				assert.Equal(t, "new_api_error", e["type"])
+			}
+			if strings.HasPrefix(name, "cached_") {
+				assert.EqualValues(t, 1, injected.Load())
+			}
+			var actual model.Token
+			require.NoError(t, f.db.First(&actual, token.Id).Error)
+			assert.Equal(t, token, actual, "auth failure/fallback never publishes cached money")
+			raw, err := common.Marshal(body)
+			require.NoError(t, err)
+			assert.NotContains(t, string(raw), "redis-sql-sensitive-canary")
+			assert.NotContains(t, string(raw), key)
+			assert.NotContains(t, f.logs.snapshot(), "redis-sql-sensitive-canary")
+			assert.NotContains(t, f.logs.snapshot(), key)
+			if name != "redis_outage" {
+				require.NoError(t, client.Del(t.Context(), cacheKey).Err())
+			}
+		})
+	}
+}
+
+func TestTokenAuthStaleExpiryDeniesHTTP(t *testing.T) {
+	f := newOrganizationProfileFixture(t, "g20-token-error-codes")
+	other, err := gorm.Open(sqlite.Open(f.mainDSN), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.Equal(t, "sqlite", f.mainKind, "HTTP race uses the trusted SQLite tier; CAS itself runs on all three engines")
+	require.NoError(t, err)
+	conn, err := other.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	for _, name := range []string{"renew", "never_expire", "disable", "delete"} {
+		t.Run(name, func(t *testing.T) {
+			token := model.Token{UserId: f.users["owner"].Id, Key: "httprace" + common.NewRequestId(), Status: common.TokenStatusEnabled,
+				ExpiredTime: time.Now().Unix() - 60, RemainQuota: 500, UsedQuota: 17, AccessedTime: 21}
+			require.NoError(t, f.db.Create(&token).Error)
+			var userBefore model.User
+			require.NoError(t, f.db.First(&userBefore, token.UserId).Error)
+			var tasksBefore int64
+			require.NoError(t, f.db.Model(&model.Task{}).Count(&tasksBefore).Error)
+			var calls atomic.Int32
+			mutationResult := make(chan error, 1)
+			const hook = "test:http-stale-expiry"
+			require.NoError(t, f.db.Callback().Update().Before("gorm:begin_transaction").Register(hook, func(tx *gorm.DB) {
+				if calls.Add(1) != 1 {
+					return
+				}
+				q := other.Model(&model.Token{}).Where("id = ?", token.Id)
+				var err error
+				switch name {
+				case "renew":
+					err = q.Update("expired_time", time.Now().Unix()+3600).Error
+				case "never_expire":
+					err = q.Update("expired_time", -1).Error
+				case "disable":
+					err = q.Update("status", common.TokenStatusDisabled).Error
+				case "delete":
+					err = other.Delete(&model.Token{}, token.Id).Error
+				}
+				mutationResult <- err
+			}))
+			t.Cleanup(func() { f.db.Callback().Update().Remove(hook) })
+			// A valid relay body must never reach channel selection or billing on
+			// this stale request, even though a renewal has just committed.
+			status, _, body := f.request(t, http.MethodPost, "/v1/chat/completions", "sk-"+token.Key,
+				`{"model":"fixture-only","messages":[{"role":"user","content":"test"}],"max_tokens":1}`, nil)
+			require.EqualValues(t, 1, calls.Load())
+			require.NoError(t, <-mutationResult)
+			assert.Equal(t, 401, status)
+			assert.Equal(t, "token_expired", body["error"].(map[string]any)["code"])
+			var actual model.Token
+			require.NoError(t, other.Unscoped().First(&actual, token.Id).Error)
+			assert.Equal(t, token.RemainQuota, actual.RemainQuota)
+			assert.Equal(t, token.UsedQuota, actual.UsedQuota)
+			assert.Equal(t, token.AccessedTime, actual.AccessedTime)
+			switch name {
+			case "renew":
+				assert.Equal(t, common.TokenStatusEnabled, actual.Status)
+				assert.Greater(t, actual.ExpiredTime, time.Now().Unix())
+			case "never_expire":
+				assert.Equal(t, common.TokenStatusEnabled, actual.Status)
+				assert.EqualValues(t, -1, actual.ExpiredTime)
+			case "disable":
+				assert.Equal(t, common.TokenStatusDisabled, actual.Status)
+			case "delete":
+				assert.True(t, actual.DeletedAt.Valid)
+			}
+			var userAfter model.User
+			require.NoError(t, other.First(&userAfter, token.UserId).Error)
+			assert.Equal(t, userBefore, userAfter)
+			var tasksAfter int64
+			require.NoError(t, other.Model(&model.Task{}).Count(&tasksAfter).Error)
+			assert.Equal(t, tasksBefore, tasksAfter)
+			assert.NotContains(t, f.logs.snapshot(), token.Key)
 		})
 	}
 }

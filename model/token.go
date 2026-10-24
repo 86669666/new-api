@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -8,6 +9,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type Token struct {
@@ -235,12 +238,15 @@ func ValidateUserToken(key string) (token *Token, err error) {
 		default:
 			return token, ErrTokenInvalid
 		}
-		if token.ExpiredTime != -1 && token.ExpiredTime < common.GetTimestamp() {
+		now := common.GetTimestamp()
+		if token.ExpiredTime != -1 && token.ExpiredTime < now {
 			if !common.RedisEnabled {
-				token.Status = common.TokenStatusExpired
-				err := token.SelectUpdate()
-				if err != nil {
-					common.SysLog(common.LogText("failed to update token status%s", err.Error()))
+				changed, updateErr := ExpireTokenIfUnchanged(context.Background(), *token, now)
+				if updateErr != nil {
+					common.SysLog(common.LogText("failed to update token status%s", ""))
+				}
+				if changed {
+					token.Status = common.TokenStatusExpired
 				}
 			}
 			return token, ErrTokenExpired
@@ -257,11 +263,38 @@ func ValidateUserToken(key string) (token *Token, err error) {
 		}
 		return token, nil
 	}
-	common.SysLog(common.LogText("ValidateUserToken: failed to get token: %s", err.Error()))
+	common.SysLog(common.LogText("ValidateUserToken: failed to get token: %s", ""))
 	if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, ErrTokenCacheIdentity) {
 		return nil, ErrTokenInvalid
 	}
 	return nil, fmt.Errorf("%w: %v", ErrDatabase, err)
+}
+
+// ExpireTokenIfUnchanged records a previously observed expiry without overwriting
+// a concurrent renewal, disable or deletion. A lost comparison never authorizes
+// the old request. Only status changes; quota and access timestamps are untouched.
+func ExpireTokenIfUnchanged(ctx context.Context, observed Token, now int64) (bool, error) {
+	if observed.Id <= 0 || observed.UserId <= 0 || observed.Key == "" || observed.Status != common.TokenStatusEnabled ||
+		observed.ExpiredTime == -1 || observed.ExpiredTime >= now {
+		return false, nil
+	}
+	if DB == nil {
+		return false, ErrDatabase
+	}
+	query := DB.WithContext(ctx).Session(&gorm.Session{Logger: gormlogger.Default.LogMode(gormlogger.Silent)}).
+		Model(&Token{}).
+		Where(&Token{Id: observed.Id, UserId: observed.UserId, Key: observed.Key, Status: common.TokenStatusEnabled}).
+		Where("expired_time = ? AND expired_time <> ? AND expired_time < ?", observed.ExpiredTime, -1, now)
+	// MySQL's default text collation ignores case and trailing spaces. The
+	// credential comparison must remain byte-exact even during a concurrent edit.
+	if DB.Dialector.Name() == "mysql" {
+		query = query.Where("BINARY ? = BINARY ?", clause.Column{Name: "key"}, observed.Key)
+	}
+	result := query.Update("status", common.TokenStatusExpired)
+	if result.Error != nil {
+		return false, ErrDatabase
+	}
+	return result.RowsAffected == 1, nil
 }
 
 func GetTokenByIds(id int, userId int) (*Token, error) {
@@ -297,7 +330,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// A genuine miss or Redis outage may fall through to canonical SQL.
 	}
 	token = &Token{}
-	if err = DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
+	if err = DB.Session(&gorm.Session{Logger: gormlogger.Default.LogMode(gormlogger.Silent)}).Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
 		return nil, err
 	}
 	if common.RedisEnabled {

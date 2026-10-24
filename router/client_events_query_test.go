@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,10 +60,8 @@ func clientStatsFailure(t *testing.T, f *organizationHTTPFixture, path, actor st
 }
 
 // Uses the existing full-router fixture and only its collision-failing databases.
-// The runner must select each real engine explicitly; there is no SQLite fallback.
+// Legacy engines require explicit owned endpoints; the trusted runner supplies a real SQLite birth.
 func TestClientEventsQueryHTTP(t *testing.T) {
-	require.Equal(t, "g1-W03-08-client-stats", os.Getenv("NEWAPI_S2_OWNED"))
-	require.Contains(t, []string{"sqlite", "mysql", "postgres"}, os.Getenv("NEWAPI_S2_MAIN"))
 	oldSearch := common.SearchRateLimitEnable
 	common.SearchRateLimitEnable = false
 	t.Cleanup(func() { common.SearchRateLimitEnable = oldSearch })
@@ -76,7 +73,7 @@ func TestClientEventsQueryHTTP(t *testing.T) {
 		t.Setenv("CLIENT_EVENTS_ENABLED", "false")
 		require.NoError(t, service.InitClientEventsConfig())
 	})
-	f := newOrganizationHTTPFixture(t)
+	f := newOrganizationProfileFixture(t, "g1-W03-08-client-stats")
 	require.NoError(t, f.db.AutoMigrate(&model.ClientEvent{}, &model.SystemTask{}, &model.SystemTaskLock{}))
 	// Init sets only the environment fallback; observe the fresh fixture Option table.
 	require.NoError(t, model.ReloadClientEventsConfig())

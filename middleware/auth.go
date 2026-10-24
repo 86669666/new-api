@@ -724,12 +724,20 @@ func TokenAuth() func(c *gin.Context) {
 		// update status or consult a cached identity. Never infer manual from an
 		// absent/unready provenance store. Silence SQL logging of the credential.
 		var sqlToken model.Token
-		if key == "" || model.DB == nil {
+		if key == "" {
 			abortWithOpenAiMessage(c, http.StatusUnauthorized, i18n.T(c, i18n.MsgTokenInvalid), types.ErrorCode("token_invalid"))
+			return
+		}
+		if model.DB == nil {
+			abortWithOpenAiMessage(c, http.StatusInternalServerError, common.TranslateMessage(c, i18n.MsgDatabaseError))
 			return
 		}
 		err := model.DB.WithContext(c.Request.Context()).Session(&gorm.Session{Logger: gormlogger.Default.LogMode(gormlogger.Silent)}).
 			Where(&model.Token{Key: key}).First(&sqlToken).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			abortWithOpenAiMessage(c, http.StatusInternalServerError, common.TranslateMessage(c, i18n.MsgDatabaseError))
+			return
+		}
 		if err != nil || sqlToken.Id <= 0 || sqlToken.UserId <= 0 || sqlToken.Key != key {
 			abortWithOpenAiMessage(c, http.StatusUnauthorized, i18n.T(c, i18n.MsgTokenInvalid), types.ErrorCode("token_invalid"))
 			return
@@ -740,6 +748,7 @@ func TokenAuth() func(c *gin.Context) {
 			return
 		}
 		// Fresh SQL security checks retain the public #21 error contract.
+		now := common.GetTimestamp()
 		switch sqlToken.Status {
 		case common.TokenStatusExpired:
 			err = model.ErrTokenExpired
@@ -748,8 +757,13 @@ func TokenAuth() func(c *gin.Context) {
 		case common.TokenStatusDisabled:
 			err = model.ErrTokenDisabled
 		case common.TokenStatusEnabled:
-			if sqlToken.ExpiredTime != -1 && sqlToken.ExpiredTime < common.GetTimestamp() {
+			if sqlToken.ExpiredTime != -1 && sqlToken.ExpiredTime < now {
 				err = model.ErrTokenExpired
+				if kind == model.OAuthDerivedTokenManualProven && !common.RedisEnabled {
+					if _, updateErr := model.ExpireTokenIfUnchanged(c.Request.Context(), sqlToken, now); updateErr != nil {
+						common.SysLog(common.LogText("failed to update token status%s", ""))
+					}
+				}
 			} else if !sqlToken.UnlimitedQuota && sqlToken.RemainQuota <= 0 {
 				err = model.ErrTokenExhausted
 			}
@@ -761,6 +775,10 @@ func TokenAuth() func(c *gin.Context) {
 			// Preserve legacy quota/cache validation, but a cache hit must not
 			// change the SQL credential's owner or token identity.
 			cached, cacheErr := model.GetTokenByKey(key, false)
+			if cacheErr != nil && !errors.Is(cacheErr, gorm.ErrRecordNotFound) && !errors.Is(cacheErr, model.ErrTokenCacheIdentity) {
+				abortWithOpenAiMessage(c, http.StatusInternalServerError, common.TranslateMessage(c, i18n.MsgDatabaseError))
+				return
+			}
 			if cacheErr != nil || cached == nil || cached.Id != sqlToken.Id || cached.UserId != sqlToken.UserId || cached.Key != sqlToken.Key {
 				abortWithOpenAiMessage(c, http.StatusUnauthorized, i18n.T(c, i18n.MsgTokenInvalid), types.ErrorCode("token_invalid"))
 				return
@@ -790,7 +808,7 @@ func TokenAuth() func(c *gin.Context) {
 		}
 		if err != nil {
 			if errors.Is(err, model.ErrDatabase) {
-				common.SysLog(common.LogText("TokenAuth ValidateUserToken database error: %s", err.Error()))
+				common.SysLog(common.LogText("TokenAuth ValidateUserToken database error: %s", ""))
 				abortWithOpenAiMessage(c, http.StatusInternalServerError,
 					common.TranslateMessage(c, i18n.MsgDatabaseError))
 			} else {

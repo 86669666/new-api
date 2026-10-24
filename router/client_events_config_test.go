@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,11 @@ func TestClientEventsConfigProcess(t *testing.T) {
 		t.Skip("subprocess fixture only")
 	}
 	kind, dsn := os.Getenv("NEWAPI_S2_MAIN"), os.Getenv("CLIENT_CONFIG_TEST_DSN")
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+		kind = os.Getenv("CLIENT_CONFIG_TEST_ENGINE")
+		require.Equal(t, "sqlite", kind)
+		organizationTrustedSQLitePath(t, dsn, os.Getenv("CLIENT_CONFIG_TEST_ROOT"))
+	}
 	var dial gorm.Dialector
 	switch kind {
 	case "mysql":
@@ -54,6 +60,10 @@ func TestClientEventsConfigProcess(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 	model.DB, model.LOG_DB = db, db
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+		require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+		common.SQLitePath = dsn
+	}
 	common.SetDatabaseTypes(common.DatabaseType(kind), common.DatabaseType(kind))
 	common.SessionSecret = os.Getenv("CLIENT_CONFIG_TEST_SECRET")
 	common.RedisEnabled = false
@@ -78,15 +88,13 @@ func TestClientEventsConfigProcess(t *testing.T) {
 }
 
 func TestClientEventsConfigHTTP(t *testing.T) {
-	require.Equal(t, "g1-W03-09-client-config", os.Getenv("NEWAPI_S2_OWNED"))
-	require.Contains(t, []string{"sqlite", "mysql", "postgres"}, os.Getenv("NEWAPI_S2_MAIN"))
 	t.Setenv("CLIENT_EVENTS_ENABLED", "true")
 	t.Setenv("CLIENT_EVENTS_RETENTION_DAYS", "45")
 	t.Setenv("CLIENT_EVENTS_RATE_LIMIT", "90")
 	require.NoError(t, service.InitClientEventsConfig())
 	assert.False(t, operation_setting.CurrentClientEventsSnapshot().Valid)
 	assert.False(t, service.CurrentClientEventsConfig().Enabled)
-	f := newOrganizationHTTPFixture(t)
+	f := newOrganizationProfileFixture(t, "g1-W03-09-client-config")
 	require.NoError(t, f.db.AutoMigrate(&model.ClientEvent{}, &model.SystemTask{}, &model.SystemTaskLock{}))
 	require.NoError(t, model.ReloadClientEventsConfig())
 	require.NoError(t, f.db.Model(f.users["admin"]).Update("role", common.RoleAdminUser).Error)
@@ -341,7 +349,7 @@ func TestClientEventsConfigHTTP(t *testing.T) {
 	t.Run("independent_instance_poll_and_restart", func(t *testing.T) {
 		startChild := func() (*exec.Cmd, io.WriteCloser, string) {
 			cmd := exec.Command(os.Args[0], "-test.run=^TestClientEventsConfigProcess$", "-test.v")
-			cmd.Env = append(os.Environ(), "CLIENT_CONFIG_TEST_CHILD=1", "CLIENT_CONFIG_TEST_DSN="+f.mainDSN, "CLIENT_CONFIG_TEST_SECRET="+common.SessionSecret)
+			cmd.Env = append(os.Environ(), "CLIENT_CONFIG_TEST_CHILD=1", "CLIENT_CONFIG_TEST_DSN="+f.mainDSN, "CLIENT_CONFIG_TEST_SECRET="+common.SessionSecret, "CLIENT_CONFIG_TEST_ENGINE="+f.mainKind, "CLIENT_CONFIG_TEST_ROOT="+filepath.Dir(f.mainDSN))
 			input, e := cmd.StdinPipe()
 			require.NoError(t, e)
 			output, e := cmd.StdoutPipe()

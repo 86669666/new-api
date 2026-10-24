@@ -3,7 +3,6 @@ package router
 import (
 	"maps"
 	"net/http"
-	"os"
 	"strings"
 	"testing"
 
@@ -76,8 +75,7 @@ func TestModelMetadataDeclarationContract(t *testing.T) {
 // The existing dedicated fixture exercises the actual router, authorization,
 // option persistence and response encoder on each explicitly supplied dialect.
 func TestModelMetadataCatalogueHTTP(t *testing.T) {
-	require.Equal(t, "g19-model-capability-metadata", os.Getenv("NEWAPI_S2_OWNED"))
-	f := newOrganizationHTTPFixture(t)
+	f := newOrganizationProfileFixture(t, "g19-model-capability-metadata")
 	require.NoError(t, f.db.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Channel{}, &model.Ability{}))
 	common.OptionMapRWMutex.Lock()
 	previousOptions := common.OptionMap
