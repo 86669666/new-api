@@ -292,6 +292,9 @@ func TestTelegramOAuthRejectsInvalidTokens(t *testing.T) {
 
 func TestTelegramOAuthBindingIsAtomicAndSessionBound(t *testing.T) {
 	fixture := setupTelegramOAuthTest(t)
+	initial, err := model.GetUserById(fixture.user.Id, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, initial.AuthVersion, "fixture starts at explicit version one")
 	// Older rows may predate the Telegram column and have a NULL binding.
 	require.NoError(t, model.DB.Model(fixture.user).Update("telegram_id", nil).Error)
 	state, code := fixture.authorization(t, "bind", fixture.identity, "", telegramIdentityClaims(42))
@@ -315,6 +318,43 @@ func TestTelegramOAuthBindingIsAtomicAndSessionBound(t *testing.T) {
 	var claimCount int64
 	require.NoError(t, model.DB.Model(&model.ExternalIdentityClaim{}).Count(&claimCount).Error)
 	assert.Zero(t, claimCount)
+
+	// A later failure, after the binding write and security-version increment,
+	// must roll back the full transition, not only the initial binding UPDATE.
+	state, code = fixture.authorization(t, "bind", fixture.identity, "", telegramIdentityClaims(42))
+	lateFailureHit := false
+	require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register("telegram_revocation_event_failure", func(tx *gorm.DB) {
+		if tx.Statement.Table == "session_revocation_events" {
+			lateFailureHit = true
+			tx.AddError(failure)
+		}
+	}))
+	response = telegramOAuthCallback(state, code, fixture.identity)
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.NotContains(t, response.Body.String(), "private")
+	require.NoError(t, model.DB.Callback().Create().Remove("telegram_revocation_event_failure"))
+	require.True(t, lateFailureHit, "failure must reach the security event write")
+	rolledBack, err := model.GetUserById(fixture.user.Id, false)
+	require.NoError(t, err)
+	assert.Empty(t, rolledBack.TelegramId)
+	assert.Equal(t, initial.AuthVersion, rolledBack.AuthVersion)
+	require.NoError(t, model.DB.Model(&model.ExternalIdentityClaim{}).Count(&claimCount).Error)
+	assert.Zero(t, claimCount)
+	var eventCount int64
+	require.NoError(t, model.DB.Model(&model.SessionRevocationEvent{}).Count(&eventCount).Error)
+	assert.Zero(t, eventCount)
+	var proofs []model.AuthFlow
+	require.NoError(t, model.DB.Select("id", "consumed_at").Where("purpose = ? AND user_id = ? AND session_id = ?", model.AuthFlowPurposeSecurityProof, fixture.user.Id, fixture.identity.SessionID).Order("id").Find(&proofs).Error)
+	require.Len(t, proofs, 2, "each independent authorization consumes its own proof")
+	for _, proof := range proofs {
+		assert.NotNil(t, proof.ConsumedAt, "binding rollback must not restore the separately consumed proof")
+	}
+	_, err = model.GetAuthFlow(state, model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth, Provider: "telegram"})
+	require.NoError(t, err)
+	_, _, err = service.ValidateLoginSession(fixture.identity)
+	require.NoError(t, err)
+	_, _, err = service.ValidateLoginSession(otherIdentity)
+	require.NoError(t, err)
 	state, code = fixture.authorization(t, "bind", fixture.identity, "", telegramIdentityClaims(42))
 	response = telegramOAuthCallback(state, code, fixture.identity)
 	assert.Contains(t, response.Body.String(), `"success":true`)
@@ -323,7 +363,26 @@ func TestTelegramOAuthBindingIsAtomicAndSessionBound(t *testing.T) {
 	assert.Equal(t, "42", stored.TelegramId)
 	assert.Equal(t, fixture.user.Role, stored.Role)
 	assert.Equal(t, fixture.user.Status, stored.Status)
-	assert.Equal(t, fixture.user.AuthVersion, stored.AuthVersion)
+	assert.Equal(t, initial.AuthVersion+1, stored.AuthVersion, "successful binding advances once")
+	_, _, err = service.ValidateLoginSession(otherIdentity)
+	assert.Error(t, err, "other pre-binding session must be invalid")
+	_, _, err = service.ValidateLoginSession(fixture.identity)
+	assert.Error(t, err, "old authorizing access identity must be stale")
+	var rotated struct {
+		Data struct {
+			AccessToken string `json:"access_token"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &rotated))
+	newIdentity, err := service.ParseAccessToken(rotated.Data.AccessToken)
+	require.NoError(t, err)
+	assert.Equal(t, fixture.identity.SessionID, newIdentity.SessionID)
+	assert.Equal(t, fixture.identity.SessionVersion+1, newIdentity.SessionVersion)
+	assert.Equal(t, stored.AuthVersion, newIdentity.UserAuthVersion)
+	_, _, err = service.ValidateLoginSession(newIdentity)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.ExternalIdentityClaim{}).Where("user_id = ? AND subject = ?", fixture.user.Id, "42").Count(&claimCount).Error)
+	assert.EqualValues(t, 1, claimCount)
 	assert.Equal(t, http.StatusForbidden, telegramOAuthCallback(state, code, fixture.identity).Code)
 }
 

@@ -402,9 +402,25 @@ func TestSecurityEnrollmentAccessTokenFailureDoesNotRestoreProof(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
 	require.NoError(t, model.DB.Model(user).Update("access_token", "unchanged-token").Error)
 	_, scoped := createScopedAccessToken(t, user.Id, 0, "profile:read")
+	var mutationHits, lockWrites int
 	failWrite := func(table string) func(tx *gorm.DB) {
 		return func(tx *gorm.DB) {
 			if tx.Statement.Table == table {
+				// SQLite locks the user before consuming the proof. Fail only the
+				// later credential mutation, after proof consumption has committed.
+				if table == "users" {
+					fields, ok := tx.Statement.Dest.(map[string]any)
+					if !ok {
+						return
+					}
+					if _, isMutation := fields["access_token"]; !isMutation {
+						if _, isLock := fields["auth_version"]; isLock {
+							lockWrites++
+						}
+						return
+					}
+				}
+				mutationHits++
 				tx.AddError(errors.New("private database failure"))
 			}
 		}
@@ -415,14 +431,24 @@ func TestSecurityEnrollmentAccessTokenFailureDoesNotRestoreProof(t *testing.T) {
 	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("access_token_update_failure", failWrite("user_access_tokens")))
 	for _, endpoint := range accessTokenMutationEndpoints(scoped.Id) {
 		t.Run(endpoint.name, func(t *testing.T) {
+			beforeHits := mutationHits
 			proof := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: endpoint.scope, Context: endpoint.context}, "password")
 			response := securityEnrollmentRequest(endpoint.method, endpoint.path, endpoint.body, proof, identity, endpoint.handler)
 			assert.Equal(t, http.StatusInternalServerError, response.Code)
 			assert.NotContains(t, response.Body.String(), "private database")
+			assert.Equal(t, beforeHits+1, mutationHits, "fault must hit exactly the authorized mutation")
+			var consumed model.AuthFlow
+			require.NoError(t, model.DB.Where("purpose = ? AND user_id = ? AND session_id = ?", model.AuthFlowPurposeSecurityProof, user.Id, identity.SessionID).Order("id DESC").First(&consumed).Error)
+			assert.NotNil(t, consumed.ConsumedAt, "proof commits before the failed action")
 			response = securityEnrollmentRequest(endpoint.method, endpoint.path, endpoint.body, proof, identity, endpoint.handler)
 			assert.Contains(t, response.Body.String(), `"code":"SECURITY_PROOF_CONSUMED"`)
+			assert.Equal(t, beforeHits+1, mutationHits, "replay cannot reach the mutation")
 		})
 	}
+	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		assert.Positive(t, lockWrites, "SQLite lock writes must be observed but not faulted")
+	}
+	assert.Equal(t, 4, mutationHits)
 	assertAccessTokensUnchanged(t, user.Id, scoped.Id, "unchanged-token")
 }
 

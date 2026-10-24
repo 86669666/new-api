@@ -68,7 +68,7 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 			}
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.UserAccessToken{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}))
 	require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
 	versionQuery := "SELECT version()"
 	if dialect == "sqlite" {
@@ -481,12 +481,24 @@ func TestManageUserQuotaTargetsAndWalletBounds(t *testing.T) {
 
 func TestManageUserQuotaMiddlewareKeepsOneOperationPerRequest(t *testing.T) {
 	db := setupManageUserTestDB(t)
-	pat := "quota-middleware-test-token"
-	operator := model.User{Id: 9999, Username: "root-operator", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, AccessToken: &pat, Quota: 1000}
+	operator := model.User{Id: 9999, Username: "root-operator", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, Quota: 1000}
 	require.NoError(t, db.Create(&operator).Error)
+	// Use the existing production-model PAT producer. AdminAuth must derive
+	// the actor, current AuthVersion and pat:<id> identity from this grant.
+	pat, token := createScopedAccessToken(t, operator.Id, 0, "user:write")
 	router := gin.New()
 	router.Use(middleware.RequestId(), middleware.AccessTokenAudit())
-	router.POST("/api/user/manage", middleware.AdminAuth(), ManageUser)
+	router.POST("/api/user/manage", middleware.AdminAuth(), func(c *gin.Context) {
+		identity, ok := middleware.GetStepUpIdentity(c)
+		require.True(t, ok)
+		assert.Equal(t, operator.Id, identity.UserID)
+		assert.Equal(t, operator.AuthVersion, identity.UserAuthVersion)
+		assert.Equal(t, model.AccessTokenSessionID(token.Id), identity.SessionID)
+		assert.EqualValues(t, model.AccessTokenSessionVersion, identity.SessionVersion)
+		assert.Equal(t, common.RoleRootUser, c.GetInt("role"))
+		assert.Equal(t, []string{"user:write"}, c.GetStringSlice("access_token_scopes"))
+		ManageUser(c)
+	})
 	for _, tc := range []struct {
 		body, action string
 		success      bool
@@ -533,6 +545,36 @@ func TestManageUserQuotaMiddlewareKeepsOneOperationPerRequest(t *testing.T) {
 	}
 	require.NoError(t, db.First(&operator, operator.Id).Error)
 	assert.Equal(t, 1100, operator.Quota)
+	wrongScope, _ := createScopedAccessToken(t, operator.Id, 0, "profile:read")
+	ordinary := model.User{Username: "quota-common-user", AffCode: "quota-common-user", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1}
+	require.NoError(t, db.Create(&ordinary).Error)
+	ordinaryPAT, _ := createScopedAccessToken(t, ordinary.Id, 0, "user:write")
+	for _, tc := range []struct {
+		name, credential string
+		status           int
+	}{
+		{"unrecognized_legacy_credential", "quota-middleware-test-token", http.StatusUnauthorized},
+		{"scope_does_not_grant_user_write", wrongScope, http.StatusForbidden},
+		{"scope_does_not_elevate_role", ordinaryPAT, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/api/user/manage", strings.NewReader(`{"id":9999,"action":"add_quota","mode":"add","value":100}`))
+			request.Header.Set("Authorization", "Bearer "+tc.credential)
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(response, request)
+			assert.Equal(t, tc.status, response.Code)
+			require.NoError(t, db.First(&operator, operator.Id).Error)
+			assert.Equal(t, 1100, operator.Quota)
+			requestID := response.Header().Get(common.RequestIdKey)
+			require.NotEmpty(t, requestID)
+			var count int64
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("request_id = ?", requestID).Count(&count).Error)
+			assert.Zero(t, count, "denied request cannot create a topup")
+			require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("request_id = ? AND category = ?", requestID, model.AuditCategoryOperation).Count(&count).Error)
+			assert.Zero(t, count, "denied request cannot reach the adjustment operation")
+		})
+	}
 }
 
 func TestManageUserQuotaConcurrentSnapshots(t *testing.T) {
@@ -589,20 +631,21 @@ func TestManageUserQuotaConcurrentSnapshots(t *testing.T) {
 
 func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 	for _, tc := range []struct {
-		name, mode                               string
-		before, cached, value, after, wantCached int
-		failUpdate, failCache, missingCache      bool
+		name, mode                          string
+		before, reserved, value, after      int
+		failUpdate, failCache, missingCache bool
 	}{
-		{name: "add_preserves_reservations", mode: "add", before: 1000, cached: 900, value: 500, after: 1500, wantCached: 1400},
-		{name: "subtract_preserves_reservations", mode: "subtract", before: 1000, cached: 900, value: 500, after: 500, wantCached: 400},
-		{name: "override_preserves_reservations", mode: "override", before: 1000, cached: 900, value: 2000, after: 2000, wantCached: 1900},
-		{name: "large_odd_difference", mode: "override", before: common.MaxWalletQuota - 1, cached: common.MaxWalletQuota - 1, value: -common.MaxWalletQuota, after: -common.MaxWalletQuota, wantCached: -common.MaxWalletQuota},
-		{name: "rollback_does_not_change_cache", mode: "subtract", before: 1000, cached: 900, value: 500, after: 1000, wantCached: 900, failUpdate: true},
-		{name: "cache_error_keeps_committed_change", mode: "add", before: 1000, value: 500, after: 1500, failCache: true},
-		{name: "missing_cache_is_not_partially_created", mode: "add", before: 1000, value: 500, after: 1500, missingCache: true},
+		{name: "add_preserves_reservations", mode: "add", before: 1000, reserved: 100, value: 500, after: 1400},
+		{name: "subtract_preserves_reservations", mode: "subtract", before: 1000, reserved: 100, value: 500, after: 400},
+		{name: "override_sets_available_SQL_balance", mode: "override", before: 1000, reserved: 100, value: 2000, after: 2000},
+		{name: "large_odd_difference", mode: "override", before: common.MaxWalletQuota - 1, value: -common.MaxWalletQuota, after: -common.MaxWalletQuota},
+		{name: "rollback_does_not_change_cache", mode: "subtract", before: 1000, reserved: 100, value: 500, after: 900, failUpdate: true},
+		{name: "cache_error_keeps_committed_change", mode: "add", before: 1000, reserved: 100, value: 500, after: 1400, failCache: true},
+		{name: "missing_cache_is_not_partially_created", mode: "add", before: 1000, reserved: 100, value: 500, after: 1400, missingCache: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := setupManageUserTestDB(t)
+			require.NoError(t, db.AutoMigrate(&model.OAuthDerivedTextCharge{}, &model.Task{}))
 			operator := createQuotaTestOperator(t, db, common.RoleRootUser)
 			server := miniredis.RunT(t)
 			oldRDB := common.RDB
@@ -614,6 +657,17 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 			cache, err := model.GetUserCache(user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, tc.before, cache.Quota)
+			if tc.reserved > 0 {
+				// Reserve real SQL money, including invalidation of the warm cache.
+				reserved, err := model.TryReserveUserQuota(user.Id, tc.reserved)
+				require.NoError(t, err)
+				require.True(t, reserved)
+			}
+			require.NoError(t, db.First(&user, user.Id).Error)
+			require.Equal(t, tc.before-tc.reserved, user.Quota)
+			cache, err = model.GetUserCache(user.Id)
+			require.NoError(t, err)
+			require.Equal(t, user.Quota, cache.Quota)
 			_, err = model.GetUserCache(operator.Id)
 			require.NoError(t, err)
 			keys := server.Keys()
@@ -625,7 +679,7 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 				}
 			}
 			require.NotEmpty(t, quotaKey)
-			server.HSet(quotaKey, "Quota", strconv.Itoa(tc.cached))
+			require.Equal(t, strconv.Itoa(user.Quota), server.HGet(quotaKey, "Quota"))
 			if tc.missingCache {
 				server.Del(quotaKey)
 			}
@@ -651,7 +705,22 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 					assert.Equal(t, strconv.Itoa(tc.after), server.HGet(quotaKey, "Quota"))
 				}
 			} else if !tc.failCache {
-				assert.Equal(t, strconv.Itoa(tc.wantCached), server.HGet(quotaKey, "Quota"))
+				assert.Equal(t, strconv.Itoa(tc.after), server.HGet(quotaKey, "Quota"))
+			}
+			// Reads remain SQL-authoritative even when invalidation failed. A
+			// fresh hydration must not apply the committed adjustment twice.
+			cache, err = model.GetUserCache(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, tc.after, cache.Quota)
+			server.SetError("")
+			server.Del(quotaKey)
+			for range 2 {
+				cache, err = model.GetUserCache(user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, tc.after, cache.Quota)
+				assert.Equal(t, strconv.Itoa(tc.after), server.HGet(quotaKey, "Quota"))
+				assert.Equal(t, strconv.Itoa(user.Id), server.HGet(quotaKey, "Id"))
+				assert.NotEmpty(t, server.HGet(quotaKey, "CacheSchema"))
 			}
 		})
 	}

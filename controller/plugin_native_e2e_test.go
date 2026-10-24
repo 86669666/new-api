@@ -63,6 +63,12 @@ func (b *nativeRouteBilling) Reserve(quota int) error {
 	return nil
 }
 
+// This double models legacy protocol0 billing after upstream acceptance; it
+// does not create or claim a durable protocol1 wallet obligation.
+func (b *nativeRouteBilling) ReserveAcceptedTask(quota int) error {
+	return b.Reserve(quota)
+}
+
 func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	service.InitHttpClient()
@@ -195,6 +201,8 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 
 	var persisted model.Task
 	require.NoError(t, database.Where("task_id = ?", "task_kling_public").First(&persisted).Error)
+	assert.Zero(t, persisted.BillingProtocol, "legacy native adapter fixture, not protocol1 wallet coverage")
+	assert.Nil(t, persisted.BillingRef)
 	assert.Equal(t, constant.TaskPlatform("kling"), persisted.Platform)
 	assert.Equal(t, "kling-private-1", persisted.PrivateData.UpstreamTaskID)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusNotStart), persisted.Status)
