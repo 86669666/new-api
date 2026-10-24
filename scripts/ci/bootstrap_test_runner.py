@@ -44,6 +44,10 @@ def wallet_selector(engine):
         raise ValueError('unknown wallet engine')
     return '^(' + '|'.join(WALLET_TESTS) + ')$/^' + engine + '$'
 
+METADATA_SELECTOR = '^TestOAuthTokensConsumerHTTP$'
+METADATA_CASES = ('bridge_only_rejected', 'empty_current_grant_no_writes', 'wrong_client', 'wrong_actor', 'wrong_audience', 'wrong_issuer', 'refresh_bearer', 'expired', 'future', 'write_scope_not_supported', 'old_grant_missing_read_scope', 'post_encoding_revocation_discards_empty_success', 'missing_store_is_not_empty')
+METADATA_TIERS = tuple('metadata-'+e for e in WALLET_ENGINES)
+
 JOINT_CASES = ('deny_wrong_type', 'outbox_rollback', 'late_active_fill', 'credential_rollback')
 
 
@@ -66,6 +70,10 @@ def prepare(args):
         raise ValueError('trusted provenance test runner requires Linux')
     if args.tier == 'all' and (args.package or args.run != '.'):
         raise ValueError('bounded selectors require an explicit resource --tier')
+    if args.tier in METADATA_TIERS:
+        if args.package not in (None, ['./router']) or args.run not in ('.', METADATA_SELECTOR):
+            raise ValueError('metadata tier requires the exact metadata consumer inventory')
+        args.package, args.run = ['./router'], METADATA_SELECTOR
     if args.tier.startswith('wallet-'):
         selector = wallet_selector(args.tier.removeprefix('wallet-'))
         if args.package not in (None, ['./service']) or args.run not in ('.', selector):
@@ -210,6 +218,8 @@ def verified_manifest(bundle):
 
 
 def required_leaves(tier):
+    if tier in METADATA_TIERS:
+        return ['TestOAuthTokensConsumerHTTP/'+case for case in METADATA_CASES]
     if tier.startswith('wallet-'):
         engine = tier.removeprefix('wallet-')
         wallet_selector(engine)
@@ -249,7 +259,7 @@ def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
 
 def dispatch_tier(bundle, tier):
     metadata = verified_manifest(bundle)
-    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
+    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
         raise ValueError('dispatch tier mismatch')
     if tier == 'admission':
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
@@ -258,14 +268,14 @@ def dispatch_tier(bundle, tier):
             raise RuntimeError('admission bundle exceeds private tmpfs safety budget')
         command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork', 'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=1G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && exec "$@"', 'admission-tests', sys.executable, str(bundle/'runner.py'), '_admission_run', str(bundle)])
         return
-    if tier.startswith('wallet-'):
+    if tier.startswith('wallet-') or tier in METADATA_TIERS:
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
         size=sum((bundle/name).stat().st_size for name in metadata['files'])
         if size*2+1024**3 >= 4*1024**3 or available < size*2+1024**3+3*1024**3:
             raise RuntimeError('wallet resource memory budget unavailable')
-    if tier == 'wallet-sqlite':
+    if tier in ('wallet-sqlite', 'metadata-sqlite'):
         command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork', 'sh', '-c',
-                 'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && exec "$@"',
+                 'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && '+('ip link set lo up && ' if tier == 'metadata-sqlite' else '')+'exec "$@"',
                  'wallet-tests', sys.executable, str(bundle/'runner.py'), '_wallet_run', str(bundle), tier])
         return
     if tier != 'sqlite':
@@ -1140,7 +1150,7 @@ class CombinedPostgres(OwnedPostgres):
 def postgres_container(bundle, tier='postgres'):
     # Host controller alone operates Docker. No socket, host mount, privileged
     # flag, SYS_ADMIN, sudo/ip or nested namespace tools enter the container.
-    image_id = MYSQL_IMAGE if tier == 'wallet-mysql' else PG_IMAGE if tier in ('postgres', 'wallet-postgres') else JOINT_IMAGE
+    image_id = MYSQL_IMAGE if tier in ('wallet-mysql', 'metadata-mysql') else PG_IMAGE if tier in ('postgres', 'wallet-postgres', 'metadata-postgres') else JOINT_IMAGE
     nonce = secrets.token_hex(12)
     image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', image_id]))[0]
     if image['Id'] != image_id:
@@ -1151,7 +1161,7 @@ def postgres_container(bundle, tier='postgres'):
             '--cap-drop=ALL', '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER',
             '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL', *(['--cap-add=SYS_PTRACE'] if tier == 'postgres' else []),
             '--tmpfs', '/run:rw,exec,nosuid,nodev,size=4g,mode=0755',
-            '--tmpfs', ('/var/lib/mysql' if tier == 'wallet-mysql' else '/var/lib/postgresql/data')+':rw,noexec,nosuid,nodev,size=1m,mode=0700',
+            '--tmpfs', ('/var/lib/mysql' if tier in ('wallet-mysql', 'metadata-mysql') else '/var/lib/postgresql/data')+':rw,noexec,nosuid,nodev,size=1m,mode=0700',
             '--entrypoint', '/bin/sh', image_id, '-c', 'exec sleep 600']
     cid = subprocess.check_output(argv, text=True).strip()
     try:
@@ -1173,7 +1183,7 @@ def postgres_container(bundle, tier='postgres'):
         # Detached execution keeps the authoritative result inside the owned
         # container; a Docker attach EOF cannot be mistaken for test completion.
         command(['docker','exec','-d',cid,'/bin/sh','-c',
-                 'python3 /run/input/runner.py '+('_wallet_run' if tier.startswith('wallet-') else '_run')+' /run/input '+tier+' > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
+                 'python3 /run/input/runner.py '+('_wallet_run' if tier.startswith('wallet-') or tier in METADATA_TIERS else '_run')+' /run/input '+tier+' > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
         deadline = time.monotonic() + 300
         while True:
             receipt = subprocess.run(['docker','exec',cid,'cat','/run/result.exit'], capture_output=True, text=True)
@@ -2153,9 +2163,12 @@ def wallet_client(path, action):
 
 def trusted_wallet_run(bundle,tier):
     metadata=verified_manifest(bundle)
-    engine=tier.removeprefix('wallet-')
+    metadata_tier = tier in METADATA_TIERS
+    engine=tier.removeprefix('metadata-' if metadata_tier else 'wallet-')
+    expected_cwd = 'router' if metadata_tier else 'service'
+    expected_selector = METADATA_SELECTOR if metadata_tier else wallet_selector(engine)
     if (os.geteuid()!=0 or metadata['tier']!=tier or len(metadata['entries'])!=1 or
-        metadata['entries'][0]['cwd']!='service' or metadata['entries'][0]['run']!=wallet_selector(engine)):
+        metadata['entries'][0]['cwd']!=expected_cwd or metadata['entries'][0]['run']!=expected_selector):
         raise ValueError('wallet trusted owner inventory mismatch')
     mounts=[line.split() for line in Path('/proc/mounts').read_text().splitlines()]
     runs=[m for m in mounts if m[1]=='/run']
@@ -2192,11 +2205,13 @@ def trusted_wallet_run(bundle,tier):
         env={'PATH':'/usr/bin:/bin','HOME':str(root/'tmp'),'TMPDIR':str(root/'tmp'),'GOMAXPROCS':'2',
             'NEWAPI_BOOTSTRAP_CLIENT':str(launcher),'NEWAPI_BOOTSTRAP_ENGINE':engine,
             'NEWAPI_DB_TEST_ROLE':'TRUSTED_DB_TEST_OWNER'}
+        if metadata_tier:
+            env['NEWAPI_BOOTSTRAP_TIER'] = tier
         entry=metadata['entries'][0]
         print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry,phase='trusted-db-test-owner',engine=engine,uid=uid)),flush=True)
         test_log=(root/'owner-test.log').open('xb')
         process=subprocess.Popen([str(root/'bundle'/entry['binary']),'-test.v','-test.count=1','-test.run='+entry['run']],
-            cwd=root/'bundle/source/service',env=env,preexec_fn=lambda:demote(uid),stdout=test_log,stderr=subprocess.STDOUT)
+            cwd=root/'bundle/source'/expected_cwd,env=env,preexec_fn=lambda:demote(uid),stdout=test_log,stderr=subprocess.STDOUT)
         installer.process=process
         thread=threading.Thread(target=installer.serve);thread.start()
         if not installer.first_birth.wait(timeout=150) or not installer.births:
@@ -2212,7 +2227,9 @@ def trusted_wallet_run(bundle,tier):
             except (FileNotFoundError,PermissionError):pass
         first=next(iter(installer.births.values()))['receipt']
         probe = """import os,socket,sys
-s=socket.socket(socket.AF_UNIX);s.settimeout(10);s.connect(sys.argv[1]);s.sendall(b'fresh\\n');s.shutdown(socket.SHUT_WR)
+s=socket.socket(socket.AF_UNIX);s.settimeout(10);s.connect(sys.argv[1])
+try:s.sendall(b'fresh\\n');s.shutdown(socket.SHUT_WR)
+except BrokenPipeError:pass # The rejecting peer may close before request completion.
 try:data=s.recv(8192)
 except ConnectionResetError:data=b''
 assert not data
@@ -2279,7 +2296,7 @@ def main():
         dispatch_tier(Path(sys.argv[2]), sys.argv[3])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')

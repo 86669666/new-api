@@ -600,6 +600,12 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		require.NoError(t, e)
 		status, _, _ = c.request("PUT", clientURL, "application/json", string(updated), "")
 		require.Equal(t, 200, status)
+		c.tokenMetadata("", 401)
+		challenge := sha256.Sum256([]byte(strings.Repeat("a", 43)))
+		writeRequest := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {"http://127.0.0.1:29873/oauth/callback"}, "scope": {"profile tokens:write"}, "state": {strings.Repeat("b", 43)}, "code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"}}
+		status, writeHeaders, _ := c.request("GET", input.Issuer+"oauth2/auth?"+writeRequest.Encode(), "", "", "")
+		assert.Equal(t, 400, status, "tokens:write has no public producer")
+		assert.Empty(t, writeHeaders.Get("Location"))
 		journal, e := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
 		require.NoError(t, e)
 		for _, selected := range []bool{false, true} {
@@ -627,6 +633,42 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 						assert.Equal(t, []any{}, body["data"])
 					}
 					c.tokenMetadata(grant.Refresh, 401)
+				}
+				if selected {
+					// The credential is issued and introspected by real Hydra. Mutate
+					// only this synthetic local grant to test its binding, then restore.
+					status, _, raw := c.request("POST", input.Admin+"/admin/oauth2/introspect", "application/x-www-form-urlencoded", url.Values{"token": {grant.Access}}.Encode(), "")
+					require.Equal(t, 200, status)
+					var introspection struct {
+						Active bool `json:"active"`
+						Ext    struct {
+							GrantID string `json:"newapi_grant_id"`
+						} `json:"ext"`
+					}
+					require.NoError(t, common.Unmarshal(raw, &introspection))
+					require.True(t, introspection.Active)
+					require.NotEmpty(t, introspection.Ext.GrantID)
+					var local model.OAuthGrant
+					require.NoError(t, f.db.Where("grant_id = ?", introspection.Ext.GrantID).First(&local).Error)
+					for _, mismatch := range []struct {
+						label, field    string
+						value, original any
+					}{
+						{"actor", "user_id", f.users["foreign"].Id, local.UserID},
+						{"client", "client_id", "newapi-w01-independent", local.ClientID},
+						{"grant", "grant_id", strings.Repeat("x", 43), local.GrantID},
+					} {
+						t.Run("binding_"+mismatch.label, func(t *testing.T) {
+							c.t = t
+							t.Cleanup(func() {
+								require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", local.GrantRef).UpdateColumn(mismatch.field, mismatch.original).Error)
+							})
+							require.NoError(t, f.db.Model(&model.OAuthGrant{}).Where("grant_ref = ?", local.GrantRef).UpdateColumn(mismatch.field, mismatch.value).Error)
+							c.tokenMetadata(grant.Access, 401)
+						})
+					}
+					c.t = t
+					c.tokenMetadata(grant.Access, 200)
 				}
 				// Supplying a scope on refresh never upgrades an omitted permission.
 				form := url.Values{"client_id": {c.clientID}, "grant_type": {"refresh_token"}, "refresh_token": {grant.Refresh}, "scope": {"tokens:read"}}
@@ -4664,8 +4706,187 @@ func TestOAuthTokensNamespacePrivacy(t *testing.T) {
 // This HTTP consumer fixture uses the real CLI-born store and actual model
 // checks. TLS introspection is synthetic; only the separate Hydra test proves
 // public code/PKCE/consent/refresh issuance. No source or key is issued here.
+// This bounded fixture is database-owner test code, not a gateway principal.
+// It consumes the unchanged owner grants and birth protocol; no source rows,
+// schema migration or privilege changes are needed for an empty metadata read.
+func oauthMetadataFixture(t *testing.T) *organizationHTTPFixture {
+	t.Helper()
+	if !strings.HasPrefix(os.Getenv("NEWAPI_BOOTSTRAP_TIER"), "metadata-") {
+		return newOrganizationHTTPFixture(t)
+	}
+	require.Equal(t, "TestOAuthTokensConsumerHTTP", t.Name())
+	client := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT")
+	require.NotEmpty(t, client)
+	raw, err := exec.Command(client).Output()
+	require.NoError(t, err)
+	var birth struct{ Engine, DSN, Journal, ResourceReceipt string }
+	require.NoError(t, common.Unmarshal(raw, &birth))
+	require.Equal(t, "metadata-"+birth.Engine, os.Getenv("NEWAPI_BOOTSTRAP_TIER"))
+	require.Equal(t, birth.Engine, os.Getenv("NEWAPI_BOOTSTRAP_ENGINE"))
+	root := filepath.Dir(client)
+	require.Equal(t, filepath.Join(root, "owner-client"), client)
+	manifestPath := filepath.Join(root, "bundle/manifest.json")
+	for _, file := range []string{client, birth.ResourceReceipt, birth.Journal, manifestPath} {
+		require.True(t, filepath.IsAbs(file))
+		for path := file; ; path = filepath.Dir(path) {
+			st, e := os.Lstat(path)
+			require.NoError(t, e)
+			require.Zero(t, st.Mode()&os.ModeSymlink)
+			require.Zero(t, st.Mode().Perm()&0o022)
+			owner := reflect.Indirect(reflect.ValueOf(st.Sys())).FieldByName("Uid")
+			require.True(t, owner.IsValid())
+			require.Zero(t, owner.Uint())
+			if path == "/" {
+				break
+			}
+		}
+	}
+	var receipt struct {
+		ID, RoleClass, Engine, Database, DBUser, Endpoint, Journal string
+		JournalSHA256, DSNSHA256, BinarySHA256, ManifestSHA256     string
+		OwnerUID                                                   int
+		Version                                                    string
+	}
+	resource, err := os.ReadFile(birth.ResourceReceipt)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(resource, &receipt))
+	require.Regexp(t, `^[0-9a-f]{32}$`, receipt.ID)
+	require.Equal(t, filepath.Join(root, "wallet-"+receipt.ID+".json"), birth.ResourceReceipt)
+	require.Equal(t, filepath.Join(root, "journals", receipt.ID+".json"), birth.Journal)
+	require.Equal(t, "TRUSTED_DB_TEST_OWNER", receipt.RoleClass)
+	require.Equal(t, os.Getuid(), receipt.OwnerUID)
+	require.NotZero(t, receipt.OwnerUID)
+	require.Equal(t, birth.Engine, receipt.Engine)
+	require.Equal(t, birth.Journal, receipt.Journal)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(birth.DSN))), receipt.DSNSHA256)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	binary, err := os.ReadFile(executable)
+	require.NoError(t, err)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(binary)), receipt.BinarySHA256)
+	manifest, err := os.ReadFile(manifestPath)
+	require.NoError(t, err)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(manifest)), receipt.ManifestSHA256)
+	journal, err := os.ReadFile(birth.Journal)
+	require.NoError(t, err)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(journal)), receipt.JournalSHA256)
+	var phase struct{ Phase, Engine, Target string }
+	require.NoError(t, common.Unmarshal(journal, &phase))
+	require.Equal(t, "READY", phase.Phase)
+	require.Equal(t, birth.Engine, phase.Engine)
+	require.Equal(t, receipt.Database, phase.Target)
+	qualify := func() {
+		current, e := exec.Command(client, "qualify:"+receipt.ID).Output()
+		require.NoError(t, e, "current kernel/birth binding required")
+		require.JSONEq(t, string(resource), string(current))
+	}
+	qualify()
+	t.Cleanup(qualify)
+	var dialect gorm.Dialector
+	switch birth.Engine {
+	case "sqlite":
+		require.Equal(t, receipt.Database, birth.DSN)
+		require.Equal(t, receipt.Database, receipt.Endpoint)
+		dialect = sqlite.Open(birth.DSN)
+	case "mysql":
+		cfg, e := sqlmysql.ParseDSN(birth.DSN)
+		require.True(t, e == nil, "invalid protected MySQL configuration")
+		require.Equal(t, "unix", cfg.Net)
+		require.Equal(t, filepath.Join(root, "mysql-socket/mysql.sock"), cfg.Addr)
+		require.Equal(t, receipt.Endpoint, cfg.Addr)
+		require.Equal(t, receipt.Database, cfg.DBName)
+		require.Equal(t, receipt.DBUser, cfg.User)
+		require.Empty(t, cfg.Params)
+		require.Empty(t, cfg.TLSConfig)
+		require.False(t, cfg.AllowAllFiles || cfg.AllowCleartextPasswords || cfg.MultiStatements)
+		dialect = mysql.Open(cfg.FormatDSN())
+	case "postgres":
+		for _, key := range []string{"PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGSERVICE", "PGSERVICEFILE", "PGOPTIONS"} {
+			require.Empty(t, os.Getenv(key))
+		}
+		cfg, e := pgx.ParseConfig(birth.DSN)
+		require.True(t, e == nil, "invalid protected PostgreSQL configuration")
+		require.Equal(t, filepath.Join(root, "pg-socket"), cfg.Host)
+		require.Equal(t, filepath.Join(cfg.Host, ".s.PGSQL.5432"), receipt.Endpoint)
+		require.EqualValues(t, 5432, cfg.Port)
+		require.Equal(t, receipt.Database, cfg.Database)
+		require.Equal(t, receipt.DBUser, cfg.User)
+		require.Empty(t, cfg.Fallbacks)
+		require.Empty(t, cfg.RuntimeParams)
+		require.Nil(t, cfg.TLSConfig)
+		dialect = postgres.New(postgres.Config{Conn: stdlib.OpenDB(*cfg), PreferSimpleProtocol: true})
+	default:
+		t.Fatal("unsupported metadata engine")
+	}
+	db, err := gorm.Open(dialect, &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, err)
+	connection, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, connection.Close()) })
+	oldDB, oldLog, oldKind, oldLogKind := model.DB, model.LOG_DB, common.MainDatabaseType(), common.LogDatabaseType()
+	oldMaster, oldRedis, oldMemory, oldPath := common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.SQLitePath
+	oldReady := model.OAuthCleanupReady()
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLog
+		common.SetDatabaseTypes(oldKind, oldLogKind)
+		common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.SQLitePath = oldMaster, oldRedis, oldMemory, oldPath
+		require.NoError(t, model.InitOAuthCleanupStore(oldReady))
+	})
+	model.DB = db
+	common.SetDatabaseTypes(common.DatabaseType(birth.Engine), common.DatabaseType(birth.Engine))
+	common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled = false, false, false
+	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", birth.Journal)
+	t.Setenv("SQL_DSN", birth.DSN)
+	if birth.Engine == "sqlite" {
+		common.SQLitePath = birth.DSN
+		t.Setenv("SQL_DSN", "")
+	}
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB()) // public initialization of dialect quoting, no schema writes
+	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+	if birth.Engine != "sqlite" {
+		var database, role string
+		query := "SELECT DATABASE(), CURRENT_USER()"
+		if birth.Engine == "postgres" {
+			query = "SELECT current_database(), current_user"
+		}
+		require.NoError(t, connection.QueryRow(query).Scan(&database, &role))
+		require.Equal(t, receipt.Database, database)
+		if birth.Engine == "mysql" {
+			require.Equal(t, receipt.DBUser+"@localhost", role)
+		} else {
+			require.Equal(t, receipt.DBUser, role)
+		}
+		for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity"} {
+			_, e := connection.Exec("DELETE FROM " + table + " WHERE 1=0")
+			require.Error(t, e, "immutable provenance remains SELECT-only")
+		}
+	}
+	require.Error(t, os.Chmod(birth.Journal, 0o666))
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Count(&count).Error)
+	require.Zero(t, count)
+	f := &organizationHTTPFixture{db: db, mainDSN: birth.DSN, mainKind: birth.Engine, users: map[string]*model.User{}, sids: map[string]string{}}
+	for i, label := range []string{"owner", "foreign"} {
+		u := &model.User{Id: 61000 + i, Username: "metadata-" + label, Password: "fixture-not-login-password", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: fmt.Sprint(61000 + i)}
+		require.NoError(t, db.Create(u).Error)
+		f.users[label] = u
+		sid := "metadata-" + common.NewRequestId()
+		f.sids[label] = sid
+		require.NoError(t, model.CreateUserSession(&model.UserSession{SID: sid, UserID: u.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("a", 64), LoginMethod: "password", ExpiresAt: time.Now().Unix() + 3600}))
+	}
+	key, err := common.GenerateRandomCharsKey(40)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&model.Token{UserId: f.users["owner"].Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
+	if birth.Engine == "sqlite" {
+		require.NoError(t, connection.QueryRow("SELECT sqlite_version()").Scan(&receipt.Version))
+	}
+	t.Logf("metadata qualification engine=%s version=%s role=TRUSTED_DB_TEST_OWNER same_born_database=true", birth.Engine, receipt.Version)
+	return f
+}
+
 func TestOAuthTokensConsumerHTTP(t *testing.T) {
-	f := newOrganizationHTTPFixture(t)
+	f := oauthMetadataFixture(t)
 	// Bootstrap owns provenance; the existing grant-store startup initializes
 	// only its ordinary grant/cleanup schema, as in adjacent OAuth fixtures.
 	master := common.IsMasterNode
