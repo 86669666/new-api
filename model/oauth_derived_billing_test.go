@@ -15,7 +15,6 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 	"net"
 	"net/url"
 	"os"
@@ -34,8 +33,8 @@ func newOAuthTextFixture(t *testing.T) (*gorm.DB, OAuthTextFacts) {
 
 func newOAuthTextDatabaseFixture(t *testing.T, database common.DatabaseType, driver gorm.Dialector) (*gorm.DB, OAuthTextFacts) {
 	t.Helper()
-	db, err := gorm.Open(driver, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	require.NoError(t, err)
+	db, _ := oauthBirthFixture(t)
+	database = common.DatabaseType(db.Dialector.Name())
 	sql, err := db.DB()
 	require.NoError(t, err)
 	sql.SetMaxOpenConns(1)
@@ -49,16 +48,6 @@ func newOAuthTextDatabaseFixture(t *testing.T, database common.DatabaseType, dri
 		require.NoError(t, sql.Close())
 	})
 	tables := []any{&User{}, &Token{}, &UserSession{}, &SessionRevocationEvent{}, &OAuthGrant{}, &OAuthOperation{}, &OAuthArtifact{}, &OAuthCleanupJob{}, &OAuthDerivedTokenSource{}, &OAuthDerivedTokenHistory{}, &OAuthDerivedTextCharge{}}
-	if database != common.DatabaseTypeSQLite {
-		names, err := db.Migrator().GetTables()
-		require.NoError(t, err)
-		require.Empty(t, names, "fresh dedicated newapi_ci_ database required")
-		t.Cleanup(func() {
-			for i := len(tables) - 1; i >= 0; i-- {
-				assert.NoError(t, db.Migrator().DropTable(tables[i]))
-			}
-		})
-	}
 	require.NoError(t, db.AutoMigrate(tables...))
 	require.NoError(t, InitOAuthCleanupStore(true))
 	now := time.Now().Unix()
@@ -76,7 +65,8 @@ func newOAuthTextDatabaseFixture(t *testing.T, database common.DatabaseType, dri
 	created := now - 10
 	source := OAuthDerivedTokenSource{GrantRef: g.GrantRef, UserID: u.Id, SchemaVersion: 1, QuotaLimit: 100, ExpiresAt: now + 100, PolicyHash: h, BindingHash: h, VerifiedAt: now - 20, ProofExpiresAt: now + 100, PermitDeadline: now + 40, VerifiedMethod: "password", ProofFlowID: 1, TokenID: &token.Id, KeyRef: &key, IdemHash: &h, RequestHash: &h, CreatedAt: &created}
 	require.NoError(t, db.Create(&source).Error)
-	require.NoError(t, db.Create(&OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: h, SealedAt: now - 30}).Error)
+	var birthHistory OAuthDerivedTokenHistory
+	require.NoError(t, db.First(&birthHistory).Error)
 	var version string
 	query := "SELECT version()"
 	if database == common.DatabaseTypeSQLite {

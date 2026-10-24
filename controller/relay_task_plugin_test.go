@@ -1567,12 +1567,8 @@ func newAdmissionResponsesFixture(t *testing.T, handle func(*websocket.Conn, *ht
 	require.NoError(t, i18n.Init())
 	user, token := setupResponsesWSRequestTest(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.OAuthDerivedTextCharge{}, &model.OAuthDerivedTokenSource{}, &model.OAuthDerivedTokenHistory{}, &model.Channel{}, &model.Ability{}, &model.Log{}))
-	// This synthetic history is fixture input, not a production migration seal.
-	require.NoError(t, model.DB.Where("id = ?", 1).Delete(&model.OAuthDerivedTokenHistory{}).Error)
-	require.NoError(t, model.DB.Create(&model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: strings.Repeat("a", 64), SealedAt: common.GetTimestamp() - 60}).Error)
-	t.Cleanup(func() {
-		require.NoError(t, model.DB.Where("id = ?", 1).Delete(&model.OAuthDerivedTokenHistory{}).Error)
-	})
+	var birthHistory model.OAuthDerivedTokenHistory
+	require.NoError(t, model.DB.First(&birthHistory).Error)
 	oldCount, oldBatch, oldLogs := constant.CountToken, common.BatchUpdateEnabled, common.LogConsumeEnabled
 	constant.CountToken, common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false, false
 	saved := map[string]string{}

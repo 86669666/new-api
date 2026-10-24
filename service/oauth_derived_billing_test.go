@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,11 +27,16 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// External DSNs follow the isolated-ci convention and must name fresh databases.
-// Without them, the ordinary go test entry point runs isolated SQLite coverage.
+// Provenance cases require a trusted fresh producer with a distinct service UID.
+// Legacy DSN validation remains available for explicitly leased runners.
 func TestOAuthDerivedTextRawUsageRejection(t *testing.T) {
 	for _, kind := range []common.DatabaseType{common.DatabaseTypeSQLite, common.DatabaseTypeMySQL, common.DatabaseTypePostgreSQL} {
 		t.Run(string(kind), func(t *testing.T) {
+			if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+				require.Equal(t, string(kind), os.Getenv("NEWAPI_BOOTSTRAP_ENGINE"))
+				testOAuthDerivedTextRawUsageRejection(t, kind, nil)
+				return
+			}
 			var driver gorm.Dialector
 			switch kind {
 			case common.DatabaseTypeSQLite:
@@ -164,8 +170,8 @@ func TestOAuthDerivedTextPostgresConfigIsolation(t *testing.T) {
 
 func newOAuthDerivedTextBillingFixture(t *testing.T, kind common.DatabaseType, dialect gorm.Dialector) (*gorm.DB, model.OAuthTextFacts) {
 	t.Helper()
-	db, err := gorm.Open(dialect, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	require.NoError(t, err)
+	db, _ := oauthBirthFixture(t)
+	kind = common.DatabaseType(db.Dialector.Name())
 	sql, err := db.DB()
 	require.NoError(t, err)
 	sql.SetMaxOpenConns(1)
@@ -182,17 +188,6 @@ func newOAuthDerivedTextBillingFixture(t *testing.T, kind common.DatabaseType, d
 		assert.NoError(t, sql.Close())
 	})
 	tables := []any{&model.User{}, &model.Token{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.OAuthGrant{}, &model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}, &model.OAuthDerivedTokenSource{}, &model.OAuthDerivedTokenHistory{}, &model.OAuthDerivedTextCharge{}}
-	if kind != common.DatabaseTypeSQLite {
-		names, err := db.Migrator().GetTables()
-		require.NoError(t, err)
-		require.Empty(t, names, "use a fresh dedicated newapi_ci_* database")
-		// Cleanup owns only tables created after the empty-database check.
-		t.Cleanup(func() {
-			for i := len(tables) - 1; i >= 0; i-- {
-				assert.NoError(t, db.Migrator().DropTable(tables[i]))
-			}
-		})
-	}
 	require.NoError(t, db.AutoMigrate(tables...))
 	require.NoError(t, model.InitOAuthCleanupStore(true))
 	now := time.Now().Unix()
@@ -210,7 +205,8 @@ func newOAuthDerivedTextBillingFixture(t *testing.T, kind common.DatabaseType, d
 	created := now - 10
 	source := model.OAuthDerivedTokenSource{GrantRef: g.GrantRef, UserID: u.Id, SchemaVersion: 1, QuotaLimit: 100, ExpiresAt: now + 100, PolicyHash: h, BindingHash: h, VerifiedAt: now - 20, ProofExpiresAt: now + 100, PermitDeadline: now + 40, VerifiedMethod: "password", ProofFlowID: 1, TokenID: &token.Id, KeyRef: &key, IdemHash: &h, RequestHash: &h, CreatedAt: &created}
 	require.NoError(t, db.Create(&source).Error)
-	require.NoError(t, db.Create(&model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: h, SealedAt: now - 30}).Error)
+	var birthHistory model.OAuthDerivedTokenHistory
+	require.NoError(t, db.First(&birthHistory).Error)
 	var version string
 	versionQuery := "SELECT version()"
 	if kind == common.DatabaseTypeSQLite {
@@ -308,4 +304,39 @@ func testOAuthDerivedTextRawUsageRejection(t *testing.T, kind common.DatabaseTyp
 		assert.ErrorIs(t, err, ErrOAuthDerivedTextClosed)
 		assert.Nil(t, permit)
 	})
+}
+
+// oauthBirthFixture obtains a new namespace from an external trusted installer.
+// Tests run as the service principal; neither this helper nor the client seals it.
+func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
+	t.Helper()
+	client := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT")
+	require.NotEmpty(t, client, "a separate trusted installer is required for provenance fixtures")
+	raw, err := exec.Command(client).Output()
+	require.NoError(t, err, "permanent bootstrap fixture producer failed")
+	var birth struct{ Engine, DSN, Journal string }
+	require.NoError(t, common.Unmarshal(raw, &birth))
+	require.NotEmpty(t, birth.Journal)
+	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", birth.Journal)
+	t.Setenv("SQL_DSN", birth.DSN)
+	var dialect gorm.Dialector
+	switch birth.Engine {
+	case "sqlite":
+		dialect = sqlite.Open(birth.DSN)
+	case "mysql":
+		dialect = mysql.Open(birth.DSN)
+	case "postgres":
+		dialect = postgres.Open(birth.DSN)
+	default:
+		t.Fatalf("unsupported trusted fixture engine %q", birth.Engine)
+	}
+	db, err := gorm.Open(dialect, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	var rows int64
+	require.NoError(t, db.Table("tokens").Count(&rows).Error)
+	require.Zero(t, rows, "producer must return a fresh namespace without token writers")
+	return db, birth.DSN
 }

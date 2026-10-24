@@ -659,6 +659,10 @@ func assertOAuthTextCASBalances(t *testing.T, db *gorm.DB, facts model.OAuthText
 
 func oauthTextCASWireDialect(t *testing.T, kind common.DatabaseType) gorm.Dialector {
 	t.Helper()
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+		require.Equal(t, string(kind), os.Getenv("NEWAPI_BOOTSTRAP_ENGINE"))
+		return nil // The billing fixture asks the trusted installer for this namespace.
+	}
 	switch kind {
 	case common.DatabaseTypeSQLite:
 		return sqlite.Open(filepath.Join(t.TempDir(), "cas-wire.sqlite") + "?_pragma=busy_timeout(5000)")

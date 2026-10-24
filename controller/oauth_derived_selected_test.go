@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -45,69 +46,89 @@ import (
 // provenance fixtures, not a migration, production history seal or issuance.
 func newOAuthSelectedHTTPStore(t *testing.T, kind common.DatabaseType) (*gorm.DB, *gorm.DB) {
 	t.Helper()
-	var lease struct {
-		RunID        string
-		Database     string
-		MySQLPort    int
-		PostgresPort int
-	}
-	raw, err := os.ReadFile(os.Getenv("NEWAPI_W03_SELECTED_LEASE"))
-	require.NoError(t, err)
-	require.NoError(t, common.Unmarshal(raw, &lease))
-	runBytes, err := hex.DecodeString(lease.RunID)
-	require.NoError(t, err)
-	require.Len(t, runBytes, 12)
-	require.Equal(t, os.Getenv("NEWAPI_W03_SELECTED_RUN"), lease.RunID)
-	require.Equal(t, "newapi_ci_w03_"+lease.RunID, lease.Database)
-	password := os.Getenv("NEWAPI_W03_SELECTED_PASSWORD")
-	require.True(t, len(password) >= 32, "private database credential required")
-	sqlitePath := filepath.Join(t.TempDir(), "selected.sqlite")
 	var pools []*gorm.DB
-	for range 2 {
-		var dialect gorm.Dialector
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+		db, dsn := oauthBirthFixture(t)
+		require.Equal(t, string(kind), db.Dialector.Name())
+		var d gorm.Dialector
 		switch kind {
 		case common.DatabaseTypeSQLite:
-			dialect = sqlite.Open(sqlitePath)
+			d = sqlite.Open(dsn)
 		case common.DatabaseTypeMySQL:
-			require.Greater(t, lease.MySQLPort, 0)
-			require.LessOrEqual(t, lease.MySQLPort, 65535)
-			cfg := mysqlconfig.NewConfig()
-			cfg.Net, cfg.Addr = "tcp", "127.0.0.1:"+strconv.Itoa(lease.MySQLPort)
-			cfg.User, cfg.Passwd, cfg.DBName = "w03", password, lease.Database
-			cfg.ParseTime = true
-			cfg.Timeout, cfg.ReadTimeout, cfg.WriteTimeout = 5*time.Second, 5*time.Second, 5*time.Second
-			dialect = mysql.Open(cfg.FormatDSN())
+			d = mysql.Open(dsn)
 		case common.DatabaseTypePostgreSQL:
-			// No ambient PG service/host/database defaults, query overrides or fallback
-			// hosts may redirect this fixture. The runner verifies the port's lease.
-			for _, entry := range os.Environ() {
-				key, value, _ := strings.Cut(entry, "=")
-				require.False(t, strings.HasPrefix(key, "PG") && value != "", "PG environment overrides forbidden")
-			}
-			require.Greater(t, lease.PostgresPort, 0)
-			require.LessOrEqual(t, lease.PostgresPort, 65535)
-			cfg, parseErr := pgx.ParseConfig("postgres://w03@127.0.0.1:" + strconv.Itoa(lease.PostgresPort) + "/" + lease.Database + "?sslmode=disable")
-			require.True(t, parseErr == nil, "fixed private PostgreSQL configuration must parse")
-			require.Equal(t, "127.0.0.1", cfg.Host)
-			require.Equal(t, lease.Database, cfg.Database)
-			require.Equal(t, "w03", cfg.User)
-			require.Equal(t, lease.PostgresPort, int(cfg.Port))
-			require.Empty(t, cfg.Fallbacks)
-			cfg.Password, cfg.ConnectTimeout = password, 5*time.Second
-			sqlDB := stdlib.OpenDB(*cfg)
-			t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
-			dialect = postgres.New(postgres.Config{Conn: sqlDB})
-		default:
-			t.Fatal("unsupported selected database")
+			d = postgres.Open(dsn)
 		}
-		db, openErr := gorm.Open(dialect, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-		require.True(t, openErr == nil, "private selected database connection failed")
-		sqlDB, sqlErr := db.DB()
-		require.NoError(t, sqlErr)
-		sqlDB.SetMaxOpenConns(1)
-		sqlDB.SetMaxIdleConns(1)
-		t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
-		pools = append(pools, db)
+		observer, err := gorm.Open(d, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+		require.NoError(t, err)
+		conn, err := observer.DB()
+		require.NoError(t, err)
+		t.Cleanup(func() { assert.NoError(t, conn.Close()) })
+		pools = []*gorm.DB{db, observer}
+	} else {
+		var lease struct {
+			RunID        string
+			Database     string
+			MySQLPort    int
+			PostgresPort int
+		}
+		raw, err := os.ReadFile(os.Getenv("NEWAPI_W03_SELECTED_LEASE"))
+		require.NoError(t, err)
+		require.NoError(t, common.Unmarshal(raw, &lease))
+		runBytes, err := hex.DecodeString(lease.RunID)
+		require.NoError(t, err)
+		require.Len(t, runBytes, 12)
+		require.Equal(t, os.Getenv("NEWAPI_W03_SELECTED_RUN"), lease.RunID)
+		require.Equal(t, "newapi_ci_w03_"+lease.RunID, lease.Database)
+		password := os.Getenv("NEWAPI_W03_SELECTED_PASSWORD")
+		require.True(t, len(password) >= 32, "private database credential required")
+		sqlitePath := filepath.Join(t.TempDir(), "selected.sqlite")
+		for range 2 {
+			var dialect gorm.Dialector
+			switch kind {
+			case common.DatabaseTypeSQLite:
+				dialect = sqlite.Open(sqlitePath)
+			case common.DatabaseTypeMySQL:
+				require.Greater(t, lease.MySQLPort, 0)
+				require.LessOrEqual(t, lease.MySQLPort, 65535)
+				cfg := mysqlconfig.NewConfig()
+				cfg.Net, cfg.Addr = "tcp", "127.0.0.1:"+strconv.Itoa(lease.MySQLPort)
+				cfg.User, cfg.Passwd, cfg.DBName = "w03", password, lease.Database
+				cfg.ParseTime = true
+				cfg.Timeout, cfg.ReadTimeout, cfg.WriteTimeout = 5*time.Second, 5*time.Second, 5*time.Second
+				dialect = mysql.Open(cfg.FormatDSN())
+			case common.DatabaseTypePostgreSQL:
+				// No ambient PG service/host/database defaults, query overrides or fallback
+				// hosts may redirect this fixture. The runner verifies the port's lease.
+				for _, entry := range os.Environ() {
+					key, value, _ := strings.Cut(entry, "=")
+					require.False(t, strings.HasPrefix(key, "PG") && value != "", "PG environment overrides forbidden")
+				}
+				require.Greater(t, lease.PostgresPort, 0)
+				require.LessOrEqual(t, lease.PostgresPort, 65535)
+				cfg, parseErr := pgx.ParseConfig("postgres://w03@127.0.0.1:" + strconv.Itoa(lease.PostgresPort) + "/" + lease.Database + "?sslmode=disable")
+				require.True(t, parseErr == nil, "fixed private PostgreSQL configuration must parse")
+				require.Equal(t, "127.0.0.1", cfg.Host)
+				require.Equal(t, lease.Database, cfg.Database)
+				require.Equal(t, "w03", cfg.User)
+				require.Equal(t, lease.PostgresPort, int(cfg.Port))
+				require.Empty(t, cfg.Fallbacks)
+				cfg.Password, cfg.ConnectTimeout = password, 5*time.Second
+				sqlDB := stdlib.OpenDB(*cfg)
+				t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
+				dialect = postgres.New(postgres.Config{Conn: sqlDB})
+			default:
+				t.Fatal("unsupported selected database")
+			}
+			db, openErr := gorm.Open(dialect, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+			require.True(t, openErr == nil, "private selected database connection failed")
+			sqlDB, sqlErr := db.DB()
+			require.NoError(t, sqlErr)
+			sqlDB.SetMaxOpenConns(1)
+			sqlDB.SetMaxIdleConns(1)
+			t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
+			pools = append(pools, db)
+		}
 	}
 	db, observer := pools[0], pools[1]
 	primarySQL, err := db.DB()
@@ -117,7 +138,9 @@ func newOAuthSelectedHTTPStore(t *testing.T, kind common.DatabaseType) (*gorm.DB
 	require.NotSame(t, primarySQL, observerSQL)
 	tables, err := db.Migrator().GetTables()
 	require.NoError(t, err)
-	require.Empty(t, tables, "lease must target a fresh empty database")
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") == "" {
+		require.Empty(t, tables, "lease must target a fresh empty database")
+	}
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.OAuthDerivedTextCharge{}, &model.OAuthGrant{}, &model.OAuthDerivedTokenSource{}, &model.OAuthDerivedTokenHistory{}, &model.Channel{}, &model.Ability{}, &model.Log{}, &model.UserSession{}, &model.UserAccessToken{}, &model.AuditLog{}))
 	var version string
 	versionQuery := "SELECT version()"
@@ -164,7 +187,7 @@ func newOAuthSelectedHTTPStore(t *testing.T, kind common.DatabaseType) (*gorm.DB
 }
 
 func TestOAuthDerivedSelectedHTTP(t *testing.T) {
-	if os.Getenv("NEWAPI_W03_SELECTED_LEASE") == "" {
+	if os.Getenv("NEWAPI_W03_SELECTED_LEASE") == "" && os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") == "" {
 		t.Skip("requires private three-database lease")
 	}
 	require.NoError(t, i18n.Init())
@@ -199,7 +222,8 @@ func TestOAuthDerivedSelectedHTTP(t *testing.T) {
 			db, observer := newOAuthSelectedHTTPStore(t, kind)
 			now := time.Now().Unix()
 			h := strings.Repeat("a", 64)
-			require.NoError(t, db.Create(&model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: h, SealedAt: now - 60}).Error)
+			var birthHistory model.OAuthDerivedTokenHistory
+			require.NoError(t, db.First(&birthHistory).Error)
 			// Count attempted writes as well as verifying durable balances. Even a
 			// reserve+refund that restored balances would fail this assertion.
 			var moneyWrites atomic.Int64
@@ -237,7 +261,7 @@ func TestOAuthDerivedSelectedHTTP(t *testing.T) {
 					if tc.name == "history_not_ready" {
 						require.NoError(t, db.Delete(&model.OAuthDerivedTokenHistory{}, 1).Error)
 						t.Cleanup(func() {
-							require.NoError(t, db.Create(&model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: h, SealedAt: now - 60}).Error)
+							require.NoError(t, db.Create(&birthHistory).Error)
 						})
 					}
 					if tc.name == "source_table_missing" {
@@ -653,4 +677,39 @@ func installOAuthSelectedTokenCache(t *testing.T, token model.Token, remain int)
 	common.RedisEnabled = true
 	t.Cleanup(func() { require.NoError(t, common.RDB.Close()); common.RDB, common.RedisEnabled = oldRDB, oldEnabled })
 	require.NoError(t, common.RDB.HSet(context.Background(), "token:"+common.GenerateHMAC(token.Key), map[string]any{"Id": token.Id, "UserId": token.UserId, "Status": common.TokenStatusEnabled, "ExpiredTime": time.Now().Unix() + 300, "RemainQuota": remain, "UsedQuota": 0}).Err())
+}
+
+// oauthBirthFixture obtains a new namespace from an external trusted installer.
+// Tests run as the service principal; neither this helper nor the client seals it.
+func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
+	t.Helper()
+	client := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT")
+	require.NotEmpty(t, client, "a separate trusted installer is required for provenance fixtures")
+	raw, err := exec.Command(client).Output()
+	require.NoError(t, err, "permanent bootstrap fixture producer failed")
+	var birth struct{ Engine, DSN, Journal string }
+	require.NoError(t, common.Unmarshal(raw, &birth))
+	require.NotEmpty(t, birth.Journal)
+	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", birth.Journal)
+	t.Setenv("SQL_DSN", birth.DSN)
+	var dialect gorm.Dialector
+	switch birth.Engine {
+	case "sqlite":
+		dialect = sqlite.Open(birth.DSN)
+	case "mysql":
+		dialect = mysql.Open(birth.DSN)
+	case "postgres":
+		dialect = postgres.Open(birth.DSN)
+	default:
+		t.Fatalf("unsupported trusted fixture engine %q", birth.Engine)
+	}
+	db, err := gorm.Open(dialect, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	var rows int64
+	require.NoError(t, db.Table("tokens").Count(&rows).Error)
+	require.Zero(t, rows, "producer must return a fresh namespace without token writers")
+	return db, birth.DSN
 }

@@ -2,7 +2,13 @@ package model
 
 import (
 	"bytes"
+	"github.com/glebarez/sqlite"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -94,4 +100,39 @@ func TestOAuthBootstrapProducer(t *testing.T) {
 		require.Equal(t, 0, RunOAuthDatabaseBootstrap(args, &out))
 		require.NoError(t, validateOAuthBirth(db, original, true))
 	})
+}
+
+// oauthBirthFixture obtains a new namespace from an external trusted installer.
+// Tests run as the service principal; neither this helper nor the client seals it.
+func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
+	t.Helper()
+	client := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT")
+	require.NotEmpty(t, client, "a separate trusted installer is required for provenance fixtures")
+	raw, err := exec.Command(client).Output()
+	require.NoError(t, err, "permanent bootstrap fixture producer failed")
+	var birth struct{ Engine, DSN, Journal string }
+	require.NoError(t, common.Unmarshal(raw, &birth))
+	require.NotEmpty(t, birth.Journal)
+	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", birth.Journal)
+	t.Setenv("SQL_DSN", birth.DSN)
+	var dialect gorm.Dialector
+	switch birth.Engine {
+	case "sqlite":
+		dialect = sqlite.Open(birth.DSN)
+	case "mysql":
+		dialect = mysql.Open(birth.DSN)
+	case "postgres":
+		dialect = postgres.Open(birth.DSN)
+	default:
+		t.Fatalf("unsupported trusted fixture engine %q", birth.Engine)
+	}
+	db, err := gorm.Open(dialect, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	var rows int64
+	require.NoError(t, db.Table("tokens").Count(&rows).Error)
+	require.Zero(t, rows, "producer must return a fresh namespace without token writers")
+	return db, birth.DSN
 }

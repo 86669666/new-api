@@ -446,7 +446,20 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 	if kind == "" {
 		kind = "sqlite"
 	}
-	db, mainDSN := organizationTestDB(t, kind, os.Getenv("NEWAPI_S2_MAIN_DSN"))
+	var db *gorm.DB
+	var mainDSN string
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+		oldSQLite := common.SQLitePath
+		t.Cleanup(func() { common.SQLitePath = oldSQLite })
+		db, mainDSN = oauthBirthFixture(t)
+		require.Equal(t, kind, db.Dialector.Name())
+		if kind == "sqlite" {
+			common.SQLitePath = mainDSN
+			t.Setenv("SQL_DSN", "")
+		}
+	} else {
+		db, mainDSN = organizationTestDB(t, kind, os.Getenv("NEWAPI_S2_MAIN_DSN"))
+	}
 	model.DB = db
 	common.SetDatabaseTypes(common.DatabaseType(kind), common.DatabaseType(kind))
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}))

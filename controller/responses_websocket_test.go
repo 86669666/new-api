@@ -59,6 +59,14 @@ func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	t.Setenv("LOG_SQL_DSN", os.Getenv("TEST_RESPONSES_LOG_SQL_DSN"))
 	common.IsMasterNode, common.MemoryCacheEnabled, common.RedisEnabled = false, false, false
 	common.SQLitePath = filepath.Join(t.TempDir(), "responses.db")
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+		birthDB, dsn := oauthBirthFixture(t)
+		if birthDB.Dialector.Name() == "sqlite" {
+			common.SQLitePath = dsn
+			t.Setenv("SQL_DSN", "")
+		}
+	}
+
 	require.NoError(t, model.InitDB())
 	db := model.DB
 	sqlDB, err := db.DB()

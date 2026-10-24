@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/glebarez/sqlite"
 	"io"
 	"maps"
 	"math"
@@ -22,6 +23,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -3858,7 +3860,8 @@ func newOAuthDerivedK1aFixture(t *testing.T) *organizationHTTPFixture {
 	require.NoError(t, model.InitOAuthGrantStore(true))
 	common.IsMasterNode = false
 	require.NoError(t, f.db.AutoMigrate(&model.OAuthDerivedTokenSource{}, &model.OAuthDerivedTokenHistory{}))
-	require.NoError(t, f.db.Create(&model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: model.OAuthDerivedTokenKeyRef("explicit private K1a fixture history"), SealedAt: time.Now().Unix()}).Error)
+	var birthHistory model.OAuthDerivedTokenHistory
+	require.NoError(t, f.db.First(&birthHistory).Error)
 	return f
 }
 
@@ -3896,6 +3899,7 @@ func seedOAuthDerivedK1aSource(t *testing.T, f *organizationHTTPFixture) (*model
 
 func TestOAuthDerivedK1aSchema(t *testing.T) {
 	f := newOAuthDerivedK1aDatabaseFixture(t)
+	require.NoError(t, f.db.Migrator().DropTable(&model.OAuthDerivedTokenSource{}, &model.OAuthDerivedTokenHistory{}, &model.OAuthDerivedTokenBootstrapIdentity{}))
 	require.False(t, f.db.Migrator().HasTable(&model.OAuthDerivedTokenSource{}))
 	require.False(t, f.db.Migrator().HasTable(&model.OAuthDerivedTokenHistory{}))
 	assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
@@ -3904,6 +3908,10 @@ func TestOAuthDerivedK1aSchema(t *testing.T) {
 	assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
 	history := &model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: strings.Repeat("a", 64), SealedAt: time.Now().Unix()}
 	require.NoError(t, f.db.Create(history).Error)
+	assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown, "arbitrary seal is never birth evidence")
+	f = newOAuthDerivedK1aFixture(t)
+	require.NoError(t, f.db.First(history).Error)
+	originalHistory := *history
 	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
 	for _, tc := range []struct {
 		name    string
@@ -3916,7 +3924,7 @@ func TestOAuthDerivedK1aSchema(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NoError(t, f.db.Model(history).Updates(tc.updates).Error)
 			assert.ErrorIs(t, model.ValidateOAuthDerivedTokenStore(t.Context()), model.ErrOAuthDerivedTokenUnknown)
-			require.NoError(t, f.db.Model(history).Updates(map[string]any{"schema_version": 1, "history_seal": strings.Repeat("a", 64), "sealed_at": time.Now().Unix()}).Error)
+			require.NoError(t, f.db.Model(history).Updates(map[string]any{"schema_version": originalHistory.SchemaVersion, "history_seal": originalHistory.HistorySeal, "sealed_at": originalHistory.SealedAt}).Error)
 		})
 	}
 	for _, name := range []string{"uq_oauth_derived_proof", "uq_oauth_derived_token", "uq_oauth_derived_key", "uq_oauth_derived_grant_idem", "idx_oauth_derived_user_created"} {
@@ -4099,6 +4107,8 @@ func TestOAuthDerivedK1aMetadata(t *testing.T) {
 
 func TestOAuthDerivedK1aClassification(t *testing.T) {
 	f := newOAuthDerivedK1aFixture(t)
+	var birthHistory model.OAuthDerivedTokenHistory
+	require.NoError(t, f.db.First(&birthHistory).Error)
 	grant, source, token := seedOAuthDerivedK1aSource(t, f)
 	kind, err := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
 	require.NoError(t, err)
@@ -4114,7 +4124,7 @@ func TestOAuthDerivedK1aClassification(t *testing.T) {
 	kind, err = model.ClassifyOAuthDerivedToken(t.Context(), manual.Id)
 	assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
 	assert.Equal(t, model.OAuthDerivedTokenUnknown, kind)
-	require.NoError(t, f.db.Create(&model.OAuthDerivedTokenHistory{ID: 1, SchemaVersion: 1, HistorySeal: strings.Repeat("d", 64), SealedAt: time.Now().Unix()}).Error)
+	require.NoError(t, f.db.Create(&birthHistory).Error)
 	t.Run("missing both lookup members cannot become manual", func(t *testing.T) {
 		keyRef := *source.KeyRef
 		require.NoError(t, f.db.Model(source).UpdateColumns(map[string]any{"token_id": nil, "key_ref": nil}).Error)
@@ -4288,4 +4298,39 @@ func TestOAuthDerivedK1aHandlerBoundary(t *testing.T) {
 		assert.Empty(t, response.Header().Get("Location"))
 		assert.NotContains(t, response.Body.String(), "k1a-fixture-opaque")
 	}
+}
+
+// oauthBirthFixture obtains a new namespace from an external trusted installer.
+// Tests run as the service principal; neither this helper nor the client seals it.
+func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
+	t.Helper()
+	client := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT")
+	require.NotEmpty(t, client, "a separate trusted installer is required for provenance fixtures")
+	raw, err := exec.Command(client).Output()
+	require.NoError(t, err, "permanent bootstrap fixture producer failed")
+	var birth struct{ Engine, DSN, Journal string }
+	require.NoError(t, common.Unmarshal(raw, &birth))
+	require.NotEmpty(t, birth.Journal)
+	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", birth.Journal)
+	t.Setenv("SQL_DSN", birth.DSN)
+	var dialect gorm.Dialector
+	switch birth.Engine {
+	case "sqlite":
+		dialect = sqlite.Open(birth.DSN)
+	case "mysql":
+		dialect = mysql.Open(birth.DSN)
+	case "postgres":
+		dialect = postgres.Open(birth.DSN)
+	default:
+		t.Fatalf("unsupported trusted fixture engine %q", birth.Engine)
+	}
+	db, err := gorm.Open(dialect, &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	var rows int64
+	require.NoError(t, db.Table("tokens").Count(&rows).Error)
+	require.Zero(t, rows, "producer must return a fresh namespace without token writers")
+	return db, birth.DSN
 }
