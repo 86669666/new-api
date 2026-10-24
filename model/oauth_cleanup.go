@@ -221,9 +221,16 @@ func RevokeOAuthWithTx(tx *gorm.DB, userID int, scope, value, reason string, ses
 	if len(sessionEventRef) > 1 {
 		return ErrOAuthGrantInvalid
 	}
+	if err := validateOAuthDerivedTokenStore(tx, time.Now().Unix()); err != nil {
+		return err
+	}
 	if !OAuthCleanupReady() {
 		if len(sessionEventRef) != 0 {
 			return ErrSessionRevocationStore
+		}
+		var sources int64
+		if err := tx.Model(&OAuthDerivedTokenSource{}).Where("user_id = ?", userID).Count(&sources).Error; err != nil || sources != 0 {
+			return ErrOAuthDerivedTokenUnknown
 		}
 		return nil
 	}
@@ -296,7 +303,7 @@ func RevokeOAuthWithTx(tx *gorm.DB, userID int, scope, value, reason string, ses
 			return err
 		}
 	}
-	return nil
+	return revokeOAuthDerivedTokens(tx, userID, grants, match, now)
 }
 
 func RevokeOAuth(ctx context.Context, userID int, scope, value string) error {

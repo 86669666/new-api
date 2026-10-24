@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -13,15 +14,18 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -524,7 +528,7 @@ func TestGetTokenMasksKeyInResponse(t *testing.T) {
 }
 
 func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
-	db := setupTokenControllerTestDB(t)
+	db := setupTokenOwnerTestDB(t)
 	token := seedToken(t, db, 1, "editable-token", "yzab1234cdef5678")
 
 	body := map[string]any{
@@ -560,7 +564,7 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 }
 
 func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
-	db := setupTokenControllerTestDB(t)
+	db := setupTokenOwnerTestDB(t)
 	token := seedToken(t, db, 1, "owned-token", "owner1234token5678")
 
 	authorizedCtx, authorizedRecorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/"+strconv.Itoa(token.Id)+"/key", nil, 1)
@@ -610,7 +614,7 @@ func TestTokenAllowUserQuotaQueryOnCreateAndUpdate(t *testing.T) {
 		{name: "status update leaves it alone", target: "/api/token/?status_only=true", stored: common.GetPointer(true), field: false, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := setupTokenControllerTestDB(t)
+			db := setupTokenOwnerTestDB(t)
 			body := map[string]any{"name": "quota-query", "expired_time": -1, "unlimited_quota": true, "status": common.TokenStatusEnabled}
 			if tc.field != nil {
 				body["allow_user_quota_query"] = tc.field
@@ -1328,10 +1332,11 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 				common.RedisEnabled, common.IsMasterNode = false, true
 				common.SessionSecret = "api-token-audit-test-secret"
 				t.Setenv("LOG_SQL_DSN", "")
-				db, _ := newAuditTestDatabase(t, database.name, dsn)
+				db, _ := oauthBirthFixture(t)
+				require.Equal(t, database.name, db.Dialector.Name())
 				model.DB = db
 				common.SetDatabaseTypes(database.typ, database.typ)
-				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.Token{}))
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.Token{}, &model.UserAccessToken{}))
 				// Initialize production column quoting as well as the existing audit table.
 				require.NoError(t, model.InitLogDB())
 				if separateLog {
@@ -1359,9 +1364,9 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 
 func verifyAPITokenAudit(t *testing.T) {
 	t.Helper()
-	pat := "api-token-audit-pat-secret"
-	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AccessToken: &pat, AffCode: "token-owner"}
+	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "token-owner"}
 	require.NoError(t, model.DB.Create(user).Error)
+	pat, _ := createScopedAccessToken(t, user.Id, time.Now().Unix()+3600, "api_key:reveal")
 	other := &model.User{Username: "other-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "other-owner"}
 	require.NoError(t, model.DB.Create(other).Error)
 	session := &model.UserSession{SID: "token-audit-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "placeholder", LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
@@ -1608,5 +1613,354 @@ func verifyAPITokenAudit(t *testing.T) {
 		var count int64
 		require.NoError(t, model.DB.Model(&model.Token{}).Where("name = ?", "audit-down").Count(&count).Error)
 		assert.EqualValues(t, 1, count)
+	})
+}
+
+// A production bootstrap CLI, outside the service UID, owns the seal and its
+// single-database journal. These tests never invent provenance history.
+func tokenOwnerStore(t *testing.T) *gorm.DB {
+	t.Helper()
+	require.NoError(t, i18n.Init())
+	oldDB, oldLog := model.DB, model.LOG_DB
+	oldMain, oldLogKind := common.MainDatabaseType(), common.LogDatabaseType()
+	oldRedis, oldMaster, oldReady := common.RedisEnabled, common.IsMasterNode, model.OAuthCleanupReady()
+	db, _ := oauthBirthFixture(t)
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLog
+		common.SetDatabaseTypes(oldMain, oldLogKind)
+		common.RedisEnabled, common.IsMasterNode = oldRedis, oldMaster
+		require.NoError(t, model.InitOAuthCleanupStore(oldReady))
+	})
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(common.DatabaseType(db.Dialector.Name()), common.DatabaseType(db.Dialector.Name()))
+	common.RedisEnabled, common.IsMasterNode = false, false
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.OAuthGrant{}, &model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}, &model.OAuthDerivedTextCharge{}, &model.AuditLog{}))
+	require.NoError(t, model.InitOAuthCleanupStore(true))
+	require.NoError(t, model.ValidateOAuthDerivedTokenStore(context.Background()))
+	pool, err := db.DB()
+	require.NoError(t, err)
+	if db.Dialector.Name() == "sqlite" {
+		pool.SetMaxOpenConns(1)
+	}
+	var version string
+	q := "SELECT version()"
+	if db.Dialector.Name() == "sqlite" {
+		q = "SELECT sqlite_version()"
+	}
+	require.NoError(t, db.Raw(q).Scan(&version).Error)
+	t.Logf("owner lifecycle engine=%s version=%s", db.Dialector.Name(), version)
+	return db
+}
+
+func setupTokenOwnerTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db := tokenOwnerStore(t)
+	for id := 1; id <= 2; id++ {
+		require.NoError(t, db.Create(&model.User{Id: id, Username: fmt.Sprintf("owner-%d", id), AffCode: fmt.Sprintf("own-%d", id), AuthVersion: 1, Status: common.UserStatusEnabled, Group: "default"}).Error)
+	}
+	return db
+}
+
+func ownerDerivedFixture(t *testing.T, db *gorm.DB, userID int, suffix string, unused bool) (*model.OAuthGrant, *model.OAuthDerivedTokenSource, *model.Token) {
+	t.Helper()
+	now := time.Now().Unix()
+	grant := &model.OAuthGrant{Issuer: "https://issuer.example", GrantID: "grant-" + suffix, ConsentRef: model.OAuthDerivedTokenKeyRef("consent-" + suffix), UserID: userID, Subject: strconv.Itoa(userID), ClientID: "client-" + suffix, OriginSID: "owner-session", UserAuthVersion: 1, SessionVersion: 1, Scopes: `["tokens:read","tokens:write"]`, PolicyHash: strings.Repeat("a", 64), Revision: 1, State: "active", CreatedAt: now - 5, ApprovedAt: now - 4, ExpiresAt: now + 1800}
+	grant.GrantRef = model.OAuthGrantRef(grant.Issuer, grant.GrantID)
+	require.NoError(t, db.Create(grant).Error)
+	var count int64
+	require.NoError(t, db.Model(&model.OAuthDerivedTokenSource{}).Count(&count).Error)
+	source := &model.OAuthDerivedTokenSource{GrantRef: grant.GrantRef, UserID: userID, SchemaVersion: 1, QuotaLimit: 1000, ExpiresAt: now + 600, PolicyHash: strings.Repeat("a", 64), BindingHash: strings.Repeat("b", 64), VerifiedAt: now - 10, ProofExpiresAt: now + 40, PermitDeadline: now + 40, VerifiedMethod: "password", ProofFlowID: count + 1}
+	var token *model.Token
+	if !unused {
+		key, err := common.GenerateKey()
+		require.NoError(t, err)
+		token = &model.Token{UserId: userID, Key: key, Name: "derived-" + suffix, Status: common.TokenStatusEnabled, RemainQuota: 1000, ExpiredTime: source.ExpiresAt}
+		require.NoError(t, token.Insert())
+		created := now - 1
+		keyRef, idem, request := model.OAuthDerivedTokenKeyRef(key), model.OAuthDerivedTokenKeyRef("idem-"+suffix), model.OAuthDerivedTokenKeyRef("req-"+suffix)
+		source.TokenID, source.KeyRef, source.IdemHash, source.RequestHash, source.CreatedAt = &token.Id, &keyRef, &idem, &request, &created
+	}
+	require.NoError(t, db.Create(source).Error)
+	return grant, source, token
+}
+
+func ownerLifecycleRouter(t *testing.T, db *gorm.DB) (*gin.Engine, string) {
+	t.Helper()
+	session := &model.UserSession{SID: "owner-session", UserID: 1, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "unused-fixture-hash", LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 3600}
+	require.NoError(t, model.CreateUserSession(session))
+	jwt, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: 1, SessionID: session.SID, UserAuthVersion: 1, SessionVersion: 1})
+	require.NoError(t, err)
+	r := gin.New()
+	g := r.Group("/api/token", middleware.UserAuth())
+	g.POST("/:id/key", GetTokenKey)
+	g.POST("/batch/keys", GetTokenKeysBatch)
+	g.PUT("/", UpdateToken)
+	g.DELETE("/:id", DeleteToken)
+	g.POST("/batch", DeleteTokenBatch)
+	return r, jwt
+}
+
+func TestOAuthDerivedTokenOwnerLifecycle(t *testing.T) {
+	t.Run("owner_reveal_and_mutation", func(t *testing.T) {
+		db := setupTokenOwnerTestDB(t)
+		r, jwt := ownerLifecycleRouter(t, db)
+		_, source, derived := ownerDerivedFixture(t, db, 1, "one", false)
+		manual := seedToken(t, db, 1, "manual", "owner-manual-secret")
+		request := func(method, path string, body any) *httptest.ResponseRecorder {
+			data, err := common.Marshal(body)
+			require.NoError(t, err)
+			req := httptest.NewRequest(method, path, bytes.NewReader(data))
+			req.Header.Set("Authorization", "Bearer "+jwt)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			return w
+		}
+		for _, tc := range []struct {
+			path   string
+			body   any
+			status int
+			secret bool
+		}{
+			{fmt.Sprintf("/api/token/%d/key", manual.Id), nil, 200, true},
+			{fmt.Sprintf("/api/token/%d/key", derived.Id), nil, 403, false},
+			{"/api/token/batch/keys", TokenBatch{Ids: []int{manual.Id, derived.Id}}, 403, false},
+		} {
+			w := request("POST", tc.path, tc.body)
+			require.Equal(t, tc.status, w.Code)
+			assert.NotContains(t, w.Body.String(), derived.Key)
+			if tc.secret {
+				assert.Contains(t, w.Body.String(), manual.Key)
+			} else {
+				assert.NotContains(t, w.Body.String(), manual.Key)
+				assert.False(t, decodeAPIResponse(t, w).Success)
+			}
+		}
+		for _, body := range []any{
+			gin.H{"id": derived.Id, "remain_quota": 2000}, gin.H{"id": derived.Id, "expired_time": -1}, gin.H{"id": derived.Id, "model_limits": "extra"},
+		} {
+			w := request("PUT", "/api/token/", body)
+			assert.Equal(t, 403, w.Code)
+		}
+		w := request("PUT", "/api/token/?status_only=true", gin.H{"id": derived.Id, "status": common.TokenStatusDisabled})
+		require.Equal(t, 200, w.Code)
+		require.True(t, decodeAPIResponse(t, w).Success)
+		require.NoError(t, db.First(derived, derived.Id).Error)
+		assert.Equal(t, common.TokenStatusDisabled, derived.Status)
+		assert.Equal(t, 1000, derived.RemainQuota)
+		require.NoError(t, db.First(source, "grant_ref = ?", source.GrantRef).Error)
+		require.NotNil(t, source.TerminalReason)
+		assert.Equal(t, "disabled", *source.TerminalReason)
+		w = request("PUT", "/api/token/?status_only=true", gin.H{"id": derived.Id, "status": common.TokenStatusEnabled})
+		assert.Equal(t, 403, w.Code)
+		w = request("POST", "/api/token/batch", TokenBatch{Ids: []int{manual.Id, derived.Id}})
+		require.True(t, decodeAPIResponse(t, w).Success)
+		require.NoError(t, db.Unscoped().First(derived, derived.Id).Error)
+		assert.True(t, derived.DeletedAt.Valid)
+		require.NoError(t, db.First(source, "grant_ref = ?", source.GrantRef).Error)
+		assert.Equal(t, "deleted", *source.TerminalReason)
+		assert.NotNil(t, source.CreatedAt)
+		// Physical loss is not a valid soft-deleted result, even with a tombstone.
+		require.NoError(t, db.Unscoped().Delete(derived).Error)
+		w = request("POST", fmt.Sprintf("/api/token/%d/key", derived.Id), nil)
+		assert.Equal(t, 503, w.Code)
+		assert.NotContains(t, w.Body.String(), derived.Key)
+		w = request("DELETE", fmt.Sprintf("/api/token/%d", derived.Id), nil)
+		assert.Equal(t, 503, w.Code)
+		var user model.User
+		require.NoError(t, db.First(&user, 1).Error)
+		assert.Zero(t, user.Quota)
+		assert.Zero(t, user.UsedQuota)
+		var charges int64
+		require.NoError(t, db.Model(&model.OAuthDerivedTextCharge{}).Count(&charges).Error)
+		assert.Zero(t, charges)
+	})
+	t.Run("revoke_and_rollback", func(t *testing.T) {
+		db := setupTokenOwnerTestDB(t)
+		grant, source, token := ownerDerivedFixture(t, db, 1, "revoke", false)
+		other, otherSource, otherToken := ownerDerivedFixture(t, db, 1, "other", false)
+		unusedGrant, unused, _ := ownerDerivedFixture(t, db, 1, "unused", true)
+		for _, table := range []string{"oauth_derived_token_sources", "tokens", "o_auth_cleanup_jobs"} {
+			require.NoError(t, db.Callback().Update().After("gorm:update").Register("owner:rollback", func(tx *gorm.DB) {
+				if tx.Statement.Table == table {
+					tx.AddError(errors.New("forced rollback"))
+				}
+			}))
+			require.NoError(t, db.Callback().Create().After("gorm:create").Register("owner:rollback", func(tx *gorm.DB) {
+				if tx.Statement.Table == table {
+					tx.AddError(errors.New("forced rollback"))
+				}
+			}))
+			require.Error(t, model.RevokeOAuth(context.Background(), 1, "grant", grant.GrantRef))
+			require.NoError(t, db.Callback().Update().Remove("owner:rollback"))
+			require.NoError(t, db.Callback().Create().Remove("owner:rollback"))
+			require.NoError(t, db.First(grant, "grant_ref = ?", grant.GrantRef).Error)
+			assert.Zero(t, grant.RevokedAt)
+			require.NoError(t, db.First(source, "grant_ref = ?", source.GrantRef).Error)
+			assert.Nil(t, source.TerminalAt)
+			require.NoError(t, db.First(token, token.Id).Error)
+			assert.Equal(t, common.TokenStatusEnabled, token.Status)
+		}
+		require.NoError(t, model.RevokeOAuth(context.Background(), 1, "grant", grant.GrantRef))
+		require.NoError(t, db.First(source, "grant_ref = ?", source.GrantRef).Error)
+		require.NotNil(t, source.TerminalReason)
+		assert.Equal(t, "revoked", *source.TerminalReason)
+		require.NoError(t, db.First(token, token.Id).Error)
+		assert.Equal(t, common.TokenStatusDisabled, token.Status)
+		require.NoError(t, db.First(other, "grant_ref = ?", other.GrantRef).Error)
+		assert.Zero(t, other.RevokedAt)
+		require.NoError(t, db.First(otherSource, "grant_ref = ?", otherSource.GrantRef).Error)
+		assert.Nil(t, otherSource.TerminalAt)
+		require.NoError(t, db.First(otherToken, otherToken.Id).Error)
+		assert.Equal(t, common.TokenStatusEnabled, otherToken.Status)
+		require.NoError(t, model.RevokeOAuth(context.Background(), 1, "grant", unusedGrant.GrantRef))
+		require.NoError(t, db.First(unused, "grant_ref = ?", unused.GrantRef).Error)
+		require.NotNil(t, unused.TerminalReason)
+		assert.Equal(t, "revoked", *unused.TerminalReason)
+		assert.Nil(t, unused.TokenID)
+		// Readiness off must not turn retained source state into a no-op.
+		require.NoError(t, model.InitOAuthCleanupStore(false))
+		require.Error(t, model.RevokeOAuth(context.Background(), 1, "user", ""))
+	})
+	t.Run("disable_delete_rollback", func(t *testing.T) {
+		db := setupTokenOwnerTestDB(t)
+		_, source, token := ownerDerivedFixture(t, db, 1, "rollback", false)
+		require.NoError(t, db.Callback().Update().After("gorm:update").Register("owner:fail", func(tx *gorm.DB) {
+			if tx.Statement.Table == "tokens" {
+				tx.AddError(errors.New("failure after SQL update"))
+			}
+		}))
+		token.Status = common.TokenStatusDisabled
+		require.Error(t, token.UpdateForOwner(true))
+		require.NoError(t, db.Callback().Update().Remove("owner:fail"))
+		require.NoError(t, db.First(source, "grant_ref = ?", source.GrantRef).Error)
+		assert.Nil(t, source.TerminalAt)
+		require.NoError(t, db.First(token, token.Id).Error)
+		assert.Equal(t, common.TokenStatusEnabled, token.Status)
+		require.NoError(t, db.Callback().Delete().After("gorm:delete").Register("owner:fail", func(tx *gorm.DB) { tx.AddError(errors.New("failure after SQL delete")) }))
+		require.Error(t, token.Delete())
+		require.NoError(t, db.Callback().Delete().Remove("owner:fail"))
+		require.NoError(t, db.Unscoped().First(token, token.Id).Error)
+		assert.False(t, token.DeletedAt.Valid)
+		require.NoError(t, db.First(source, "grant_ref = ?", source.GrantRef).Error)
+		assert.Nil(t, source.TerminalAt)
+	})
+	t.Run("unknown_is_not_manual", func(t *testing.T) {
+		db := setupTokenOwnerTestDB(t)
+		_, source, derived := ownerDerivedFixture(t, db, 1, "unknown", false)
+		manual := seedToken(t, db, 1, "manual", "unknown-manual-key")
+		// Invalid binding must reject an entire mixed batch, never yield manual data.
+		require.NoError(t, db.Model(source).UpdateColumn("key_ref", strings.Repeat("0", 64)).Error)
+		tokens, err := model.GetTokenKeysByIds([]int{manual.Id, derived.Id}, 1)
+		require.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+		assert.Nil(t, tokens)
+		ctx, w := newAuthenticatedContext(t, "POST", "/api/token/batch/keys", TokenBatch{Ids: []int{manual.Id, derived.Id}}, 1)
+		GetTokenKeysBatch(ctx)
+		assert.Equal(t, 503, w.Code)
+		assert.NotContains(t, w.Body.String(), manual.Key)
+		assert.NotContains(t, w.Body.String(), derived.Key)
+		// Missing source table is a real SQL error, not proof of manual origin.
+		require.NoError(t, db.Migrator().DropTable(&model.OAuthDerivedTokenSource{}))
+		tokens, err = model.GetTokenKeysByIds([]int{manual.Id}, 1)
+		require.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+		assert.Nil(t, tokens)
+		ctx, w = newAuthenticatedContext(t, "POST", "/api/token/batch/keys", TokenBatch{Ids: []int{manual.Id}}, 1)
+		GetTokenKeysBatch(ctx)
+		assert.Equal(t, 503, w.Code)
+		assert.NotContains(t, w.Body.String(), "oauth_derived_token_sources")
+		assert.NotContains(t, w.Body.String(), manual.Key)
+		// Transaction begin failures have the same safe unknown contract.
+		pool, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, pool.Close())
+		tokens, err = model.GetTokenKeysByIds([]int{manual.Id}, 1)
+		require.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+		assert.Nil(t, tokens)
+		_, err = model.GetTokenForOwner(manual.Id, 1)
+		require.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+		ctx, w = newAuthenticatedContext(t, "POST", "/api/token/batch/keys", TokenBatch{Ids: []int{manual.Id}}, 1)
+		GetTokenKeysBatch(ctx)
+		assert.Equal(t, 503, w.Code)
+		assert.NotContains(t, w.Body.String(), "database is closed")
+		assert.NotContains(t, w.Body.String(), manual.Key)
+	})
+
+	t.Run("same_user_creation_limit", func(t *testing.T) {
+		db := setupTokenOwnerTestDB(t)
+		old := operation_setting.GetTokenSetting().MaxUserTokens
+		operation_setting.GetTokenSetting().MaxUserTokens = 1
+		t.Cleanup(func() { operation_setting.GetTokenSetting().MaxUserTokens = old })
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		var wg sync.WaitGroup
+		for i := range 2 {
+			wg.Go(func() {
+				<-start
+				token := &model.Token{UserId: 1, Key: fmt.Sprintf("manual-default-%d", i), UnlimitedQuota: true, ExpiredTime: -1}
+				results <- token.Insert()
+			})
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		success := 0
+		for err := range results {
+			if err == nil {
+				success++
+			}
+		}
+		assert.Equal(t, 1, success)
+		var count int64
+		require.NoError(t, db.Model(&model.Token{}).Where("user_id = ?", 1).Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+	})
+	t.Run("registration_default_token", func(t *testing.T) {
+		db := setupTokenOwnerTestDB(t)
+		register, password, email, generate, bonus := common.RegisterEnabled, common.PasswordRegisterEnabled, common.EmailVerificationEnabled, constant.GenerateDefaultToken, common.QuotaForNewUser
+		common.RegisterEnabled, common.PasswordRegisterEnabled, common.EmailVerificationEnabled, constant.GenerateDefaultToken, common.QuotaForNewUser = true, true, false, true, 0
+		t.Cleanup(func() {
+			common.RegisterEnabled, common.PasswordRegisterEnabled, common.EmailVerificationEnabled, constant.GenerateDefaultToken, common.QuotaForNewUser = register, password, email, generate, bonus
+		})
+		ctx, w := newAuthenticatedContext(t, "POST", "/api/user/register", gin.H{"username": "new-owner", "password": "only-test-password-987"}, 0)
+		Register(ctx)
+		require.True(t, decodeAPIResponse(t, w).Success)
+		var user model.User
+		require.NoError(t, db.Where("username = ?", "new-owner").First(&user).Error)
+		var tokens []model.Token
+		require.NoError(t, db.Where("user_id = ?", user.Id).Find(&tokens).Error)
+		require.Len(t, tokens, 1)
+		assert.True(t, tokens[0].UnlimitedQuota)
+		assert.EqualValues(t, -1, tokens[0].ExpiredTime)
+		assert.Equal(t, 500000, tokens[0].RemainQuota)
+		assert.NotEmpty(t, tokens[0].Key)
+		assert.NotContains(t, w.Body.String(), tokens[0].Key)
+	})
+
+	t.Run("historical_finalize_after_revoke", func(t *testing.T) {
+		db := setupTokenOwnerTestDB(t)
+		_, jwt := ownerLifecycleRouter(t, db)
+		require.NotEmpty(t, jwt)
+		grant, source, token := ownerDerivedFixture(t, db, 1, "settle", false)
+		require.NoError(t, db.Model(&model.User{}).Where("id = ?", 1).Update("quota", 1000).Error)
+		facts := model.OAuthTextFacts{GrantRef: grant.GrantRef, UserID: 1, TokenID: token.Id, PolicyHash: source.PolicyHash, Model: "gpt-test", ChannelID: 1, RouteHash: strings.Repeat("c", 64), BodyHash: strings.Repeat("d", 64), ModelRatio: 1, CompletionRatio: 1, GroupRatio: 1, CacheRatio: 1, PromptEstimate: 10, MaxCompletion: 10}
+		ref := strings.Repeat("e", 64)
+		_, err := model.ReserveOAuthDerivedText(context.Background(), ref, facts, 80)
+		require.NoError(t, err)
+		_, err = model.ClaimOAuthDerivedText(context.Background(), ref, facts, 80)
+		require.NoError(t, err)
+		require.NoError(t, model.RevokeOAuth(context.Background(), 1, "grant", grant.GrantRef))
+		for range 2 {
+			out, err := model.FinalizeOAuthDerivedText(context.Background(), ref, 60, model.OAuthTextUsage{Prompt: 10, Completion: 10, Total: 20})
+			require.NoError(t, err)
+			assert.Equal(t, "settled", out.State)
+			assert.Equal(t, 1, out.PayerID)
+		}
+		var user model.User
+		require.NoError(t, db.First(&user, 1).Error)
+		assert.Equal(t, 940, user.Quota)
+		require.NoError(t, db.First(token, token.Id).Error)
+		assert.Equal(t, 940, token.RemainQuota)
+		assert.Equal(t, 60, token.UsedQuota)
+		assert.Equal(t, common.TokenStatusDisabled, token.Status)
 	})
 }

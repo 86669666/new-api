@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -307,6 +309,30 @@ func GetTokenByIds(id int, userId int) (*Token, error) {
 	return &token, err
 }
 
+// GetTokenForOwner validates provenance before owner mutation preparation.
+// The mutation re-reads under its own User lock; this result is not permission.
+func GetTokenForOwner(id, userID int) (*Token, error) {
+	var token *Token
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userID); err != nil {
+			return ErrOAuthDerivedTokenUnknown
+		}
+		if err := validateOAuthDerivedTokenStore(tx, time.Now().Unix()); err != nil {
+			return err
+		}
+		var err error
+		token, _, err = oauthOwnerToken(tx, userID, id)
+		if err == nil && token.DeletedAt.Valid {
+			return gorm.ErrRecordNotFound
+		}
+		return err
+	})
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrOAuthDerivedTokenUnknown
+	}
+	return token, err
+}
+
 func GetTokenById(id int) (*Token, error) {
 	if id == 0 {
 		return nil, errors.New("token id is empty")
@@ -343,21 +369,96 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	return token, nil
 }
 
+// Insert serializes manual/default creation with future derived issuance on
+// the same User. Registration calls this only after User.Insert commits.
 func (token *Token) Insert() error {
-	var err error
-	err = DB.Create(token).Error
-	return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, token.UserId); err != nil {
+			return err
+		}
+		return insertUserToken(tx, token)
+	})
+}
+
+// insertUserToken requires the existing User lock and participates in that
+// transaction; K2 must use this rather than opening a nested/global Insert.
+func insertUserToken(tx *gorm.DB, token *Token) error {
+	var user User
+	if err := tx.Select("id").First(&user, token.UserId).Error; err != nil {
+		return err
+	}
+	var count int64
+	if err := tx.Model(&Token{}).Where("user_id = ?", token.UserId).Count(&count).Error; err != nil {
+		return err
+	}
+	limit := operation_setting.GetMaxUserTokens()
+	if count >= int64(limit) {
+		return common.NewMessage("Maximum number of tokens reached ({{max}})", map[string]any{"max": limit})
+	}
+	if err := tx.Session(&gorm.Session{Logger: gormlogger.Default.LogMode(gormlogger.Silent)}).Create(token).Error; err != nil {
+		return common.NewMessage("Database error, please contact the administrator")
+	}
+	return nil
 }
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
-func (token *Token) Update() (err error) {
-	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog(common.LogText("failed to invalidate token cache before update: %s", cacheErr.Error()))
+func (token *Token) Update() error { return token.UpdateForOwner(false) }
+
+// UpdateForOwner never applies a stale owner snapshot to derived money. Only
+// the explicit status-only disable action can mutate a derived credential.
+func (token *Token) UpdateForOwner(statusOnly bool) error {
+	var changed Token
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, token.UserId); err != nil {
+			return ErrOAuthDerivedTokenUnknown
+		}
+		if err := validateOAuthDerivedTokenStore(tx, time.Now().Unix()); err != nil {
+			return err
+		}
+		current, source, err := oauthOwnerToken(tx, token.UserId, token.Id)
+		if err != nil {
+			return err
+		}
+		if current.DeletedAt.Valid {
+			return gorm.ErrRecordNotFound
+		}
+		if source != nil {
+			if !statusOnly || token.Status != common.TokenStatusDisabled {
+				return ErrOAuthDerivedTokenOwnerAction
+			}
+			if err := terminalOAuthToken(tx, source, "disabled", time.Now().Unix()); err != nil {
+				return err
+			}
+			if err := tx.Model(current).Update("status", common.TokenStatusDisabled).Error; err != nil {
+				return ErrOAuthDerivedTokenUnknown
+			}
+			current.Status = common.TokenStatusDisabled
+			changed = *current
+			return nil
+		}
+		if statusOnly {
+			if err := tx.Model(current).Update("status", token.Status).Error; err != nil {
+				return err
+			}
+			current.Status = token.Status
+			changed = *current
+			return nil
+		}
+		if err := tx.Model(current).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
+			"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups", "allow_user_quota_query").Updates(token).Error; err != nil {
+			return err
+		}
+		changed = *token
+		changed.Key = current.Key
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups",
-		"allow_user_quota_query").Updates(token).Error
+	*token = changed
+	// Projection only after SQL commit; the existing fence rejects late fills.
+	_ = invalidateTokenCacheForMutation(token.Key)
+	return nil
 }
 
 func (token *Token) SelectUpdate() (err error) {
@@ -368,11 +469,9 @@ func (token *Token) SelectUpdate() (err error) {
 	return DB.Model(token).Select("accessed_time", "status").Updates(token).Error
 }
 
-func (token *Token) Delete() (err error) {
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog(common.LogText("failed to invalidate token cache before delete: %s", cacheErr.Error()))
-	}
-	return DB.Delete(token).Error
+func (token *Token) Delete() error {
+	_, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
+	return err
 }
 
 func (token *Token) IsModelLimitsEnabled() bool {
@@ -483,35 +582,88 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 		return 0, common.NewMessage("Token IDs cannot be empty")
 	}
 
-	tx := DB.Begin()
-
-	var tokens []Token
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
-		tx.Rollback()
+	var deleted []Token
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userId); err != nil {
+			return ErrOAuthDerivedTokenUnknown
+		}
+		if err := validateOAuthDerivedTokenStore(tx, time.Now().Unix()); err != nil {
+			return err
+		}
+		ordered := slices.Clone(ids)
+		slices.Sort(ordered)
+		for _, id := range slices.Compact(ordered) {
+			token, source, err := oauthOwnerToken(tx, userId, id)
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if token.DeletedAt.Valid {
+				continue
+			}
+			if source != nil {
+				if err := terminalOAuthToken(tx, source, "deleted", time.Now().Unix()); err != nil {
+					return err
+				}
+			}
+			if err := tx.Delete(token).Error; err != nil {
+				return ErrOAuthDerivedTokenUnknown
+			}
+			deleted = append(deleted, *token)
+		}
+		return nil
+	})
+	if err != nil {
 		return 0, err
 	}
-	if err := invalidateTokensCache(tokens); err != nil {
-		common.SysLog(common.LogText("failed to invalidate token cache before batch delete: %s", err.Error()))
-	}
-
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		return 0, err
-	}
-
-	return len(tokens), nil
+	_ = invalidateTokensCache(deleted)
+	return len(deleted), nil
 }
 
+// GetTokenKeysByIds has all-or-nothing disclosure: a single unknown/derived
+// source denies the whole batch. No caller receives a partially filled slice.
 func GetTokenKeysByIds(ids []int, userId int) ([]Token, error) {
 	var tokens []Token
-	err := DB.Select("id", commonKeyCol).
-		Where("user_id = ? AND id IN (?)", userId, ids).
-		Find(&tokens).Error
-	return tokens, err
+	derived := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := LockOAuthUser(tx, userId); err != nil {
+			return ErrOAuthDerivedTokenUnknown
+		}
+		if err := validateOAuthDerivedTokenStore(tx, time.Now().Unix()); err != nil {
+			return err
+		}
+		ordered := slices.Clone(ids)
+		slices.Sort(ordered)
+		for _, id := range slices.Compact(ordered) {
+			token, source, err := oauthOwnerToken(tx, userId, id)
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if source != nil {
+				derived = true
+				continue
+			}
+			if !token.DeletedAt.Valid {
+				tokens = append(tokens, *token)
+			}
+		}
+		if derived {
+			return ErrOAuthDerivedTokenOwnerAction
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrOAuthDerivedTokenOwnerAction) {
+			return nil, err
+		}
+		return nil, ErrOAuthDerivedTokenUnknown
+	}
+	return tokens, nil
 }
 
 // InvalidateUserTokensCache 清理指定用户所有令牌在 Redis 中的缓存，

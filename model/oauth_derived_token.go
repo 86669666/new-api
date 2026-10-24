@@ -405,29 +405,13 @@ func ClassifyOAuthDerivedToken(ctx context.Context, tokenID int) (OAuthDerivedTo
 		if err := tx.Unscoped().First(&token, tokenID).Error; err != nil || token.UserId <= 0 || token.Key == "" {
 			return ErrOAuthDerivedTokenUnknown
 		}
-		var sources []OAuthDerivedTokenSource
-		if err := tx.Where("token_id = ? OR key_ref = ?", token.Id, OAuthDerivedTokenKeyRef(token.Key)).Limit(2).Find(&sources).Error; err != nil || len(sources) > 1 {
-			return ErrOAuthDerivedTokenUnknown
+		source, err := oauthTokenSource(tx, &token, false)
+		if err != nil {
+			return err
 		}
-		if len(sources) == 0 {
-			// Losing both lookup members of a partial success tuple must not
-			// turn that user's previously derived token into a manual token.
-			var partial int64
-			if err := tx.Model(&OAuthDerivedTokenSource{}).Where("user_id = ?", token.UserId).
-				Where("(token_id IS NULL OR key_ref IS NULL OR idem_hash IS NULL OR request_hash IS NULL OR created_at IS NULL) AND (token_id IS NOT NULL OR key_ref IS NOT NULL OR idem_hash IS NOT NULL OR request_hash IS NOT NULL OR created_at IS NOT NULL)").
-				Count(&partial).Error; err != nil || partial != 0 {
-				return ErrOAuthDerivedTokenUnknown
-			}
+		if source == nil {
 			kind = OAuthDerivedTokenManualProven
 			return nil
-		}
-		source := &sources[0]
-		var grant OAuthGrant
-		if err := tx.Where("grant_ref = ?", source.GrantRef).First(&grant).Error; err != nil {
-			return ErrOAuthDerivedTokenUnknown
-		}
-		if err := validateOAuthDerivedTokenBinding(source, &grant, &token, time.Now().Unix()); err != nil {
-			return err
 		}
 		kind = OAuthDerivedTokenBound
 		return nil
@@ -436,6 +420,51 @@ func ClassifyOAuthDerivedToken(ctx context.Context, tokenID int) (OAuthDerivedTo
 		return OAuthDerivedTokenUnknown, ErrOAuthDerivedTokenUnknown
 	}
 	return kind, nil
+}
+
+// oauthTokenSource reuses classification's strict history-relative lookup. The
+// caller validates the store first. A lifecycle caller already holds User and
+// locks the matching grant, source and Token in that order; no cached identity.
+func oauthTokenSource(tx *gorm.DB, token *Token, locked bool) (*OAuthDerivedTokenSource, error) {
+	var sources []OAuthDerivedTokenSource
+	if err := tx.Where("token_id = ? OR key_ref = ?", token.Id, OAuthDerivedTokenKeyRef(token.Key)).Limit(2).Find(&sources).Error; err != nil || len(sources) > 1 {
+		return nil, ErrOAuthDerivedTokenUnknown
+	}
+	if len(sources) == 0 {
+		// Losing both lookup members of a partial success tuple must not
+		// turn that user's previously derived token into a manual token.
+		var partial int64
+		if err := tx.Model(&OAuthDerivedTokenSource{}).Where("user_id = ?", token.UserId).
+			Where("(token_id IS NULL OR key_ref IS NULL OR idem_hash IS NULL OR request_hash IS NULL OR created_at IS NULL) AND (token_id IS NOT NULL OR key_ref IS NOT NULL OR idem_hash IS NOT NULL OR request_hash IS NOT NULL OR created_at IS NOT NULL)").
+			Count(&partial).Error; err != nil || partial != 0 {
+			return nil, ErrOAuthDerivedTokenUnknown
+		}
+		return nil, nil
+	}
+	source := &sources[0]
+	if source.UserID != token.UserId {
+		return nil, ErrOAuthDerivedTokenUnknown
+	}
+	var grant OAuthGrant
+	grantQuery := tx
+	if locked {
+		grantQuery = lockForUpdate(tx)
+	}
+	if err := grantQuery.Where("grant_ref = ? AND user_id = ?", source.GrantRef, token.UserId).First(&grant).Error; err != nil {
+		return nil, ErrOAuthDerivedTokenUnknown
+	}
+	if locked {
+		if err := lockForUpdate(tx).Where("grant_ref = ?", source.GrantRef).First(source).Error; err != nil {
+			return nil, ErrOAuthDerivedTokenUnknown
+		}
+		if err := lockForUpdate(tx.Unscoped()).Where("user_id = ?", token.UserId).First(token, token.Id).Error; err != nil {
+			return nil, ErrOAuthDerivedTokenUnknown
+		}
+	}
+	if err := validateOAuthDerivedTokenBinding(source, &grant, token, time.Now().Unix()); err != nil {
+		return nil, err
+	}
+	return source, nil
 }
 
 func validateOAuthDerivedTokenBinding(source *OAuthDerivedTokenSource, grant *OAuthGrant, token *Token, now int64) error {
@@ -547,4 +576,93 @@ func ReadOAuthDerivedTokenMetadata(ctx context.Context, grantRef string, userID 
 		return nil, err
 	}
 	return snapshot, nil
+}
+
+var ErrOAuthDerivedTokenOwnerAction = errors.New("derived token owner action is not permitted")
+
+// oauthOwnerToken is called only inside a User-locked transaction. Missing
+// Token rows that still have provenance are unknown, including tombstones.
+func oauthOwnerToken(tx *gorm.DB, userID, tokenID int) (*Token, *OAuthDerivedTokenSource, error) {
+	var token Token
+	if err := tx.Unscoped().Where("id = ? AND user_id = ?", tokenID, userID).First(&token).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, ErrOAuthDerivedTokenUnknown
+		}
+		var count int64
+		if err := tx.Model(&OAuthDerivedTokenSource{}).Where("token_id = ? AND user_id = ?", tokenID, userID).Count(&count).Error; err != nil || count != 0 {
+			return nil, nil, ErrOAuthDerivedTokenUnknown
+		}
+		return nil, nil, gorm.ErrRecordNotFound
+	}
+	if token.Key == "" {
+		return nil, nil, ErrOAuthDerivedTokenUnknown
+	}
+	source, err := oauthTokenSource(tx, &token, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	if source == nil {
+		if err := lockForUpdate(tx.Unscoped()).Where("user_id = ?", userID).First(&token, tokenID).Error; err != nil {
+			return nil, nil, ErrOAuthDerivedTokenUnknown
+		}
+	}
+	return &token, source, nil
+}
+
+// terminalOAuthToken preserves the successful issuance tuple and monetary
+// fields. Deletion is a stronger tombstone; other terminal reasons never reopen.
+func terminalOAuthToken(tx *gorm.DB, source *OAuthDerivedTokenSource, reason string, now int64) error {
+	if source.TerminalAt != nil && reason != "deleted" {
+		return nil
+	}
+	source.TerminalAt, source.TerminalReason = &now, &reason
+	if err := tx.Model(source).Select("terminal_at", "terminal_reason").Updates(source).Error; err != nil {
+		return ErrOAuthDerivedTokenUnknown
+	}
+	return nil
+}
+
+// revokeOAuthDerivedTokens joins the existing security transaction after its
+// grant/operation/job prefix. It cannot manufacture missing history or silently
+// ignore an orphaned source, even when the OAuth feature has been turned off.
+func revokeOAuthDerivedTokens(tx *gorm.DB, userID int, grants []OAuthGrant, match OAuthCleanupJob, now int64) error {
+	var sources []OAuthDerivedTokenSource
+	if err := lockForUpdate(tx).Where("user_id = ?", userID).Order("grant_ref").Find(&sources).Error; err != nil {
+		return ErrOAuthDerivedTokenUnknown
+	}
+	byRef := make(map[string]*OAuthGrant, len(grants))
+	for i := range grants {
+		byRef[grants[i].GrantRef] = &grants[i]
+	}
+	for i := range sources {
+		source := &sources[i]
+		grant := byRef[source.GrantRef]
+		if grant == nil {
+			return ErrOAuthDerivedTokenUnknown
+		}
+		var token *Token
+		if source.TokenID != nil {
+			token = &Token{}
+			if err := lockForUpdate(tx.Unscoped()).Where("user_id = ?", userID).First(token, *source.TokenID).Error; err != nil {
+				return ErrOAuthDerivedTokenUnknown
+			}
+		}
+		if err := validateOAuthDerivedTokenBinding(source, grant, token, now); err != nil {
+			return err
+		}
+		if !match.matches(grant.ClientID, grant.OriginSID, grant.GrantRef) {
+			continue
+		}
+		if err := terminalOAuthToken(tx, source, "revoked", now); err != nil {
+			return err
+		}
+		if token != nil {
+			if err := tx.Unscoped().Model(token).Update("status", common.TokenStatusDisabled).Error; err != nil {
+				return ErrOAuthDerivedTokenUnknown
+			}
+		}
+	}
+	// No Redis writes inside the outer security transaction. Strict token auth
+	// reads SQL status and source on every request; stale cache cannot authorize.
+	return nil
 }

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -195,17 +196,23 @@ func GetTokenAutoGroups(c *gin.Context) {
 }
 
 func GetTokenKey(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
 	id, err := strconv.Atoi(c.Param("id"))
 	userId := c.GetInt("id")
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	token, err := model.GetTokenByIds(id, userId)
+	tokens, err := model.GetTokenKeysByIds([]int{id}, userId)
 	if err != nil {
-		common.ApiError(c, err)
+		tokenOwnerError(c, err)
 		return
 	}
+	if len(tokens) != 1 {
+		common.ApiErrorT(c, "Operation failed")
+		return
+	}
+	token := &tokens[0]
 	params := tokenAuditParams(c)
 	params["id"], params["name"] = token.Id, token.Name
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
@@ -395,16 +402,16 @@ func AddToken(c *gin.Context) {
 func DeleteToken(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
 	userId := c.GetInt("id")
-	token, err := model.GetTokenByIds(id, userId)
+	token, err := model.GetTokenForOwner(id, userId)
 	if err != nil {
-		common.ApiError(c, err)
+		tokenOwnerError(c, err)
 		return
 	}
 	params := tokenAuditParams(c)
 	params["id"], params["name"] = token.Id, token.Name
 	err = token.Delete()
 	if err != nil {
-		common.ApiError(c, err)
+		tokenOwnerError(c, err)
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
@@ -420,7 +427,7 @@ func UpdateToken(c *gin.Context) {
 	request := tokenRequest{}
 	err := c.ShouldBindJSON(&request)
 	if err != nil {
-		common.ApiError(c, err)
+		tokenOwnerError(c, err)
 		return
 	}
 	token := request.Token
@@ -443,9 +450,9 @@ func UpdateToken(c *gin.Context) {
 			return
 		}
 	}
-	cleanToken, err := model.GetTokenByIds(token.Id, userId)
+	cleanToken, err := model.GetTokenForOwner(token.Id, userId)
 	if err != nil {
-		common.ApiError(c, err)
+		tokenOwnerError(c, err)
 		return
 	}
 	params["name"] = cleanToken.Name
@@ -485,9 +492,9 @@ func UpdateToken(c *gin.Context) {
 			}
 		}
 	}
-	err = cleanToken.Update()
+	err = cleanToken.UpdateForOwner(statusOnly != "")
 	if err != nil {
-		common.ApiError(c, err)
+		tokenOwnerError(c, err)
 		return
 	}
 	params["name"] = cleanToken.Name
@@ -544,7 +551,7 @@ func DeleteTokenBatch(c *gin.Context) {
 	userId := c.GetInt("id")
 	count, err := model.BatchDeleteTokens(tokenBatch.Ids, userId)
 	if err != nil {
-		common.ApiError(c, err)
+		tokenOwnerError(c, err)
 		return
 	}
 	params["count"] = count
@@ -557,6 +564,7 @@ func DeleteTokenBatch(c *gin.Context) {
 }
 
 func GetTokenKeysBatch(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
 	tokenBatch := TokenBatch{}
 	if err := c.ShouldBindJSON(&tokenBatch); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
@@ -574,7 +582,7 @@ func GetTokenKeysBatch(c *gin.Context) {
 	userId := c.GetInt("id")
 	tokens, err := model.GetTokenKeysByIds(tokenBatch.Ids, userId)
 	if err != nil {
-		common.ApiError(c, err)
+		tokenOwnerError(c, err)
 		return
 	}
 	keysMap := make(map[int]string)
@@ -587,4 +595,18 @@ func GetTokenKeysBatch(c *gin.Context) {
 	params["returned_ids"] = returnedIDs
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	common.ApiSuccess(c, gin.H{"keys": keysMap})
+}
+
+// Keep provenance/storage failures generic; neither SQL nor credentials belong
+// in owner responses or the operation audit. Existing validation stays intact.
+func tokenOwnerError(c *gin.Context, err error) {
+	if errors.Is(err, model.ErrOAuthDerivedTokenOwnerAction) {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "Operation failed", "message_key": "Operation failed"})
+		return
+	}
+	if errors.Is(err, model.ErrOAuthDerivedTokenUnknown) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "Database error, please contact the administrator", "message_key": "Database error, please contact the administrator"})
+		return
+	}
+	common.ApiError(c, err)
 }
