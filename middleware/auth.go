@@ -793,6 +793,16 @@ func TokenAuth() func(c *gin.Context) {
 				// A separately verified cache observation can only veto new admission.
 				sqlToken.RemainQuota, sqlToken.UsedQuota = token.RemainQuota, token.UsedQuota
 				token = &sqlToken
+				observation, observationErr := model.ReadTokenCacheAdmissionObservation(sqlToken.Id, key)
+				if observationErr != nil {
+					if errors.Is(observationErr, model.ErrTokenCacheIdentity) {
+						err = model.ErrTokenInvalid
+					} else {
+						err = model.ErrDatabase
+					}
+				} else if !sqlToken.UnlimitedQuota && observation.Exhausted() {
+					err = model.ErrTokenExhausted
+				}
 			}
 		} else if err == nil && kind == model.OAuthDerivedTokenBound && (c.Request.Method != http.MethodPost || c.Request.URL.Path != "/v1/chat/completions" ||
 			c.Request.URL.RawQuery != "" || c.Request.URL.RawPath != "" || len(parts) != 1 ||

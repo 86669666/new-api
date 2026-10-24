@@ -106,6 +106,11 @@ type TokenCacheAdmissionObservation struct {
 	remaining int
 }
 
+// Exhausted only vetoes strict admission; it never establishes an available balance.
+func (o TokenCacheAdmissionObservation) Exhausted() bool {
+	return o.finite && o.remaining <= 0
+}
+
 func (o TokenCacheAdmissionObservation) Rejects(quota int) bool {
 	return quota > 0 && o.finite && o.remaining < quota
 }

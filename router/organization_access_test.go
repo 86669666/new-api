@@ -35,6 +35,8 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relay"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
@@ -715,6 +717,9 @@ func TestRelayTokenErrorCodesHTTP(t *testing.T) {
 func TestRelayTokenCachedErrorCodesHTTP(t *testing.T) {
 	require.Equal(t, "g20-token-error-codes", os.Getenv("NEWAPI_S2_OWNED"))
 	f := newOrganizationHTTPFixture(t)
+	// The HTTP-only fixture starts with zero wallet quota. Fund SQL explicitly
+	// so billing controls reach token admission rather than wallet insufficiency.
+	require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("quota", 100).Error)
 	address := os.Getenv("NEWAPI_TOKEN_STATE_REDIS_ADDR")
 	host, port, err := net.SplitHostPort(address)
 	require.NoError(t, err, "an explicitly owned Redis endpoint is required")
@@ -765,6 +770,134 @@ func TestRelayTokenCachedErrorCodesHTTP(t *testing.T) {
 			assert.Equal(t, 50, stored.RemainQuota, "classifying a cached rejection must not settle cached quota")
 			assert.NotContains(t, f.logs.snapshot(), key)
 			require.NoError(t, client.Del(context.Background(), cacheKey).Err())
+		})
+	}
+	// A strict read may consume a denial, never a cache-supplied balance.
+	for _, tc := range []struct {
+		name, cached string
+		sqlQuota     int
+		unlimited    bool
+		want         int
+	}{
+		{"negative", "-1", 50, false, 401},
+		{"positive_low", "1", 50, false, 200},
+		{"high_cannot_override_sql", "500", 0, false, 401},
+		{"sql_unlimited", "-1", 0, true, 200},
+		{"missing", "", 50, false, 200},
+		{"malformed", "invalid", 50, false, 200},
+		{"overflow", "9223372036854775808", 50, false, 200},
+		{"wrong_type", "", 50, false, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "strictcache" + common.NewRequestId()
+			token := model.Token{UserId: f.users["owner"].Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: tc.sqlQuota, UnlimitedQuota: tc.unlimited}
+			require.NoError(t, token.Insert())
+			cacheKey := "token:" + common.GenerateHMAC(key)
+			_, err := model.GetTokenByKey(key, true)
+			require.NoError(t, err)
+			require.NoError(t, client.HSet(t.Context(), cacheKey, "RemainQuota", tc.cached, "UnlimitedQuota", true).Err())
+			if tc.name == "missing" {
+				require.NoError(t, client.HDel(t.Context(), cacheKey, "RemainQuota").Err())
+			}
+			if tc.name == "wrong_type" {
+				require.NoError(t, client.Del(t.Context(), cacheKey).Err())
+				require.NoError(t, client.Set(t.Context(), cacheKey, "not-a-hash", 0).Err())
+			}
+			var before model.User
+			require.NoError(t, f.db.First(&before, token.UserId).Error)
+			var tasksBefore int64
+			require.NoError(t, f.db.Model(&model.Task{}).Count(&tasksBefore).Error)
+			status, _, body := f.request(t, http.MethodGet, "/v1/models", "sk-"+key, "", nil)
+			require.Equal(t, tc.want, status)
+			if tc.want == 401 {
+				errorBody, ok := body["error"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, "token_exhausted", errorBody["code"])
+			}
+			status, _, _ = f.request(t, http.MethodGet, "/api/usage/token/", "sk-"+key, "", nil)
+			assert.Equal(t, 200, status)
+			if tc.name == "positive_low" || tc.name == "negative" {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				info := &relaycommon.RelayInfo{UserId: token.UserId, TokenId: token.Id, TokenKey: key, ForcePreConsume: true}
+				info.UserSetting.BillingPreference = "wallet_only"
+				session, apiErr := service.NewBillingSession(c, info, 10)
+				require.Nil(t, session)
+				require.NotNil(t, apiErr)
+				assert.Equal(t, "pre_consume_token_quota_failed", string(apiErr.GetErrorCode()))
+			}
+			var after model.User
+			var actual model.Token
+			var tasksAfter int64
+			require.NoError(t, f.db.First(&after, token.UserId).Error)
+			require.NoError(t, f.db.First(&actual, token.Id).Error)
+			require.NoError(t, f.db.Model(&model.Task{}).Count(&tasksAfter).Error)
+			assert.Equal(t, before, after)
+			assert.Equal(t, token, actual, "read/veto must not publish cached money or status")
+			assert.Equal(t, tasksBefore, tasksAfter)
+			assert.NotContains(t, f.logs.snapshot(), key)
+			require.NoError(t, client.Del(t.Context(), cacheKey).Err())
+		})
+	}
+	for _, state := range []string{"held", "send_claimed"} {
+		t.Run("historical_and_new_admission_"+state, func(t *testing.T) {
+			key := "cachehistory" + common.NewRequestId()
+			token := model.Token{UserId: f.users["owner"].Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 500}
+			require.NoError(t, token.Insert())
+			var before model.User
+			require.NoError(t, f.db.First(&before, token.UserId).Error)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{UserId: token.UserId, TokenId: token.Id, TokenKey: key, ForcePreConsume: true}
+			info.UserSetting.BillingPreference = "wallet_only"
+			session, apiErr := service.NewBillingSession(c, info, 10)
+			require.Nil(t, apiErr)
+			require.NotNil(t, session)
+			require.NoError(t, session.Reserve(10))
+			require.NoError(t, session.Reserve(5))
+			assert.Equal(t, 10, session.GetPreConsumedQuota())
+			oldTrust := operation_setting.GetQuotaSetting().TrustQuotaUSD
+			operation_setting.GetQuotaSetting().TrustQuotaUSD = 0.000001
+			t.Cleanup(func() { operation_setting.GetQuotaSetting().TrustQuotaUSD = oldTrust })
+			c.Set("token_quota", 490)
+			trustedInfo := *info
+			trustedInfo.ForcePreConsume = false
+			trusted, trustErr := service.NewBillingSession(c, &trustedInfo, 10)
+			require.Nil(t, trustErr)
+			require.NotNil(t, trusted)
+			assert.Zero(t, trusted.GetPreConsumedQuota(), "control must exercise the actual trusted bypass")
+			trusted.Refund(c)
+			charge := model.OAuthDerivedTextCharge{Ref: common.GenerateHMAC(key), UserID: token.UserId, State: state}
+			require.NoError(t, f.db.Create(&charge).Error)
+			t.Cleanup(func() { assert.NoError(t, f.db.Delete(&charge).Error) })
+			for _, target := range []int{10, 5, 20} {
+				require.Error(t, session.Reserve(target))
+			}
+			for _, quota := range []int{0, 10} {
+				next := *info
+				next.ForcePreConsume = false
+				blocked, err := service.NewBillingSession(c, &next, quota)
+				require.NotNil(t, err)
+				require.Nil(t, blocked)
+				assert.Equal(t, "update_data_error", string(err.GetErrorCode()))
+			}
+			free := *info
+			free.PriceData.FreeModel = true
+			freeErr := relay.PrepareRequestBilling(c, &free)
+			require.NotNil(t, freeErr)
+			assert.Equal(t, "update_data_error", string(freeErr.GetErrorCode()), "must fail admission before pricing/free shortcuts")
+			require.NoError(t, session.Settle(8))
+			require.NoError(t, session.Settle(8))
+			session.Refund(c) // settled history cannot refund twice
+			var actual model.Token
+			var after model.User
+			require.NoError(t, f.db.First(&actual, token.Id).Error)
+			require.NoError(t, f.db.First(&after, token.UserId).Error)
+			assert.Equal(t, before.Quota-8, after.Quota)
+			assert.Equal(t, 492, actual.RemainQuota)
+			assert.Equal(t, 8, actual.UsedQuota)
+			assert.Equal(t, token.Status, actual.Status)
+			require.NoError(t, client.Del(t.Context(), "token:"+common.GenerateHMAC(key), "user:"+strconv.Itoa(token.UserId)).Err())
 		})
 	}
 }
