@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -714,9 +715,75 @@ func TestRelayTokenErrorCodesHTTP(t *testing.T) {
 	})
 }
 
+// newOrganizationTokenCacheFixture keeps legacy ownership gates and validates
+// the official installer's protected resource receipt against the live daemon.
+func newOrganizationTokenCacheFixture(t *testing.T) *organizationHTTPFixture {
+	t.Helper()
+	f := newOrganizationProfileFixture(t, "g20-token-error-codes")
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") == "" {
+		return f
+	}
+	receiptPath := os.Getenv("NEWAPI_BOOTSTRAP_REDIS_RECEIPT")
+	root := filepath.Dir(filepath.Dir(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL")))
+	require.Equal(t, filepath.Join(root, "redis-resource.json"), receiptPath)
+	for path := receiptPath; ; path = filepath.Dir(path) {
+		info, err := os.Lstat(path)
+		require.NoError(t, err)
+		require.Zero(t, info.Mode()&os.ModeSymlink)
+		require.Zero(t, info.Mode().Perm()&0o022)
+		owner := reflect.Indirect(reflect.ValueOf(info.Sys())).FieldByName("Uid")
+		require.True(t, owner.IsValid(), "Unix ownership evidence required")
+		require.Zero(t, owner.Uint(), "installer owns receipt and ancestors")
+		if path == "/" {
+			break
+		}
+	}
+	var receipt struct {
+		Address      string `json:"address"`
+		Port         int    `json:"port"`
+		PID          int    `json:"pid"`
+		ServiceUID   int    `json:"service_uid"`
+		RunID        string `json:"run_id"`
+		Version      string `json:"version"`
+		NetNamespace string `json:"net_namespace"`
+		Persistence  bool   `json:"persistence"`
+		KeyLifecycle string `json:"key_lifecycle"`
+	}
+	raw, err := os.ReadFile(receiptPath)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(raw, &receipt))
+	require.NotZero(t, os.Getuid())
+	require.Equal(t, os.Getuid(), receipt.ServiceUID)
+	require.Equal(t, "127.0.0.1:"+strconv.Itoa(receipt.Port), receipt.Address)
+	require.Equal(t, receipt.Address, os.Getenv("NEWAPI_TOKEN_STATE_REDIS_ADDR"))
+	require.Equal(t, strconv.Itoa(receipt.Port), os.Getenv("NEWAPI_TOKEN_STATE_REDIS_PORT"))
+	ns, err := os.Readlink("/proc/self/ns/net")
+	require.NoError(t, err)
+	require.Equal(t, ns, receipt.NetNamespace)
+	require.False(t, receipt.Persistence)
+	require.Equal(t, "EXISTS0/SET-NX/GET/DEL1/EXISTS0", receipt.KeyLifecycle)
+	client := redis.NewClient(&redis.Options{Addr: receipt.Address, MaxRetries: -1})
+	defer client.Close()
+	info, err := client.Info(t.Context(), "server").Result()
+	require.NoError(t, err)
+	values := map[string]string{}
+	for line := range strings.SplitSeq(info, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok {
+			values[k] = v
+		}
+	}
+	require.Equal(t, receipt.RunID, values["run_id"])
+	require.Equal(t, receipt.Version, values["redis_version"])
+	require.Equal(t, strconv.Itoa(receipt.PID), values["process_id"])
+	require.Equal(t, strconv.Itoa(receipt.Port), values["tcp_port"])
+	require.Regexp(t, `^[0-9a-f]{40}$`, receipt.RunID)
+	require.NoError(t, client.Ping(t.Context()).Err())
+	return f
+}
+
 func TestRelayTokenCachedErrorCodesHTTP(t *testing.T) {
-	require.Equal(t, "g20-token-error-codes", os.Getenv("NEWAPI_S2_OWNED"))
-	f := newOrganizationHTTPFixture(t)
+	f := newOrganizationTokenCacheFixture(t)
 	// The HTTP-only fixture starts with zero wallet quota. Fund SQL explicitly
 	// so billing controls reach token admission rather than wallet insufficiency.
 	require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.users["owner"].Id).Update("quota", 100).Error)
@@ -6515,7 +6582,7 @@ func TestTokenAuthFailureBoundariesHTTP(t *testing.T) {
 }
 
 func TestTokenAuthRedisFailureBoundariesHTTP(t *testing.T) {
-	f := newOrganizationProfileFixture(t, "g20-token-error-codes")
+	f := newOrganizationTokenCacheFixture(t)
 	address := os.Getenv("NEWAPI_TOKEN_STATE_REDIS_ADDR")
 	host, port, err := net.SplitHostPort(address)
 	require.NoError(t, err)
