@@ -367,8 +367,29 @@ def bootstrap_observation(side, phase, started, peer_pid, *, label='unspecified'
                'category': category, 'errno': errno if isinstance(errno, int) and 0 <= errno <= 4095 else None,
                'cli_exit': cli_exit if isinstance(cli_exit, int) and -255 <= cli_exit <= 255 else None}
         data = (json.dumps(row, separators=(',', ':'))+'\n').encode()
-        if len(data) <= 768:
-            os.write(2 if side == 'client' else 1, data)
+        if len(data) > 768:
+            return
+        sink = 2 if side == 'client' else 1
+        original = os.fstat(sink)
+        # O_NONBLOCK cannot bound regular-file/device writes. Unsupported sinks
+        # lose diagnostics rather than acquiring a new operation dependency.
+        if not stat.S_ISFIFO(original.st_mode):
+            return
+        # On Linux, reopening proc/self/fd creates an independent open file
+        # description. dup()/F_SETFL would change the caller's shared flags.
+        diagnostic = os.open('/proc/self/fd/' + str(sink),
+                             os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            opened = os.fstat(diagnostic)
+            if (not stat.S_ISFIFO(opened.st_mode) or
+                    (opened.st_dev, opened.st_ino) != (original.st_dev, original.st_ino)):
+                return
+            # One <= PIPE_BUF write is all-or-EAGAIN, even with concurrent
+            # writers. No readiness-check race, retry, queue or retained fd.
+            if len(data) <= os.fpathconf(diagnostic, 'PC_PIPE_BUF'):
+                os.write(diagnostic, data)
+        finally:
+            os.close(diagnostic)
     except Exception:
         # A closed/broken diagnostic sink cannot change the operation's result.
         pass
