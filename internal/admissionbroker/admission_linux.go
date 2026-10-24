@@ -613,7 +613,7 @@ func Check(ctx context.Context, configPath string) (Result, error) {
 	if e != nil {
 		return result, e
 	}
-	dialer := net.Dialer{}
+	dialer := net.Dialer{Timeout: readTimeout}
 	raw, e := dialer.DialContext(ctx, "unix", cfg.Socket)
 	if e != nil {
 		return result, ErrQualification
