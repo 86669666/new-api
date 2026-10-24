@@ -39,7 +39,7 @@ func setupAccessTokenAudit(t *testing.T, additionalModels ...any) (*model.User, 
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	previousRedis := common.RedisEnabled
-	models := []any{&model.User{}, &model.UserSession{}, &model.Log{}, &model.AuditLog{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{},
+	models := []any{&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.Log{}, &model.AuditLog{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.UserAccessToken{}, &model.Option{},
 		&model.AuthFlow{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}}
 	models = append(models, additionalModels...)
 	dialect := common.DatabaseType(os.Getenv("TEST_TASK_DB_DIALECT"))

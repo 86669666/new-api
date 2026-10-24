@@ -811,7 +811,7 @@ func TestGetTokenUsageAuthenticatedSnapshot(t *testing.T) {
 			}
 			var dashboardJWT, pat string
 			if tc.mode == "jwt" || tc.mode == "pat" || strings.HasPrefix(tc.mode, "mixed_") {
-				require.NoError(t, db.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+				require.NoError(t, db.AutoMigrate(&model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}))
 				previousSecret := common.SessionSecret
 				common.SessionSecret = "usage-only-test-signing-key"
 				t.Cleanup(func() { common.SessionSecret = previousSecret })
@@ -921,7 +921,7 @@ func TestGetTokenPricingProjection(t *testing.T) {
 		common.SetDatabaseTypes(previousMainType, previousLogType)
 		common.RedisEnabled, common.SessionSecret = previousRedis, previousSecret
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.AuditLog{}, &model.UserAccessToken{}, &model.Option{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.AuditLog{}, &model.UserAccessToken{}, &model.Option{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
 	t.Setenv("LOG_SQL_DSN", "")
 	require.NoError(t, model.InitLogDB())
 	common.SessionSecret = "pricing-fixture-session-signing-secret"
@@ -1331,7 +1331,7 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 				db, _ := newAuditTestDatabase(t, database.name, dsn)
 				model.DB = db
 				common.SetDatabaseTypes(database.typ, database.typ)
-				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.Token{}))
 				// Initialize production column quoting as well as the existing audit table.
 				require.NoError(t, model.InitLogDB())
 				if separateLog {
