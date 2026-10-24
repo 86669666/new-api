@@ -7,6 +7,7 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -123,6 +124,20 @@ func ValidateOAuthDerivedTokenStore(ctx context.Context) error {
 }
 
 func validateOAuthDerivedTokenSchema(db *gorm.DB) error {
+	if db.Dialector.Name() == "postgres" {
+		// Pin the SELECT and catalog lookups to one connection. Its relation
+		// locks remain held until all physical metadata checks finish.
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			return validateOAuthDerivedTokenSchemaMetadata(tx)
+		}); err != nil {
+			return ErrOAuthDerivedTokenUnknown
+		}
+		return nil
+	}
+	return validateOAuthDerivedTokenSchemaMetadata(db)
+}
+
+func validateOAuthDerivedTokenSchemaMetadata(db *gorm.DB) error {
 	for _, value := range []any{&OAuthDerivedTokenSource{}, &OAuthDerivedTokenHistory{}, &OAuthDerivedTokenBootstrapIdentity{}} {
 		statement := &gorm.Statement{DB: db}
 		if err := statement.Parse(value); err != nil {
@@ -131,20 +146,71 @@ func validateOAuthDerivedTokenSchema(db *gorm.DB) error {
 		if err := db.Model(value).Select(statement.Schema.DBNames).Limit(0).Find(value).Error; err != nil {
 			return ErrOAuthDerivedTokenUnknown
 		}
-		columns, err := db.Migrator().ColumnTypes(value)
-		if err != nil {
-			return ErrOAuthDerivedTokenUnknown
-		}
 		var primary []string
-		for _, column := range columns {
-			if yes, _ := column.PrimaryKey(); yes {
-				primary = append(primary, column.Name())
-				continue
+		if db.Dialector.Name() == "postgres" {
+			// information_schema hides PK constraints from SELECT-only principals.
+			// Resolve the same unqualified relation as the preceding SQL, require
+			// the bootstrap public namespace, and read its physical attributes.
+			var columns []struct {
+				Name            string
+				Type            string
+				NotNull         bool
+				PrimaryPosition int64
 			}
-			field := statement.Schema.LookUpField(column.Name())
-			nullable, known := column.Nullable()
-			if field == nil || !known || nullable == field.NotNull {
+			if err := db.Raw(`SELECT a.attname AS name,
+				pg_catalog.format_type(a.atttypid, a.atttypmod) AS type,
+				a.attnotnull AS not_null, COALESCE(k.position, 0) AS primary_position
+				FROM pg_catalog.pg_class AS r
+				JOIN pg_catalog.pg_namespace AS n ON n.oid = r.relnamespace
+				JOIN pg_catalog.pg_attribute AS a ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
+				LEFT JOIN pg_catalog.pg_index AS i ON i.indrelid = r.oid AND i.indisprimary
+				LEFT JOIN LATERAL pg_catalog.unnest(i.indkey::smallint[]) WITH ORDINALITY AS k(attnum, position) ON k.attnum = a.attnum
+				WHERE r.oid = pg_catalog.to_regclass(?) AND n.nspname = 'public'
+				AND current_schema() = 'public' AND r.relkind = 'r'
+				ORDER BY a.attnum`, statement.Table).Scan(&columns).Error; err != nil || len(columns) != len(statement.Schema.DBNames) {
 				return ErrOAuthDerivedTokenUnknown
+			}
+			ordered := map[int64]string{}
+			for _, column := range columns {
+				field := statement.Schema.LookUpField(column.Name)
+				if field == nil || column.NotNull != (field.NotNull || field.PrimaryKey) {
+					return ErrOAuthDerivedTokenUnknown
+				}
+				expectedType := db.Dialector.DataTypeOf(field)
+				expectedType = strings.Replace(expectedType, "varchar(", "character varying(", 1)
+				expectedType = strings.Replace(expectedType, "char(", "character(", 1)
+				if column.Type != expectedType {
+					return ErrOAuthDerivedTokenUnknown
+				}
+				if column.PrimaryPosition > 0 {
+					if _, duplicate := ordered[column.PrimaryPosition]; duplicate {
+						return ErrOAuthDerivedTokenUnknown
+					}
+					ordered[column.PrimaryPosition] = column.Name
+				}
+			}
+			for position := int64(1); position <= int64(len(ordered)); position++ {
+				name, exists := ordered[position]
+				if !exists {
+					return ErrOAuthDerivedTokenUnknown
+				}
+				primary = append(primary, name)
+			}
+		} else {
+			columns, err := db.Migrator().ColumnTypes(value)
+			if err != nil {
+				return ErrOAuthDerivedTokenUnknown
+			}
+			for _, column := range columns {
+				if yes, _ := column.PrimaryKey(); yes {
+					primary = append(primary, column.Name())
+					continue
+				}
+				field := statement.Schema.LookUpField(column.Name())
+				nullable, known := column.Nullable()
+				if field == nil || !known || nullable == field.NotNull {
+					return ErrOAuthDerivedTokenUnknown
+				}
 			}
 		}
 		if len(statement.Schema.PrimaryFieldDBNames) != 1 || !slices.Equal(primary, statement.Schema.PrimaryFieldDBNames) {
@@ -153,24 +219,38 @@ func validateOAuthDerivedTokenSchema(db *gorm.DB) error {
 		if err := validateOAuthDerivedTokenIndex(db, statement.Table, "", primary, true); err != nil {
 			return err
 		}
-		indexes, err := db.Migrator().GetIndexes(value)
-		if err != nil {
-			return ErrOAuthDerivedTokenUnknown
-		}
-		for _, expected := range statement.Schema.ParseIndexes() {
-			var names []string
-			for _, field := range expected.Fields {
-				names = append(names, field.DBName)
-			}
-			matched := false
-			for _, actual := range indexes {
-				unique, known := actual.Unique()
-				if actual.Name() == expected.Name && known && unique == (expected.Class == "UNIQUE") && slices.Equal(actual.Columns(), names) {
-					matched = true
+		if db.Dialector.Name() == "postgres" {
+			// The physical verifier binds each index to the resolved public OID;
+			// GORM's name-only GetIndexes query is not a namespace authority.
+			for _, expected := range statement.Schema.ParseIndexes() {
+				var names []string
+				for _, field := range expected.Fields {
+					names = append(names, field.DBName)
+				}
+				if err := validateOAuthDerivedTokenIndex(db, statement.Table, expected.Name, names, expected.Class == "UNIQUE"); err != nil {
+					return err
 				}
 			}
-			if !matched || validateOAuthDerivedTokenIndex(db, statement.Table, expected.Name, names, expected.Class == "UNIQUE") != nil {
+		} else {
+			indexes, err := db.Migrator().GetIndexes(value)
+			if err != nil {
 				return ErrOAuthDerivedTokenUnknown
+			}
+			for _, expected := range statement.Schema.ParseIndexes() {
+				var names []string
+				for _, field := range expected.Fields {
+					names = append(names, field.DBName)
+				}
+				matched := false
+				for _, actual := range indexes {
+					unique, known := actual.Unique()
+					if actual.Name() == expected.Name && known && unique == (expected.Class == "UNIQUE") && slices.Equal(actual.Columns(), names) {
+						matched = true
+					}
+				}
+				if !matched || validateOAuthDerivedTokenIndex(db, statement.Table, expected.Name, names, expected.Class == "UNIQUE") != nil {
+					return ErrOAuthDerivedTokenUnknown
+				}
 			}
 		}
 	}
@@ -280,10 +360,14 @@ func validateOAuthDerivedTokenIndex(db *gorm.DB, table, name string, columns []s
 			AND pg_catalog.array_length(i.indclass::oid[], 1) = ?) AS verified
 			FROM pg_catalog.pg_index AS i
 			JOIN pg_catalog.pg_class AS c ON c.oid = i.indexrelid
+            JOIN pg_catalog.pg_class AS r ON r.oid = i.indrelid
+            JOIN pg_catalog.pg_namespace AS n ON n.oid = r.relnamespace
 			CROSS JOIN LATERAL pg_catalog.unnest(i.indkey::smallint[]) WITH ORDINALITY AS k(attnum, position)
 			JOIN pg_catalog.pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = k.attnum AND NOT a.attisdropped
-			WHERE i.indrelid = pg_catalog.to_regclass(?) AND ((? = '' AND i.indisprimary) OR c.relname = ?)
-			ORDER BY k.position`, unique, len(columns), len(columns), table, name, name).Scan(&keys).Error; err != nil || len(keys) != len(columns) {
+			WHERE i.indrelid = pg_catalog.to_regclass(?) AND n.nspname = 'public'
+            AND current_schema() = 'public' AND r.relkind = 'r' AND c.relnamespace = r.relnamespace
+            AND ((? = '' AND i.indisprimary) OR (? <> '' AND c.relname = ?))
+			ORDER BY k.position`, unique, len(columns), len(columns), table, name, name, name).Scan(&keys).Error; err != nil || len(keys) != len(columns) {
 			return ErrOAuthDerivedTokenUnknown
 		}
 		for i, key := range keys {
