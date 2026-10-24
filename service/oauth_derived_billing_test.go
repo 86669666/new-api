@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -171,6 +174,9 @@ func TestOAuthDerivedTextPostgresConfigIsolation(t *testing.T) {
 func newOAuthDerivedTextBillingFixture(t *testing.T, kind common.DatabaseType, dialect gorm.Dialector) (*gorm.DB, model.OAuthTextFacts) {
 	t.Helper()
 	db, _ := oauthBirthFixture(t)
+	if os.Getenv("NEWAPI_DB_TEST_ROLE") == "TRUSTED_DB_TEST_OWNER" {
+		require.Equal(t, string(kind), db.Dialector.Name())
+	}
 	kind = common.DatabaseType(db.Dialector.Name())
 	sql, err := db.DB()
 	require.NoError(t, err)
@@ -188,6 +194,12 @@ func newOAuthDerivedTextBillingFixture(t *testing.T, kind common.DatabaseType, d
 		assert.NoError(t, sql.Close())
 	})
 	tables := []any{&model.User{}, &model.Token{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.OAuthGrant{}, &model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}, &model.OAuthDerivedTokenSource{}, &model.OAuthDerivedTokenHistory{}, &model.OAuthDerivedTextCharge{}}
+	if os.Getenv("NEWAPI_DB_TEST_ROLE") == "TRUSTED_DB_TEST_OWNER" {
+		// The permanent CLI alone creates history/identity/source schema. The
+		// trusted test owner may insert the existing synthetic source fixture,
+		// but must never AutoMigrate installer-owned provenance.
+		tables = []any{&model.User{}, &model.Token{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.OAuthGrant{}, &model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}, &model.OAuthDerivedTextCharge{}}
+	}
 	require.NoError(t, db.AutoMigrate(tables...))
 	require.NoError(t, model.InitOAuthCleanupStore(true))
 	now := time.Now().Unix()
@@ -314,19 +326,40 @@ func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
 	require.NotEmpty(t, client, "a separate trusted installer is required for provenance fixtures")
 	raw, err := exec.Command(client).Output()
 	require.NoError(t, err, "permanent bootstrap fixture producer failed")
-	var birth struct{ Engine, DSN, Journal string }
+	var birth struct{ Engine, DSN, Journal, ResourceReceipt string }
 	require.NoError(t, common.Unmarshal(raw, &birth))
 	require.NotEmpty(t, birth.Journal)
 	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", birth.Journal)
 	t.Setenv("SQL_DSN", birth.DSN)
 	var dialect gorm.Dialector
+	owner := os.Getenv("NEWAPI_DB_TEST_ROLE") == "TRUSTED_DB_TEST_OWNER"
+	var receipt walletOwnerReceipt
+	if owner {
+		receipt = qualifyWalletOwnerFixture(t, client, birth.Engine, birth.DSN, birth.Journal, birth.ResourceReceipt)
+	}
 	switch birth.Engine {
 	case "sqlite":
 		dialect = sqlite.Open(birth.DSN)
 	case "mysql":
 		dialect = mysql.Open(birth.DSN)
 	case "postgres":
-		dialect = postgres.Open(birth.DSN)
+		if owner {
+			for _, name := range []string{"PGSERVICE", "PGSERVICEFILE", "PGHOST", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGOPTIONS"} {
+				require.Empty(t, os.Getenv(name), "external PG configuration is forbidden")
+			}
+			cfg, parseErr := pgx.ParseConfig(birth.DSN)
+			require.True(t, parseErr == nil, "invalid protected PostgreSQL config")
+			require.Equal(t, filepath.Dir(receipt.Endpoint), cfg.Host)
+			require.EqualValues(t, 5432, cfg.Port)
+			require.Equal(t, receipt.Database, cfg.Database)
+			require.Equal(t, receipt.DBUser, cfg.User)
+			require.Empty(t, cfg.Fallbacks)
+			require.Empty(t, cfg.RuntimeParams["search_path"])
+			conn := stdlib.OpenDB(*cfg)
+			dialect = postgres.New(postgres.Config{Conn: conn})
+		} else {
+			dialect = postgres.Open(birth.DSN)
+		}
 	default:
 		t.Fatalf("unsupported trusted fixture engine %q", birth.Engine)
 	}
@@ -338,5 +371,106 @@ func oauthBirthFixture(t *testing.T) (*gorm.DB, string) {
 	var rows int64
 	require.NoError(t, db.Table("tokens").Count(&rows).Error)
 	require.Zero(t, rows, "producer must return a fresh namespace without token writers")
+	if owner {
+		switch birth.Engine {
+		case "postgres":
+			var actual struct {
+				Database, Role              string
+				Super, CreateDB, CreateRole bool
+			}
+			require.NoError(t, db.Raw("SELECT current_database() AS database, current_user AS role, rolsuper AS super, rolcreatedb AS create_db, rolcreaterole AS create_role FROM pg_roles WHERE rolname = current_user").Scan(&actual).Error)
+			require.Equal(t, receipt.Database, actual.Database)
+			require.Equal(t, receipt.DBUser, actual.Role)
+			require.False(t, actual.Super)
+			require.False(t, actual.CreateDB)
+			require.False(t, actual.CreateRole)
+		case "mysql":
+			var actual struct{ Database, Role string }
+			require.NoError(t, db.Raw("SELECT DATABASE() AS `database`, CURRENT_USER() AS role").Scan(&actual).Error)
+			require.Equal(t, receipt.Database, actual.Database)
+			require.Equal(t, receipt.DBUser+"@localhost", actual.Role)
+		}
+		// Verify the live owned endpoint and immutable birth again after the
+		// original fixture's cleanup; the runner repeats this independently.
+		t.Cleanup(func() {
+			qualifyWalletOwnerFixture(t, client, birth.Engine, birth.DSN, birth.Journal, birth.ResourceReceipt)
+		})
+	}
 	return db, birth.DSN
+}
+
+// This receipt identifies a trusted database-test owner, not a gateway service.
+// Credentials arrive only over the root peer's authenticated private IPC.
+type walletOwnerReceipt struct {
+	ID, RoleClass, Engine, Database, DBUser, Endpoint, Journal               string
+	JournalSHA256, ProvenanceSHA256, DSNSHA256, BinarySHA256, ManifestSHA256 string
+	OwnerUID                                                                 int
+}
+
+func qualifyWalletOwnerFixture(t *testing.T, client, engine, dsn, journal, path string) walletOwnerReceipt {
+	t.Helper()
+	top, _, ok := strings.Cut(t.Name(), "/")
+	require.True(t, ok)
+	require.Contains(t, []string{"TestBillingSessionSQLAdmission", "TestBillingLegacySQLRegressions"}, top)
+	require.Equal(t, engine, os.Getenv("NEWAPI_BOOTSTRAP_ENGINE"))
+	require.NotZero(t, os.Getuid())
+	require.NotEmpty(t, path)
+	require.True(t, filepath.IsAbs(path))
+	manifestPath := filepath.Join(filepath.Dir(client), "bundle", "manifest.json")
+	for _, protected := range []string{path, client, manifestPath} {
+		require.True(t, filepath.IsAbs(protected))
+		for current := protected; ; current = filepath.Dir(current) {
+			st, err := os.Lstat(current)
+			require.NoError(t, err)
+			require.Zero(t, st.Mode()&os.ModeSymlink)
+			require.Zero(t, st.Mode().Perm()&0022)
+			raw, valid := st.Sys().(*syscall.Stat_t)
+			require.True(t, valid)
+			require.Zero(t, raw.Uid)
+			if current == "/" {
+				break
+			}
+		}
+	}
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var receipt walletOwnerReceipt
+	require.NoError(t, common.Unmarshal(raw, &receipt))
+	require.Equal(t, "TRUSTED_DB_TEST_OWNER", receipt.RoleClass)
+	require.Equal(t, os.Getuid(), receipt.OwnerUID)
+	require.Equal(t, engine, receipt.Engine)
+	require.Equal(t, journal, receipt.Journal)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(dsn))), receipt.DSNSHA256)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	binary, err := os.ReadFile(executable)
+	require.NoError(t, err)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(binary)), receipt.BinarySHA256)
+	rawJournal, err := os.ReadFile(journal)
+	require.NoError(t, err)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(rawJournal)), receipt.JournalSHA256)
+	var phase struct{ Phase string }
+	require.NoError(t, common.Unmarshal(rawJournal, &phase))
+	require.Equal(t, "READY", phase.Phase)
+	if engine == "sqlite" {
+		require.Equal(t, receipt.Database, dsn)
+		require.Equal(t, receipt.Endpoint, dsn)
+	} else if engine == "mysql" {
+		cfg, parseErr := mysqlconfig.ParseDSN(dsn)
+		require.True(t, parseErr == nil, "invalid protected MySQL config")
+		require.Equal(t, "unix", cfg.Net)
+		require.Equal(t, receipt.Endpoint, cfg.Addr)
+		require.Equal(t, receipt.Database, cfg.DBName)
+		require.Equal(t, receipt.DBUser, cfg.User)
+		require.Empty(t, cfg.Params)
+	}
+	liveRaw, err := exec.Command(client, "qualify:"+receipt.ID).Output()
+	require.NoError(t, err, "current owned database qualification failed")
+	var live walletOwnerReceipt
+	require.NoError(t, common.Unmarshal(liveRaw, &live))
+	manifest, err := os.ReadFile(manifestPath)
+	require.NoError(t, err)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(manifest)), receipt.ManifestSHA256)
+	require.Equal(t, receipt, live, "stale resource receipt")
+	return receipt
 }

@@ -34,12 +34,25 @@ PG_IMAGE = 'sha256:ba9938eb70de48e82a511ea812eef26cc1399b0b072d6f2f7dc22a977e783
 PG_SELECTOR = '^TestSessionRevocationS1Namespace$'
 JOINT_IMAGE = 'sha256:894680346c8e75455a0a6c969b7b8241aeb9b6e9c0d0d95689669153d4627c4d'
 JOINT_SELECTOR = '^TestSessionRevocationS1RealRedis$'
+MYSQL_IMAGE = 'sha256:6ec0af605b45e088e789150f865fc1ad92434f6aab0e3f3ab27688312be19000'
+WALLET_TESTS = ('TestBillingSessionSQLAdmission', 'TestBillingLegacySQLRegressions')
+WALLET_ENGINES = ('sqlite', 'mysql', 'postgres')
+WALLET_SCENARIOS = ('arrears_retry', 'arrears_retry_held', 'arrears_retry_claimed', 'arrears_settle', 'held_refund', 'image_available', 'search_available', 'zero_held', 'trusted_held', 'task_zero_held', 'task_trusted_held')
+
+def wallet_selector(engine):
+    if engine not in WALLET_ENGINES:
+        raise ValueError('unknown wallet engine')
+    return '^(' + '|'.join(WALLET_TESTS) + ')$/^' + engine + '$'
+
 JOINT_CASES = ('deny_wrong_type', 'outbox_rollback', 'late_active_fill', 'credential_rollback')
 
 
 def digest(path):
     with open(path, 'rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+        result = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            result.update(chunk)
+        return result.hexdigest()
 
 
 def command(argv, **kwargs):
@@ -53,6 +66,11 @@ def prepare(args):
         raise ValueError('trusted provenance test runner requires Linux')
     if args.tier == 'all' and (args.package or args.run != '.'):
         raise ValueError('bounded selectors require an explicit resource --tier')
+    if args.tier.startswith('wallet-'):
+        selector = wallet_selector(args.tier.removeprefix('wallet-'))
+        if args.package not in (None, ['./service']) or args.run not in ('.', selector):
+            raise ValueError('wallet owner tier requires exact two-matrix inventory')
+        args.package, args.run = ['./service'], selector
     if args.tier in ('postgres', 'postgres-redis'):
         selector = PG_SELECTOR if args.tier == 'postgres' else JOINT_SELECTOR
         if args.package not in (None, ['./router']) or args.run not in ('.', selector):
@@ -128,33 +146,40 @@ def compiled_inventory(bundle, entries):
 
 
 def resource_partitions(entries, inventory):
-    # Exact names, not prefix exclusions. Test.list freezes the compiled set;
-    # each (binary, top-level test) belongs to exactly one required partition.
-    if set(inventory) != {entry['binary'] for entry in entries}:
-        raise ValueError('inventory package mismatch')
+    # Partition the compiled top-level set, expanding only the two mandatory
+    # wallet matrices into their three exact engine jobs. No prefix exclusions.
+    if set(inventory) != {e['binary'] for e in entries} or any(e['run'] != '.' for e in entries):
+        raise ValueError('default inventory package mismatch')
     routers = [e for e in entries if e['cwd'] == 'router']
-    if len(routers) != 1 or any(e['run'] != '.' for e in entries):
-        raise ValueError('default inventory requires one complete router package')
-    router = routers[0]
+    services = [e for e in entries if e['cwd'] == 'service']
+    if len(routers) != 1 or len(services) != 1:
+        raise ValueError('default requires complete router and service packages')
+    router, service = routers[0], services[0]
     required = {'postgres': PG_SELECTOR[1:-1], 'postgres-redis': JOINT_SELECTOR[1:-1]}
-    if not set(required.values()).issubset(inventory[router['binary']]):
+    if (not set(required.values()).issubset(inventory[router['binary']]) or
+            not set(WALLET_TESTS).issubset(inventory[service['binary']])):
         raise ValueError('required compiled test missing')
-    partitions = {'sqlite': [], 'postgres': [], 'postgres-redis': []}
+    partitions = {tier: [] for tier in (*required, *('wallet-'+e for e in WALLET_ENGINES), 'sqlite')}
     assigned = []
     for entry in entries:
         names = inventory[entry['binary']]
         if len(names) != len(set(names)):
             raise ValueError('duplicate inventory member')
-        ordinary = [n for n in names if entry != router or n not in required.values()]
-        run = entry['run'] if entry != router else '^(' + '|'.join(re.escape(n) for n in ordinary) + ')$'
-        if entry == router and not ordinary:
-            raise ValueError('empty ordinary router partition')
+        excluded = set(required.values()) if entry == router else set(WALLET_TESTS) if entry == service else set()
+        ordinary = [n for n in names if n not in excluded]
+        run = '^(' + '|'.join(re.escape(n) for n in ordinary) + ')$' if excluded else '.'
+        if excluded and not ordinary:
+            raise ValueError('empty ordinary package partition')
         partitions['sqlite'].append(dict(entry, run=run))
-        assigned.extend((entry['binary'], n) for n in ordinary)
+        assigned.extend((entry['binary'], n, '') for n in ordinary)
     for tier, name in required.items():
         partitions[tier] = [dict(router, run='^'+name+'$')]
-        assigned.append((router['binary'], name))
-    expected = {(b, n) for b, names in inventory.items() for n in names}
+        assigned.append((router['binary'], name, ''))
+    for engine in WALLET_ENGINES:
+        partitions['wallet-'+engine] = [dict(service, run=wallet_selector(engine))]
+        assigned.extend((service['binary'], name, engine) for name in WALLET_TESTS)
+    expected = {(b, n, engine) for b, names in inventory.items() for n in names
+                for engine in (WALLET_ENGINES if b == service['binary'] and n in WALLET_TESTS else ('',))}
     if len(assigned) != len(set(assigned)) or set(assigned) != expected:
         raise ValueError('resource partitions overlap or omit tests')
     return partitions
@@ -185,6 +210,11 @@ def verified_manifest(bundle):
 
 
 def required_leaves(tier):
+    if tier.startswith('wallet-'):
+        engine = tier.removeprefix('wallet-')
+        wallet_selector(engine)
+        return ([WALLET_TESTS[0]+'/'+engine+'/'+case for case in WALLET_SCENARIOS] +
+                [WALLET_TESTS[1]+'/'+engine+'/'+case for case in ('starts_after_free', 'arrears', 'top_up')])
     if tier == 'postgres':
         return ['TestSessionRevocationS1Namespace/restricted_'+v for v in ('false', 'true')]
     if tier == 'postgres-redis':
@@ -219,7 +249,7 @@ def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
 
 def dispatch_tier(bundle, tier):
     metadata = verified_manifest(bundle)
-    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission') or metadata['tier'] != tier:
+    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
         raise ValueError('dispatch tier mismatch')
     if tier == 'admission':
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
@@ -227,6 +257,16 @@ def dispatch_tier(bundle, tier):
         if sum((bundle/name).stat().st_size for name in metadata['files']) > 768*1024**2:
             raise RuntimeError('admission bundle exceeds private tmpfs safety budget')
         command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork', 'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=1G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && exec "$@"', 'admission-tests', sys.executable, str(bundle/'runner.py'), '_admission_run', str(bundle)])
+        return
+    if tier.startswith('wallet-'):
+        available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
+        size=sum((bundle/name).stat().st_size for name in metadata['files'])
+        if size*2+1024**3 >= 4*1024**3 or available < size*2+1024**3+3*1024**3:
+            raise RuntimeError('wallet resource memory budget unavailable')
+    if tier == 'wallet-sqlite':
+        command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork', 'sh', '-c',
+                 'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && exec "$@"',
+                 'wallet-tests', sys.executable, str(bundle/'runner.py'), '_wallet_run', str(bundle), tier])
         return
     if tier != 'sqlite':
         postgres_container(bundle, tier)
@@ -257,7 +297,7 @@ def execute_prepared(bundle, tier):
     invocation = secrets.token_hex(32)
     summary = {'scope': 'default-full', 'invocation': invocation,
                'manifest_sha256': digest(bundle / 'manifest.json'), 'tiers': [], 'exit': 1,
-               'unexecuted': ['postgres', 'postgres-redis', 'sqlite']}
+               'unexecuted': list(plan)}
     try:
         for resource in list(summary['unexecuted']):
             child = execution / resource
@@ -836,7 +876,10 @@ def observe_daemon(process, uid, executable, listener):
             before = (proc / 'stat').read_text().rsplit(')', 1)[1].split()[19]
             with (proc / 'exe').open('rb') as stream:
                 exe = os.fstat(stream.fileno())
-                exe_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
+                hasher = hashlib.sha256()
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    hasher.update(chunk)
+                exe_hash = hasher.hexdigest()
             ns = {n: os.readlink(proc / 'ns' / n) for n in namespaces}
             fds = set()
             for fd in (proc / 'fd').iterdir():
@@ -989,7 +1032,7 @@ class CombinedPostgres(OwnedPostgres):
 def postgres_container(bundle, tier='postgres'):
     # Host controller alone operates Docker. No socket, host mount, privileged
     # flag, SYS_ADMIN, sudo/ip or nested namespace tools enter the container.
-    image_id = PG_IMAGE if tier == 'postgres' else JOINT_IMAGE
+    image_id = MYSQL_IMAGE if tier == 'wallet-mysql' else PG_IMAGE if tier in ('postgres', 'wallet-postgres') else JOINT_IMAGE
     nonce = secrets.token_hex(12)
     image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', image_id]))[0]
     if image['Id'] != image_id:
@@ -1000,7 +1043,7 @@ def postgres_container(bundle, tier='postgres'):
             '--cap-drop=ALL', '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER',
             '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL', *(['--cap-add=SYS_PTRACE'] if tier == 'postgres' else []),
             '--tmpfs', '/run:rw,exec,nosuid,nodev,size=4g,mode=0755',
-            '--tmpfs', '/var/lib/postgresql/data:rw,noexec,nosuid,nodev,size=1m,mode=0700',
+            '--tmpfs', ('/var/lib/mysql' if tier == 'wallet-mysql' else '/var/lib/postgresql/data')+':rw,noexec,nosuid,nodev,size=1m,mode=0700',
             '--entrypoint', '/bin/sh', image_id, '-c', 'exec sleep 600']
     cid = subprocess.check_output(argv, text=True).strip()
     try:
@@ -1022,7 +1065,7 @@ def postgres_container(bundle, tier='postgres'):
         # Detached execution keeps the authoritative result inside the owned
         # container; a Docker attach EOF cannot be mistaken for test completion.
         command(['docker','exec','-d',cid,'/bin/sh','-c',
-                 'python3 /run/input/runner.py _run /run/input '+tier+' > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
+                 'python3 /run/input/runner.py '+('_wallet_run' if tier.startswith('wallet-') else '_run')+' /run/input '+tier+' > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
         deadline = time.monotonic() + 300
         while True:
             receipt = subprocess.run(['docker','exec',cid,'cat','/run/result.exit'], capture_output=True, text=True)
@@ -1704,7 +1747,417 @@ def trusted_admission(bundle):
     if status:raise RuntimeError('admission cleanup failed')
 
 
+# Wallet matrices are trusted DB-owner tests, never gateway/service processes.
+# This role is granted only to the two exact compiled matrix jobs above.
+WALLET_MUTABLE = ('users', 'tokens', 'user_sessions', 'session_revocation_events',
+                  'oauth_grants', 'o_auth_operations', 'o_auth_artifacts', 'o_auth_cleanup_jobs',
+                  'oauth_derived_text_charges', 'tasks', 'logs', 'channels', 'midjourneys',
+                  'top_ups', 'user_subscriptions', 'system_task_locks', 'system_tasks')
+WALLET_IMMUTABLE = ('oauth_derived_token_history', 'oauth_derived_token_bootstrap_identity')
+
+
+class OwnedWalletMySQL:
+    def __init__(self, root):
+        self.root = root
+        self.daemon_uid = pwd.getpwnam('mysql').pw_uid
+        if self.daemon_uid == 0:
+            raise ValueError('MySQL daemon cannot be root')
+        self.executable = Path('/usr/sbin/mysqld')
+        self.socket_dir = root/'mysql-socket'
+        self.socket_path = self.socket_dir/'mysql.sock'
+        self.process = self.log = self.identity = None
+        self.password = secrets.token_hex(32)
+        self.commands = []
+
+    def sql(self, database, statement, initial=False):
+        if not re.fullmatch(r'[a-z][a-z0-9_]{0,47}', database):
+            raise ValueError('invalid installer database')
+        q = subprocess.run(['/usr/bin/mysql', '--no-defaults', '--protocol=SOCKET',
+                            '--socket='+str(self.socket_path), '-uroot', '-N', '-B', database],
+                           input=statement.encode(), capture_output=True,
+                           env={'PATH':'/usr/bin:/bin', 'MYSQL_PWD':'' if initial else self.password}, timeout=30)
+        self.commands.append({'operation':'installer SQL', 'exit':q.returncode,
+                              'error_sha256':hashlib.sha256(q.stderr).hexdigest()})
+        if q.returncode:
+            raise RuntimeError('MySQL installer SQL failed')
+        return q.stdout.decode().strip()
+
+    def verify(self):
+        daemon_process_identity(self.process, self.daemon_uid)
+        st, endpoint = self.socket_dir.lstat(), self.socket_path.lstat()
+        if (not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o022 or st.st_uid != self.daemon_uid or
+                not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != self.daemon_uid):
+            raise RuntimeError('MySQL socket path ownership mismatch')
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(2);conn.connect(str(self.socket_path))
+            peer = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if peer[:2] != (self.process.pid, self.daemon_uid):
+                raise RuntimeError('MySQL endpoint peer mismatch')
+        rows = [l.split() for l in Path('/proc/net/unix').read_text().splitlines()[1:]]
+        rows = [r for r in rows if len(r) == 8 and r[7] == str(self.socket_path) and r[3] == '00010000']
+        if len(rows) != 1:
+            raise RuntimeError('MySQL listener missing or ambiguous')
+        observed = observe_daemon(self.process, self.daemon_uid, self.executable, rows[0][6])
+        identity = dict(observed, socket_file_inode=endpoint.st_ino, directory_inode=st.st_ino,
+                        pid=self.process.pid, daemon_uid=self.daemon_uid)
+        if self.identity is not None and identity != self.identity:
+            raise RuntimeError('MySQL listener replaced')
+        self.identity = identity
+        return identity
+
+    def start(self):
+        for executable in (self.executable, Path('/usr/bin/mysql')):
+            st = executable.stat()
+            if st.st_uid != 0 or st.st_mode & 0o022 or not stat.S_ISREG(st.st_mode):
+                raise ValueError('untrusted MySQL dependency')
+        data, temp = self.root/'mysql-data', self.root/'mysql-tmp'
+        for path in (data, temp, self.socket_dir):
+            path.mkdir(mode=0o700 if path == data else 0o755)
+            os.chown(path, self.daemon_uid, self.daemon_uid)
+        argv = [str(self.executable), '--no-defaults', '--datadir='+str(data), '--tmpdir='+str(temp)]
+        init = subprocess.run(argv+['--initialize-insecure'], preexec_fn=lambda:demote(self.daemon_uid),
+                              capture_output=True, timeout=90, env={'PATH':'/usr/bin:/bin'})
+        self.commands.append({'operation':'initialize', 'exit':init.returncode,
+                              'output_sha256':hashlib.sha256(init.stdout+init.stderr).hexdigest()})
+        if init.returncode:
+            raise RuntimeError('MySQL initialization failed')
+        self.log = (self.root/'mysql.log').open('xb')
+        self.process = subprocess.Popen(argv+['--socket='+str(self.socket_path),
+            '--pid-file='+str(self.socket_dir/'mysql.pid'), '--skip-networking', '--mysqlx=OFF',
+            '--skip-log-bin', '--innodb-buffer-pool-size=64M'], stdout=self.log, stderr=self.log,
+            preexec_fn=lambda:demote(self.daemon_uid), env={'PATH':'/usr/bin:/bin'})
+        deadline = time.monotonic()+40
+        while not self.socket_path.exists():
+            if self.process.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError('MySQL startup failed')
+            time.sleep(0.02)
+        self.verify()
+        self.sql('mysql', "ALTER USER 'root'@'localhost' IDENTIFIED BY '"+self.password+"';", initial=True)
+        self.version = self.sql('mysql', 'SELECT VERSION();')
+
+    def close(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:self.process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.process.kill();self.process.wait(timeout=5)
+        if self.log:self.log.close()
+        print(json.dumps({'wallet_mysql_version':getattr(self,'version',None), 'commands':self.commands,
+            'kernel':self.identity, 'exit':self.process.returncode if self.process else None,
+            'cleanup':'owned MySQL child reaped'}), flush=True)
+
+
+class WalletInstaller:
+    def __init__(self, root, uid, engine, metadata):
+        self.root, self.uid, self.engine, self.metadata = root, uid, engine, metadata
+        self.resource = None
+        self.process = None
+        self.births = {}
+        self.stopped = threading.Event()
+        self.failures = []
+        self.first_birth = threading.Event()
+        self.server = socket.socket(socket.AF_UNIX)
+        self.server.bind(str(root/'wallet.sock'));os.chmod(root/'wallet.sock',0o666)
+        self.server.listen(4);self.server.settimeout(0.2)
+
+    def start(self):
+        if self.engine == 'postgres':
+            self.resource = CombinedPostgres(self.root, self.uid)
+        elif self.engine == 'mysql':
+            self.resource = OwnedWalletMySQL(self.root)
+        if self.resource:self.resource.start()
+
+    def snapshot(self, database):
+        if self.engine == 'sqlite':
+            import sqlite3
+            with sqlite3.connect(database) as conn:
+                rows = [conn.execute('SELECT * FROM '+table+' ORDER BY id').fetchall() for table in WALLET_IMMUTABLE]
+            return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+        result = '\n'.join(self.resource.sql(database, 'SELECT * FROM '+table+' ORDER BY id;') for table in WALLET_IMMUTABLE)
+        return hashlib.sha256(result.encode()).hexdigest()
+
+    def qualify(self, ident):
+        row = self.births[ident]
+        receipt = row['receipt']
+        if self.resource and self.resource.verify() != row['kernel']:
+            raise RuntimeError('wallet endpoint changed')
+        if (digest(receipt['Journal']) != receipt['JournalSHA256'] or
+                self.snapshot(receipt['Database']) != receipt['ProvenanceSHA256'] or
+                digest(row['path']) != row['receipt_hash']):
+            raise RuntimeError('wallet immutable provenance changed')
+        if self.engine == 'sqlite':
+            st = Path(receipt['Database']).lstat()
+            if (st.st_dev,st.st_ino,st.st_uid) != tuple(row['file_identity']):
+                raise RuntimeError('wallet SQLite database replaced')
+        return receipt
+
+    def audit_owner_permissions(self, database, role, password):
+        # Fixed probes against this born synthetic DB. No SQL is accepted over
+        # IPC, and the owner receives no global administration credentials.
+        if self.engine == 'sqlite':
+            return
+        if self.engine == 'postgres':
+            argv=[str(self.resource.bin/'psql'),'-X','-qAt','-v','ON_ERROR_STOP=1',
+                  '-h',str(self.resource.socket_dir),'-U',role,'-d',database]
+            env={'PATH':'/usr/bin:/bin','PGPASSWORD':password}
+            probes=(('global_create','CREATE DATABASE wallet_forbidden;'),
+                    ('create_role','CREATE ROLE wallet_forbidden;'),
+                    ('grant','GRANT SELECT ON oauth_derived_token_history TO PUBLIC;'))
+        else:
+            argv=['/usr/bin/mysql','--no-defaults','--protocol=SOCKET','--socket='+str(self.resource.socket_path),'-u'+role,'-N','-B',database]
+            env={'PATH':'/usr/bin:/bin','MYSQL_PWD':password}
+            probes=(('global_create','CREATE DATABASE wallet_forbidden;'),
+                    ('create_role',"CREATE USER 'wallet_forbidden'@'localhost';"),
+                    ('grant',f"GRANT SELECT ON {database}.oauth_derived_token_history TO '{role}'@'localhost';"))
+        probes += (('write_history','DELETE FROM oauth_derived_token_history WHERE 1=0;'),
+                   ('write_identity','DELETE FROM oauth_derived_token_bootstrap_identity WHERE 1=0;'),
+                   ('mutate_source','DELETE FROM oauth_derived_token_sources WHERE 1=0;'))
+        for label,statement in [('select_history','SELECT COUNT(*) FROM oauth_derived_token_history;'),*probes,('select_identity','SELECT COUNT(*) FROM oauth_derived_token_bootstrap_identity;')]:
+            acl_query = "SELECT relacl::text FROM pg_class WHERE oid='public.oauth_derived_token_history'::regclass;"
+            before_acl = self.resource.sql(database,acl_query) if self.engine=='postgres' and label=='grant' else None
+            result=subprocess.run(argv,input=statement.encode(),env=env,preexec_fn=lambda:demote(self.uid),capture_output=True,timeout=10)
+            expected=label.startswith('select_')
+            print(json.dumps({'wallet_owner_permission':label,'engine':self.engine,'exit':result.returncode,
+                'expected_success':expected,'stderr_sha256':hashlib.sha256(result.stderr).hexdigest()}),flush=True)
+            if before_acl is not None:
+                # PostgreSQL reports an unauthorized GRANT as a warning, not
+                # necessarily a nonzero exit. Verify the physical ACL, too.
+                unchanged=self.resource.sql(database,acl_query)==before_acl
+                print(json.dumps({'wallet_grant_acl_unchanged':unchanged,'warning_present':bool(result.stderr)}),flush=True)
+                if not unchanged or not result.stderr:raise RuntimeError('wallet owner acquired grant authority')
+            elif (result.returncode==0)!=expected:
+                raise RuntimeError('wallet owner permission boundary failed')
+
+    def birth(self):
+        if self.resource:self.resource.verify()
+        ident = secrets.token_hex(16)
+        journal = self.root/'journals'/(ident+'.json')
+        env = {'PATH':'/usr/bin:/bin', 'GOMAXPROCS':'2'}
+        role, password = 'owner_'+ident[:20], secrets.token_hex(32)
+        if self.engine == 'sqlite':
+            data = self.root/('data-'+ident);data.mkdir(mode=0o700)
+            database = str(data/'main.db')
+        else:
+            database = 'birth_'+ident
+            if self.engine == 'postgres':
+                env['BOOTSTRAP_ADMIN_DSN'] = 'postgresql://bootstrap:'+self.resource.password+'@/postgres?host='+str(self.resource.socket_dir)+'&sslmode=disable'
+            else:
+                env['BOOTSTRAP_ADMIN_DSN'] = 'root:'+self.resource.password+'@unix('+str(self.resource.socket_path)+')/mysql?parseTime=true'
+        result = subprocess.run([str(self.root/'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', self.engine,
+            '--target', database, '--journal', str(journal)], env=env, capture_output=True, timeout=120)
+        print(json.dumps({'wallet_birth':ident, 'engine':self.engine, 'exit':result.returncode,
+            'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest()}),flush=True)
+        if result.returncode:
+            raise RuntimeError('permanent wallet birth failed')
+        j = json.loads(journal.read_text())
+        if j['phase'] != 'READY' or j['engine'] != self.engine or j['target'] != database:
+            raise RuntimeError('wallet birth identity mismatch')
+        provenance = self.snapshot(database)
+        file_identity = None
+        if self.engine == 'sqlite':
+            os.chown(database,self.uid,self.uid);os.chmod(database,0o600)
+            os.chown(data,self.uid,self.uid)
+            st = Path(database).stat();file_identity=(st.st_dev,st.st_ino,st.st_uid)
+            dsn, endpoint, role = database, database, 'file-owner'
+        elif self.engine == 'postgres':
+            self.resource.sql(database, f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}'; REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE,CREATE ON SCHEMA public TO {role};")
+            existing = set(self.resource.sql(database,"SELECT tablename FROM pg_tables WHERE schemaname='public';").splitlines())
+            for table in WALLET_MUTABLE:
+                if table in existing:self.resource.sql(database,f'ALTER TABLE public.{table} OWNER TO {role};')
+            for table in WALLET_IMMUTABLE:
+                self.resource.sql(database,f'GRANT SELECT ON public.{table} TO {role};')
+            self.resource.sql(database,f'GRANT SELECT,INSERT ON public.oauth_derived_token_sources TO {role}; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO {role};')
+            self.resource.sql('postgres',f'REVOKE ALL ON DATABASE {database} FROM PUBLIC; GRANT CONNECT ON DATABASE {database} TO {role}; ALTER DATABASE {database} CONNECTION LIMIT 20;')
+            endpoint = str(self.resource.socket_path)
+            dsn = 'postgresql://'+role+':'+password+'@/'+database+'?host='+str(self.resource.socket_dir)+'&sslmode=disable'
+        else:
+            self.resource.sql(database,f"CREATE USER '{role}'@'localhost' IDENTIFIED BY '{password}';")
+            for table in WALLET_MUTABLE:
+                self.resource.sql(database,f"GRANT SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,DROP,INDEX,REFERENCES ON {database}.{table} TO '{role}'@'localhost';")
+            for table in WALLET_IMMUTABLE:
+                self.resource.sql(database,f"GRANT SELECT ON {database}.{table} TO '{role}'@'localhost';")
+            self.resource.sql(database,f"GRANT SELECT,INSERT ON {database}.oauth_derived_token_sources TO '{role}'@'localhost';")
+            endpoint = str(self.resource.socket_path)
+            dsn = role+':'+password+'@unix('+endpoint+')/'+database+'?parseTime=true&loc=Local'
+        if not self.births:self.audit_owner_permissions(database,role,password)
+        receipt = {'ID':ident,'RoleClass':'TRUSTED_DB_TEST_OWNER','Engine':self.engine,'Database':database,
+            'DBUser':role,'Endpoint':endpoint,'OwnerUID':self.uid,'Journal':str(journal),
+            'JournalSHA256':digest(journal),'ProvenanceSHA256':provenance,
+            'DSNSHA256':hashlib.sha256(dsn.encode()).hexdigest(),'BinarySHA256':self.metadata['files'][self.metadata['entries'][0]['binary']],
+            'ManifestSHA256':digest(self.root/'bundle/manifest.json'),
+            'Version':self.resource.version if self.resource else 'SQLite via permanent CLI'}
+        path=self.root/('wallet-'+ident+'.json');path.write_text(json.dumps(receipt,sort_keys=True));path.chmod(0o644)
+        self.births[ident]={'receipt':receipt,'path':path,'receipt_hash':digest(path),
+            'kernel':self.resource.verify() if self.resource else None,'file_identity':file_identity}
+        self.first_birth.set()
+        return {'Engine':self.engine,'DSN':dsn,'Journal':str(journal),'ResourceReceipt':str(path)}
+
+    def serve(self):
+        while not self.stopped.is_set():
+            try:conn,_=self.server.accept()
+            except socket.timeout:continue
+            with conn:
+                conn.settimeout(3)
+                try:
+                    pid,uid,_=struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+                    if uid != self.uid or not self.process or self.process.poll() is not None:
+                        continue
+                    # Only the root-launched, hash-bound owner test can spawn
+                    # this fixed client. A different service UID has no route.
+                    status=dict(line.split(':',1) for line in Path(f'/proc/{pid}/status').read_text().splitlines() if ':' in line)
+                    if int(status['PPid']) != self.process.pid:continue
+                    identity=admission_identity(self.process,self.uid,self.root/'bundle'/self.metadata['entries'][0]['binary'])
+                    if identity['ExeSHA256'] != self.metadata['files'][self.metadata['entries'][0]['binary']]:continue
+                    request=conn.recv(96)
+                    if conn.recv(1):continue
+                    if request==b'fresh\n':response=self.birth()
+                    elif re.fullmatch(rb'qualify:[0-9a-f]{32}\n',request):response=self.qualify(request[8:-1].decode())
+                    else:continue
+                    conn.sendall(json.dumps(response,sort_keys=True).encode())
+                except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as error:
+                    self.failures.append(type(error).__name__)
+                    self.first_birth.set()
+                    print(json.dumps({'wallet_installer_error':type(error).__name__,'reason':str(error) if isinstance(error,RuntimeError) else 'request rejected'}),flush=True)
+
+    def close(self):
+        for ident in self.births:self.qualify(ident)
+        print(json.dumps({'wallet_immutable_provenance':list(self.births), 'unchanged':True,
+            'owner_uid':self.uid,'role':'TRUSTED_DB_TEST_OWNER','installer_errors':self.failures}),flush=True)
+
+
+def wallet_client(path, action):
+    if os.geteuid()==0 or (action!='fresh' and not re.fullmatch(r'qualify:[0-9a-f]{32}',action)):
+        raise ValueError('wallet client action or UID denied')
+    with socket.socket(socket.AF_UNIX) as conn:
+        conn.settimeout(150);conn.connect(path)
+        if struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))[1]!=0:
+            raise ValueError('wallet installer must be root')
+        conn.sendall((action+'\n').encode());conn.shutdown(socket.SHUT_WR)
+        data=b''
+        while len(data)<=8192:
+            part=conn.recv(8192)
+            if not part:break
+            data+=part
+        if len(data)>8192:raise ValueError('wallet response too large')
+        result=json.loads(data)
+        sys.stdout.write(json.dumps(result))
+
+
+def trusted_wallet_run(bundle,tier):
+    metadata=verified_manifest(bundle)
+    engine=tier.removeprefix('wallet-')
+    if (os.geteuid()!=0 or metadata['tier']!=tier or len(metadata['entries'])!=1 or
+        metadata['entries'][0]['cwd']!='service' or metadata['entries'][0]['run']!=wallet_selector(engine)):
+        raise ValueError('wallet trusted owner inventory mismatch')
+    mounts=[line.split() for line in Path('/proc/mounts').read_text().splitlines()]
+    runs=[m for m in mounts if m[1]=='/run']
+    if (len(runs)!=1 or runs[0][2]!='tmpfs' or 'noexec' in runs[0][3].split(',') or
+        not {'nosuid','nodev'}.issubset(runs[0][3].split(',')) or
+        os.statvfs('/run').f_blocks*os.statvfs('/run').f_frsize>4*1024**3):
+        raise ValueError('wallet requires bounded private executable tmpfs')
+    if engine!='sqlite':
+        caps=dict(line.split(':',1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+        if (not os.statvfs('/').f_flag & os.ST_RDONLY or Path('/proc/1/comm').read_text().strip()!='sleep' or
+            int(caps['CapBnd'],16)&((1<<19)|(1<<21)) or caps['NoNewPrivs'].strip()!='1'):
+            raise ValueError('wallet requires constrained fixed-image container')
+    root=Path(tempfile.mkdtemp(prefix='newapi-wallet-',dir='/run'));root.chmod(0o755);owned=root.stat()
+    installer=thread=process=test_log=None
+    output_printed=False
+    status=1
+    try:
+        for name,expected in metadata['files'].items():
+            dst=root/'bundle'/name;dst.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(bundle/name,dst);dst.chmod(0o755 if (bundle/name).stat().st_mode&0o111 else 0o644)
+            if digest(dst)!=expected:raise ValueError('wallet copied input mismatch')
+        (root/'bundle/manifest.json').write_bytes((bundle/'manifest.json').read_bytes())
+        uid=200000+secrets.randbelow(100000000)
+        try:pwd.getpwuid(uid);raise ValueError('owner UID occupied')
+        except KeyError:pass
+        for proc in Path('/proc').glob('[0-9]*/status'):
+            try:
+                if re.search(r'^Uid:\s+'+str(uid)+r'\s',proc.read_text(),re.M):raise ValueError('owner UID active')
+            except (FileNotFoundError,PermissionError):pass
+        (root/'journals').mkdir(mode=0o755);(root/'tmp').mkdir(mode=0o700);os.chown(root/'tmp',uid,uid)
+        launcher=root/'owner-client'
+        launcher.write_text('#!/bin/sh\nexec /usr/bin/python3 '+str(root/'bundle/runner.py')+' _wallet_client '+str(root/'wallet.sock')+' "$@"\n');launcher.chmod(0o755)
+        installer=WalletInstaller(root,uid,engine,metadata);installer.start()
+        env={'PATH':'/usr/bin:/bin','HOME':str(root/'tmp'),'TMPDIR':str(root/'tmp'),'GOMAXPROCS':'2',
+            'NEWAPI_BOOTSTRAP_CLIENT':str(launcher),'NEWAPI_BOOTSTRAP_ENGINE':engine,
+            'NEWAPI_DB_TEST_ROLE':'TRUSTED_DB_TEST_OWNER'}
+        entry=metadata['entries'][0]
+        print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry,phase='trusted-db-test-owner',engine=engine,uid=uid)),flush=True)
+        test_log=(root/'owner-test.log').open('xb')
+        process=subprocess.Popen([str(root/'bundle'/entry['binary']),'-test.v','-test.count=1','-test.run='+entry['run']],
+            cwd=root/'bundle/source/service',env=env,preexec_fn=lambda:demote(uid),stdout=test_log,stderr=subprocess.STDOUT)
+        installer.process=process
+        thread=threading.Thread(target=installer.serve);thread.start()
+        if not installer.first_birth.wait(timeout=150) or not installer.births:
+            raise RuntimeError('wallet first birth unavailable')
+        # A separate non-root service receives no owner env or credentials. It
+        # cannot request them through the owner IPC, or write the root journal.
+        denied_uid=uid+1
+        try:pwd.getpwuid(denied_uid);raise ValueError('restricted probe UID occupied')
+        except KeyError:pass
+        for proc in Path('/proc').glob('[0-9]*/status'):
+            try:
+                if re.search(r'^Uid:\s+'+str(denied_uid)+r'\s',proc.read_text(),re.M):raise ValueError('restricted probe UID active')
+            except (FileNotFoundError,PermissionError):pass
+        first=next(iter(installer.births.values()))['receipt']
+        probe = """import os,socket,sys
+s=socket.socket(socket.AF_UNIX);s.settimeout(10);s.connect(sys.argv[1]);s.sendall(b'fresh\\n');s.shutdown(socket.SHUT_WR)
+try:data=s.recv(8192)
+except ConnectionResetError:data=b''
+assert not data
+for p in sys.argv[2:]:
+ try:fd=os.open(p,os.O_WRONLY)
+ except PermissionError:continue
+ else:os.close(fd);raise SystemExit(1)
+assert os.getgroups()==[] and 'NoNewPrivs:\\t1' in open('/proc/self/status').read()
+"""
+        protected=[first['Journal']]
+        if engine=='sqlite':protected.append(first['Database'])
+        command(['/usr/bin/python3','-c',probe,str(root/'wallet.sock'),*protected],
+            env={'PATH':'/usr/bin:/bin'},preexec_fn=lambda:demote(denied_uid))
+        print(json.dumps({'wallet_restricted_service_uid':denied_uid,'owner_uid':uid,
+            'owner_credentials_rejected':True,'protected_files_write_denied':protected,'empty_groups_nnp':True}),flush=True)
+        process.wait(timeout=240)
+        test_log.close()
+        output=(root/'owner-test.log').read_bytes()
+        print(output.decode(errors='replace'),end='',flush=True)
+        output_printed=True
+        validate_required_output(tier,output.decode(errors='replace'),process.returncode)
+        print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry,phase='trusted-db-test-owner',exit=0)),flush=True)
+        installer.close()
+        status=0
+    finally:
+        if process and process.poll() is None:process.kill();process.wait(timeout=10)
+        if test_log:
+            test_log.close()
+            if not output_printed:print((root/'owner-test.log').read_text(errors='replace'),end='',flush=True)
+        if installer:
+            installer.stopped.set()
+            if thread:thread.join(timeout=150)
+            installer.server.close()
+            if thread and thread.is_alive():raise RuntimeError('wallet installer did not join')
+            if installer.resource:installer.resource.close()
+        now=root.lstat()
+        if (now.st_dev,now.st_ino,now.st_uid)!=(owned.st_dev,owned.st_ino,0):raise RuntimeError('wallet cleanup identity changed')
+        shutil.rmtree(root)
+        print(json.dumps({'wallet_cleanup':str(root),'exit':status,'cleanup':True}),flush=True)
+    if 'invocation' in metadata:
+        print('BOOTSTRAP_TIER_RESULT '+json.dumps({'tier':tier,'invocation':metadata['invocation'],
+            'manifest_sha256':digest(bundle/'manifest.json'),'producer_sha256':metadata['files']['new-api'],
+            'runner_sha256':metadata['files']['runner.py'],'entries':metadata['entries'],
+            'required_leaves':required_leaves(tier),'exit':status,'cleanup':True},sort_keys=True),flush=True)
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '_wallet_run':
+        trusted_wallet_run(Path(sys.argv[2]), sys.argv[3])
+        return
+    if len(sys.argv) in (3, 4) and sys.argv[1] == '_wallet_client':
+        wallet_client(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'fresh')
+        return
     if len(sys.argv) == 3 and sys.argv[1] == '_admission_run':
         trusted_admission(sys.argv[2])
         return
@@ -1718,7 +2171,7 @@ def main():
         dispatch_tier(Path(sys.argv[2]), sys.argv[3])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission'), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')
