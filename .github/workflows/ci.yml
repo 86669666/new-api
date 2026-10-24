@@ -74,8 +74,8 @@ jobs:
         working-directory: tokenkit
         run: go build ./...
 
-      - name: Test root, relaykit, and tokenkit modules
-        run: make test
+      - name: Test root, relaykit, and tokenkit modules with isolated bootstrap authority
+        run: make test BOOTSTRAP_TEST_ARGS="--bundle $RUNNER_TEMP/newapi-test-build"
 
   frontend:
     name: Frontend typecheck and test

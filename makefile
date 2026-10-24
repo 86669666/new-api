@@ -39,16 +39,11 @@ dev-web:
 
 dev: dev-api dev-web
 
-# The main package embeds the ignored web/dist output and is covered after build-web.
+# Linux provenance tests use the same-source CLI and a separate installer UID.
+# Build real web/dist first; override args for a bounded package/selector check.
+BOOTSTRAP_TEST_ARGS ?= --bundle $$(mktemp -u -d /tmp/newapi-test-build-XXXXXXXX)
 test:
-	@echo "Testing root Go module..."
-	@root_module=$$(GOWORK=off go list -m); \
-		root_packages=$$(GOWORK=off go list -e ./... | grep -vxF "$$root_module"); \
-		GOWORK=off go test $$root_packages
-	@echo "Testing relaykit Go module..."
-	@cd relaykit && GOWORK=off go test ./...
-	@echo "Testing tokenkit Go module..."
-	@cd tokenkit && GOWORK=off go test ./...
+	@python3 scripts/ci/bootstrap_test_runner.py $(BOOTSTRAP_TEST_ARGS)
 
 reset-setup:
 	@echo "Resetting local setup wizard state..."

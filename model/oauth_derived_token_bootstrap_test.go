@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -20,11 +21,18 @@ import (
 // Run in an isolated installer container, with /birth owned by root. Ordinary
 // developer tests cannot manufacture the required provisioning authority.
 func TestOAuthBootstrapProducer(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires isolated root installer and protected /birth directory")
+	if runtime.GOOS != "linux" {
+		var out bytes.Buffer
+		assert.Equal(t, 1, RunOAuthDatabaseBootstrap([]string{"fresh"}, &out))
+		assert.Equal(t, 1, RunOAuthDatabaseBootstrap([]string{"resume"}, &out))
+		assert.ErrorIs(t, validateOAuthDerivedTokenAnchor(nil), ErrOAuthDerivedTokenUnknown)
+		return
 	}
-	require.NoError(t, oauthProtectedPath("/birth", false))
-	dir, err := os.MkdirTemp("/birth", "producer-test-")
+	require.Zero(t, os.Geteuid(), "run make test: producer tests need the isolated installer principal")
+	root := os.Getenv("NEWAPI_BOOTSTRAP_ROOT_TEST_DIR")
+	require.NotEmpty(t, root, "run make test: protected per-run installer test directory is required")
+	require.NoError(t, oauthProtectedPath(root, false))
+	dir, err := os.MkdirTemp(root, "producer-test-")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
 	target, journal := filepath.Join(dir, "new.db"), filepath.Join(dir, "birth.json")
