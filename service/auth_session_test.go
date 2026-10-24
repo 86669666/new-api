@@ -457,7 +457,7 @@ func TestOrganizationVerificationLifecycleAndFailureAtomicity(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			useTestSessionSecret(t)
 			user := setupAuthSessionTestDB(t, true)
-			require.NoError(t, model.DB.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}))
+			require.NoError(t, model.DB.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.Option{}))
 			enabled, encrypted := common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled
 			common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled = true, false
 			t.Cleanup(func() { common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled = enabled, encrypted })
@@ -734,7 +734,7 @@ func TestOrganizationRequestCancellationStages(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			useTestSessionSecret(t)
 			user := setupAuthSessionTestDB(t, true)
-			require.NoError(t, model.DB.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}))
+			require.NoError(t, model.DB.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.Option{}))
 			hash, err := common.Password2Hash("fixture-password")
 			require.NoError(t, err)
 			require.NoError(t, model.DB.Model(user).Update("password", hash).Error)
