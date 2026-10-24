@@ -111,3 +111,12 @@ const (
 )
 
 const MsgQuotaUserInsufficientPrivate = "quota.user_insufficient_private"
+
+// Read-only usage API errors.
+const (
+	MsgUsageQueryInvalid    = "usage.query_invalid"
+	MsgUsageRangeInvalid    = "usage.range_invalid"
+	MsgUsageLogsDisabled    = "usage.logs_disabled"
+	MsgUsageStatUnavailable = "usage.stat_unavailable"
+	MsgUsageQueryFailed     = "usage.query_failed"
+)
