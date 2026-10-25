@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Link, useLocation } from '@tanstack/react-router'
+import { Link, useLocation, useNavigate } from '@tanstack/react-router'
 import { ExternalLink, Loader2, ChevronRight } from 'lucide-react'
 import { useMemo, useCallback, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -47,6 +47,7 @@ import {
 } from '@/features/chat/hooks/use-active-chat-key'
 import { useChatPresets } from '@/features/chat/hooks/use-chat-presets'
 import {
+  BOXNAI_V2_TEMPLATE,
   chatLinkRequiresApiKey,
   isCherryV2Attempt,
   resolveChatUrl,
@@ -164,6 +165,7 @@ function DropdownPresetItem({
  */
 export function ChatPresetsItem({ item }: { item: NavChatPresets }) {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const { chatPresets, serverAddress } = useChatPresets()
   const { openV2, isOpening } = useCherryStudioV2Import(
     chatPresets.map((preset) => `${preset.id}:${preset.url}`).join('\n')
@@ -181,6 +183,14 @@ export function ChatPresetsItem({ item }: { item: NavChatPresets }) {
   const handleOpenExternal = useCallback(
     async (preset: ChatPreset) => {
       if (preset.type === 'web') return
+      if (preset.url === BOXNAI_V2_TEMPLATE) {
+        await navigate({ to: '/keys' })
+        setOpenMobile(false)
+        toast.info(
+          t('Select an API key, then choose Boxnai from its chat clients menu.')
+        )
+        return
+      }
       if (isCherryV2Attempt(preset.url)) {
         await openV2(preset.url)
         return
@@ -230,7 +240,7 @@ export function ChatPresetsItem({ item }: { item: NavChatPresets }) {
       window.open(url, '_blank', 'noopener')
       setOpenMobile(false)
     },
-    [openV2, serverAddress, setOpenMobile, t]
+    [navigate, openV2, serverAddress, setOpenMobile, t]
   )
 
   const normalizedHref = normalizeHref(href)

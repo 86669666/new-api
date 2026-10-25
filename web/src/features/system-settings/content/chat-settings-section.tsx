@@ -36,8 +36,10 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   BOXO_V2_TEMPLATE,
+  BOXNAI_V2_TEMPLATE,
   CHERRY_V2_TEMPLATE,
   withBoxoV2Preset,
+  withBoxnaiV2Preset,
 } from '@/features/chat/lib/chat-links'
 
 import { SettingsForm } from '../components/settings-form-layout'
@@ -171,6 +173,38 @@ export function ChatSettingsSection({
           }}
         >
           {t('Add Boxo preset')}
+        </Button>
+      </div>
+      <div className='flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between'>
+        <p className='text-muted-foreground text-sm'>
+          {t(
+            'To enable Boxnai v2, add a preset using this exact template, then save. Other schemes that contain the v2 placeholder stay rejected.'
+          )}{' '}
+          <code className='break-all'>{BOXNAI_V2_TEMPLATE}</code>
+        </p>
+        <Button
+          type='button'
+          variant='outline'
+          className='shrink-0'
+          onClick={() => {
+            try {
+              form.setValue(
+                'Chats',
+                withBoxnaiV2Preset(form.getValues('Chats')),
+                {
+                  shouldDirty: true,
+                  shouldValidate: true,
+                }
+              )
+            } catch {
+              form.setError('Chats', {
+                type: 'manual',
+                message: t('Invalid JSON string.'),
+              })
+            }
+          }}
+        >
+          {t('Add Boxnai preset')}
         </Button>
       </div>
       <Form {...form}>

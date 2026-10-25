@@ -1,3 +1,11 @@
+import { QueryClientProvider } from '@tanstack/react-query'
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  RouterProvider,
+} from '@tanstack/react-router'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -16,14 +24,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { QueryClientProvider } from '@tanstack/react-query'
-import {
-  createMemoryHistory,
-  createRootRoute,
-  createRoute,
-  createRouter,
-  RouterProvider,
-} from '@tanstack/react-router'
+import { useReactTable, getCoreRowModel } from '@tanstack/react-table'
 import {
   act,
   cleanup,
@@ -39,8 +40,11 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { SidebarMenu, SidebarProvider } from '@/components/ui/sidebar'
 import {
   CHERRY_V2_TEMPLATE,
+  BOXNAI_V2_TEMPLATE,
   CHERRY_V2_ERROR,
 } from '@/features/chat/lib/chat-links'
+import { ApiKeysProvider } from '@/features/keys/components/api-keys-provider'
+import { DataTableRowActions } from '@/features/keys/components/data-table-row-actions'
 import { api } from '@/lib/api'
 import { createAppQueryClient } from '@/lib/query-client'
 import { Route as ChatRoute } from '@/routes/_authenticated/chat/$chatId'
@@ -86,6 +90,36 @@ afterEach(() => {
   localStorage.clear()
 })
 
+function KeyRows() {
+  const table = useReactTable({
+    data: [7, 9].map((id) => ({
+      id,
+      name: `Key ${id}`,
+      key: 'masked',
+      status: 1,
+      remain_quota: 100,
+      used_quota: 0,
+      unlimited_quota: false,
+      expired_time: -1,
+      created_time: 1,
+      accessed_time: 1,
+      group: 'named',
+      model_limits_enabled: false,
+    })),
+    columns: [],
+    getCoreRowModel: getCoreRowModel(),
+  })
+  return (
+    <ApiKeysProvider>
+      {table.getRowModel().rows.map((row) => (
+        <div key={row.id} aria-label={`Key ${row.original.id}`}>
+          <DataTableRowActions row={row} />
+        </div>
+      ))}
+    </ApiKeysProvider>
+  )
+}
+
 async function mount(presets: Array<Record<string, string>>, entry = '/test') {
   const client = createAppQueryClient()
   clients.push(client)
@@ -107,11 +141,16 @@ async function mount(presets: Array<Record<string, string>>, entry = '/test') {
         },
       }
     }
-    if (url === '/api/token/7') {
+    if (url === '/api/token/7' || url === '/api/token/9') {
       return {
         data: {
           success: true,
-          data: { id: 7, status: 1, expired_time: -1, group: 'named' },
+          data: {
+            id: Number(url.split('/').at(-1)),
+            status: 1,
+            expired_time: -1,
+            group: 'named',
+          },
         },
       }
     }
@@ -143,8 +182,20 @@ async function mount(presets: Array<Record<string, string>>, entry = '/test') {
     path: 'chat2link',
     component: Chat2LinkRoute.options.component,
   })
+  const keys = createRoute({
+    getParentRoute: () => auth,
+    path: 'keys',
+    component: () => <div>Select a key fixture</div>,
+  })
+  const keyActions = createRoute({
+    getParentRoute: () => auth,
+    path: 'key-actions',
+    component: KeyRows,
+  })
   const router = createRouter({
-    routeTree: root.addChildren([auth.addChildren([sidebar, chat, automatic])]),
+    routeTree: root.addChildren([
+      auth.addChildren([sidebar, chat, automatic, keys, keyActions]),
+    ]),
     history: createMemoryHistory({ initialEntries: [entry] }),
   })
   await router.load()
@@ -318,3 +369,102 @@ it('shows only a fixed failure with a real mounted status observer and app Query
   expect(post).not.toHaveBeenCalled()
   expect(window.open).not.toHaveBeenCalled()
 })
+
+it('requires user selection on the keys page instead of exporting the first token from the Boxnai sidebar', async () => {
+  const user = userEvent.setup()
+  const { get, post } = await mount([{ Boxnai: BOXNAI_V2_TEMPLATE }])
+  await user.click(screen.getByRole('button', { name: 'Clients' }))
+  await user.click(await screen.findByRole('menuitem', { name: 'Boxnai' }))
+  await screen.findByText('Select a key fixture')
+  expect(get.mock.calls.some((call) => call[0].startsWith('/api/token/'))).toBe(
+    false
+  )
+  expect(post).not.toHaveBeenCalled()
+  expect(window.open).not.toHaveBeenCalled()
+})
+
+it.each(['/chat/0', '/chat2link'])(
+  'never automatically exports or launches Boxnai on %s',
+  async (entry) => {
+    const { get, post } = await mount([{ Boxnai: BOXNAI_V2_TEMPLATE }], entry)
+    await screen.findByText(
+      entry === '/chat/0'
+        ? 'Use sidebar shortcut'
+        : 'Redirecting to chat page...'
+    )
+    expect(
+      get.mock.calls.some((call) => call[0].startsWith('/api/token/'))
+    ).toBe(false)
+    expect(post).not.toHaveBeenCalled()
+    expect(window.open).not.toHaveBeenCalled()
+  }
+)
+
+it('exports the selected second row to Boxnai only after its explicit menu action', async () => {
+  const user = userEvent.setup()
+  const { post } = await mount([{ Boxnai: BOXNAI_V2_TEMPLATE }], '/key-actions')
+  expect(post).not.toHaveBeenCalled()
+  const row = await screen.findByLabelText('Key 9')
+  await user.click(
+    row.querySelector('button[aria-label="Open menu"]') as HTMLButtonElement
+  )
+  const chat = await screen.findByRole('menuitem', { name: 'Chat' })
+  act(() => chat.focus())
+  await user.keyboard('{ArrowRight}')
+  const boxnai = await screen.findByRole('menuitem', { name: 'Boxnai' })
+  act(() => boxnai.focus())
+  await user.keyboard('{Enter}')
+  await waitFor(() => expect(window.open).toHaveBeenCalledTimes(1))
+  expect(post).toHaveBeenCalledExactlyOnceWith(
+    '/api/token/9/key',
+    undefined,
+    expect.any(Object)
+  )
+  expect(String(vi.mocked(window.open).mock.calls[0][0])).toMatch(
+    /^boxnai:\/\/providers\/api-keys\?v=2&data=[A-Za-z0-9_-]+$/
+  )
+  expect(document.body.textContent).not.toContain('synthetic-only')
+  expect(JSON.stringify(localStorage)).not.toContain('synthetic-only')
+})
+
+it.each(['session', 'unmount'])(
+  'discards selected Boxnai export after %s while reveal is in flight',
+  async (change) => {
+    const user = userEvent.setup()
+    const { post, unmount } = await mount(
+      [{ Boxnai: BOXNAI_V2_TEMPLATE }],
+      '/key-actions'
+    )
+    let release!: (value: {
+      data: { success: boolean; data: { key: string } }
+    }) => void
+    const gate = new Promise<{
+      data: { success: boolean; data: { key: string } }
+    }>((resolve) => {
+      release = resolve
+    })
+    post.mockReturnValueOnce(gate)
+    const row = await screen.findByLabelText('Key 9')
+    await user.click(
+      row.querySelector('button[aria-label="Open menu"]') as HTMLButtonElement
+    )
+    const chat = await screen.findByRole('menuitem', { name: 'Chat' })
+    act(() => chat.focus())
+    await user.keyboard('{ArrowRight}')
+    const boxnai = await screen.findByRole('menuitem', { name: 'Boxnai' })
+    act(() => boxnai.focus())
+    await user.keyboard('{Enter}')
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1))
+    act(() => {
+      if (change === 'unmount') unmount()
+      else login('new-session')
+    })
+    await act(async () => {
+      release({ data: { success: true, data: { key: 'obsolete-synthetic' } } })
+      await gate
+    })
+    expect(window.open).not.toHaveBeenCalled()
+    expect(document.body.textContent).not.toContain('obsolete-synthetic')
+    expect(JSON.stringify(localStorage)).not.toContain('obsolete-synthetic')
+  }
+)

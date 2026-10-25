@@ -49,6 +49,8 @@ export const CHERRY_V2_TEMPLATE =
   'cherrystudio://providers/api-keys?v=2&data={cherryConfigV2}'
 export const BOXO_V2_TEMPLATE =
   'boxo://providers/api-keys?v=2&data={cherryConfigV2}'
+export const BOXNAI_V2_TEMPLATE =
+  'boxnai://providers/api-keys?v=2&data={cherryConfigV2}'
 export const CHERRY_V2_ERROR =
   'Unable to prepare Cherry Studio v2 import. Check the site configuration and selected API key.'
 export const BOXO_V2_ERROR =
@@ -60,9 +62,10 @@ export const CHERRY_V2_ORIGIN_WARNING =
 // still detected as an attempt so the legacy resolver cannot send the key.
 export function v2ImportScheme(
   template: string
-): 'cherrystudio' | 'boxo' | null {
+): 'cherrystudio' | 'boxo' | 'boxnai' | null {
   if (template === CHERRY_V2_TEMPLATE) return 'cherrystudio'
   if (template === BOXO_V2_TEMPLATE) return 'boxo'
+  if (template === BOXNAI_V2_TEMPLATE) return 'boxnai'
   return null
 }
 
@@ -83,10 +86,18 @@ export function validateCherryV2Template(template: string): void {
   if (v2ImportScheme(template) == null) throw new Error(CHERRY_V2_ERROR)
 }
 
-// Adds the Boxo preset an administrator saves in chat settings. It does not
+// Adds an exact client preset an administrator saves in chat settings. It does not
 // replace a different preset that already uses the name, and it does not
 // accept any other scheme.
 export function withBoxoV2Preset(raw: string): string {
+  return withV2Preset(raw, 'Boxo', BOXO_V2_TEMPLATE)
+}
+
+export function withBoxnaiV2Preset(raw: string): string {
+  return withV2Preset(raw, 'Boxnai', BOXNAI_V2_TEMPLATE)
+}
+
+function withV2Preset(raw: string, client: string, template: string): string {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw.trim() === '' ? '[]' : raw)
@@ -103,16 +114,16 @@ export function withBoxoV2Preset(raw: string): string {
     if (entries.length !== 1 || typeof entries[0][1] !== 'string') {
       throw new Error(BOXO_V2_ERROR)
     }
-    if (entries[0][1] === BOXO_V2_TEMPLATE) return raw
+    if (entries[0][1] === template) return raw
     names.add(entries[0][0])
   }
-  let name = 'Boxo'
+  let name = client
   if (names.has(name)) {
     let suffix = 2
-    while (names.has(`Boxo ${suffix}`)) suffix += 1
-    name = `Boxo ${suffix}`
+    while (names.has(`${client} ${suffix}`)) suffix += 1
+    name = `${client} ${suffix}`
   }
-  return JSON.stringify([...parsed, { [name]: BOXO_V2_TEMPLATE }], null, 2)
+  return JSON.stringify([...parsed, { [name]: template }], null, 2)
 }
 
 export type CherryV2Site = {
