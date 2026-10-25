@@ -652,6 +652,11 @@ func validOAuthProviderRedirect(raw, registered string) bool {
 	if u.Scheme == "https" && u.Hostname() != "" {
 		return raw == registered
 	}
+	// Boxnai is a fixed callback, not permission to register arbitrary schemes
+	// or URI variants. The client must still register this exact URI.
+	if u.Scheme == "boxnai" {
+		return raw == "boxnai://oauth/callback" && raw == registered
+	}
 	if u.Scheme == "cherrystudio" {
 		return raw == registered && u.Host == "oauth" && u.Path == "/callback"
 	}

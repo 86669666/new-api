@@ -101,6 +101,7 @@ type oauthHydraClient struct {
 	fixture  *organizationHTTPFixture
 	http     *http.Client
 	clientID string
+	redirect string
 	secrets  []string
 }
 
@@ -171,7 +172,7 @@ func (c *oauthHydraClient) consent(scopes string) (string, oauthHydraGrant, stri
 	_, err = rand.Read(random)
 	require.NoError(c.t, err)
 	nonce := base64.RawURLEncoding.EncodeToString(random)
-	q := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {"http://127.0.0.1:29873/oauth/callback"}, "scope": {scopes}, "state": {state}, "nonce": {nonce}, "code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"}}
+	q := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {c.redirect}, "scope": {scopes}, "state": {state}, "nonce": {nonce}, "code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"}}
 	status, headers, _ := c.request("GET", c.input.Issuer+"oauth2/auth?"+q.Encode(), "", "", "")
 	require.Equal(c.t, 302, status, "real authorize did not issue login challenge")
 	login, err := url.Parse(headers.Get("Location"))
@@ -198,9 +199,11 @@ func (c *oauthHydraClient) code(scopes string, selected ...string) oauthHydraGra
 	require.Equal(c.t, http.StatusSeeOther, status, "real consent verifier failed")
 	callback, err := url.Parse(headers.Get("Location"))
 	require.NoError(c.t, err)
-	require.Equal(c.t, "http", callback.Scheme)
-	require.Equal(c.t, "127.0.0.1:29873", callback.Host)
-	require.Equal(c.t, "/oauth/callback", callback.Path)
+	registered, err := url.Parse(c.redirect)
+	require.NoError(c.t, err)
+	require.Equal(c.t, registered.Scheme, callback.Scheme)
+	require.Equal(c.t, registered.Host, callback.Host)
+	require.Equal(c.t, registered.EscapedPath(), callback.EscapedPath())
 	require.True(c.t, state == callback.Query().Get("state"), "callback state must match this transaction")
 	require.Equal(c.t, c.input.Issuer, callback.Query().Get("iss"))
 	require.True(c.t, callback.Query().Get("code") != "", "missing authorization code")
@@ -210,7 +213,7 @@ func (c *oauthHydraClient) code(scopes string, selected ...string) oauthHydraGra
 }
 func (c *oauthHydraClient) exchange(grant oauthHydraGrant) (int, oauthHydraGrant) {
 	c.t.Helper()
-	form := url.Values{"client_id": {c.clientID}, "grant_type": {"authorization_code"}, "code": {grant.Code}, "redirect_uri": {"http://127.0.0.1:29873/oauth/callback"}, "code_verifier": {grant.Verifier}}
+	form := url.Values{"client_id": {c.clientID}, "grant_type": {"authorization_code"}, "code": {grant.Code}, "redirect_uri": {c.redirect}, "code_verifier": {grant.Verifier}}
 	status, _, data := c.request("POST", c.input.Issuer+"oauth2/token", "application/x-www-form-urlencoded", form.Encode(), "")
 	var value struct {
 		Access  string `json:"access_token"`
@@ -479,7 +482,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 	require.NoError(t, err)
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}, Jar: jar, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	t.Cleanup(client.CloseIdleConnections)
-	c := &oauthHydraClient{t: t, input: input, fixture: f, http: client, clientID: "newapi-w01-desktop"}
+	c := &oauthHydraClient{t: t, input: input, fixture: f, http: client, clientID: "newapi-w01-desktop", redirect: "http://127.0.0.1:29873/oauth/callback"}
 	t.Cleanup(func() {
 		for _, secret := range c.secrets {
 			assert.True(t, secret == "" || !strings.Contains(f.logs.String(), secret), "gateway logs must exclude protocol secrets")
@@ -564,6 +567,61 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		require.Equal(t, strconv.Itoa(f.users["owner"].Id), claims["sub"])
 		require.True(t, grant.Nonce == claims["nonce"], "ID token nonce must match this transaction")
 	})
+	t.Run("personal_callback_rejections", func(t *testing.T) {
+		c.t = t
+		pkce := sha256.Sum256([]byte(strings.Repeat("v", 43)))
+		for _, redirect := range []string{
+			"boxnai://oauth/other", "boxnai://other/callback", "boxnai://oauth/callback?x=1",
+			"boxnai://oauth:123/callback", "boxnai://oauth/callback#", "other://oauth/callback",
+			"http://localhost:39874/oauth/callback", "http://127.0.0.1:39874/other",
+		} {
+			q := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {redirect}, "scope": {"profile"}, "state": {"personal-callback-negative"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(pkce[:])}, "code_challenge_method": {"S256"}}
+			status, headers, _ := c.request("GET", input.Issuer+"oauth2/auth?"+q.Encode(), "", "", "")
+			assert.Equal(t, 400, status, redirect)
+			assert.Empty(t, headers.Get("Location"))
+			assert.Contains(t, headers.Get("Cache-Control"), "no-store")
+		}
+		// A fixed scheme is not sufficient: this other allowed public client
+		// has only a loopback redirect registered with the real issuer.
+		q := url.Values{"client_id": {"newapi-w01-independent"}, "response_type": {"code"}, "redirect_uri": {"boxnai://oauth/callback"}, "scope": {"profile"}, "state": {"personal-callback-unregistered"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(pkce[:])}, "code_challenge_method": {"S256"}}
+		status, headers, _ := c.request("GET", input.Issuer+"oauth2/auth?"+q.Encode(), "", "", "")
+		assert.Equal(t, 400, status)
+		assert.Empty(t, headers.Get("Location"))
+	})
+
+	t.Run("personal_registered_callbacks", func(t *testing.T) {
+		original := c.redirect
+		t.Cleanup(func() { c.redirect = original })
+		for _, tc := range []struct{ name, redirect string }{
+			{"dynamic_loopback", "http://127.0.0.1:39874/oauth/callback"},
+			{"boxnai", "boxnai://oauth/callback"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				c.t, c.redirect = t, tc.redirect
+				grant := c.grant("openid profile offline_access")
+				require.Equal(t, 200, c.userinfo(grant.Access))
+				status, next := c.refresh(grant)
+				require.Equal(t, 200, status)
+				require.True(t, next.Refresh != "" && next.Refresh != grant.Refresh, "refresh must rotate")
+				require.Equal(t, 200, c.userinfo(next.Access))
+				// OAuth identity is not a dashboard/organization credential.
+				status, _, _ = c.request("GET", input.Issuer+"api/organizations", "", "", next.Access)
+				assert.Equal(t, 401, status)
+				status, _, _ = c.request("POST", input.Issuer+"oauth2/revoke", "application/x-www-form-urlencoded", url.Values{"token": {next.Refresh}, "client_id": {c.clientID}}.Encode(), "")
+				require.Equal(t, 200, status)
+				assert.False(t, c.active(next.Access))
+				assert.False(t, c.active(next.Refresh))
+				assert.Equal(t, 401, c.userinfo(next.Access))
+
+				code := c.code("profile")
+				c.redirect = original // Another registered URI cannot redeem this code.
+				status, _ = c.exchange(code)
+				assert.Equal(t, 400, status)
+				c.redirect = tc.redirect
+			})
+		}
+	})
+
 	t.Run("scopes_control_issuance", func(t *testing.T) {
 		c.t = t
 		grant := c.grant("profile")
