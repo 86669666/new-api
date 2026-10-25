@@ -11,6 +11,7 @@ import (
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
+	createUserSessionTestUser(t, 7, 1)
 	token := Token{
 		UserId:     7,
 		Key:        "token-auto-groups-cache-key",
@@ -33,6 +34,7 @@ func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 func TestTokenAllowUserQuotaQueryRoundTripsThroughRedisHashCache(t *testing.T) {
 	truncateTables(t)
 	server := useUserCacheMiniRedis(t)
+	createUserSessionTestUser(t, 7, 1)
 	token := Token{UserId: 7, Key: "token-user-quota-cache-key", Name: "user-quota-cache", AllowUserQuotaQuery: true}
 
 	require.NoError(t, token.Insert())
@@ -47,8 +49,12 @@ func TestTokenAllowUserQuotaQueryRoundTripsThroughRedisHashCache(t *testing.T) {
 }
 
 func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
-	truncateTables(t)
+	db, _ := oauthBirthFixture(t)
+	oldDB := DB
+	DB = db
+	t.Cleanup(func() { DB = oldDB })
 	useUserCacheMiniRedis(t)
+	createUserSessionTestUser(t, 7, 1)
 	token := Token{
 		UserId:          7,
 		Key:             "token-auto-groups-update-cache-key",

@@ -10,7 +10,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/alicebob/miniredis/v2"
-	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -670,8 +669,7 @@ func TestSecurityRevocationReasonsPreserveInvalidation(t *testing.T) {
 	for _, reason := range []string{"password_reset", "admin_demote"} {
 		for _, retainedSID := range []string{"", "current"} {
 			t.Run(reason+"/retained="+retainedSID, func(t *testing.T) {
-				db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-				require.NoError(t, err)
+				db, _ := oauthBirthFixture(t)
 				sqlDB, err := db.DB()
 				require.NoError(t, err)
 				sqlDB.SetMaxOpenConns(1)
@@ -680,7 +678,6 @@ func TestSecurityRevocationReasonsPreserveInvalidation(t *testing.T) {
 				t.Cleanup(func() {
 					DB, LOG_DB = oldDB, oldLogDB
 					oauthCleanupDB.Store(oldCleanupDB)
-					require.NoError(t, sqlDB.Close())
 				})
 				setupUserSessionTest(t)
 				require.NoError(t, db.AutoMigrate(&OAuthGrant{}, &OAuthOperation{}, &OAuthArtifact{}, &OAuthCleanupJob{}))

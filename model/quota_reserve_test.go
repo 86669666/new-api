@@ -34,10 +34,10 @@ func createReserveTestUser(t *testing.T, quota int) User {
 	return user
 }
 
-func createReserveTestToken(t *testing.T, remainQuota int) Token {
+func createReserveTestToken(t *testing.T, ownerID, remainQuota int) Token {
 	t.Helper()
 	token := Token{
-		UserId:      1,
+		UserId:      ownerID,
 		Key:         "reserve-token-" + common.GetRandomString(8),
 		Name:        "reserve-test",
 		Status:      common.TokenStatusEnabled,
@@ -97,7 +97,7 @@ func TestTryReserveQuotaWithoutRedis(t *testing.T) {
 	assert.False(t, reserved)
 	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
 
-	token := createReserveTestToken(t, 80)
+	token := createReserveTestToken(t, user.Id, 80)
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 25, false)
 	require.NoError(t, err)
 	assert.True(t, reserved)
@@ -130,7 +130,7 @@ func TestRedisBatchReserveUsesSQLWalletAndSQLToken(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, cachedUser.Quota)
 
-	token := createReserveTestToken(t, 9)
+	token := createReserveTestToken(t, user.Id, 9)
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 7, false)
 	require.NoError(t, err)
 	assert.True(t, reserved)
@@ -215,7 +215,10 @@ func TestSynchronousReserveCompensatesCacheWhenPersistenceFails(t *testing.T) {
 	require.NoError(t, cacheErr)
 	assert.Equal(t, 10, cached.Quota)
 
-	token := createReserveTestToken(t, 12)
+	// The wallet failure deliberately deleted its payer; the independent token
+	// failure still needs a live owner before the token itself is deleted.
+	tokenOwner := createReserveTestUser(t, 0)
+	token := createReserveTestToken(t, tokenOwner.Id, 12)
 	_, err = GetTokenByKey(token.Key, true)
 	require.NoError(t, err)
 	require.NoError(t, DB.Delete(&token).Error)
@@ -232,7 +235,8 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 	resetBatchUpdateTestState(t)
 	server := useUserCacheMiniRedis(t)
 
-	token := createReserveTestToken(t, 100)
+	owner := createReserveTestUser(t, 0)
+	token := createReserveTestToken(t, owner.Id, 100)
 	loaded, err := GetTokenByKey(token.Key, true)
 	require.NoError(t, err)
 	stale := *loaded
