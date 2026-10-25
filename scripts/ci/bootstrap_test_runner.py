@@ -35,6 +35,8 @@ PG_SELECTOR = '^TestSessionRevocationS1Namespace$'
 JOINT_IMAGE = 'sha256:894680346c8e75455a0a6c969b7b8241aeb9b6e9c0d0d95689669153d4627c4d'
 JOINT_SELECTOR = '^TestSessionRevocationS1RealRedis$'
 MYSQL_IMAGE = 'sha256:6ec0af605b45e088e789150f865fc1ad92434f6aab0e3f3ab27688312be19000'
+# Same MySQL base plus signed, pinned Redis runtime closure; lifecycle alone requires both.
+LIFECYCLE_MYSQL_IMAGE = 'sha256:029f948eedb0182550fa11bc4249927cc17970788230d999a8eb35909e48b131'
 WALLET_TESTS = ('TestBillingSessionSQLAdmission', 'TestBillingLegacySQLRegressions')
 WALLET_ENGINES = ('sqlite', 'mysql', 'postgres')
 WALLET_SCENARIOS = ('arrears_retry', 'arrears_retry_held', 'arrears_retry_claimed', 'arrears_settle', 'held_refund', 'image_available', 'search_available', 'zero_held', 'trusted_held', 'task_zero_held', 'task_trusted_held')
@@ -1179,7 +1181,7 @@ class CombinedPostgres(OwnedPostgres):
 def postgres_container(bundle, tier='postgres'):
     # Host controller alone operates Docker. No socket, host mount, privileged
     # flag, SYS_ADMIN, sudo/ip or nested namespace tools enter the container.
-    image_id = MYSQL_IMAGE if tier in ('wallet-mysql', 'metadata-mysql', 'lifecycle-mysql') else PG_IMAGE if tier in ('postgres', 'wallet-postgres', 'metadata-postgres') else JOINT_IMAGE
+    image_id = LIFECYCLE_MYSQL_IMAGE if tier == 'lifecycle-mysql' else MYSQL_IMAGE if tier in ('wallet-mysql', 'metadata-mysql') else PG_IMAGE if tier in ('postgres', 'wallet-postgres', 'metadata-postgres') else JOINT_IMAGE
     nonce = secrets.token_hex(12)
     image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', image_id]))[0]
     if image['Id'] != image_id:
