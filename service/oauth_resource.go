@@ -389,6 +389,31 @@ func (r *OAuthUserInfoResource) introspectPurpose(ctx context.Context, credentia
 	return OAuthResourceIdentity{userID: int(id), authVersion: authVersion, issuer: issuer, clientID: clientID, expiresAt: expires, notBefore: notBefore, email: scopes["email"], scopes: strings.Split(scope, " "), grantID: grantID, grantExpiresAt: grantExpires}, nil
 }
 
+// OrdinaryTokenAuditEntry exposes only the identity verified by Authorize.
+// The grant correlation is a hash, never a bearer or raw issuer capability.
+func (a *OAuthUserInfoAccess) OrdinaryTokenAuditEntry(ctx context.Context) model.AuditLog {
+	if !a.resource.grantsRequired {
+		return model.AuditLog{}
+	}
+	entry := model.AuditLog{
+		UserId:   a.identity.userID,
+		Category: model.AuditCategorySecurity, Action: "token.create", AuthMethod: "oauth_access_token",
+		Content: "OAuth ordinary API token creation",
+		Other: model.AuditOther{Op: &model.AuditOperation{Action: "token.create", Params: model.AuditFields{
+			"oauth_client_id": a.identity.clientID,
+			"oauth_grant_ref": model.OAuthGrantRef(a.identity.issuer, a.identity.grantID),
+		}}},
+	}
+	// The delegated profile deliberately excludes role. Read only these audit
+	// fields; failure keeps the existing unknown-role/root-only visibility and
+	// cannot change the authentication or creation result.
+	var actor model.User
+	if model.DB.WithContext(ctx).Select("username", "role").First(&actor, a.identity.userID).Error == nil {
+		entry.Username, entry.ActorRole = actor.Username, actor.Role
+	}
+	return entry
+}
+
 // RequireOrdinaryTokenWriteScope never accepts bridge-only or ambient credentials.
 func (a *OAuthUserInfoAccess) RequireOrdinaryTokenWriteScope() error {
 	if a == nil || a.resource == nil || !a.resource.grantsRequired || a.identity.grantID == "" || a.credential == "" {

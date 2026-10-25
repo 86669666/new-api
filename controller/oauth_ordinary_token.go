@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -36,5 +37,7 @@ func CreateOAuthOrdinaryToken(c *gin.Context) {
 		middleware.WriteOAuthResourceError(c, err, "tokens:write")
 		return
 	}
+	tokenAuditParams(c)["id"] = token.Id
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"id": token.Id, "name": token.Name, "key": token.Key}})
 }

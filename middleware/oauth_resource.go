@@ -87,6 +87,10 @@ func oauthResourceAuth(resource *service.OAuthUserInfoResource, scope string) gi
 			WriteOAuthResourceError(c, err, scope)
 			return
 		}
+		if scope == "tokens:write" {
+			// Capture verified identity before a possible authorization rejection.
+			c.Set(oauthOrdinaryTokenAuditKey, access.OrdinaryTokenAuditEntry(c.Request.Context()))
+		}
 		if scope == "balance:read" {
 			if err := access.RequireBalanceScope(); err != nil {
 				WriteOAuthResourceError(c, err, scope)

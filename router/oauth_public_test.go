@@ -5322,7 +5322,7 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 	bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: admin.URL, AuthorizationURL: grant.Issuer + "oauth2/auth"}, resource)
 	require.NoError(t, err)
 	engine := gin.New()
-	engine.Use(middleware.OAuthTokensBoundary)
+	engine.Use(middleware.RequestId(), middleware.OAuthTokensBoundary)
 	SetOAuthResourceRouter(engine, resource)
 	request := func() *httptest.ResponseRecorder {
 		calls.Store(0)
@@ -5428,9 +5428,80 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		assert.NotContains(t, w.Body.String(), "data")
 	})
 	t.Run("ordinary_key_creation", func(t *testing.T) {
+		// Keep audit storage distinct from primary/provenance and give this
+		// fixture only its own temporary log file, including external main tiers.
+		previousLog, previousMainKind, previousLogKind := model.LOG_DB, common.MainDatabaseType(), common.LogDatabaseType()
+		auditDB, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "ordinary-audit.db")), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+		require.NoError(t, err)
+		auditConnection, err := auditDB.DB()
+		require.NoError(t, err)
+		require.NoError(t, auditDB.AutoMigrate(&model.AuditLog{}))
+		model.LOG_DB = auditDB
+		common.SetDatabaseTypes(previousMainKind, common.DatabaseTypeSQLite)
+		t.Cleanup(func() {
+			model.LOG_DB = previousLog
+			common.SetDatabaseTypes(previousMainKind, previousLogKind)
+			require.NoError(t, auditConnection.Close())
+		})
+		const auditCanary = "W77_SECRET_REQUEST_CANARY"
+		assertAudit := func(w *httptest.ResponseRecorder, result, failure string, tokenID int) model.AuditLog {
+			t.Helper()
+			var row model.AuditLog
+			require.NoError(t, auditDB.Where("request_id = ?", w.Header().Get(common.RequestIdKey)).Take(&row).Error)
+			assert.Equal(t, grant.UserID, row.UserId)
+			assert.Equal(t, f.users["owner"].Username, row.Username)
+			assert.Equal(t, common.RoleCommonUser, row.ActorRole)
+			assert.Equal(t, model.AuditCategorySecurity, row.Category)
+			assert.Equal(t, "token.create", row.Action)
+			assert.Equal(t, "oauth_access_token", row.AuthMethod)
+			assert.Equal(t, w.Code, row.Status)
+			assert.Equal(t, tokenID > 0, row.Success)
+			assert.Equal(t, "POST", row.Method)
+			assert.Equal(t, "/api/v1/oauth/tokens", row.Route)
+			assert.NotEmpty(t, row.EventId)
+			assert.NotEmpty(t, row.RequestId)
+			assert.NotEqual(t, auditCanary, row.RequestId)
+			require.NotNil(t, row.Other.Op)
+			params, err := common.Marshal(row.Other.Op.Params)
+			require.NoError(t, err)
+			var fields struct {
+				ClientID string `json:"oauth_client_id"`
+				GrantRef string `json:"oauth_grant_ref"`
+				Result   string `json:"result"`
+				Failure  string `json:"failure_class"`
+				ID       int    `json:"id"`
+			}
+			require.NoError(t, common.Unmarshal(params, &fields))
+			assert.Equal(t, grant.ClientID, fields.ClientID)
+			assert.Equal(t, grant.GrantRef, fields.GrantRef)
+			assert.Equal(t, result, fields.Result)
+			assert.Equal(t, failure, fields.Failure)
+			assert.Equal(t, tokenID, fields.ID)
+			keys := []string{"oauth_client_id", "oauth_grant_ref", "result", "failure_class"}
+			if tokenID > 0 {
+				keys = append(keys, "id")
+			}
+			assert.ElementsMatch(t, keys, slices.Collect(maps.Keys(row.Other.Op.Params)))
+			raw, err := common.Marshal(row)
+			require.NoError(t, err)
+			for _, secret := range []string{auditCanary, "synthetic-metadata", grant.GrantID, f.sids["owner"]} {
+				assert.False(t, strings.Contains(string(raw), secret), "audit excludes request secrets and raw capabilities")
+			}
+			return row
+		}
+		assertNoAudit := func(w *httptest.ResponseRecorder) {
+			t.Helper()
+			var n int64
+			require.NoError(t, auditDB.Model(&model.AuditLog{}).Where("request_id = ?", w.Header().Get(common.RequestIdKey)).Count(&n).Error)
+			assert.Zero(t, n, "unverified claims cannot manufacture an attributed actor")
+		}
 		post := func(body, bearer string) *httptest.ResponseRecorder {
 			r := httptest.NewRequest("POST", "/api/v1/oauth/tokens", strings.NewReader(body))
 			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("User-Agent", auditCanary)
+			r.Header.Set(common.RequestIdKey, auditCanary)
+			r.Header.Set("X-User-ID", strconv.Itoa(f.users["foreign"].Id))
+			r.Header.Set("Cookie", "attacker_identity="+auditCanary)
 			if bearer != "" {
 				r.Header.Set("Authorization", "Bearer "+bearer)
 			}
@@ -5440,8 +5511,12 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		}
 		count := func() int64 { var n int64; require.NoError(t, f.db.Model(&model.Token{}).Count(&n).Error); return n }
 		initial := count()
-		assert.Equal(t, 403, post(`{"name":"ordinary"}`, "synthetic-metadata").Code)
-		assert.Equal(t, 401, post(`{"name":"ordinary"}`, "").Code)
+		denied := post(`{"name":"ordinary"}`, "synthetic-metadata")
+		assert.Equal(t, 403, denied.Code)
+		assertAudit(denied, "rejected", "insufficient_scope", 0)
+		unauthenticated := post(`{"name":"ordinary"}`, "")
+		assert.Equal(t, 401, unauthenticated.Code)
+		assertNoAudit(unauthenticated)
 		writeScopes := `["profile","tokens:read","tokens:write"]`
 		require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", writeScopes).Error)
 		claims["scope"] = "profile tokens:read tokens:write"
@@ -5449,8 +5524,10 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 			claims["scope"] = "profile tokens:read"
 			require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", string(encoded)).Error)
 		}()
-		for _, body := range []string{`{}`, `{"name":""}`, `{"name":" "}`, `{"name":null}`, `{"name":1}`, `{"name":"a","user_id":1}`, `{"name":"a","organization_id":1}`, `{"name":"a","unlimited_quota":true}`, `{"name":"a","group":"vip"}`, `{"name":"a","quota":999}`, `{"name":"a","name":"b"}`, `{"name":"a"} {}`, `{"Name":"a"}`, `{"name":"` + strings.Repeat("a", 31) + `"}`} {
-			assert.Equal(t, 400, post(body, "synthetic-metadata").Code)
+		for _, body := range []string{`{}`, `{"name":""}`, `{"name":" "}`, `{"name":null}`, `{"name":1}`, `{"name":"` + auditCanary + `","password":"` + auditCanary + `"}`, `{"name":"a","user_id":1}`, `{"name":"a","organization_id":1}`, `{"name":"a","unlimited_quota":true}`, `{"name":"a","group":"vip"}`, `{"name":"a","quota":999}`, `{"name":"a","name":"b"}`, `{"name":"a"} {}`, `{"Name":"a"}`, `{"name":"` + strings.Repeat("a", 31) + `"}`} {
+			denied := post(body, "synthetic-metadata")
+			assert.Equal(t, 400, denied.Code)
+			assertAudit(denied, "rejected", "invalid_request", 0)
 		}
 		for _, path := range []string{"/api/v1/oauth/tokens/", "/api/v1/oauth/tokens?", "/api/v1/oauth/tokens?name=other", "/api/v1/oauth/%74okens"} {
 			r := httptest.NewRequest("POST", path, strings.NewReader(`{"name":"boundary"}`))
@@ -5481,10 +5558,14 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		}
 		oldActor := claims["sub"]
 		claims["sub"] = strconv.Itoa(f.users["foreign"].Id)
-		assert.Equal(t, 401, post(`{"name":"ordinary"}`, "synthetic-metadata").Code)
+		wrongActor := post(`{"name":"ordinary"}`, "synthetic-metadata")
+		assert.Equal(t, 401, wrongActor.Code)
+		assertNoAudit(wrongActor)
 		claims["sub"] = oldActor
 		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).UpdateColumn("status", common.UserStatusDisabled).Error)
-		assert.Equal(t, 401, post(`{"name":"ordinary"}`, "synthetic-metadata").Code)
+		disabled := post(`{"name":"ordinary"}`, "synthetic-metadata")
+		assert.Equal(t, 401, disabled.Code)
+		assertNoAudit(disabled)
 		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).UpdateColumn("status", common.UserStatusEnabled).Error)
 		assert.Equal(t, initial, count(), "all rejected requests leave token table unchanged")
 		w := post(`{"name":"ordinary"}`, "synthetic-metadata")
@@ -5499,6 +5580,10 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		}
 		require.NoError(t, common.Unmarshal(w.Body.Bytes(), &created))
 		require.True(t, created.Success)
+		createdAudit := assertAudit(w, "created", "none", created.Data.ID)
+		auditBytes, e := common.Marshal(createdAudit)
+		require.NoError(t, e)
+		assert.False(t, strings.Contains(string(auditBytes), created.Data.Key), "usable created key is never audited")
 		require.True(t, len(created.Data.Key) > 20, "created key must be usable")
 		var token model.Token
 		require.NoError(t, f.db.First(&token, created.Data.ID).Error)
@@ -5519,7 +5604,12 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		require.NoError(t, f.db.First(&afterUser, grant.UserID).Error)
 		assert.Equal(t, userBefore.Quota, afterUser.Quota)
 		assert.Equal(t, userBefore.UsedQuota, afterUser.UsedQuota)
+		var auditCountBefore int64
+		require.NoError(t, auditDB.Model(&model.AuditLog{}).Count(&auditCountBefore).Error)
 		metadata := request()
+		var auditCountAfter int64
+		require.NoError(t, auditDB.Model(&model.AuditLog{}).Count(&auditCountAfter).Error)
+		assert.Equal(t, auditCountBefore, auditCountAfter, "metadata GET never emits a key creation event")
 		require.Equal(t, 200, metadata.Code)
 		assert.False(t, strings.Contains(metadata.Body.String(), created.Data.Key), "GET must not disclose the new ordinary key")
 		var response struct{ Data []any }
@@ -5537,7 +5627,9 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		require.NoError(t, e)
 		operation_setting.GetTokenSetting().MaxUserTokens = int(ownedCount)
 		defer func() { operation_setting.GetTokenSetting().MaxUserTokens = oldLimit }()
-		assert.Equal(t, 503, post(`{"name":"over-limit"}`, "synthetic-metadata").Code)
+		overLimit := post(`{"name":"over-limit"}`, "synthetic-metadata")
+		assert.Equal(t, 503, overLimit.Code)
+		assertAudit(overLimit, "rejected", "creation_unavailable", 0)
 		assert.Equal(t, initial+1, count())
 	})
 
