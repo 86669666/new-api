@@ -3,18 +3,26 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,6 +37,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -1624,16 +1633,27 @@ func tokenOwnerStore(t *testing.T) *gorm.DB {
 	oldDB, oldLog := model.DB, model.LOG_DB
 	oldMain, oldLogKind := common.MainDatabaseType(), common.LogDatabaseType()
 	oldRedis, oldMaster, oldReady := common.RedisEnabled, common.IsMasterNode, model.OAuthCleanupReady()
-	db, _ := oauthBirthFixture(t)
+	t.Setenv("LOG_SQL_DSN", "")
+	db, dsn := oauthBirthFixture(t)
+	if strings.HasPrefix(os.Getenv("NEWAPI_BOOTSTRAP_TIER"), "lifecycle-") {
+		tokenLifecycleQualification(t, dsn, db.Dialector.Name())
+	}
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = oldDB, oldLog
 		common.SetDatabaseTypes(oldMain, oldLogKind)
+		common.IsMasterNode = false
+		require.NoError(t, model.InitLogDB())
+		model.LOG_DB = oldLog
+		common.SetLogDatabaseType(oldLogKind)
 		common.RedisEnabled, common.IsMasterNode = oldRedis, oldMaster
 		require.NoError(t, model.InitOAuthCleanupStore(oldReady))
 	})
 	model.DB, model.LOG_DB = db, db
 	common.SetDatabaseTypes(common.DatabaseType(db.Dialector.Name()), common.DatabaseType(db.Dialector.Name()))
 	common.RedisEnabled, common.IsMasterNode = false, false
+	// Existing no-DSN initializer restores canonical dialect columns without
+	// opening a connection or migrating; cache misses use these SQL columns.
+	require.NoError(t, model.InitLogDB())
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.OAuthGrant{}, &model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}, &model.OAuthDerivedTextCharge{}, &model.AuditLog{}))
 	require.NoError(t, model.InitOAuthCleanupStore(true))
 	require.NoError(t, model.ValidateOAuthDerivedTokenStore(context.Background()))
@@ -1652,11 +1672,77 @@ func tokenOwnerStore(t *testing.T) *gorm.DB {
 	return db
 }
 
+// The installer owns this receipt, journal and fresh birth. No marker alone
+// authorizes source seeding or a Redis endpoint.
+func tokenLifecycleQualification(t *testing.T, dsn, engine string) {
+	t.Helper()
+	require.Equal(t, "lifecycle-"+engine, os.Getenv("NEWAPI_BOOTSTRAP_TIER"))
+	require.Equal(t, "TRUSTED_DB_TEST_OWNER", os.Getenv("NEWAPI_DB_TEST_ROLE"))
+	require.NotZero(t, os.Geteuid())
+	journal := os.Getenv("OAUTH_BOOTSTRAP_JOURNAL")
+	ident := strings.TrimSuffix(filepath.Base(journal), ".json")
+	raw, err := exec.Command(os.Getenv("NEWAPI_BOOTSTRAP_CLIENT"), "qualify:"+ident).Output()
+	require.NoError(t, err)
+	var receipt struct {
+		ID, Engine, Journal, JournalSHA256, DSNSHA256, BinarySHA256, RoleClass string
+		OwnerUID                                                               int
+	}
+	require.NoError(t, common.Unmarshal(raw, &receipt))
+	require.Equal(t, ident, receipt.ID)
+	require.Equal(t, engine, receipt.Engine)
+	require.Equal(t, journal, receipt.Journal)
+	require.Equal(t, os.Geteuid(), receipt.OwnerUID)
+	require.Equal(t, "TRUSTED_DB_TEST_OWNER", receipt.RoleClass)
+	sum := sha256.Sum256([]byte(dsn))
+	require.Equal(t, hex.EncodeToString(sum[:]), receipt.DSNSHA256)
+	for _, file := range []string{journal, filepath.Join(filepath.Dir(filepath.Dir(journal)), "wallet-"+ident+".json")} {
+		st, err := os.Lstat(file)
+		require.NoError(t, err)
+		require.True(t, st.Mode().IsRegular())
+		require.Zero(t, st.Mode().Perm()&0022)
+		require.Zero(t, st.Sys().(*syscall.Stat_t).Uid)
+	}
+	data, err := os.ReadFile(journal)
+	require.NoError(t, err)
+	sum = sha256.Sum256(data)
+	require.Equal(t, hex.EncodeToString(sum[:]), receipt.JournalSHA256)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	file, err := os.Open(executable)
+	require.NoError(t, err)
+	hash := sha256.New()
+	_, err = io.Copy(hash, file)
+	require.NoError(t, file.Close())
+	require.NoError(t, err)
+	require.Equal(t, hex.EncodeToString(hash.Sum(nil)), receipt.BinarySHA256)
+}
+
+func tokenLifecycleAction(t *testing.T, action string) {
+	t.Helper()
+	ident := strings.TrimSuffix(filepath.Base(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL")), ".json")
+	kind, tail, _ := strings.Cut(action, ":")
+	request := kind + ":" + ident
+	if tail != "" {
+		request += ":" + tail
+	}
+	raw, err := exec.Command(os.Getenv("NEWAPI_BOOTSTRAP_CLIENT"), request).Output()
+	require.NoError(t, err)
+	var result struct {
+		Applied bool   `json:"applied"`
+		Action  string `json:"fixture_action"`
+	}
+	require.NoError(t, common.Unmarshal(raw, &result))
+	require.True(t, result.Applied)
+	require.Equal(t, kind, result.Action)
+}
+
 func setupTokenOwnerTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := tokenOwnerStore(t)
 	for id := 1; id <= 2; id++ {
-		require.NoError(t, db.Create(&model.User{Id: id, Username: fmt.Sprintf("owner-%d", id), AffCode: fmt.Sprintf("own-%d", id), AuthVersion: 1, Status: common.UserStatusEnabled, Group: "default"}).Error)
+		user := &model.User{Username: fmt.Sprintf("owner-%d", id), AffCode: fmt.Sprintf("own-%d", id), AuthVersion: 1, Status: common.UserStatusEnabled, Group: "default"}
+		require.NoError(t, db.Create(user).Error)
+		require.Equal(t, id, user.Id, "fresh fixture keeps database-generated IDs and sequence in sync")
 	}
 	return db
 }
@@ -1680,7 +1766,18 @@ func ownerDerivedFixture(t *testing.T, db *gorm.DB, userID int, suffix string, u
 		keyRef, idem, request := model.OAuthDerivedTokenKeyRef(key), model.OAuthDerivedTokenKeyRef("idem-"+suffix), model.OAuthDerivedTokenKeyRef("req-"+suffix)
 		source.TokenID, source.KeyRef, source.IdemHash, source.RequestHash, source.CreatedAt = &token.Id, &keyRef, &idem, &request, &created
 	}
-	require.NoError(t, db.Create(source).Error)
+	if strings.HasPrefix(os.Getenv("NEWAPI_BOOTSTRAP_TIER"), "lifecycle-") {
+		tokenID := 0
+		if token != nil {
+			tokenID = token.Id
+		}
+		tokenLifecycleAction(t, fmt.Sprintf("seed:%s:%d", grant.GrantRef, tokenID))
+		source = &model.OAuthDerivedTokenSource{}
+		require.NoError(t, db.First(source, "grant_ref = ?", grant.GrantRef).Error)
+		require.NoError(t, source.Validate(time.Now().Unix()))
+	} else {
+		require.NoError(t, db.Create(source).Error)
+	}
 	return grant, source, token
 }
 
@@ -1860,7 +1957,11 @@ func TestOAuthDerivedTokenOwnerLifecycle(t *testing.T) {
 		assert.NotContains(t, w.Body.String(), manual.Key)
 		assert.NotContains(t, w.Body.String(), derived.Key)
 		// Missing source table is a real SQL error, not proof of manual origin.
-		require.NoError(t, db.Migrator().DropTable(&model.OAuthDerivedTokenSource{}))
+		if strings.HasPrefix(os.Getenv("NEWAPI_BOOTSTRAP_TIER"), "lifecycle-") {
+			tokenLifecycleAction(t, "source_absent")
+		} else {
+			require.NoError(t, db.Migrator().DropTable(&model.OAuthDerivedTokenSource{}))
+		}
 		tokens, err = model.GetTokenKeysByIds([]int{manual.Id}, 1)
 		require.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
 		assert.Nil(t, tokens)
@@ -1934,6 +2035,141 @@ func TestOAuthDerivedTokenOwnerLifecycle(t *testing.T) {
 		assert.Equal(t, 500000, tokens[0].RemainQuota)
 		assert.NotEmpty(t, tokens[0].Key)
 		assert.NotContains(t, w.Body.String(), tokens[0].Key)
+	})
+
+	t.Run("real_redis", func(t *testing.T) {
+		db := setupTokenOwnerTestDB(t)
+		path := os.Getenv("NEWAPI_LIFECYCLE_REDIS_RECEIPT")
+		require.NotEmpty(t, path, "real Redis qualification is mandatory in the lifecycle tier")
+		st, err := os.Lstat(path)
+		require.NoError(t, err)
+		require.True(t, st.Mode().IsRegular())
+		require.Zero(t, st.Sys().(*syscall.Stat_t).Uid)
+		require.Zero(t, st.Mode().Perm()&0022)
+		raw, err := os.ReadFile(path)
+		require.NoError(t, err)
+		var receipt struct {
+			Address    string `json:"address"`
+			RunID      string `json:"run_id"`
+			Version    string `json:"version"`
+			ServiceUID int    `json:"service_uid"`
+		}
+		require.NoError(t, common.Unmarshal(raw, &receipt))
+		host, _, err := net.SplitHostPort(receipt.Address)
+		require.NoError(t, err)
+		require.Equal(t, "127.0.0.1", host)
+		require.Equal(t, os.Geteuid(), receipt.ServiceUID)
+		client := redis.NewClient(&redis.Options{Addr: receipt.Address, MaxRetries: -1})
+		oldRDB, oldEnabled := common.RDB, common.RedisEnabled
+		common.RDB, common.RedisEnabled = client, true
+		t.Cleanup(func() { common.RDB, common.RedisEnabled = oldRDB, oldEnabled; require.NoError(t, client.Close()) })
+		require.Equal(t, "PONG", client.Ping(t.Context()).Val())
+		info, err := client.Info(t.Context(), "server").Result()
+		require.NoError(t, err)
+		require.Contains(t, info, "run_id:"+receipt.RunID+"\r\n")
+		require.Contains(t, info, "redis_version:"+receipt.Version+"\r\n")
+		manual := seedToken(t, db, 1, "cache-control", strings.Repeat("m", 48))
+		manual.Status, manual.ExpiredTime, manual.UnlimitedQuota = common.TokenStatusEnabled, -1, true
+		require.NoError(t, db.Model(manual).Updates(map[string]any{"status": manual.Status, "expired_time": -1, "unlimited_quota": true}).Error)
+		r := gin.New()
+		reached := 0
+		r.GET("/v1/models", middleware.TokenAuth(), func(c *gin.Context) { reached++; c.Status(http.StatusOK) })
+		request := func(key string) *httptest.ResponseRecorder {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/v1/models", nil)
+			req.Header.Set("Authorization", "Bearer sk-"+key)
+			r.ServeHTTP(w, req)
+			return w
+		}
+		key := "token:" + common.GenerateHMAC(manual.Key)
+		values := map[string]any{"Id": manual.Id, "UserId": manual.UserId, "Status": common.TokenStatusEnabled, "ExpiredTime": -1, "UnlimitedQuota": true, "RemainQuota": 1000, "UsedQuota": 0}
+		require.NoError(t, client.HSet(t.Context(), key, values).Err())
+		require.Equal(t, 200, request(manual.Key).Code)
+		require.NoError(t, client.HSet(t.Context(), key, "UserId", 2).Err())
+		require.Equal(t, 401, request(manual.Key).Code)
+		require.Equal(t, 1, reached)
+		// An unreachable cache is not provenance and cannot disable SQL checks.
+		dead := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0", MaxRetries: -1, DialTimeout: time.Second})
+		common.RDB = dead
+		require.Equal(t, 200, request(manual.Key).Code)
+		require.NoError(t, dead.Close())
+		common.RDB = client
+		grant, _, derived := ownerDerivedFixture(t, db, 1, "cached-revoke", false)
+		require.NoError(t, model.RevokeOAuth(t.Context(), 1, "grant", grant.GrantRef))
+		staleKey := "token:" + common.GenerateHMAC(derived.Key)
+		require.NoError(t, client.HSet(t.Context(), staleKey, map[string]any{"Id": derived.Id, "UserId": 1, "Status": common.TokenStatusEnabled, "ExpiredTime": derived.ExpiredTime, "RemainQuota": 1000, "UsedQuota": 0}).Err())
+		w := request(derived.Key)
+		require.Equal(t, 401, w.Code)
+		assert.NotContains(t, w.Body.String(), derived.Key)
+		assert.Equal(t, 2, reached)
+		var stored model.Token
+		require.NoError(t, db.First(&stored, derived.Id).Error)
+		assert.Equal(t, common.TokenStatusDisabled, stored.Status)
+		assert.Equal(t, 1000, stored.RemainQuota)
+		var payer model.User
+		require.NoError(t, db.First(&payer, 1).Error)
+		assert.Zero(t, payer.Quota)
+		assert.Zero(t, payer.UsedQuota)
+		var charges int64
+		require.NoError(t, db.Model(&model.OAuthDerivedTextCharge{}).Count(&charges).Error)
+		assert.Zero(t, charges)
+		require.NoError(t, client.Del(t.Context(), key, staleKey, "token:fence:"+common.GenerateHMAC(manual.Key), "token:fence:"+common.GenerateHMAC(derived.Key)).Err())
+	})
+	t.Run("create_revoke_order", func(t *testing.T) {
+		for _, createFirst := range []bool{true, false} {
+			t.Run(strconv.FormatBool(createFirst), func(t *testing.T) {
+				db := setupTokenOwnerTestDB(t)
+				grant, _, derived := ownerDerivedFixture(t, db, 1, "ordered", false)
+				manual := &model.Token{UserId: 1, Key: strings.Repeat("x", 48), UnlimitedQuota: true, ExpiredTime: -1, Status: common.TokenStatusEnabled}
+				create := func() error { return manual.Insert() }
+				revoke := func() error { return model.RevokeOAuth(t.Context(), 1, "grant", grant.GrantRef) }
+				first, second := create, revoke
+				if !createFirst {
+					first, second = revoke, create
+				}
+				if db.Dialector.Name() == "sqlite" {
+					// SQLite's fixture has one writer; it is an ordered control,
+					// never evidence of PostgreSQL/MySQL row-lock concurrency.
+					require.NoError(t, first())
+					require.NoError(t, second())
+				} else {
+					locked, attempted, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+					var before, after atomic.Int32
+					require.NoError(t, db.Callback().Query().Before("gorm:query").Register("lifecycle:attempt", func(tx *gorm.DB) {
+						if tx.Statement.Table == "users" && before.Add(1) == 2 {
+							close(attempted)
+						}
+					}))
+					require.NoError(t, db.Callback().Query().After("gorm:query").Register("lifecycle:locked", func(tx *gorm.DB) {
+						if tx.Statement.Table == "users" && after.Add(1) == 1 {
+							close(locked)
+							<-release
+						}
+					}))
+					t.Cleanup(func() {
+						require.NoError(t, db.Callback().Query().Remove("lifecycle:attempt"))
+						require.NoError(t, db.Callback().Query().Remove("lifecycle:locked"))
+					})
+					firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+					go func() { firstDone <- first() }()
+					<-locked
+					go func() { secondDone <- second() }()
+					<-attempted
+					close(release)
+					require.NoError(t, <-firstDone)
+					require.NoError(t, <-secondDone)
+					require.GreaterOrEqual(t, after.Load(), int32(2))
+				}
+				require.NoError(t, db.First(derived, derived.Id).Error)
+				assert.Equal(t, common.TokenStatusDisabled, derived.Status)
+				require.NoError(t, db.First(manual, manual.Id).Error)
+				assert.Equal(t, common.TokenStatusEnabled, manual.Status)
+				assert.True(t, manual.UnlimitedQuota)
+				kind, err := model.ClassifyOAuthDerivedToken(t.Context(), manual.Id)
+				require.NoError(t, err)
+				assert.Equal(t, model.OAuthDerivedTokenManualProven, kind)
+			})
+		}
 	})
 
 	t.Run("historical_finalize_after_revoke", func(t *testing.T) {

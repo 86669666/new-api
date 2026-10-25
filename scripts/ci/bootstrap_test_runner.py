@@ -47,6 +47,12 @@ def wallet_selector(engine):
 METADATA_SELECTOR = '^TestOAuthTokensConsumerHTTP$'
 METADATA_CASES = ('bridge_only_rejected', 'empty_current_grant_no_writes', 'wrong_client', 'wrong_actor', 'wrong_audience', 'wrong_issuer', 'refresh_bearer', 'expired', 'future', 'write_scope_not_supported', 'old_grant_missing_read_scope', 'post_encoding_revocation_discards_empty_success', 'missing_store_is_not_empty')
 METADATA_TIERS = tuple('metadata-'+e for e in WALLET_ENGINES)
+LIFECYCLE_SELECTOR = '^TestOAuthDerivedTokenOwnerLifecycle$'
+LIFECYCLE_CASES = ('owner_reveal_and_mutation', 'revoke_and_rollback', 'disable_delete_rollback',
+                   'unknown_is_not_manual', 'same_user_creation_limit', 'registration_default_token',
+                   'historical_finalize_after_revoke', 'real_redis', 'create_revoke_order')
+LIFECYCLE_TIERS = tuple('lifecycle-'+e for e in WALLET_ENGINES)
+
 
 JOINT_CASES = ('deny_wrong_type', 'outbox_rollback', 'late_active_fill', 'credential_rollback')
 
@@ -70,6 +76,10 @@ def prepare(args):
         raise ValueError('trusted provenance test runner requires Linux')
     if args.tier == 'all' and (args.package or args.run != '.'):
         raise ValueError('bounded selectors require an explicit resource --tier')
+    if args.tier in LIFECYCLE_TIERS:
+        if args.package not in (None, ['./controller']) or args.run not in ('.', LIFECYCLE_SELECTOR):
+            raise ValueError('lifecycle tier requires the exact controller lifecycle inventory')
+        args.package, args.run = ['./controller'], LIFECYCLE_SELECTOR
     if args.tier in METADATA_TIERS:
         if args.package not in (None, ['./router']) or args.run not in ('.', METADATA_SELECTOR):
             raise ValueError('metadata tier requires the exact metadata consumer inventory')
@@ -160,20 +170,24 @@ def resource_partitions(entries, inventory):
         raise ValueError('default inventory package mismatch')
     routers = [e for e in entries if e['cwd'] == 'router']
     services = [e for e in entries if e['cwd'] == 'service']
-    if len(routers) != 1 or len(services) != 1:
+    controllers = [e for e in entries if e['cwd'] == 'controller']
+    if len(routers) != 1 or len(services) != 1 or len(controllers) != 1:
         raise ValueError('default requires complete router and service packages')
-    router, service = routers[0], services[0]
+    router, service, controller = routers[0], services[0], controllers[0]
+    lifecycle_name = LIFECYCLE_SELECTOR[1:-1]
+    if lifecycle_name not in inventory[controller['binary']]:
+        raise ValueError('required lifecycle inventory missing')
     required = {'postgres': PG_SELECTOR[1:-1], 'postgres-redis': JOINT_SELECTOR[1:-1]}
     if (not set(required.values()).issubset(inventory[router['binary']]) or
             not set(WALLET_TESTS).issubset(inventory[service['binary']])):
         raise ValueError('required compiled test missing')
-    partitions = {tier: [] for tier in (*required, *('wallet-'+e for e in WALLET_ENGINES), 'sqlite')}
+    partitions = {tier: [] for tier in (*required, *('wallet-'+e for e in WALLET_ENGINES), *LIFECYCLE_TIERS, 'sqlite')}
     assigned = []
     for entry in entries:
         names = inventory[entry['binary']]
         if len(names) != len(set(names)):
             raise ValueError('duplicate inventory member')
-        excluded = set(required.values()) if entry == router else set(WALLET_TESTS) if entry == service else set()
+        excluded = set(required.values()) if entry == router else set(WALLET_TESTS) if entry == service else {lifecycle_name} if entry == controller else set()
         ordinary = [n for n in names if n not in excluded]
         run = '^(' + '|'.join(re.escape(n) for n in ordinary) + ')$' if excluded else '.'
         if excluded and not ordinary:
@@ -186,8 +200,10 @@ def resource_partitions(entries, inventory):
     for engine in WALLET_ENGINES:
         partitions['wallet-'+engine] = [dict(service, run=wallet_selector(engine))]
         assigned.extend((service['binary'], name, engine) for name in WALLET_TESTS)
+        partitions['lifecycle-'+engine] = [dict(controller, run=LIFECYCLE_SELECTOR)]
+        assigned.append((controller['binary'], lifecycle_name, engine))
     expected = {(b, n, engine) for b, names in inventory.items() for n in names
-                for engine in (WALLET_ENGINES if b == service['binary'] and n in WALLET_TESTS else ('',))}
+                for engine in (WALLET_ENGINES if (b == service['binary'] and n in WALLET_TESTS or b == controller['binary'] and n == lifecycle_name) else ('',))}
     if len(assigned) != len(set(assigned)) or set(assigned) != expected:
         raise ValueError('resource partitions overlap or omit tests')
     return partitions
@@ -218,6 +234,8 @@ def verified_manifest(bundle):
 
 
 def required_leaves(tier):
+    if tier in LIFECYCLE_TIERS:
+        return ['TestOAuthDerivedTokenOwnerLifecycle/'+case for case in LIFECYCLE_CASES]
     if tier in METADATA_TIERS:
         return ['TestOAuthTokensConsumerHTTP/'+case for case in METADATA_CASES]
     if tier.startswith('wallet-'):
@@ -259,7 +277,7 @@ def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
 
 def dispatch_tier(bundle, tier):
     metadata = verified_manifest(bundle)
-    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
+    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
         raise ValueError('dispatch tier mismatch')
     if tier == 'admission':
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
@@ -268,7 +286,7 @@ def dispatch_tier(bundle, tier):
             raise RuntimeError('admission bundle exceeds private tmpfs safety budget')
         command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork', 'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=1G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && exec "$@"', 'admission-tests', sys.executable, str(bundle/'runner.py'), '_admission_run', str(bundle)])
         return
-    if tier.startswith('wallet-') or tier in METADATA_TIERS:
+    if tier.startswith('wallet-') or tier in METADATA_TIERS or tier in LIFECYCLE_TIERS:
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
         size=sum((bundle/name).stat().st_size for name in metadata['files'])
         if size*2+1024**3 >= 4*1024**3 or available < size*2+1024**3+3*1024**3:
@@ -387,7 +405,10 @@ def bootstrap_observation(side, phase, started, peer_pid, *, label='unspecified'
         data = (json.dumps(row, separators=(',', ':'))+'\n').encode()
         if len(data) > 768:
             return
-        sink = 2 if side == 'client' else 1
+        sink = (_wallet_observation_fd if side == 'installer' and label == 'wallet' and
+                _wallet_observation_fd is not None else 2 if side == 'client' else 1)
+        if sink == _wallet_observation_fd and _wallet_observation_attempts is not None:
+            next(_wallet_observation_attempts, None)
         original = os.fstat(sink)
         # O_NONBLOCK cannot bound regular-file/device writes. Unsupported sinks
         # lose diagnostics rather than acquiring a new operation dependency.
@@ -1158,7 +1179,7 @@ class CombinedPostgres(OwnedPostgres):
 def postgres_container(bundle, tier='postgres'):
     # Host controller alone operates Docker. No socket, host mount, privileged
     # flag, SYS_ADMIN, sudo/ip or nested namespace tools enter the container.
-    image_id = MYSQL_IMAGE if tier in ('wallet-mysql', 'metadata-mysql') else PG_IMAGE if tier in ('postgres', 'wallet-postgres', 'metadata-postgres') else JOINT_IMAGE
+    image_id = MYSQL_IMAGE if tier in ('wallet-mysql', 'metadata-mysql', 'lifecycle-mysql') else PG_IMAGE if tier in ('postgres', 'wallet-postgres', 'metadata-postgres') else JOINT_IMAGE
     nonce = secrets.token_hex(12)
     image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', image_id]))[0]
     if image['Id'] != image_id:
@@ -1169,7 +1190,7 @@ def postgres_container(bundle, tier='postgres'):
             '--cap-drop=ALL', '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER',
             '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL', *(['--cap-add=SYS_PTRACE'] if tier == 'postgres' else []),
             '--tmpfs', '/run:rw,exec,nosuid,nodev,size=4g,mode=0755',
-            '--tmpfs', ('/var/lib/mysql' if tier in ('wallet-mysql', 'metadata-mysql') else '/var/lib/postgresql/data')+':rw,noexec,nosuid,nodev,size=1m,mode=0700',
+            '--tmpfs', ('/var/lib/mysql' if tier in ('wallet-mysql', 'metadata-mysql', 'lifecycle-mysql') else '/var/lib/postgresql/data')+':rw,noexec,nosuid,nodev,size=1m,mode=0700',
             '--entrypoint', '/bin/sh', image_id, '-c', 'exec sleep 600']
     cid = subprocess.check_output(argv, text=True).strip()
     try:
@@ -1191,7 +1212,7 @@ def postgres_container(bundle, tier='postgres'):
         # Detached execution keeps the authoritative result inside the owned
         # container; a Docker attach EOF cannot be mistaken for test completion.
         command(['docker','exec','-d',cid,'/bin/sh','-c',
-                 'python3 /run/input/runner.py '+('_wallet_run' if tier.startswith('wallet-') or tier in METADATA_TIERS else '_run')+' /run/input '+tier+' > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
+                 'python3 /run/input/runner.py '+('_wallet_run' if tier.startswith('wallet-') or tier in METADATA_TIERS or tier in LIFECYCLE_TIERS else '_run')+' /run/input '+tier+' > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
         deadline = time.monotonic() + 300
         while True:
             receipt = subprocess.run(['docker','exec',cid,'cat','/run/result.exit'], capture_output=True, text=True)
@@ -1882,6 +1903,105 @@ WALLET_MUTABLE = ('users', 'tokens', 'user_sessions', 'session_revocation_events
 WALLET_IMMUTABLE = ('oauth_derived_token_history', 'oauth_derived_token_bootstrap_identity')
 
 
+_wallet_observation_fd = None
+_wallet_observation_attempts = None
+
+
+class WalletObservationCollector:
+    """Root-private bounded diagnostics, independent of business stdout/exit.
+
+    No path or descriptor is accepted from the caller/environment. The emitter
+    retains its one nonblocking atomic write. A daemon reader never delays the
+    installer, including when the existing result sink is full or unavailable.
+    """
+    def __enter__(self):
+        global _wallet_observation_fd, _wallet_observation_attempts
+        self.attempts = iter(range(2049))
+        self.owns_sink = False
+        self.read = self.write = self.sink = None
+        self.thread = None
+        self.stop = threading.Event()
+        self.received = self.delivered = self.dropped = 0
+        self.failed = False
+        try:
+            if os.geteuid() != 0 or _wallet_observation_fd is not None:
+                raise ValueError('collector requires sole root owner')
+            original = os.fstat(1)
+            if not (stat.S_ISFIFO(original.st_mode) or
+                    stat.S_ISREG(original.st_mode) and original.st_uid == 0 and not original.st_mode & 0o022):
+                raise ValueError('unsupported collector result stream')
+            self.sink = (os.dup(1) if stat.S_ISREG(original.st_mode) else
+                         os.open('/proc/self/fd/1', os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC))
+            opened = os.fstat(self.sink)
+            if (original.st_dev,original.st_ino) != (opened.st_dev,opened.st_ino):
+                raise ValueError('collector output replaced')
+            self.read,self.write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+            _wallet_observation_fd = self.write
+            _wallet_observation_attempts = self.attempts
+            self.owns_sink = True
+            self.thread = threading.Thread(target=self.drain, daemon=True)
+            self.thread.start()
+        except Exception:
+            self.failed = True
+            if self.owns_sink:
+                _wallet_observation_fd = _wallet_observation_attempts = None
+        return self
+
+    def drain(self):
+        pending = b''
+        discarding = False
+        try:
+            while not self.stop.is_set():
+                try:part = os.read(self.read,4096)
+                except BlockingIOError:
+                    self.stop.wait(0.005)
+                    continue
+                if not part:break
+                for byte in part:
+                    if byte == 10:
+                        if not discarding and pending:
+                            self.received += 1
+                            if self.received <= 2048:
+                                try:
+                                    # Bytes come only from the fixed in-process emitter.
+                                    count = os.write(self.sink,pending+b'\n')
+                                    if count != len(pending)+1:raise OSError('partial diagnostic')
+                                    self.delivered += 1
+                                except OSError:self.dropped += 1
+                            else:self.dropped += 1
+                        pending,discarding = b'',False
+                    elif len(pending) < 768 and not discarding:pending += bytes((byte,))
+                    else:
+                        self.failed = True
+                        pending,discarding = b'',True
+        except Exception:self.failed = True
+        finally:
+            try:
+                if pending or discarding:self.failed = True
+                attempted = next(self.attempts, 2049)
+                summary = ('BOOTSTRAP_OBSERVATION_RESULT '+json.dumps({'attempted':attempted,'received':self.received,
+                    'delivered':self.delivered,'dropped':self.dropped,
+                    'capture_complete':not self.failed and self.dropped==0 and attempted==self.delivered and self.delivered>0})+'\n').encode()
+                os.write(self.sink,summary)
+            except Exception:pass
+
+    def __exit__(self, kind, error, traceback):
+        global _wallet_observation_fd, _wallet_observation_attempts
+        if self.owns_sink:
+            _wallet_observation_fd = _wallet_observation_attempts = None
+        if self.write is not None:os.close(self.write);self.write=None
+        if self.thread:self.thread.join(timeout=0.5)
+        alive = bool(self.thread and self.thread.is_alive())
+        if alive:self.failed = True
+        self.stop.set()
+        # A stalled regular-file sink may retain only this bounded daemon thread
+        # until process exit; never close/reuse its descriptor from another thread.
+        if not alive:
+            for fd in (self.read,self.sink):
+                if fd is not None:os.close(fd)
+        return False
+
+
 class WalletObservation:
     """Bounded wallet phases on the existing drop-on-backpressure diagnostic sink.
 
@@ -2027,6 +2147,9 @@ class OwnedWalletMySQL:
 
 
 class WalletInstaller:
+    mutable_tables = WALLET_MUTABLE
+    source_access = 'SELECT,INSERT'
+
     def __init__(self, root, uid, engine, metadata):
         self.root, self.uid, self.engine, self.metadata = root, uid, engine, metadata
         self.resource = None
@@ -2094,6 +2217,11 @@ class WalletInstaller:
         probes += (('write_history','DELETE FROM oauth_derived_token_history WHERE 1=0;'),
                    ('write_identity','DELETE FROM oauth_derived_token_bootstrap_identity WHERE 1=0;'),
                    ('mutate_source','DELETE FROM oauth_derived_token_sources WHERE 1=0;'))
+        if isinstance(self, LifecycleInstaller):
+            probes += (('insert_source','INSERT INTO oauth_derived_token_sources (grant_ref) SELECT grant_ref FROM oauth_derived_token_sources WHERE 1=0;'),
+                       ('alter_source','ALTER TABLE oauth_derived_token_sources ADD COLUMN forbidden_owner INTEGER;'),
+                       ('write_task','DELETE FROM tasks WHERE 1=0;'),
+                       ('select_source_state','UPDATE oauth_derived_token_sources SET terminal_reason=terminal_reason WHERE 1=0;'))
         for label,statement in [('select_history','SELECT COUNT(*) FROM oauth_derived_token_history;'),*probes,('select_identity','SELECT COUNT(*) FROM oauth_derived_token_bootstrap_identity;')]:
             acl_query = "SELECT relacl::text FROM pg_class WHERE oid='public.oauth_derived_token_history'::regclass;"
             before_acl = self.resource.sql(database,acl_query) if self.engine=='postgres' and label=='grant' else None
@@ -2144,21 +2272,23 @@ class WalletInstaller:
         elif self.engine == 'postgres':
             self.resource.sql(database, f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}'; REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE,CREATE ON SCHEMA public TO {role};")
             existing = set(self.resource.sql(database,"SELECT tablename FROM pg_tables WHERE schemaname='public';").splitlines())
-            for table in WALLET_MUTABLE:
+            for table in self.mutable_tables:
                 if table in existing:self.resource.sql(database,f'ALTER TABLE public.{table} OWNER TO {role};')
             for table in WALLET_IMMUTABLE:
                 self.resource.sql(database,f'GRANT SELECT ON public.{table} TO {role};')
-            self.resource.sql(database,f'GRANT SELECT,INSERT ON public.oauth_derived_token_sources TO {role}; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO {role};')
+            self.resource.sql(database,f'GRANT {self.source_access} ON public.oauth_derived_token_sources TO {role};')
+            if not isinstance(self,LifecycleInstaller):
+                self.resource.sql(database,f'GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO {role};')
             self.resource.sql('postgres',f'REVOKE ALL ON DATABASE {database} FROM PUBLIC; GRANT CONNECT ON DATABASE {database} TO {role}; ALTER DATABASE {database} CONNECTION LIMIT 20;')
             endpoint = str(self.resource.socket_path)
             dsn = 'postgresql://'+role+':'+password+'@/'+database+'?host='+str(self.resource.socket_dir)+'&sslmode=disable'
         else:
             self.resource.sql(database,f"CREATE USER '{role}'@'localhost' IDENTIFIED BY '{password}';")
-            for table in WALLET_MUTABLE:
+            for table in self.mutable_tables:
                 self.resource.sql(database,f"GRANT SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,DROP,INDEX,REFERENCES ON {database}.{table} TO '{role}'@'localhost';")
             for table in WALLET_IMMUTABLE:
                 self.resource.sql(database,f"GRANT SELECT ON {database}.{table} TO '{role}'@'localhost';")
-            self.resource.sql(database,f"GRANT SELECT,INSERT ON {database}.oauth_derived_token_sources TO '{role}'@'localhost';")
+            self.resource.sql(database,f"GRANT {self.source_access} ON {database}.oauth_derived_token_sources TO '{role}'@'localhost';")
             endpoint = str(self.resource.socket_path)
             dsn = role+':'+password+'@unix('+endpoint+')/'+database+'?parseTime=true&loc=Local'
         if not self.births:self.audit_owner_permissions(database,role,password)
@@ -2193,11 +2323,12 @@ class WalletInstaller:
                             identity=admission_identity(self.process,self.uid,self.root/'bundle'/self.metadata['entries'][0]['binary'])
                             if identity['ExeSHA256'] != self.metadata['files'][self.metadata['entries'][0]['binary']]:continue
                         with WalletObservation('wallet_read'):
-                            request=conn.recv(96)
+                            request=conn.recv(160 if isinstance(self, LifecycleInstaller) else 96)
                             if conn.recv(1):continue
                         with WalletObservation('wallet_dispatch'):
                             if request==b'fresh\n':response=self.birth()
                             elif re.fullmatch(rb'qualify:[0-9a-f]{32}\n',request):response=self.qualify(request[8:-1].decode())
+                            elif isinstance(self, LifecycleInstaller):response=self.fixture_action(request)
                             else:continue
                         with WalletObservation('wallet_reply'):
                             conn.sendall(json.dumps(response,sort_keys=True).encode())
@@ -2211,8 +2342,90 @@ class WalletInstaller:
             'owner_uid':self.uid,'role':'TRUSTED_DB_TEST_OWNER','installer_errors':self.failures}),flush=True)
 
 
+class LifecycleInstaller(WalletInstaller):
+    # Synthetic lifecycle fixture owner only. No Task, subscription, top-up or
+    # system-task rights; immutable history remains owned by the installer.
+    mutable_tables = ('users', 'tokens', 'user_sessions', 'session_revocation_events',
+                      'user_access_tokens', 'oauth_grants', 'o_auth_operations',
+                      'o_auth_artifacts', 'o_auth_cleanup_jobs',
+                      'oauth_derived_text_charges', 'audit_logs', 'logs')
+    source_access = 'SELECT,UPDATE'
+
+    def __init__(self, root, uid, engine, metadata):
+        super().__init__(root, uid, engine, metadata)
+        self.redis = CombinedRedis(root, uid)
+        self.redis_path = root/'redis-resource.json'
+
+    def start(self):
+        super().start()
+        self.redis.start()
+        self.redis_hash = digest(self.redis_path)
+
+    def qualify(self, ident):
+        if digest(self.redis_path) != self.redis_hash:
+            raise RuntimeError('lifecycle Redis receipt changed')
+        self.redis.verify()
+        return super().qualify(ident)
+
+    def fixture_action(self, request):
+        # Only a verified direct child of the exact lifecycle test binary can
+        # request these two fixed fixture operations. No caller SQL or secret.
+        match = re.fullmatch(rb'(seed|source_absent):([0-9a-f]{32})(?::([0-9a-f]{64}):([0-9]{1,10}))?\n', request)
+        if not match:
+            raise ValueError('lifecycle fixture request denied')
+        action, ident = match[1].decode(), match[2].decode()
+        receipt = self.qualify(ident)
+        database = receipt['Database']
+        if action == 'source_absent':
+            if match[3] is not None:raise ValueError('invalid source fault')
+            statement = 'DROP TABLE oauth_derived_token_sources;'
+        else:
+            if match[3] is None:raise ValueError('missing source fixture binding')
+            grant, token = match[3].decode(), int(match[4])
+            # The SQL INSERT SELECT takes all identity and token fields from
+            # this newly born DB. Fixed bounded fixture facts are not issuance.
+            now = int(time.time())
+            key_col = '"key"' if self.engine == 'postgres' else '`key`'
+            token_fields = 'NULL,NULL,NULL,NULL,NULL'
+            expires = str(now+600)
+            if token:
+                if self.engine == 'sqlite':
+                    import sqlite3
+                    with sqlite3.connect(database) as conn:
+                        rows = conn.execute('SELECT '+key_col+',expired_time FROM tokens WHERE id=? AND user_id=(SELECT user_id FROM oauth_grants WHERE grant_ref=?)', (token,grant)).fetchall()
+                else:
+                    raw = self.resource.sql(database, f"SELECT {key_col},expired_time FROM tokens WHERE id={token} AND user_id=(SELECT user_id FROM oauth_grants WHERE grant_ref='{grant}');")
+                    rows = [raw.split('|' if self.engine=='postgres' else '\t')] if raw else []
+                if len(rows)!=1 or len(rows[0])!=2:raise ValueError('synthetic token binding absent')
+                key, expiry = rows[0]
+                expires = str(int(expiry))
+                key_ref = hashlib.sha256(b'newapi.oauth.derived-key.v1\x00'+str(key).encode()).hexdigest()
+                idem = hashlib.sha256(('fixture-idem:'+grant).encode()).hexdigest()
+                req = hashlib.sha256(('fixture-request:'+grant).encode()).hexdigest()
+                token_fields = f"{token},'{key_ref}','{idem}','{req}',{now}"
+            statement = f"""INSERT INTO oauth_derived_token_sources
+                (grant_ref,user_id,schema_version,quota_limit,expires_at,policy_hash,binding_hash,
+                 verified_at,proof_expires_at,permit_deadline,verified_method,proof_flow_id,
+                 token_id,key_ref,idem_hash,request_hash,created_at)
+                SELECT grant_ref,user_id,1,1000,{expires},policy_hash,'{'b'*64}',
+                 {now-10},{now+40},{now+40},'password',
+                 (SELECT COALESCE(MAX(proof_flow_id),0)+1 FROM oauth_derived_token_sources),{token_fields}
+                FROM oauth_grants WHERE grant_ref='{grant}' AND state='active';"""
+        if self.engine == 'sqlite':
+            import sqlite3
+            with sqlite3.connect(database) as conn:
+                cursor = conn.execute(statement)
+                if action=='seed' and cursor.rowcount!=1:raise ValueError('synthetic grant missing')
+        else:
+            self.resource.sql(database,statement)
+            if action=='seed' and self.resource.sql(database,f"SELECT COUNT(*) FROM oauth_derived_token_sources WHERE grant_ref='{grant}';")!='1':
+                raise ValueError('synthetic grant missing')
+        self.qualify(ident)
+        return {'fixture_action':action,'applied':True}
+
+
 def wallet_client(path, action):
-    if os.geteuid()==0 or (action!='fresh' and not re.fullmatch(r'qualify:[0-9a-f]{32}',action)):
+    if os.geteuid()==0 or (action!='fresh' and not re.fullmatch(r'(qualify:[0-9a-f]{32}|seed:[0-9a-f]{32}:[0-9a-f]{64}:[0-9]{1,10}|source_absent:[0-9a-f]{32})',action)):
         raise ValueError('wallet client action or UID denied')
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(150);conn.connect(path)
@@ -2232,9 +2445,10 @@ def wallet_client(path, action):
 def trusted_wallet_run(bundle,tier):
     metadata=verified_manifest(bundle)
     metadata_tier = tier in METADATA_TIERS
-    engine=tier.removeprefix('metadata-' if metadata_tier else 'wallet-')
-    expected_cwd = 'router' if metadata_tier else 'service'
-    expected_selector = METADATA_SELECTOR if metadata_tier else wallet_selector(engine)
+    lifecycle_tier = tier in LIFECYCLE_TIERS
+    engine=tier.removeprefix('lifecycle-' if lifecycle_tier else 'metadata-' if metadata_tier else 'wallet-')
+    expected_cwd = 'controller' if lifecycle_tier else 'router' if metadata_tier else 'service'
+    expected_selector = LIFECYCLE_SELECTOR if lifecycle_tier else METADATA_SELECTOR if metadata_tier else wallet_selector(engine)
     if (os.geteuid()!=0 or metadata['tier']!=tier or len(metadata['entries'])!=1 or
         metadata['entries'][0]['cwd']!=expected_cwd or metadata['entries'][0]['run']!=expected_selector):
         raise ValueError('wallet trusted owner inventory mismatch')
@@ -2244,7 +2458,7 @@ def trusted_wallet_run(bundle,tier):
         not {'nosuid','nodev'}.issubset(runs[0][3].split(',')) or
         os.statvfs('/run').f_blocks*os.statvfs('/run').f_frsize>4*1024**3):
         raise ValueError('wallet requires bounded private executable tmpfs')
-    if engine!='sqlite':
+    if engine!='sqlite' or lifecycle_tier:
         caps=dict(line.split(':',1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
         if (not os.statvfs('/').f_flag & os.ST_RDONLY or Path('/proc/1/comm').read_text().strip()!='sleep' or
             int(caps['CapBnd'],16)&((1<<19)|(1<<21)) or caps['NoNewPrivs'].strip()!='1'):
@@ -2269,12 +2483,14 @@ def trusted_wallet_run(bundle,tier):
         (root/'journals').mkdir(mode=0o755);(root/'tmp').mkdir(mode=0o700);os.chown(root/'tmp',uid,uid)
         launcher=root/'owner-client'
         launcher.write_text('#!/bin/sh\nexec /usr/bin/python3 '+str(root/'bundle/runner.py')+' _wallet_client '+str(root/'wallet.sock')+' "$@"\n');launcher.chmod(0o755)
-        installer=WalletInstaller(root,uid,engine,metadata);installer.start()
+        installer=(LifecycleInstaller if lifecycle_tier else WalletInstaller)(root,uid,engine,metadata);installer.start()
         env={'PATH':'/usr/bin:/bin','HOME':str(root/'tmp'),'TMPDIR':str(root/'tmp'),'GOMAXPROCS':'2',
             'NEWAPI_BOOTSTRAP_CLIENT':str(launcher),'NEWAPI_BOOTSTRAP_ENGINE':engine,
             'NEWAPI_DB_TEST_ROLE':'TRUSTED_DB_TEST_OWNER'}
-        if metadata_tier:
+        if metadata_tier or lifecycle_tier:
             env['NEWAPI_BOOTSTRAP_TIER'] = tier
+        if lifecycle_tier:
+            env['NEWAPI_LIFECYCLE_REDIS_RECEIPT'] = str(installer.redis_path)
         entry=metadata['entries'][0]
         print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry,phase='trusted-db-test-owner',engine=engine,uid=uid)),flush=True)
         test_log=(root/'owner-test.log').open('xb')
@@ -2286,7 +2502,7 @@ def trusted_wallet_run(bundle,tier):
             raise RuntimeError('wallet first birth unavailable')
         # A separate non-root service receives no owner env or credentials. It
         # cannot request them through the owner IPC, or write the root journal.
-        denied_uid=uid+1
+        denied_uid=uid+(2 if lifecycle_tier else 1)
         try:pwd.getpwuid(denied_uid);raise ValueError('restricted probe UID occupied')
         except KeyError:pass
         for proc in Path('/proc').glob('[0-9]*/status'):
@@ -2311,6 +2527,10 @@ assert os.getgroups()==[] and 'NoNewPrivs:\\t1' in open('/proc/self/status').rea
         if engine=='sqlite':protected.append(first['Database'])
         command(['/usr/bin/python3','-c',probe,str(root/'wallet.sock'),*protected],
             env={'PATH':'/usr/bin:/bin'},preexec_fn=lambda:demote(denied_uid))
+        if lifecycle_tier:
+            command(['/usr/bin/python3','-c',probe,str(root/'wallet.sock'),first['Journal']],
+                env={'PATH':'/usr/bin:/bin'},preexec_fn=lambda:demote(uid))
+            print(json.dumps({'lifecycle_same_uid_unrelated_parent_denied':True}),flush=True)
         print(json.dumps({'wallet_restricted_service_uid':denied_uid,'owner_uid':uid,
             'owner_credentials_rejected':True,'protected_files_write_denied':protected,'empty_groups_nnp':True}),flush=True)
         process.wait(timeout=240)
@@ -2318,8 +2538,8 @@ assert os.getgroups()==[] and 'NoNewPrivs:\\t1' in open('/proc/self/status').rea
         output=(root/'owner-test.log').read_bytes()
         print(output.decode(errors='replace'),end='',flush=True)
         output_printed=True
+        print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry,phase='trusted-db-test-owner',exit=process.returncode)),flush=True)
         validate_required_output(tier,output.decode(errors='replace'),process.returncode)
-        print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry,phase='trusted-db-test-owner',exit=0)),flush=True)
         installer.close()
         status=0
     finally:
@@ -2332,6 +2552,7 @@ assert os.getgroups()==[] and 'NoNewPrivs:\\t1' in open('/proc/self/status').rea
             if thread:thread.join(timeout=150)
             installer.server.close()
             if thread and thread.is_alive():raise RuntimeError('wallet installer did not join')
+            if isinstance(installer, LifecycleInstaller):installer.redis.close()
             if installer.resource:installer.resource.close()
         now=root.lstat()
         if (now.st_dev,now.st_ino,now.st_uid)!=(owned.st_dev,owned.st_ino,0):raise RuntimeError('wallet cleanup identity changed')
@@ -2346,7 +2567,8 @@ assert os.getgroups()==[] and 'NoNewPrivs:\\t1' in open('/proc/self/status').rea
 
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == '_wallet_run':
-        trusted_wallet_run(Path(sys.argv[2]), sys.argv[3])
+        with WalletObservationCollector():
+            trusted_wallet_run(Path(sys.argv[2]), sys.argv[3])
         return
     if len(sys.argv) in (3, 4) and sys.argv[1] == '_wallet_client':
         wallet_client(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'fresh')
@@ -2364,7 +2586,7 @@ def main():
         dispatch_tier(Path(sys.argv[2]), sys.argv[3])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')
