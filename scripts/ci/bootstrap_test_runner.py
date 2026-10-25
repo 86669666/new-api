@@ -56,7 +56,7 @@ LIFECYCLE_CASES = ('owner_reveal_and_mutation', 'revoke_and_rollback', 'disable_
 LIFECYCLE_TIERS = tuple('lifecycle-'+e for e in WALLET_ENGINES)
 
 
-JOINT_CASES = ('deny_wrong_type', 'outbox_rollback', 'late_active_fill', 'credential_rollback')
+JOINT_CASES = ('nonempty_source_restricted_rollback', 'deny_wrong_type', 'outbox_rollback', 'late_active_fill', 'credential_rollback')
 
 
 def digest(path):
@@ -448,7 +448,7 @@ def client(sock, action="fresh"):
             conn.settimeout(120)
             phase = 'connect'
             conn.connect(sock)
-            if action not in ('fresh', 'redis') and not re.fullmatch(r'pg:[0-9a-f]{32}', action):
+            if action not in ('fresh', 'redis') and not re.fullmatch(r'(pg|s1-seed):[0-9a-f]{32}', action):
                 raise ValueError('unsupported installer request')
             phase = 'peer_check'
             _, peer_uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
@@ -483,7 +483,7 @@ def client(sock, action="fresh"):
 
 
 class Installer:
-    def __init__(self, root, uid, redis_resource=None, pg_resource=None):
+    def __init__(self, root, uid, redis_resource=None, pg_resource=None, metadata=None):
         self.root, self.uid = root, uid
         self.redis_resource = redis_resource
         self.pg_resource = pg_resource
@@ -494,6 +494,108 @@ class Installer:
         self.server.listen(8)
         self.server.settimeout(0.2)
         self.receipts = []
+        self.metadata = metadata
+        self.process = None
+        self.process_ready = threading.Event()
+        self.seed_births = {}
+
+    def s1_peer(self, pid):
+        # Only the fixed joint tier's exact root-launched router binary may
+        # request synthetic input. A same-UID sibling or shell grandchild is
+        # not its authenticated client. No actor/path/SQL is accepted over IPC.
+        if (not self.metadata or self.metadata.get('tier') != 'postgres-redis' or
+                len(self.metadata['entries']) != 1 or
+                self.metadata['entries'][0]['cwd'] != 'router' or
+                self.metadata['entries'][0]['run'] != JOINT_SELECTOR or
+                not self.process_ready.wait(3) or self.process is None):
+            raise ValueError('S1 seed caller unavailable')
+        status = dict(line.split(':', 1) for line in Path(f'/proc/{pid}/status').read_text().splitlines() if ':' in line)
+        if (int(status['PPid']) != self.process.pid or
+                any(int(v) != self.uid for v in status['Uid'].split()) or
+                status['NoNewPrivs'].strip() != '1' or int(status['CapEff'], 16)):
+            raise ValueError('S1 seed peer denied')
+        binary = self.metadata['entries'][0]['binary']
+        identity = admission_identity(self.process, self.uid, self.root/'bundle'/binary)
+        if identity['ExeSHA256'] != self.metadata['files'][binary]:
+            raise ValueError('S1 seed binary changed')
+        return identity
+
+    def s1_provenance(self, database):
+        rows = '\n'.join(self.pg_resource.sql(database, 'SELECT row_to_json(t)::text FROM '+table+' t ORDER BY id;')
+                         for table in ('oauth_derived_token_history', 'oauth_derived_token_bootstrap_identity'))
+        return hashlib.sha256(rows.encode()).hexdigest()
+
+    def seed_s1(self, ident, peer):
+        record = self.seed_births[ident]
+        if record['used'] or time.monotonic() >= record['deadline'] or peer != record['peer']:
+            raise ValueError('S1 seed expired, replayed or foreign')
+        receipt = self.pg_resource.qualify(ident)
+        database = receipt['database']
+        if (digest(self.root/('pg-resource-'+ident+'.json')) != record['receipt_sha256'] or
+                self.s1_provenance(database) != record['provenance_sha256']):
+            raise ValueError('S1 seed birth changed')
+        # One fixed fixture. Root reads identity from its own born database,
+        # never from an actor claimed by the client. All predicates are repeated
+        # under User -> session -> grant -> Token locks before the sole INSERT.
+        projection = """SELECT u.id AS user_id,g.grant_ref,g.grant_id,g.policy_hash,g.created_at,
+                   t.id AS token_id,t.key,t.expired_time
+            FROM users u JOIN user_sessions s ON s.user_id=u.id
+            JOIN oauth_grants g ON g.user_id=u.id AND g.origin_s_id=s.sid
+            JOIN tokens t ON t.user_id=u.id
+            WHERE u.username='s2-owner' AND u.status=1 AND u.deleted_at IS NULL
+              AND s.status='active' AND s.user_auth_version=u.auth_version
+              AND s.version=g.session_version AND g.user_auth_version=u.auth_version
+              AND s.expires_at>EXTRACT(EPOCH FROM clock_timestamp())
+              AND g.subject=u.id::text AND g.state='active' AND g.revision=1
+              AND g.issuer='https://s1-seed.invalid/' AND g.client_id='s1-seed-client'
+              AND g.consent_request_id='s1-seed-consent' AND g.hydra_login_session_id='s1-seed-login'
+              AND g.scopes='["tokens:write"]' AND g.policy_hash=repeat('b',64)
+              AND g.expires_at>=t.expired_time AND t.expired_time>EXTRACT(EPOCH FROM clock_timestamp())
+              AND t.expired_time<=EXTRACT(EPOCH FROM clock_timestamp())+600
+              AND t.name='s1-seed-token' AND t.status=1 AND t.deleted_at IS NULL
+              AND NOT t.unlimited_quota AND t.remain_quota=1000 AND t.used_quota=0
+              AND NOT EXISTS(SELECT 1 FROM oauth_derived_token_sources)
+            """
+        raw = self.pg_resource.sql(database, "SELECT row_to_json(x)::text FROM ("+projection+") x;")
+        rows = raw.splitlines()
+        if len(rows) != 1:
+            raise ValueError('S1 seed fixed fixture binding absent')
+        row = json.loads(rows[0])
+        if (not re.fullmatch(r'[0-9a-f]{64}', row['grant_ref']) or
+                not re.fullmatch(r'[A-Za-z0-9_-]{43}', row['grant_id']) or
+                row['grant_ref'] != hashlib.sha256(('newapi.oauth.grant.v1\x00https://s1-seed.invalid/\x00'+row['grant_id']).encode()).hexdigest() or
+                not re.fullmatch(r'[A-Za-z0-9]{32,48}', row['key']) or
+                not 0 < row['user_id'] <= 2147483647 or not 0 < row['token_id'] <= 2147483647 or
+                not int(time.time())-60 <= row['created_at'] <= int(time.time())):
+            raise ValueError('S1 seed fixture bounds denied')
+        key_ref = hashlib.sha256(b'newapi.oauth.derived-key.v1\x00'+row['key'].encode()).hexdigest()
+        grant, token, user = row['grant_ref'], row['token_id'], row['user_id']
+        # Fixed-format integer/hex/alphanumeric values only; no arbitrary SQL.
+        statement = f"""BEGIN;
+            SELECT id FROM users WHERE id={user} FOR UPDATE;
+            SELECT sid FROM user_sessions WHERE sid=(SELECT origin_s_id FROM oauth_grants WHERE grant_ref='{grant}') FOR UPDATE;
+            SELECT grant_ref FROM oauth_grants WHERE grant_ref='{grant}' FOR UPDATE;
+            SELECT id FROM tokens WHERE id={token} FOR UPDATE;
+            INSERT INTO oauth_derived_token_sources
+            (grant_ref,user_id,schema_version,quota_limit,expires_at,policy_hash,binding_hash,
+             verified_at,proof_expires_at,permit_deadline,verified_method,proof_flow_id,
+             token_id,key_ref,idem_hash,request_hash,created_at)
+            SELECT x.grant_ref,x.user_id,1,1000,x.expired_time,x.policy_hash,repeat('c',64),
+                   x.created_at-1,x.created_at+40,x.created_at+40,'password',1,
+                   x.token_id,'{key_ref}',repeat('d',64),repeat('e',64),x.created_at
+            FROM ({projection}) x
+            WHERE x.user_id={user} AND x.grant_ref='{grant}' AND x.token_id={token}
+              AND x.key='{row["key"]}' AND x.grant_id='{row["grant_id"]}' AND x.created_at={row['created_at']}
+              AND EXTRACT(EPOCH FROM clock_timestamp())<{record['expires_at']};
+            COMMIT;"""
+        self.pg_resource.sql(database, statement)
+        count = self.pg_resource.sql(database, f"SELECT COUNT(*) FROM oauth_derived_token_sources WHERE grant_ref='{grant}' AND token_id={token};")
+        if count != '1':
+            raise ValueError('S1 seed current binding changed')
+        record['used'] = True
+        if self.s1_provenance(database) != record['provenance_sha256']:
+            raise RuntimeError('S1 seed immutable provenance changed')
+        return {'seeded': True}
 
     def serve(self):
         while not self.stopped.is_set():
@@ -523,6 +625,14 @@ class Installer:
                             conn.sendall(json.dumps(self.redis_resource.receipt).encode())
                             outcome = 'success'
                             continue
+                        if re.fullmatch(rb's1-seed:[0-9a-f]{32}\n', request) and self.pg_resource is not None:
+                            label, phase = 's1_seed', 'peer_check'
+                            peer = self.s1_peer(pid)
+                            phase = 'fixed_seed'
+                            reply = self.seed_s1(request[8:-1].decode(), peer)
+                            conn.sendall(json.dumps(reply).encode())
+                            outcome = 'success'
+                            continue
                         if re.fullmatch(rb'pg:[0-9a-f]{32}\n', request) and self.pg_resource is not None:
                             label, phase = 'pg', 'resource_check'
                             reply = self.pg_resource.qualify(request[3:-1].decode())
@@ -537,6 +647,13 @@ class Installer:
                             phase = 'cli_begin'
                             bootstrap_observation('installer', phase, started, pid, label=label)
                             reply = self.pg_resource.birth()
+                            if self.metadata and self.metadata.get('tier') == 'postgres-redis':
+                                peer = self.s1_peer(pid)
+                                ident = Path(reply['Journal']).stem
+                                receipt = self.pg_resource.qualify(ident)
+                                self.seed_births[ident] = {'peer': peer, 'deadline': time.monotonic()+120, 'expires_at': int(time.time())+120, 'used': False,
+                                    'receipt_sha256': digest(reply['ResourceReceipt']),
+                                    'provenance_sha256': self.s1_provenance(receipt['database'])}
                             phase = 'reply_write'
                             conn.sendall(json.dumps(reply).encode())
                             outcome = 'success'
@@ -1340,7 +1457,7 @@ def trusted_run(bundle, tier="sqlite"):
                 print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='producer')), flush=True)
                 command([str(root / 'bundle' / entry['binary']), '-test.run=^' + PRODUCER_TEST + '$', '-test.v'], cwd=root / 'bundle/source/model', env=dict(env, NEWAPI_BOOTSTRAP_ROOT_TEST_DIR=str(root / 'producer-tests')))
                 print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry, phase='producer', exit=0)), flush=True)
-        installer = Installer(root, uid, redis_resource, pg_resource)
+        installer = Installer(root, uid, redis_resource, pg_resource, metadata)
         thread = threading.Thread(target=installer.serve)
         thread.start()
         for entry in metadata['entries']:
@@ -1356,7 +1473,17 @@ def trusted_run(bundle, tier="sqlite"):
                 redis_resource.verify()
             if pg_resource:
                 pg_resource.verify()
-                result = subprocess.run(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+                installer.process_ready.clear()
+                with subprocess.Popen(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid), stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+                    installer.process = process
+                    installer.process_ready.set()
+                    try:
+                        stdout, _ = process.communicate(timeout=180)
+                    except BaseException:
+                        process.kill()
+                        process.communicate()
+                        raise
+                    result = subprocess.CompletedProcess(argv, process.returncode, stdout)
                 output = result.stdout.decode(errors='replace')
                 print(output, end='', flush=True)
                 validate_required_output(tier, output, result.returncode)

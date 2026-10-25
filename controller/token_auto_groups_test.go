@@ -40,8 +40,7 @@ func stringInt(value int) string {
 
 func setupTokenAutoGroupsControllerTest(t *testing.T) *model.User {
 	t.Helper()
-	db := setupTokenControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.User{}))
+	db := tokenOwnerStore(t)
 	user := &model.User{
 		Id:       101,
 		Username: "token-auto-user",
@@ -154,7 +153,9 @@ func TestUpdateTokenAutoGroupsTriStateAndNonAutoCleanup(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			configureTokenAutoGroupsTest(t, "5", `["default","vip"]`)
 			user := setupTokenAutoGroupsControllerTest(t)
-			token := seedToken(t, model.DB, user.Id, "update-auto", "update-auto-key")
+			token := &model.Token{UserId: user.Id, Name: "update-auto", Key: "update-auto-key", Status: common.TokenStatusEnabled,
+				CreatedTime: 1, AccessedTime: 1, ExpiredTime: -1, RemainQuota: 100, UnlimitedQuota: true, Group: "default"}
+			require.NoError(t, token.Insert())
 			token.Group = "auto"
 			token.CrossGroupRetry = true
 			require.NoError(t, token.SetAutoGroups([]string{"vip", "default"}))

@@ -3609,7 +3609,139 @@ func (*sessionRevocationRedisPrefix) AfterProcessPipeline(context.Context, []red
 	return nil
 }
 
+// Compare private SQL state by digest so a failing assertion cannot print
+// credentials, session identifiers, source bindings or usable Token keys.
+func s1RevocationStateDigest(t *testing.T, db *gorm.DB) string {
+	t.Helper()
+	h := sha256.New()
+	for _, table := range []string{"users", "user_sessions", "oauth_grants", "tokens", "oauth_derived_token_sources", "o_auth_operations", "o_auth_cleanup_jobs", "session_revocation_events", "oauth_derived_token_history", "oauth_derived_token_bootstrap_identity"} {
+		var rows []map[string]any
+		require.NoError(t, db.Table(table).Find(&rows).Error)
+		encoded := make([]string, len(rows))
+		for i := range rows {
+			data, err := common.Marshal(rows[i])
+			require.NoError(t, err)
+			encoded[i] = string(data)
+		}
+		slices.Sort(encoded)
+		for _, row := range encoded {
+			_, err := h.Write([]byte(row))
+			require.NoError(t, err)
+		}
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
 func TestSessionRevocationS1RealRedis(t *testing.T) {
+	t.Run("nonempty_source_restricted_rollback", func(t *testing.T) {
+		f := sessionRevocationRepairFixture(t)
+		require.Equal(t, "postgres", f.db.Dialector.Name())
+		userID := f.users["owner"].Id
+		grant := &model.OAuthGrant{GrantID: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{46}, 32)),
+			Issuer: "https://s1-seed.invalid/", ClientID: "s1-seed-client", Subject: strconv.Itoa(userID), UserID: userID,
+			ConsentRequestID: "s1-seed-consent", HydraLoginSessionID: "s1-seed-login", OriginSID: f.sids["owner"],
+			SessionVersion: 1, UserAuthVersion: 1, Scopes: `["tokens:write"]`, PolicyHash: strings.Repeat("b", 64)}
+		require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+		// Synthetic active grant input only; this is not the K2 issuance path.
+		require.NoError(t, f.db.Model(grant).UpdateColumn("state", "active").Error)
+		key, err := common.GenerateRandomCharsKey(40)
+		require.NoError(t, err)
+		token := &model.Token{UserId: userID, Name: "s1-seed-token", Key: key, Status: common.TokenStatusEnabled,
+			RemainQuota: 1000, ExpiredTime: time.Now().Unix() + 300}
+		require.NoError(t, token.Insert())
+		client := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT")
+		ident := strings.TrimSuffix(filepath.Base(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL")), ".json")
+		require.Regexp(t, `^[0-9a-f]{32}$`, ident)
+		action := "s1-seed:" + ident
+		// Real fixed IPC negative controls. Neither a claimed actor nor an
+		// arbitrary SQL/DSN is accepted. All bad requests precede the sole seed.
+		for _, bad := range []string{"s1-seed:" + strings.Repeat("0", 32), action + ":actor:1"} {
+			_, err := exec.Command(client, bad).Output()
+			require.Error(t, err)
+		}
+		conn, err := net.Dial("unix", filepath.Join(filepath.Dir(client), "installer.sock"))
+		require.NoError(t, err)
+		require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+		_, err = io.WriteString(conn, action+"\n")
+		require.NoError(t, err)
+		require.NoError(t, conn.(*net.UnixConn).CloseWrite())
+		response, _ := io.ReadAll(conn)
+		require.NoError(t, conn.Close())
+		require.Empty(t, response, "the test process itself is not its direct-child installer client")
+		for _, fault := range []string{"foreign_user", "foreign_grant", "expired"} {
+			switch fault {
+			case "foreign_user":
+				require.NoError(t, f.db.Model(token).UpdateColumn("user_id", f.users["foreign"].Id).Error)
+			case "foreign_grant":
+				require.NoError(t, f.db.Model(grant).UpdateColumn("client_id", "other-client").Error)
+			case "expired":
+				require.NoError(t, f.db.Model(token).UpdateColumn("expired_time", time.Now().Unix()-1).Error)
+			}
+			_, err := exec.Command(client, action).Output()
+			require.Error(t, err, fault)
+			var count int64
+			require.NoError(t, f.db.Model(&model.OAuthDerivedTokenSource{}).Count(&count).Error)
+			require.Zero(t, count, "rejected input must have no source side effect")
+			require.NoError(t, f.db.Model(token).Updates(map[string]any{"user_id": userID, "expired_time": time.Now().Unix() + 300}).Error)
+			require.NoError(t, f.db.Model(grant).UpdateColumn("client_id", "s1-seed-client").Error)
+		}
+		var canUpdate bool
+		require.NoError(t, f.db.Raw("SELECT has_any_column_privilege(current_user, 'public.oauth_derived_token_sources', 'UPDATE')").Scan(&canUpdate).Error)
+		require.False(t, canUpdate)
+		raw, err := exec.Command(client, action).Output()
+		require.NoError(t, err, "root-controlled fixed seed must use this already born database")
+		require.JSONEq(t, `{"seeded":true}`, string(raw))
+		_, err = exec.Command(client, action).Output()
+		require.Error(t, err, "each born database permits only one seed")
+		kind, err := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+		require.NoError(t, err, "the seed must satisfy real history and source/Token binding")
+		require.Equal(t, model.OAuthDerivedTokenBound, kind)
+		before := s1RevocationStateDigest(t, f.db)
+		var lockDenied atomic.Bool
+		require.NoError(t, f.db.Callback().Query().After("gorm:query").Register("s1:source-lock-state", func(tx *gorm.DB) {
+			if tx.Statement.Table == "oauth_derived_token_sources" && strings.Contains(tx.Statement.SQL.String(), "FOR UPDATE") {
+				var state interface{ SQLState() string }
+				if errors.As(tx.Error, &state) && state.SQLState() == "42501" {
+					lockDenied.Store(true)
+				}
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, f.db.Callback().Query().Remove("s1:source-lock-state")) })
+		err = f.db.Transaction(func(tx *gorm.DB) error {
+			_, err := model.StartSessionRevocationWithTx(tx, userID, "", "session_revoked")
+			return err
+		}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		require.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+		require.True(t, lockDenied.Load(), "real ordinary-role source row lock must fail with SQLSTATE 42501")
+		assert.Equal(t, before, s1RevocationStateDigest(t, f.db), "all security state and amounts must roll back atomically")
+		for _, column := range []string{"grant_ref", "user_id", "schema_version", "quota_limit", "expires_at", "policy_hash", "binding_hash", "verified_at", "proof_expires_at", "permit_deadline", "verified_method", "proof_flow_id", "token_id", "key_ref", "idem_hash", "request_hash", "created_at", "terminal_at", "terminal_reason"} {
+			var state interface{ SQLState() string }
+			err := f.db.Exec("UPDATE oauth_derived_token_sources SET " + column + "=" + column + " WHERE false").Error
+			require.ErrorAs(t, err, &state)
+			assert.Equal(t, "42501", state.SQLState(), column)
+		}
+		for _, statement := range []string{
+			"INSERT INTO oauth_derived_token_sources (grant_ref) SELECT grant_ref FROM oauth_derived_token_sources WHERE false",
+			"DELETE FROM oauth_derived_token_sources WHERE false",
+			"ALTER TABLE oauth_derived_token_sources ADD COLUMN forbidden_seed_service INTEGER",
+		} {
+			var state interface{ SQLState() string }
+			err := f.db.Exec(statement).Error
+			require.ErrorAs(t, err, &state)
+			assert.Equal(t, "42501", state.SQLState())
+		}
+		for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity"} {
+			var state interface{ SQLState() string }
+			err := f.db.Exec("DELETE FROM " + table + " WHERE false").Error
+			require.ErrorAs(t, err, &state)
+			assert.Equal(t, "42501", state.SQLState(), table)
+		}
+		require.NoError(t, f.db.Raw("SELECT has_any_column_privilege(current_user, 'public.oauth_derived_token_sources', 'UPDATE')").Scan(&canUpdate).Error)
+		require.False(t, canUpdate, "root input construction must not confer service UPDATE rights")
+		assert.Equal(t, before, s1RevocationStateDigest(t, f.db))
+		t.Log("S1 source lock SQLSTATE=42501; ordinary-role privileges unchanged; complete security transaction rolled back")
+	})
+
 	// Ordinary S1's source role is SELECT-only. Empty provenance is safe only
 	// under the same existing User lock and an observed READ COMMITTED snapshot.
 	for _, scenario := range []string{"empty_read_committed", "empty_repeatable_read", "missing_user", "isolation_unavailable", "unknown_isolation", "source_select_error", "without_transaction"} {
