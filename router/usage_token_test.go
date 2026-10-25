@@ -154,9 +154,54 @@ func TestTokenUsageReadOnlyHTTP(t *testing.T) {
 		sample, err := common.Marshal(body)
 		require.NoError(t, err)
 		t.Logf("logs_sample=%s", sample)
-		status, _, body := f.request(t, "GET", "/api/usage/token/logs?end_timestamp=9223372036854775807", "A", "", nil)
+		// The default window rolls with now, unlike the UTC bucket fixtures.
+		// Keep these independent rows hours away from either rolling boundary.
+		now := time.Now().Unix()
+		const rollingModel = "rolling-default-window"
+		ages := []int64{5 * 3600, 4 * 3600, 3 * 3600, 2 * 3600, 3600}
+		var rolling []model.Log
+		var expectedTimes []int64
+		for _, age := range ages {
+			ts := now - age
+			expectedTimes = append(expectedTimes, ts)
+			rolling = append(rolling, model.Log{UserId: tokens["A"].UserId, TokenId: tokens["A"].Id, CreatedAt: ts, Type: model.LogTypeConsume, ModelName: rollingModel})
+		}
+		rolling = append(rolling,
+			model.Log{UserId: tokens["A"].UserId, TokenId: tokens["A"].Id, CreatedAt: now - 72*3600, Type: model.LogTypeConsume, ModelName: rollingModel},
+			model.Log{UserId: tokens["A"].UserId, TokenId: tokens["A"].Id, CreatedAt: now + 24*3600, Type: model.LogTypeConsume, ModelName: rollingModel},
+			model.Log{UserId: tokens["B"].UserId, TokenId: tokens["B"].Id, CreatedAt: now - 3600, Type: model.LogTypeConsume, ModelName: rollingModel},
+			model.Log{UserId: tokens["foreign"].UserId, TokenId: tokens["A"].Id, CreatedAt: now - 3600, Type: model.LogTypeConsume, ModelName: rollingModel},
+			model.Log{UserId: tokens["A"].UserId, TokenId: tokens["A"].Id, CreatedAt: now - 3600, Type: model.LogTypeRefund, ModelName: rollingModel},
+		)
+		require.NoError(t, model.LOG_DB.Create(&rolling).Error)
+		status, _, body := f.request(t, "GET", "/api/usage/token/logs?end_timestamp=9223372036854775807&model_name="+rollingModel, "A", "", nil)
 		require.Equal(t, http.StatusOK, status)
-		assert.Equal(t, float64(5), body["data"].(map[string]any)["total"], "future end is capped to now and default start is bounded")
+		require.Equal(t, true, body["success"])
+		data = body["data"].(map[string]any)
+		assert.Equal(t, float64(5), data["total"], "future end is capped to now and default start is bounded")
+		items := data["items"].([]any)
+		require.Len(t, items, 5)
+		var actualTimes []int64
+		for _, item := range items {
+			row := item.(map[string]any)
+			assert.Equal(t, rollingModel, row["model_name"])
+			actualTimes = append(actualTimes, int64(row["created_at"].(float64)))
+		}
+		assert.ElementsMatch(t, expectedTimes, actualTimes, "exclude future, too-old, other-token, wrong-owner and refund rows")
+		// Check the same fixture offsets at both UTC hours that distinguished the
+		// old failure. This arithmetic supplements, not replaces, the real HTTP query.
+		for _, hour := range []int{0, 23} {
+			t.Run(fmt.Sprintf("rolling_margin_utc_%02d", hour), func(t *testing.T) {
+				end := time.Date(2026, time.October, 25, hour, 30, 0, 0, time.UTC).Unix()
+				start := end - operation_setting.GetLogSetting().MaxRangeSeconds()
+				for _, age := range ages {
+					assert.Greater(t, end-age-start, int64(42*3600))
+					assert.GreaterOrEqual(t, age, int64(3600))
+				}
+				assert.Less(t, end-72*3600, start)
+				assert.Greater(t, end+24*3600, end)
+			})
+		}
 	})
 	t.Run("utc_hours_days_and_unknown_coverage", func(t *testing.T) {
 		for _, tc := range []struct {

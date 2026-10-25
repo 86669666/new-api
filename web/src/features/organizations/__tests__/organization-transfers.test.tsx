@@ -21,7 +21,15 @@ import {
   QueryClient,
   QueryClientProvider,
 } from '@tanstack/react-query'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import {
   AxiosError,
@@ -35,7 +43,11 @@ import { afterEach, beforeEach, expect, test } from 'vitest'
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { getMyOrganizationTransfers, OrganizationRequestFailure } from '../api'
+import {
+  declineOrganizationTransfer,
+  getMyOrganizationTransfers,
+  OrganizationRequestFailure,
+} from '../api'
 import { OrganizationTransfersCard } from '../organization-transfers-card'
 
 const originalAdapter = api.defaults.adapter
@@ -135,7 +147,7 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
-test('projects only own pending transfer data and escapes names without mutation controls', async () => {
+test('projects only own pending transfer data and escapes names with decline only', async () => {
   const raw = {
     ...transfer(),
     secret: 'not retained',
@@ -156,7 +168,7 @@ test('projects only own pending transfer data and escapes names without mutation
   expect(await screen.findByText('<script>Transfer A</script>')).toBeVisible()
   expect(screen.getByText('Pending')).toBeVisible()
   expect(
-    screen.queryByRole('button', { name: /accept|decline|join|switch|spend/i })
+    screen.queryByRole('button', { name: /accept|join|switch|spend/i })
   ).not.toBeInTheDocument()
   for (const call of calls) {
     expect(call.url).toBe('/api/organization-ownership-transfers')
@@ -421,4 +433,209 @@ test('language changes update the inbox while preserving escaped organization na
   expect(screen.getByRole('list', { name: '所有权转移' })).toBeVisible()
   expect(screen.getByText('待处理')).toBeVisible()
   expect(screen.getByText('<script>Transfer A</script>')).toBeVisible()
+})
+
+function declinedReceipt(overrides = {}) {
+  return {
+    success: true,
+    data: {
+      organization_id: transfer().organization_id,
+      revision: '9007199254740996',
+      action: 'transfer_decline',
+      event_id: '9007199254740998',
+      object_kind: 'transfer',
+      object_id: transfer().object_id,
+      generation: '1',
+      status: 'declined',
+      ...overrides,
+    },
+  }
+}
+async function openDecline() {
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Decline transfer' })
+  )
+  return screen.getByRole('alertdialog')
+}
+
+test('cancelled confirmation sends no mutation; confirmed decline uses exact string versions and refreshes', async () => {
+  let declined = false
+  handler = async (config) => {
+    if (config.method === 'post') {
+      declined = true
+      return response(config, declinedReceipt())
+    }
+    return response(config, page(declined ? [] : [transfer()]))
+  }
+  show()
+  let dialog = await openDecline()
+  expect(within(dialog).getByText(/Transfer A/)).toBeVisible()
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+  expect(calls.filter((c) => c.method === 'post')).toHaveLength(0)
+  dialog = await openDecline()
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Decline transfer' })
+  )
+  expect(await screen.findByText('Ownership transfer declined.')).toBeVisible()
+  expect(
+    await screen.findByText('No pending ownership transfers')
+  ).toBeVisible()
+  const posts = calls.filter((c) => c.method === 'post')
+  expect(posts).toHaveLength(1)
+  expect(posts[0].url).toBe(
+    '/api/organizations/9007199254740997/ownership-transfers/9007199254740993/decline'
+  )
+  expect(JSON.parse(posts[0].data)).toEqual({
+    revision: '9007199254740995',
+    generation: '1',
+  })
+  expect(posts[0].singleUseAuthorization).toBe(true)
+  expect(posts[0].expectedAuthIdentity).toEqual({ userId: 1, sid: 'session-1' })
+  expect(posts[0].headers.has('X-Security-Proof')).toBe(false)
+  expect(posts[0].headers.has('X-Organization-Id')).toBe(false)
+})
+
+test.each([
+  [403, 'ORG_FORBIDDEN'],
+  [401, 'AUTH_SESSION_REVOKED'],
+  [409, 'ORG_STATE_CHANGED'],
+  [409, 'ORG_REQUEST_RESOLVED'],
+  [410, 'ORG_REQUEST_EXPIRED'],
+  [403, 'SECURITY_PROOF_REQUIRED'],
+  [403, 'SECURITY_PROOF_INVALID'],
+  [500, 'ORG_INTERNAL_ERROR'],
+])(
+  'decline failure %s %s never retries or declares success and refreshes server state',
+  async (status, code) => {
+    let sent = false
+    handler = async (config) => {
+      if (config.method === 'post') {
+        sent = true
+        return response(
+          config,
+          { success: false, code, message: 'sensitive backend detail' },
+          status
+        )
+      }
+      return response(config, page(sent ? [] : [transfer()]))
+    }
+    show()
+    const dialog = await openDecline()
+    await userEvent.click(
+      within(dialog).getByRole('button', { name: 'Decline transfer' })
+    )
+    expect(
+      await screen.findByText(
+        'Decline was not confirmed. Review the refreshed transfer status before trying again.'
+      )
+    ).toBeVisible()
+    expect(
+      await screen.findByText('No pending ownership transfers')
+    ).toBeVisible()
+    expect(calls.filter((c) => c.method === 'post')).toHaveLength(1)
+    expect(
+      screen.queryByText('Ownership transfer declined.')
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText('sensitive backend detail')
+    ).not.toBeInTheDocument()
+  }
+)
+
+test.each(['switch', 'logout', 'A-B-A', 'new SID'])(
+  'confirmation invalidated by %s cannot send',
+  async (change) => {
+    show()
+    const dialog = await openDecline()
+    const confirm = within(dialog).getByRole('button', {
+      name: 'Decline transfer',
+    })
+    act(() => {
+      if (change === 'logout') useAuthStore.getState().auth.reset()
+      else if (change === 'new SID') login(1, 'replacement')
+      else {
+        login(2)
+        if (change === 'A-B-A') login(1)
+      }
+      fireEvent.click(confirm)
+    })
+    expect(calls.filter((c) => c.method === 'post')).toHaveLength(0)
+    await waitFor(() =>
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    )
+  }
+)
+
+test('duplicate confirmation is one-shot and a late response after identity switch gives no feedback', async () => {
+  let finish: (() => void) | undefined
+  handler = async (config) => {
+    if (config.method === 'post') {
+      return new Promise((resolve) => {
+        finish = () => resolve(response(config, declinedReceipt()))
+      })
+    }
+    return response(
+      config,
+      page(useAuthStore.getState().auth.user?.id === 1 ? [transfer()] : [])
+    )
+  }
+  show()
+  const dialog = await openDecline()
+  const button = within(dialog).getByRole('button', {
+    name: 'Decline transfer',
+  })
+  act(() => {
+    fireEvent.click(button)
+    fireEvent.click(button)
+  })
+  await waitFor(() =>
+    expect(calls.filter((c) => c.method === 'post')).toHaveLength(1)
+  )
+  act(() => login(2))
+  await act(async () => finish?.())
+  expect(
+    screen.queryByText('Ownership transfer declined.')
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByText(/Decline was not confirmed/)
+  ).not.toBeInTheDocument()
+  expect(calls.find((c) => c.method === 'post')?.signal?.aborted).toBe(true)
+})
+
+test.each([
+  { organization_id: '7' },
+  { object_id: '7' },
+  { generation: '2' },
+  { revision: '9007199254740995' },
+  { status: 'accepted' },
+  { action: 'transfer_accept' },
+])('decline refuses mismatched receipt %j', async (patch) => {
+  handler = async (config) => response(config, declinedReceipt(patch))
+  await expect(
+    declineOrganizationTransfer(
+      1,
+      'session-1',
+      transfer() as Parameters<typeof declineOrganizationTransfer>[2],
+      new AbortController().signal
+    )
+  ).rejects.toBeInstanceOf(OrganizationRequestFailure)
+  expect(calls).toHaveLength(1)
+})
+
+test.each([
+  { target_user_id: '2' },
+  { expires_at: 1 },
+  { organization_revision: '0' },
+])('invalid decline selection sends nothing %j', async (patch) => {
+  await expect(
+    declineOrganizationTransfer(
+      1,
+      'session-1',
+      { ...transfer(), ...patch } as Parameters<
+        typeof declineOrganizationTransfer
+      >[2],
+      new AbortController().signal
+    )
+  ).rejects.toBeInstanceOf(OrganizationRequestFailure)
+  expect(calls).toHaveLength(0)
 })

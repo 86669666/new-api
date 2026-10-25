@@ -17,9 +17,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
@@ -29,7 +30,11 @@ import { TitledCard } from '@/components/ui/titled-card'
 import { formatTimestamp } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { getMyOrganizationTransfers } from './api'
+import {
+  declineOrganizationTransfer,
+  getMyOrganizationTransfers,
+  type OrganizationTransfer,
+} from './api'
 
 export function OrganizationTransfersCard() {
   const actorId = useAuthStore((state) => state.auth.user?.id)
@@ -38,9 +43,38 @@ export function OrganizationTransfersCard() {
   return <TransferInbox key={`${actorId}:${sid}`} actorId={actorId} sid={sid} />
 }
 
+type DeclineConfirmation = {
+  transfer: OrganizationTransfer
+  controller: AbortController
+  invoked: boolean
+}
+
 function TransferInbox(props: { actorId: number; sid: string }) {
   const { t } = useTranslation()
   const [cursors, setCursors] = useState(['0'])
+  const confirmation = useRef<DeclineConfirmation | null>(null)
+  const [selected, setSelected] = useState<OrganizationTransfer | null>(null)
+  const [pending, setPending] = useState(false)
+  const [outcome, setOutcome] = useState<'success' | 'unconfirmed' | null>(null)
+  useEffect(() => {
+    const unsubscribe = useAuthStore.subscribe((state) => {
+      if (
+        state.auth.user?.id !== props.actorId ||
+        state.auth.session?.sid !== props.sid
+      ) {
+        confirmation.current?.controller.abort()
+        confirmation.current = null
+        setSelected(null)
+        setPending(false)
+        setOutcome(null)
+      }
+    })
+    return () => {
+      unsubscribe()
+      confirmation.current?.controller.abort()
+      confirmation.current = null
+    }
+  }, [props.actorId, props.sid])
   const afterId = cursors.at(-1) ?? '0'
   const query = useQuery({
     queryKey: [
@@ -59,7 +93,52 @@ function TransferInbox(props: { actorId: number; sid: string }) {
     refetchOnWindowFocus: 'always',
     meta: { errorToast: false },
   })
-  const busy = query.isFetching || query.isPending
+  const busy = query.isFetching || query.isPending || pending
+  async function confirmDecline() {
+    const ticket = confirmation.current
+    const auth = useAuthStore.getState().auth
+    if (
+      !ticket ||
+      ticket.invoked ||
+      ticket.controller.signal.aborted ||
+      auth.user?.id !== props.actorId ||
+      auth.session?.sid !== props.sid
+    ) {
+      return
+    }
+    ticket.invoked = true
+    setPending(true)
+    setOutcome(null)
+    try {
+      await declineOrganizationTransfer(
+        props.actorId,
+        props.sid,
+        ticket.transfer,
+        ticket.controller.signal
+      )
+      if (confirmation.current !== ticket || ticket.controller.signal.aborted) {
+        return
+      }
+      setOutcome('success')
+    } catch {
+      if (confirmation.current !== ticket || ticket.controller.signal.aborted) {
+        return
+      }
+      // A failed/lost response never proves that a mutation did not commit.
+      setOutcome('unconfirmed')
+    } finally {
+      if (
+        confirmation.current === ticket &&
+        !ticket.controller.signal.aborted
+      ) {
+        confirmation.current = null
+        setSelected(null)
+        // Refresh server state; never replay the command or infer success from a GET.
+        void query.refetch()
+        setPending(false)
+      }
+    }
+  }
   let content
   if (busy) {
     content = <LoadingState />
@@ -88,6 +167,24 @@ function TransferInbox(props: { actorId: number; sid: string }) {
                 time: formatTimestamp(transfer.expires_at),
               })}
             </p>
+            <Button
+              variant='outline'
+              size='sm'
+              disabled={pending}
+              onClick={() => {
+                confirmation.current?.controller.abort()
+                const snapshot = { ...transfer }
+                confirmation.current = {
+                  transfer: snapshot,
+                  controller: new AbortController(),
+                  invoked: false,
+                }
+                setOutcome(null)
+                setSelected(snapshot)
+              }}
+            >
+              {t('Decline transfer')}
+            </Button>
           </li>
         ))}
       </ul>
@@ -97,7 +194,7 @@ function TransferInbox(props: { actorId: number; sid: string }) {
     <TitledCard
       title={t('Ownership transfers')}
       description={t(
-        'Pending ownership transfers to you. This view is read-only.'
+        'You can decline pending ownership transfers here. Accepting is not available.'
       )}
       action={
         <Button
@@ -111,7 +208,35 @@ function TransferInbox(props: { actorId: number; sid: string }) {
         </Button>
       }
     >
+      {outcome && (
+        <p role='status' className='mb-3 text-sm'>
+          {outcome === 'success'
+            ? t('Ownership transfer declined.')
+            : t(
+                'Decline was not confirmed. Review the refreshed transfer status before trying again.'
+              )}
+        </p>
+      )}
       <div aria-busy={busy}>{content}</div>
+      <ConfirmDialog
+        open={selected !== null}
+        onOpenChange={(open) => {
+          if (!open && !pending) {
+            confirmation.current?.controller.abort()
+            confirmation.current = null
+            setSelected(null)
+          }
+        }}
+        title={t('Decline ownership transfer?')}
+        desc={t(
+          'Decline the ownership transfer for {{organization}}? You will not become its owner.',
+          { organization: selected?.organization_name ?? '' }
+        )}
+        confirmText={t('Decline transfer')}
+        destructive
+        isLoading={pending}
+        handleConfirm={() => void confirmDecline()}
+      />
       <div className='mt-3 flex flex-wrap justify-between gap-2'>
         <Button
           variant='outline'
