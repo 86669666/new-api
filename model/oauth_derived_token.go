@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"slices"
@@ -626,6 +627,40 @@ func terminalOAuthToken(tx *gorm.DB, source *OAuthDerivedTokenSource, reason str
 // grant/operation/job prefix. It cannot manufacture missing history or silently
 // ignore an orphaned source, even when the OAuth feature has been turned off.
 func revokeOAuthDerivedTokens(tx *gorm.DB, userID int, grants []OAuthGrant, match OAuthCleanupJob, now int64) error {
+	if tx.Dialector.Name() == "postgres" {
+		// A pool/connection can release a FOR UPDATE lock between statements.
+		// Only the actual outer SQL transaction may use the empty-source path.
+		pool := tx.Statement.ConnPool
+		if prepared, ok := pool.(*gorm.PreparedStmtTX); ok && prepared != nil {
+			pool = prepared.Tx
+		}
+		if transaction, ok := pool.(*sql.Tx); !ok || transaction == nil {
+			return ErrOAuthDerivedTokenUnknown
+		}
+		var isolation string
+		if err := tx.Raw("SHOW transaction_isolation").Scan(&isolation).Error; err != nil {
+			return ErrOAuthDerivedTokenUnknown
+		}
+		if isolation == "read committed" {
+			// The caller already holds User before the grant/cleanup prefix.
+			// Recheck existence with the same lock: LockOAuthUser's Find also
+			// succeeds for an absent user and cannot prove a creation barrier.
+			var user User
+			if err := lockForUpdate(tx.Unscoped()).Select("id").First(&user, userID).Error; err != nil {
+				return ErrOAuthDerivedTokenUnknown
+			}
+			var count int64
+			if err := tx.Model(&OAuthDerivedTokenSource{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+				return ErrOAuthDerivedTokenUnknown
+			}
+			if count == 0 {
+				// READ COMMITTED observes any creator committed before this User
+				// lock was acquired. Future issuance must take the same barrier
+				// and revalidate grant/session after waiting; issuance is not here.
+				return nil
+			}
+		}
+	}
 	var sources []OAuthDerivedTokenSource
 	if err := lockForUpdate(tx).Where("user_id = ?", userID).Order("grant_ref").Find(&sources).Error; err != nil {
 		return ErrOAuthDerivedTokenUnknown

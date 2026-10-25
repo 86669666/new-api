@@ -1747,12 +1747,19 @@ func setupTokenOwnerTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-func ownerDerivedFixture(t *testing.T, db *gorm.DB, userID int, suffix string, unused bool) (*model.OAuthGrant, *model.OAuthDerivedTokenSource, *model.Token) {
+func ownerGrantFixture(t *testing.T, db *gorm.DB, userID int, suffix string) *model.OAuthGrant {
 	t.Helper()
 	now := time.Now().Unix()
 	grant := &model.OAuthGrant{Issuer: "https://issuer.example", GrantID: "grant-" + suffix, ConsentRef: model.OAuthDerivedTokenKeyRef("consent-" + suffix), UserID: userID, Subject: strconv.Itoa(userID), ClientID: "client-" + suffix, OriginSID: "owner-session", UserAuthVersion: 1, SessionVersion: 1, Scopes: `["tokens:read","tokens:write"]`, PolicyHash: strings.Repeat("a", 64), Revision: 1, State: "active", CreatedAt: now - 5, ApprovedAt: now - 4, ExpiresAt: now + 1800}
 	grant.GrantRef = model.OAuthGrantRef(grant.Issuer, grant.GrantID)
 	require.NoError(t, db.Create(grant).Error)
+	return grant
+}
+
+func ownerDerivedFixture(t *testing.T, db *gorm.DB, userID int, suffix string, unused bool) (*model.OAuthGrant, *model.OAuthDerivedTokenSource, *model.Token) {
+	t.Helper()
+	now := time.Now().Unix()
+	grant := ownerGrantFixture(t, db, userID, suffix)
 	var count int64
 	require.NoError(t, db.Model(&model.OAuthDerivedTokenSource{}).Count(&count).Error)
 	source := &model.OAuthDerivedTokenSource{GrantRef: grant.GrantRef, UserID: userID, SchemaVersion: 1, QuotaLimit: 1000, ExpiresAt: now + 600, PolicyHash: strings.Repeat("a", 64), BindingHash: strings.Repeat("b", 64), VerifiedAt: now - 10, ProofExpiresAt: now + 40, PermitDeadline: now + 40, VerifiedMethod: "password", ProofFlowID: count + 1}
@@ -1798,6 +1805,99 @@ func ownerLifecycleRouter(t *testing.T, db *gorm.DB) (*gin.Engine, string) {
 }
 
 func TestOAuthDerivedTokenOwnerLifecycle(t *testing.T) {
+	if os.Getenv("NEWAPI_BOOTSTRAP_TIER") == "lifecycle-postgres" {
+		for _, creatorFirst := range []bool{true, false} {
+			t.Run("empty_source_user_barrier_"+strconv.FormatBool(creatorFirst), func(t *testing.T) {
+				db := setupTokenOwnerTestDB(t)
+				ownerLifecycleRouter(t, db)
+				grant := ownerGrantFixture(t, db, 1, "barrier")
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+				holder := db.WithContext(ctx).Begin(&sql.TxOptions{Isolation: sql.LevelReadCommitted})
+				require.NoError(t, holder.Error)
+				defer holder.Rollback()
+				require.NoError(t, model.LockOAuthUser(holder, 1))
+				var holderPID int
+				require.NoError(t, holder.Raw("SELECT pg_backend_pid()").Scan(&holderPID).Error)
+				waiterPID := make(chan int, 1)
+				done := make(chan error, 1)
+				var wg sync.WaitGroup
+				// Roll back before waiting even if an assertion fails while locked.
+				defer func() { _ = holder.Rollback().Error; cancel(); wg.Wait() }()
+				wg.Go(func() {
+					done <- db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+						var pid int
+						if err := tx.Raw("SELECT pg_backend_pid()").Scan(&pid).Error; err != nil {
+							waiterPID <- 0
+							return err
+						}
+						waiterPID <- pid
+						if creatorFirst {
+							_, err := model.StartSessionRevocationWithTx(tx, 1, "", "session_revoked")
+							return err
+						}
+						if err := model.LockOAuthUser(tx, 1); err != nil {
+							return err
+						}
+						// This is a creation-protocol fixture, not a K2 producer.
+						// A waiter must re-read current authorization after its lock.
+						var current model.OAuthGrant
+						if err := tx.First(&current, "grant_ref = ?", grant.GrantRef).Error; err != nil {
+							return err
+						}
+						var session model.UserSession
+						if err := tx.First(&session, "sid = ? AND user_id = ?", current.OriginSID, current.UserID).Error; err != nil {
+							return err
+						}
+						if current.State != "active" || current.RevokedAt != 0 || session.Status != model.UserSessionStatusActive || session.Version != current.SessionVersion {
+							return model.ErrOAuthGrantInvalid
+						}
+						return errors.New("fixture unexpectedly retained creation authority")
+					}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+				})
+				pid := <-waiterPID
+				require.NotZero(t, pid)
+				require.NotEqual(t, holderPID, pid, "two physical database connections")
+				// Observe the actual database lock wait; timing or a goroutine
+				// reaching a callback is not proof it has waited on the User row.
+				for {
+					var blocked bool
+					require.NoError(t, db.WithContext(ctx).Raw("SELECT ? = ANY(pg_blocking_pids(?))", holderPID, pid).Scan(&blocked).Error)
+					if blocked {
+						break
+					}
+					select {
+					case err := <-done:
+						t.Fatalf("waiter completed before User barrier release: %v", err)
+					default:
+					}
+				}
+				if creatorFirst {
+					// Existing protected installer seeds and commits the synthetic
+					// source while the creator fixture holds the User barrier. It
+					// is not an atomic issuance implementation or issuer evidence.
+					tokenLifecycleAction(t, "seed:"+grant.GrantRef+":0")
+				} else {
+					_, err := model.StartSessionRevocationWithTx(holder, 1, "", "session_revoked")
+					require.NoError(t, err)
+				}
+				require.NoError(t, holder.Commit().Error)
+				err := <-done
+				if creatorFirst {
+					require.NoError(t, err)
+					var source model.OAuthDerivedTokenSource
+					require.NoError(t, db.First(&source, "grant_ref = ?", grant.GrantRef).Error)
+					require.NotNil(t, source.TerminalReason)
+					assert.Equal(t, "revoked", *source.TerminalReason, "waiter cannot mistake the committed source for empty")
+				} else {
+					require.ErrorIs(t, err, model.ErrOAuthGrantInvalid)
+					var count int64
+					require.NoError(t, db.Model(&model.OAuthDerivedTokenSource{}).Where("user_id = ?", 1).Count(&count).Error)
+					assert.Zero(t, count, "revalidated creator must not insert after revocation")
+				}
+			})
+		}
+	}
 	t.Run("owner_reveal_and_mutation", func(t *testing.T) {
 		db := setupTokenOwnerTestDB(t)
 		r, jwt := ownerLifecycleRouter(t, db)
@@ -1962,6 +2062,7 @@ func TestOAuthDerivedTokenOwnerLifecycle(t *testing.T) {
 		} else {
 			require.NoError(t, db.Migrator().DropTable(&model.OAuthDerivedTokenSource{}))
 		}
+		assert.ErrorIs(t, model.RevokeOAuth(t.Context(), 1, "user", ""), model.ErrOAuthDerivedTokenUnknown, "missing source table is not empty provenance")
 		tokens, err = model.GetTokenKeysByIds([]int{manual.Id}, 1)
 		require.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
 		assert.Nil(t, tokens)

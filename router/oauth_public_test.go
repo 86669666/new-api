@@ -3610,6 +3610,75 @@ func (*sessionRevocationRedisPrefix) AfterProcessPipeline(context.Context, []red
 }
 
 func TestSessionRevocationS1RealRedis(t *testing.T) {
+	// Ordinary S1's source role is SELECT-only. Empty provenance is safe only
+	// under the same existing User lock and an observed READ COMMITTED snapshot.
+	for _, scenario := range []string{"empty_read_committed", "empty_repeatable_read", "missing_user", "isolation_unavailable", "unknown_isolation", "source_select_error", "without_transaction"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := sessionRevocationRepairFixture(t)
+			require.Equal(t, "postgres", f.db.Dialector.Name())
+			userID := f.users["owner"].Id
+			var canUpdate bool
+			require.NoError(t, f.db.Raw("SELECT has_any_column_privilege(current_user, 'public.oauth_derived_token_sources', 'UPDATE')").Scan(&canUpdate).Error)
+			require.False(t, canUpdate, "ordinary S1 must not acquire lifecycle test-owner rights")
+			if scenario == "missing_user" {
+				userID = 2147483647
+			}
+			if scenario == "isolation_unavailable" || scenario == "unknown_isolation" {
+				require.NoError(t, f.db.Callback().Row().Before("gorm:row").Register("empty-source:isolation", func(tx *gorm.DB) {
+					if tx.Statement.SQL.String() == "SHOW transaction_isolation" {
+						if scenario == "unknown_isolation" {
+							tx.Statement.SQL.Reset()
+							tx.Statement.SQL.WriteString("SELECT 'unknown' AS transaction_isolation")
+						} else {
+							tx.AddError(errors.New("isolation observation unavailable"))
+						}
+					}
+				}))
+				t.Cleanup(func() { require.NoError(t, f.db.Callback().Row().Remove("empty-source:isolation")) })
+			}
+			var isolationObserved atomic.Bool
+			if scenario == "source_select_error" {
+				require.NoError(t, f.db.Callback().Row().After("gorm:row").Register("empty-source:observed", func(tx *gorm.DB) {
+					if tx.Statement.SQL.String() == "SHOW transaction_isolation" {
+						isolationObserved.Store(true)
+					}
+				}))
+				t.Cleanup(func() { require.NoError(t, f.db.Callback().Row().Remove("empty-source:observed")) })
+				require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register("empty-source:read", func(tx *gorm.DB) {
+					if isolationObserved.Load() && tx.Statement.Table == "oauth_derived_token_sources" {
+						tx.AddError(errors.New("source observation unavailable"))
+					}
+				}))
+				t.Cleanup(func() { require.NoError(t, f.db.Callback().Query().Remove("empty-source:read")) })
+			}
+			if scenario == "without_transaction" {
+				// Do not create an outbox in autocommit mode merely to test the
+				// derived substep's transaction requirement.
+				assert.ErrorIs(t, model.RevokeOAuthWithTx(f.db, userID, "user", "", "session_revoked"), model.ErrOAuthDerivedTokenUnknown)
+				return
+			}
+			opts := &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+			if scenario == "empty_repeatable_read" {
+				opts.Isolation = sql.LevelRepeatableRead
+			}
+			err := f.db.Transaction(func(tx *gorm.DB) error {
+				_, err := model.StartSessionRevocationWithTx(tx, userID, "", "session_revoked")
+				return err
+			}, opts)
+			if scenario == "source_select_error" {
+				require.True(t, isolationObserved.Load(), "fault must reach the new empty-source read after the provenance preflight")
+			}
+			var count int64
+			require.NoError(t, f.db.Model(&model.SessionRevocationEvent{}).Where("user_id = ?", userID).Count(&count).Error)
+			if scenario == "empty_read_committed" {
+				require.NoError(t, err)
+				assert.EqualValues(t, 1, count)
+			} else {
+				assert.ErrorIs(t, err, model.ErrOAuthDerivedTokenUnknown)
+				assert.Zero(t, count, "rejected source observation rolls back the whole security transaction")
+			}
+		})
+	}
 	for _, scenario := range []string{"deny_wrong_type", "outbox_rollback", "late_active_fill", "credential_rollback"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := sessionRevocationRepairFixture(t)
