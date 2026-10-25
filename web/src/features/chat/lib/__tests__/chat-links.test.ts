@@ -29,6 +29,7 @@ import { prepareCherryV2Import } from '../../hooks/use-active-chat-key'
 import {
   BOXO_V2_ERROR,
   BOXO_V2_TEMPLATE,
+  BOXNAI_V2_TEMPLATE,
   CHERRY_V2_TEMPLATE,
   CHERRY_V2_ERROR,
   buildCherryV2Url,
@@ -36,6 +37,7 @@ import {
   parseChatConfig,
   resolveChatUrl,
   withBoxoV2Preset,
+  withBoxnaiV2Preset,
 } from '../chat-links'
 
 const site = {
@@ -559,3 +561,95 @@ it.each([{ id: 9 }, { status: 2 }, { expired_time: 1 }])(
     expect(post).not.toHaveBeenCalled()
   }
 )
+
+it('exports only the explicitly selected Boxnai token with the unchanged v2 payload', async () => {
+  const { client, get, post } = importFixture('named')
+  const original = get.getMockImplementation()
+  if (!original) throw new Error('Expected API mock implementation')
+  get.mockImplementation(async (...args) =>
+    args[0] === '/api/token/9'
+      ? {
+          data: {
+            success: true,
+            data: { id: 9, status: 1, expired_time: -1, group: 'named' },
+          },
+        }
+      : original(...args)
+  )
+  const result = await prepareCherryV2Import(client, BOXNAI_V2_TEMPLATE, 9)
+  const url = new URL(result.url)
+  expect(url.protocol).toBe('boxnai:')
+  expect(url.host + url.pathname).toBe('providers/api-keys')
+  expect(url.searchParams.get('v')).toBe('2')
+  const encoded = url.searchParams.get('data') ?? ''
+  expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/)
+  expect(
+    JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'))
+  ).toEqual({
+    v: 2,
+    site_id: site.instance_id,
+    type: 'new-api',
+    name: site.system_name,
+    baseUrl: 'https://gateway.example/prefix',
+    apiKey: 'sk-selected-synthetic-key',
+    group: 'named',
+    recommended_models: [],
+    default_model: '',
+  })
+  expect(post).toHaveBeenCalledExactlyOnceWith(
+    '/api/token/9/key',
+    undefined,
+    expect.any(Object)
+  )
+  expect(get.mock.calls.map((call) => call[0])).toEqual([
+    '/api/status',
+    '/api/token/9',
+  ])
+  expect(
+    resolveChatUrl({
+      template: BOXNAI_V2_TEMPLATE,
+      apiKey: 'never-send',
+      serverAddress: 'https://example.com',
+    })
+  ).toBe('')
+})
+
+it.each([
+  `${BOXNAI_V2_TEMPLATE}&next=1`,
+  `${BOXNAI_V2_TEMPLATE}#fragment`,
+  'boxnai://evil/api-keys?v=2&data={cherryConfigV2}',
+  'boxnai://providers/api-keys?v=1&data={cherryConfigV2}',
+  'unknown://providers/api-keys?v=2&data={cherryConfigV2}',
+  encodeURIComponent(BOXNAI_V2_TEMPLATE),
+])(
+  'rejects noncanonical Boxnai v2 before secret access: %s',
+  async (template) => {
+    const { client, get, post } = importFixture()
+    await expect(prepareCherryV2Import(client, template, 9)).rejects.toThrow(
+      CHERRY_V2_ERROR
+    )
+    expect(get).not.toHaveBeenCalled()
+    expect(post).not.toHaveBeenCalled()
+    expect(
+      resolveChatUrl({
+        template,
+        apiKey: 'never-send',
+        serverAddress: 'https://example.com',
+      })
+    ).toBe('')
+  }
+)
+
+it('adds Boxnai without replacing existing legacy or Boxo settings', () => {
+  const raw = JSON.stringify([
+    { Boxnai: 'custom://legacy?key={key}' },
+    { Boxo: BOXO_V2_TEMPLATE },
+  ])
+  const added = withBoxnaiV2Preset(raw)
+  expect(JSON.parse(added)).toEqual([
+    ...JSON.parse(raw),
+    { 'Boxnai 2': BOXNAI_V2_TEMPLATE },
+  ])
+  expect(withBoxnaiV2Preset(added)).toBe(added)
+  expect(() => withBoxnaiV2Preset('not-json')).toThrow()
+})

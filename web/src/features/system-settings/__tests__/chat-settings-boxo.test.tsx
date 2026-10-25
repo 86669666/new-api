@@ -24,7 +24,10 @@ import { useState } from 'react'
 import { I18nextProvider } from 'react-i18next'
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { BOXO_V2_TEMPLATE } from '@/features/chat/lib/chat-links'
+import {
+  BOXO_V2_TEMPLATE,
+  BOXNAI_V2_TEMPLATE,
+} from '@/features/chat/lib/chat-links'
 
 import { SettingsPageProvider } from '../components/settings-page-context'
 import { ChatSettingsSection } from '../content/chat-settings-section'
@@ -79,4 +82,33 @@ describe('Boxo chat preset', () => {
     expect(screen.getByText('Invalid JSON string.')).toBeInTheDocument()
     expect(screen.queryByText('Boxo')).not.toBeInTheDocument()
   })
+})
+
+it('adds Boxnai once and preserves Cherry v1 and Boxo', async () => {
+  const user = userEvent.setup()
+  render(
+    <Fixture
+      value={JSON.stringify([
+        {
+          'Cherry Studio':
+            'cherrystudio://providers/api-keys?v=1&data={cherryConfig}',
+        },
+        { Boxo: BOXO_V2_TEMPLATE },
+      ])}
+    />
+  )
+  await user.click(screen.getByRole('button', { name: 'Add Boxnai preset' }))
+  await user.click(screen.getByRole('button', { name: 'Add Boxnai preset' }))
+  expect(screen.getAllByText('Boxnai')).toHaveLength(1)
+  expect(screen.getAllByText(BOXNAI_V2_TEMPLATE)).toHaveLength(2)
+  expect(screen.getByText('Cherry Studio')).toBeInTheDocument()
+  expect(screen.getByText('Boxo')).toBeInTheDocument()
+})
+
+it('preserves invalid JSON when adding Boxnai fails', async () => {
+  const user = userEvent.setup()
+  render(<Fixture value='not-json' />)
+  await user.click(screen.getByRole('button', { name: 'Add Boxnai preset' }))
+  expect(screen.getByText('Invalid JSON string.')).toBeInTheDocument()
+  expect(screen.queryByText('Boxnai')).not.toBeInTheDocument()
 })
