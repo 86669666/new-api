@@ -332,6 +332,31 @@ def check_oauth_revocation(api, source_root):
             'fixed_issuer_ingress': True, 'actual_issuer_invalidation_proved': False}
 
 
+def check_oauth_ordinary_token(api, source_root):
+    path = api['paths']['/api/v1/oauth/tokens']
+    assert set(path) == {'get', 'post'}
+    operation = path['post']
+    assert operation['operationId'] == 'createOAuthOrdinaryToken'
+    assert operation['security'] == [{'OAuthResourceBearer': []}]
+    assert operation['x-required-scopes'] == ['tokens:write']
+    assert operation['x-default-off'] is True and operation['x-automatic-retry'] is False
+    assert operation['x-request-max-bytes'] == 4096
+    assert operation['x-query-policy'] == 'forbidden'
+    assert path['get']['x-required-scopes'] == ['tokens:read']
+    assert 'OAuth revocation does NOT reclaim' in operation['description']
+    assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OAuthOrdinaryTokenResult'}
+    request = api['components']['schemas']['OAuthOrdinaryTokenRequest']
+    assert request['additionalProperties'] is False and set(request['properties']) == {'name'}
+    validate_value(api, request, {'name': 'personal model key'})
+    for invalid in [{}, {'name': ''}, {'name': ' '}, {'name': 'a' * 31}, {'name': 1}, {'name': 'ok', 'group': 'vip'}, {'name': 'ok', 'user_id': 1}]:
+        assert list(OAS30Validator(request).iter_errors(invalid)), 'invalid ordinary-key request accepted'
+    source = (source_root / 'controller/oauth_ordinary_token.go').read_text()
+    assert 'common.ValidateStrictJSONObject(data)' in source and 'len(name) > 30' in source
+    assert 'CreateOrdinaryToken(c.Request.Context(), name)' in source
+    assert 'controller.CreateOAuthOrdinaryToken(c)' in (source_root / 'router/oauth_resource_router.go').read_text()
+    return {'post': True, 'metadata_get_unchanged': True, 'ordinary_lifecycle': True, 'live': False}
+
+
 def check_oauth_public(api):
     expected = {'/oauth2/auth': ('get', 'authorizeOAuthPublicClient'),
                 '/oauth2/token': ('post', 'exchangeOAuthPublicToken'),
@@ -1499,6 +1524,7 @@ def main():
     api, relay = documents['api'], documents['relay']
     results['no_available_channel_detail'] = check_no_available_channel_detail(relay)
     results['oauth_public'] = check_oauth_public(api)
+    results['oauth_ordinary_token'] = check_oauth_ordinary_token(api, source_root)
     results['oauth_usage'] = check_oauth_usage(api, source_root)
     results['native_search'] = check_native_search(relay)
     access = api['components']['schemas']['OrganizationAccess']['properties']['capabilities']

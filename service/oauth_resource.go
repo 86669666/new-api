@@ -388,3 +388,42 @@ func (r *OAuthUserInfoResource) introspectPurpose(ctx context.Context, credentia
 	}
 	return OAuthResourceIdentity{userID: int(id), authVersion: authVersion, issuer: issuer, clientID: clientID, expiresAt: expires, notBefore: notBefore, email: scopes["email"], scopes: strings.Split(scope, " "), grantID: grantID, grantExpiresAt: grantExpires}, nil
 }
+
+// RequireOrdinaryTokenWriteScope never accepts bridge-only or ambient credentials.
+func (a *OAuthUserInfoAccess) RequireOrdinaryTokenWriteScope() error {
+	if a == nil || a.resource == nil || !a.resource.grantsRequired || a.identity.grantID == "" || a.credential == "" {
+		return ErrOAuthInvalidToken
+	}
+	if !slices.Contains(a.identity.scopes, "tokens:write") {
+		return ErrOAuthInsufficientScope
+	}
+	return nil
+}
+
+// CreateOrdinaryToken uses normal token management. OAuth revocation does not
+// revoke this key; it is not a protected derived credential or issuance permit.
+func (a *OAuthUserInfoAccess) CreateOrdinaryToken(ctx context.Context, name string) (*model.Token, error) {
+	if err := a.RequireOrdinaryTokenWriteScope(); err != nil {
+		return nil, err
+	}
+	identity, _, err := a.resource.readCurrentIdentity(ctx, a.credential)
+	if err != nil {
+		return nil, err
+	}
+	if identity.expiresAt != a.identity.expiresAt || identity.notBefore != a.identity.notBefore || identity.userID != a.identity.userID || identity.authVersion != a.identity.authVersion || identity.issuer != a.identity.issuer || identity.clientID != a.identity.clientID || identity.grantID != a.identity.grantID || identity.grantExpiresAt != a.identity.grantExpiresAt || identity.grantRevision != a.identity.grantRevision || !sameOAuthProviderSet(identity.scopes, a.identity.scopes) {
+		return nil, ErrOAuthInvalidToken
+	}
+	key, err := common.GenerateKey()
+	if err != nil {
+		return nil, ErrOAuthResourceUnavailable
+	}
+	now := common.GetTimestamp()
+	token := &model.Token{UserId: identity.userID, Name: name, Key: key, Status: common.TokenStatusEnabled, CreatedTime: now, AccessedTime: now, ExpiredTime: -1, UnlimitedQuota: true, AllowUserQuotaQuery: true}
+	// Empty Group inherits the user's group. UnlimitedQuota removes only this
+	// key's sub-budget; ordinary authentication and billing still enforce the user.
+	// Insert owns the existing User lock and atomic per-user token-count limit.
+	if err := token.Insert(); err != nil {
+		return nil, ErrOAuthResourceUnavailable
+	}
+	return token, nil
+}

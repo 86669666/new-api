@@ -36,12 +36,14 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
@@ -633,6 +635,136 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		assert.Empty(t, withoutOffline.Refresh)
 	})
 
+	t.Run("ordinary_tokens_write", func(t *testing.T) {
+		c.t = t
+		clientURL := input.Admin + "/admin/clients/" + url.PathEscape(c.clientID)
+		status, _, raw := c.request("GET", clientURL, "", "", "")
+		require.Equal(t, 200, status)
+		var registration map[string]any
+		require.NoError(t, common.Unmarshal(raw, &registration))
+		original, err := common.Marshal(registration)
+		require.NoError(t, err)
+		defer func() {
+			status, _, _ = c.request("PUT", clientURL, "application/json", string(original), "")
+			require.Equal(t, 200, status)
+		}()
+		registration["scope"] = registration["scope"].(string) + " tokens:write"
+		updated, err := common.Marshal(registration)
+		require.NoError(t, err)
+		status, _, _ = c.request("PUT", clientURL, "application/json", string(updated), "")
+		require.Equal(t, 200, status)
+		journal, err := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+		require.NoError(t, err)
+		var before model.User
+		require.NoError(t, f.db.First(&before, f.users["owner"].Id).Error)
+		// The requested write scope must also be explicitly selected. A refresh
+		// preserves the omission instead of granting the newly registered scope.
+		status, omitted := c.exchange(c.code("openid profile offline_access tokens:read tokens:write", "openid", "profile", "offline_access", "tokens:read"))
+		require.Equal(t, 200, status)
+		for range 2 {
+			status, _, body := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", `{"name":"not-consented"}`, omitted.Access)
+			assert.Equal(t, 403, status)
+			assert.NotContains(t, string(body), `"key"`)
+			status, omitted = c.refresh(omitted)
+			require.Equal(t, 200, status)
+		}
+		status, grant := c.exchange(c.code("openid profile offline_access tokens:read tokens:write"))
+		require.Equal(t, 200, status)
+		status, headers, body := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", `{"name":"Hydra ordinary"}`, grant.Access)
+		require.Equal(t, 200, status)
+		assert.Contains(t, headers.Get("Cache-Control"), "no-store")
+		var created struct {
+			Success bool
+			Data    struct {
+				ID        int
+				Name, Key string
+			}
+		}
+		require.NoError(t, common.Unmarshal(body, &created))
+		require.True(t, created.Success)
+		require.True(t, len(created.Data.Key) > 20)
+		c.secrets = append(c.secrets, created.Data.Key)
+		var token model.Token
+		require.NoError(t, f.db.First(&token, created.Data.ID).Error)
+		assert.True(t, token.Key == created.Data.Key)
+		assert.Equal(t, before.Id, token.UserId)
+		assert.True(t, token.UnlimitedQuota)
+		assert.EqualValues(t, -1, token.ExpiredTime)
+		assert.Empty(t, token.Group)
+		kind, err := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+		require.NoError(t, err)
+		assert.Equal(t, model.OAuthDerivedTokenManualProven, kind)
+		t.Run("ordinary_model_call_and_user_budget", func(t *testing.T) {
+			oldCount, oldBatch, oldExport := constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled
+			oldQuota := *operation_setting.GetQuotaSetting()
+			oldPrices := ratio_setting.ModelPrice2JSONString()
+			t.Cleanup(func() {
+				constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled = oldCount, oldBatch, oldExport
+				*operation_setting.GetQuotaSetting() = oldQuota
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrices))
+			})
+			constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled = false, false, false
+			*operation_setting.GetQuotaSetting() = operation_setting.QuotaSetting{TrustQuotaUSD: 0, PreConsumeMultiplier: 1}
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"gpt-4o-mini":0.001}`))
+			require.NoError(t, f.db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				assert.Equal(t, "/v1/chat/completions", r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"isolated-model-response","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"isolated reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+			}))
+			t.Cleanup(upstream.Close)
+			base := upstream.URL
+			channel := &model.Channel{Type: constant.ChannelTypeOpenAI, Name: "ordinary OAuth isolated model", Key: "synthetic-upstream-only", Status: common.ChannelStatusEnabled, BaseURL: &base, Models: "gpt-4o-mini", Group: "default"}
+			require.NoError(t, channel.Insert())
+			t.Cleanup(func() { require.NoError(t, channel.Delete()) })
+			payload := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"test"}],"max_tokens":1}`
+			// The new unlimited token cannot bypass a zero user balance.
+			status, _, response := f.request(t, "POST", "/v1/chat/completions", "sk-"+created.Data.Key, payload, http.Header{"Content-Type": {"application/json"}})
+			assert.Equal(t, 403, status)
+			assert.Equal(t, "insufficient_user_quota", response["error"].(map[string]any)["code"])
+			assert.Zero(t, calls.Load())
+			t.Cleanup(func() {
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", before.Id).Updates(map[string]any{"quota": before.Quota, "used_quota": before.UsedQuota}).Error)
+			})
+			// Only the isolated fixture owner funds this test; creation itself did not.
+			require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", before.Id).UpdateColumn("quota", 100000).Error)
+			status, _, response = f.request(t, "POST", "/v1/chat/completions", "sk-"+created.Data.Key, payload, http.Header{"Content-Type": {"application/json"}})
+			require.Equal(t, 200, status)
+			assert.EqualValues(t, 1, calls.Load())
+			assert.Equal(t, "isolated-model-response", response["id"])
+			var billed model.User
+			require.NoError(t, f.db.First(&billed, before.Id).Error)
+			assert.Less(t, billed.Quota, 100000)
+			assert.Greater(t, billed.UsedQuota, before.UsedQuota)
+			status, _, _ = f.request(t, "POST", "/v1/chat/completions", "sk-"+created.Data.Key, strings.Replace(payload, "gpt-4o-mini", "unavailable-model", 1), http.Header{"Content-Type": {"application/json"}})
+			assert.NotEqual(t, 200, status)
+			assert.EqualValues(t, 1, calls.Load(), "key cannot select an unavailable model")
+			require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", before.Id).Updates(map[string]any{"quota": before.Quota, "used_quota": before.UsedQuota}).Error)
+			assert.False(t, strings.Contains(f.logs.snapshot(), created.Data.Key), "usable key must not enter logs")
+		})
+		c.t = t
+		metadata := c.tokenMetadata(grant.Access, 200)
+		assert.Empty(t, metadata["data"])
+		status, _, _ = c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", `{"name":"refresh-is-not-access"}`, grant.Refresh)
+		assert.Equal(t, 401, status)
+		status, _, _ = c.request("POST", input.Issuer+"oauth2/revoke", "application/x-www-form-urlencoded", url.Values{"token": {grant.Access}, "client_id": {c.clientID}}.Encode(), "")
+		require.Equal(t, 200, status)
+		status, _, _ = c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", `{"name":"revoked"}`, grant.Access)
+		assert.Equal(t, 401, status)
+		// Explicit ordinary-key debt: revoking OAuth does not revoke the issued key.
+		require.NoError(t, f.db.First(&token, token.Id).Error)
+		assert.Equal(t, common.TokenStatusEnabled, token.Status)
+		var after model.User
+		require.NoError(t, f.db.First(&after, before.Id).Error)
+		assert.Equal(t, before.Quota, after.Quota)
+		assert.Equal(t, before.UsedQuota, after.UsedQuota)
+		journalAfter, err := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+		require.NoError(t, err)
+		assert.Equal(t, journal, journalAfter)
+	})
+
 	t.Run("explicit_tokens_read_empty_and_refresh", func(t *testing.T) {
 		c.t = t
 		// The permanent CLI must have born this very database. The test never adopts
@@ -662,7 +794,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		challenge := sha256.Sum256([]byte(strings.Repeat("a", 43)))
 		writeRequest := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {"http://127.0.0.1:29873/oauth/callback"}, "scope": {"profile tokens:write"}, "state": {strings.Repeat("b", 43)}, "code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"}}
 		status, writeHeaders, _ := c.request("GET", input.Issuer+"oauth2/auth?"+writeRequest.Encode(), "", "", "")
-		assert.Equal(t, 400, status, "tokens:write has no public producer")
+		assert.Equal(t, 400, status, "unregistered write scope is rejected")
 		assert.Empty(t, writeHeaders.Get("Location"))
 		journal, e := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
 		require.NoError(t, e)
@@ -748,9 +880,9 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		}
 		require.NoError(t, common.Unmarshal(raw, &metadata))
 		assert.Contains(t, metadata.Scopes, "tokens:read")
-		assert.NotContains(t, metadata.Scopes, "tokens:write")
+		assert.Contains(t, metadata.Scopes, "tokens:write")
 		status, headers, _ := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", "{}", "")
-		assert.Equal(t, 400, status)
+		assert.Equal(t, 401, status)
 		assert.Empty(t, headers.Get("Location"))
 	})
 
@@ -4937,7 +5069,7 @@ func TestOAuthTokensNamespacePrivacy(t *testing.T) {
 		{"GET", "/api/v1/oauth/%252574okens/TOKENS_PATH_CANARY", "", "", 400},
 		{"GET", "/api//v1/oauth/tokens", "", "", 400},
 		{"GET", "/API/V1/OAUTH/TOKENS", "", "", 400},
-		{"POST", "/api/v1/oauth/tokens", "", "", 400},
+		{"POST", "/api/v1/oauth/tokens", "", "", 401},
 		{"HEAD", "/api/v1/oauth/tokens", "", "", 400},
 		{"GET", "/api/v1/oauth/tokens", "{}", "", 400},
 		{"GET", "/api/v1/oauth/tokens", "", "X-Organization-Id", 400},
@@ -5295,6 +5427,120 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		assert.Equal(t, 503, w.Code)
 		assert.NotContains(t, w.Body.String(), "data")
 	})
+	t.Run("ordinary_key_creation", func(t *testing.T) {
+		post := func(body, bearer string) *httptest.ResponseRecorder {
+			r := httptest.NewRequest("POST", "/api/v1/oauth/tokens", strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			if bearer != "" {
+				r.Header.Set("Authorization", "Bearer "+bearer)
+			}
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, r)
+			return w
+		}
+		count := func() int64 { var n int64; require.NoError(t, f.db.Model(&model.Token{}).Count(&n).Error); return n }
+		initial := count()
+		assert.Equal(t, 403, post(`{"name":"ordinary"}`, "synthetic-metadata").Code)
+		assert.Equal(t, 401, post(`{"name":"ordinary"}`, "").Code)
+		writeScopes := `["profile","tokens:read","tokens:write"]`
+		require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", writeScopes).Error)
+		claims["scope"] = "profile tokens:read tokens:write"
+		defer func() {
+			claims["scope"] = "profile tokens:read"
+			require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", string(encoded)).Error)
+		}()
+		for _, body := range []string{`{}`, `{"name":""}`, `{"name":" "}`, `{"name":null}`, `{"name":1}`, `{"name":"a","user_id":1}`, `{"name":"a","organization_id":1}`, `{"name":"a","unlimited_quota":true}`, `{"name":"a","group":"vip"}`, `{"name":"a","quota":999}`, `{"name":"a","name":"b"}`, `{"name":"a"} {}`, `{"Name":"a"}`, `{"name":"` + strings.Repeat("a", 31) + `"}`} {
+			assert.Equal(t, 400, post(body, "synthetic-metadata").Code)
+		}
+		for _, path := range []string{"/api/v1/oauth/tokens/", "/api/v1/oauth/tokens?", "/api/v1/oauth/tokens?name=other", "/api/v1/oauth/%74okens"} {
+			r := httptest.NewRequest("POST", path, strings.NewReader(`{"name":"boundary"}`))
+			r.Header.Set("Authorization", "Bearer synthetic-metadata")
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, r)
+			assert.Equal(t, 400, w.Code)
+			assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+		}
+		for _, header := range []string{"X-Organization-ID", "X-HTTP-Method-Override"} {
+			r := httptest.NewRequest("POST", "/api/v1/oauth/tokens", strings.NewReader(`{"name":"boundary"}`))
+			r.Header.Set("Authorization", "Bearer synthetic-metadata")
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set(header, "1")
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, r)
+			assert.Equal(t, 400, w.Code)
+		}
+		for _, mismatch := range []struct {
+			field string
+			value any
+		}{{"client_id", "other-client"}, {"iss", "https://wrong-issuer.example"}, {"token_use", "refresh_token"}} {
+			old := claims[mismatch.field]
+			claims[mismatch.field] = mismatch.value
+			assert.Equal(t, 401, post(`{"name":"binding"}`, "synthetic-metadata").Code)
+			claims[mismatch.field] = old
+		}
+		oldActor := claims["sub"]
+		claims["sub"] = strconv.Itoa(f.users["foreign"].Id)
+		assert.Equal(t, 401, post(`{"name":"ordinary"}`, "synthetic-metadata").Code)
+		claims["sub"] = oldActor
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).UpdateColumn("status", common.UserStatusDisabled).Error)
+		assert.Equal(t, 401, post(`{"name":"ordinary"}`, "synthetic-metadata").Code)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).UpdateColumn("status", common.UserStatusEnabled).Error)
+		assert.Equal(t, initial, count(), "all rejected requests leave token table unchanged")
+		w := post(`{"name":"ordinary"}`, "synthetic-metadata")
+		require.Equal(t, 200, w.Code)
+		assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+		var created struct {
+			Success bool
+			Data    struct {
+				ID        int
+				Name, Key string
+			}
+		}
+		require.NoError(t, common.Unmarshal(w.Body.Bytes(), &created))
+		require.True(t, created.Success)
+		require.True(t, len(created.Data.Key) > 20, "created key must be usable")
+		var token model.Token
+		require.NoError(t, f.db.First(&token, created.Data.ID).Error)
+		assert.True(t, token.Key == created.Data.Key, "response matches persisted key")
+		assert.Equal(t, grant.UserID, token.UserId)
+		assert.Equal(t, "ordinary", token.Name)
+		assert.True(t, token.UnlimitedQuota)
+		assert.EqualValues(t, -1, token.ExpiredTime)
+		assert.Empty(t, token.Group)
+		assert.Zero(t, token.RemainQuota)
+		kind, e := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+		require.NoError(t, e)
+		assert.Equal(t, model.OAuthDerivedTokenManualProven, kind)
+		var sources int64
+		require.NoError(t, f.db.Model(&model.OAuthDerivedTokenSource{}).Count(&sources).Error)
+		assert.Zero(t, sources)
+		var afterUser model.User
+		require.NoError(t, f.db.First(&afterUser, grant.UserID).Error)
+		assert.Equal(t, userBefore.Quota, afterUser.Quota)
+		assert.Equal(t, userBefore.UsedQuota, afterUser.UsedQuota)
+		metadata := request()
+		require.Equal(t, 200, metadata.Code)
+		assert.False(t, strings.Contains(metadata.Body.String(), created.Data.Key), "GET must not disclose the new ordinary key")
+		var response struct{ Data []any }
+		require.NoError(t, common.Unmarshal(metadata.Body.Bytes(), &response))
+		assert.Empty(t, response.Data)
+		models := gin.New()
+		SetRelayRouter(models)
+		modelsRequest := httptest.NewRequest("GET", "/v1/models", nil)
+		modelsRequest.Header.Set("Authorization", "Bearer "+created.Data.Key)
+		modelsResponse := httptest.NewRecorder()
+		models.ServeHTTP(modelsResponse, modelsRequest)
+		assert.Equal(t, 200, modelsResponse.Code, "normal token authentication reaches the production model-list route")
+		oldLimit := operation_setting.GetTokenSetting().MaxUserTokens
+		ownedCount, e := model.CountUserTokens(grant.UserID)
+		require.NoError(t, e)
+		operation_setting.GetTokenSetting().MaxUserTokens = int(ownedCount)
+		defer func() { operation_setting.GetTokenSetting().MaxUserTokens = oldLimit }()
+		assert.Equal(t, 503, post(`{"name":"over-limit"}`, "synthetic-metadata").Code)
+		assert.Equal(t, initial+1, count())
+	})
+
 }
 
 // tokenMetadata checks the metadata envelope without treating it as a usage feed.

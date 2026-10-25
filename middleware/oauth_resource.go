@@ -34,7 +34,13 @@ func OAuthUsageAuth(resource *service.OAuthUserInfoResource) gin.HandlerFunc {
 }
 
 func OAuthTokensAuth(resource *service.OAuthUserInfoResource) gin.HandlerFunc {
-	return oauthResourceAuth(resource, "tokens:read")
+	return func(c *gin.Context) {
+		scope := "tokens:read"
+		if c.Request.Method == http.MethodPost {
+			scope = "tokens:write"
+		}
+		oauthResourceAuth(resource, scope)(c)
+	}
 }
 
 func oauthResourceAuth(resource *service.OAuthUserInfoResource, scope string) gin.HandlerFunc {
@@ -99,6 +105,12 @@ func oauthResourceAuth(resource *service.OAuthUserInfoResource, scope string) gi
 				return
 			}
 		}
+		if scope == "tokens:write" {
+			if err := access.RequireOrdinaryTokenWriteScope(); err != nil {
+				WriteOAuthResourceError(c, err, scope)
+				return
+			}
+		}
 		c.Set(oauthUserInfoAccessKey, access)
 		c.Next()
 	}
@@ -118,7 +130,7 @@ func WriteOAuthResourceError(c *gin.Context, err error, requiredScope ...string)
 	} else if errors.Is(err, service.ErrOAuthInsufficientScope) {
 		status, code = http.StatusForbidden, "insufficient_scope"
 		scope := "profile"
-		if len(requiredScope) == 1 && (requiredScope[0] == "balance:read" || requiredScope[0] == "usage:read" || requiredScope[0] == "tokens:read") {
+		if len(requiredScope) == 1 && (requiredScope[0] == "balance:read" || requiredScope[0] == "usage:read" || requiredScope[0] == "tokens:read" || requiredScope[0] == "tokens:write") {
 			scope = requiredScope[0]
 		}
 		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+scope+`"`)
@@ -254,8 +266,8 @@ func OAuthUsageBoundary(c *gin.Context) {
 	c.Next()
 }
 
-// OAuthTokensBoundary reserves metadata reads even when public OAuth is off.
-// Selectors, request bodies and method overrides never change the current grant.
+// OAuthTokensBoundary reserves metadata reads and ordinary-key creation.
+// Only POST accepts a bounded JSON body; selectors never change the actor.
 func OAuthTokensBoundary(c *gin.Context) {
 	if !OAuthTokensPath(c.Request.URL.EscapedPath()) {
 		c.Next()
@@ -263,14 +275,15 @@ func OAuthTokensBoundary(c *gin.Context) {
 	}
 	c.Header("Cache-Control", "private, no-store")
 	c.Header("Referrer-Policy", "no-referrer")
-	invalid := c.Request.Method != http.MethodGet || c.Request.URL.EscapedPath() != "/api/v1/oauth/tokens" || c.Request.URL.RawQuery != "" || c.Request.URL.ForceQuery || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0
+	isCreate := c.Request.Method == http.MethodPost
+	invalid := (c.Request.Method != http.MethodGet && !isCreate) || c.Request.URL.EscapedPath() != "/api/v1/oauth/tokens" || c.Request.URL.RawQuery != "" || c.Request.URL.ForceQuery || (!isCreate && (c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0))
 	for key := range c.Request.Header {
 		switch strings.ToLower(key) {
 		case "x-organization-id", "x-http-method-override", "x-method-override", "x-http-method":
 			invalid = true
 		}
 	}
-	if c.Request.Body != nil {
+	if !isCreate && c.Request.Body != nil {
 		var one [1]byte
 		n, err := io.ReadFull(c.Request.Body, one[:])
 		if n != 0 || err != nil && err != io.EOF {

@@ -25465,7 +25465,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Default-off public OAuth only. Requires separately selected tokens:read, unchecked and reset on every new consent preview; profile remains mandatory. Only requested and registered scopes can be approved. Existing grants and refreshes never acquire this scope. Reads only the exact current issuer, user, client and grant binding; never searches other grants, manual keys or secret fields. A new read-only grant returns an empty data array because no key/source producer is enabled. GET never creates, reveals or changes a key, source, permit, history or wallet. tokens:write remains unsupported; POST is rejected and has no producer. Only the exact GET path is accepted: no query (including empty ?), body, organization selector or method override. JWT, PAT, relay key, cookie, refresh or bridge-only credentials cannot authenticate. Before publishing, live identity, consent scopes, grant revision, session, cleanup fence, source projection and expiry are checked again; database/provenance uncertainty discards prepared data. This is a request-level observation, not an atomic issuer/database snapshot. No fallback or redirects; reserved path suffix/query data are redacted from access logs. Privacy headers precede authentication and rate limiting. status oauth.enabled and client_features.oauth remain false. Empty metadata is not evidence of key issuance or relay authorization.",
+        "description": "Default-off public OAuth only. Requires separately selected tokens:read, unchecked and reset on every new consent preview; profile remains mandatory. Only requested and registered scopes can be approved. Existing grants and refreshes never acquire this scope. Reads only the exact current issuer, user, client and grant binding; never searches other grants, manual keys or secret fields. A new read-only grant returns an empty data array because no key/source producer is enabled. GET never creates, reveals or changes a key, source, permit, history or wallet. Separately consented tokens:write enables POST creation of an ordinary key; those keys are not derived metadata and are never returned by GET. Only the exact GET path is accepted: no query (including empty ?), body, organization selector or method override. JWT, PAT, relay key, cookie, refresh or bridge-only credentials cannot authenticate. Before publishing, live identity, consent scopes, grant revision, session, cleanup fence, source projection and expiry are checked again; database/provenance uncertainty discards prepared data. This is a request-level observation, not an atomic issuer/database snapshot. No fallback or redirects; reserved path suffix/query data are redacted from access logs. Privacy headers precede authentication and rate limiting. status oauth.enabled and client_features.oauth remain false. Empty metadata is not evidence of key issuance or relay authorization.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -25660,6 +25660,223 @@
                 "schema": {
                   "$ref": "#/components/schemas/OAuthResourceUnavailable"
                 }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createOAuthOrdinaryToken",
+        "summary": "Create one ordinary personal model key",
+        "tags": [
+          "OAuth"
+        ],
+        "description": "Default-off public OAuth only. Requires profile and exact tokens:write in the current registered client and explicitly approved grant; old grants and refresh never gain it. Only the exact POST path accepts a bounded JSON object containing name, nonblank and at most 30 UTF-8 bytes. Query, organization selectors, method overrides, extra or duplicate fields and trailing JSON are rejected. No cookie, PAT, refresh-token or bridge fallback. Revalidates the current user, issuer, client, session and grant before ordinary Token.Insert, which enforces the normal per-user token count limit. UnlimitedQuota applies only to the token sub-budget: user balance, billing and normal model routing remain authoritative. ExpiredTime is -1 and the empty group inherits the user group. Only this response reveals the raw key; clients must store it securely. No derived source, proof, permit, history or wallet writes. OAuth revocation does NOT reclaim this ordinary key; use ordinary token management to revoke it. This is explicitly weaker than protected derived-key semantics. No automatic retry or idempotent issuance guarantee; a lost response may leave an ordinary key requiring management. GET remains derived metadata-only. No production activation is implied.",
+        "security": [
+          {
+            "OAuthResourceBearer": []
+          }
+        ],
+        "x-required-scopes": [
+          "tokens:write"
+        ],
+        "x-query-policy": "forbidden",
+        "x-organization-selection": "any selector presence rejected",
+        "x-default-off": true,
+        "x-automatic-retry": false,
+        "responses": {
+          "200": {
+            "description": "New ordinary key. Plaintext is disclosed only by this creation response.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthOrdinaryTokenResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid name/body, forbidden field/query/selector/override, or noncanonical path.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthBalanceInvalidRequest"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Inactive or invalid public access token, user, grant, or source session. Legacy bridge-only mode is rejected.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"invalid_token\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInvalidToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing exact tokens:write scope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "Bearer error=\"insufficient_scope\", scope=\"tokens:write\""
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthInsufficientScope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Global API rate limit; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Global API limiter storage failure; empty body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Identity/store uncertainty, key generation or ordinary insertion/count-limit failure; no key is returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "private, no-store; set by the global tokens boundary before authorization and rate limiting."
+              },
+              "Referrer-Policy": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-referrer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthResourceUnavailable"
+                }
+              }
+            }
+          }
+        },
+        "x-request-max-bytes": 4096,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthOrdinaryTokenRequest"
               }
             }
           }
@@ -36377,6 +36594,61 @@
             "format": "int64"
           }
         }
+      },
+      "OAuthOrdinaryTokenRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 30,
+            "pattern": "\\S",
+            "description": "Nonblank name; server additionally limits UTF-8 encoded length to 30 bytes."
+          }
+        }
+      },
+      "OAuthOrdinaryTokenResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "name",
+              "key"
+            ],
+            "properties": {
+              "id": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "name": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Usable ordinary model key, disclosed only once in this no-store creation response."
+              }
+            }
+          }
+        }
       }
     },
     "responses": {
@@ -37224,7 +37496,7 @@
       "OAuthResourceBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected. Account usage additionally requires public grant mode and the separately selected usage:read scope; existing profile/balance grants and their refreshes never acquire it. Current-grant key metadata additionally requires separately selected tokens:read in public grant mode; GET creates no key and returns no secret. Existing grants and refreshes never gain it; tokens:write remains unsupported."
+        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected. Account usage additionally requires public grant mode and the separately selected usage:read scope; existing profile/balance grants and their refreshes never acquire it. Current-grant key metadata additionally requires separately selected tokens:read in public grant mode; GET creates no key and returns no secret. Existing grants and refreshes never gain it; Separately registered and explicitly consented tokens:write creates an ordinary model key by POST, without derived-key revocation guarantees. Existing grants and refreshes cannot upgrade."
       },
       "ClientEventsBearer": {
         "type": "http",
