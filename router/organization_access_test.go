@@ -3480,6 +3480,29 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 				system_setting.ServerAddress = issuer
 				common.OptionMapRWMutex.Unlock()
 			})
+			t.Run("registration_connection_refused", func(t *testing.T) {
+				// Prove the same selected registration and topology work immediately
+				// before closing only this fixture's listener, not a real issuer.
+				request(true, 1)
+				address := admin.Listener.Addr().String()
+				admin.Close()
+				conn, err := net.DialTimeout("tcp", address, time.Second)
+				if conn != nil {
+					_ = conn.Close()
+				}
+				require.Error(t, err)
+				var dialError *net.OpError
+				require.ErrorAs(t, err, &dialError)
+				assert.Equal(t, "dial", dialError.Op)
+				var connectError *os.SyscallError
+				require.ErrorAs(t, err, &connectError)
+				assert.Equal(t, "connect", connectError.Syscall)
+				require.Equal(t, "connection refused", connectError.Err.Error())
+				// No registration handler can run. The public HTTP route must
+				// discard the preceding positive result and preserve no-SQL/privacy.
+				request(false, 0)
+				fmt.Println("SITE_DESCRIPTION_CONNECTION_REFUSED=CONNECT_REFUSED/HTTP200/OAUTH_FALSE/FEATURE_FALSE/NO_SQL")
+			})
 			fmt.Println("SITE_DESCRIPTION_OAUTH_CONTROLS=missing-selector,nonallowed,valid,missing-write,missing-offline,wrong-callback,callback-variant,wrong-client,confidential,type,deleted,restore,topology,resource-identity,cancel,lock-order,no-sql,no-secret,concurrent-topology")
 		}
 		fmt.Println("SITE_DESCRIPTION_ID=" + model.SiteInstanceID())
