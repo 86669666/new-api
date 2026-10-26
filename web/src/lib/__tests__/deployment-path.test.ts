@@ -34,7 +34,10 @@ import {
   normalizeBasePath,
 } from '../deployment-path'
 
-vi.mock('@/lib/api', () => ({ api: {}, getFreshAuthHeaders: async () => ({}) }))
+vi.mock('@/lib/api', async () => {
+  const { default: axios } = await import('axios')
+  return { api: axios.create(), getFreshAuthHeaders: async () => ({}) }
+})
 
 afterEach(() => {
   vi.unstubAllEnvs()
@@ -96,6 +99,48 @@ describe('fixed deployment paths', () => {
     }
   )
 })
+
+test.each(['/', '/gateway'])(
+  'requests canonical admin logs and user logs under %s with filters intact',
+  async (basepath) => {
+    vi.stubEnv('VITE_REACT_APP_BASE_PATH', basepath)
+    const { api } = await import('@/lib/api')
+    const { getAllLogs, getUserLogs } = await import('@/features/usage-logs/api')
+    const previousBaseURL = api.defaults.baseURL
+    const previousAdapter = api.defaults.adapter
+    const urls: string[] = []
+    api.defaults.baseURL = getAppBasePath()
+    api.defaults.adapter = async (config) => {
+      urls.push(api.getUri(config))
+      return {
+        data: { success: true, data: { items: [], total: 0 } },
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config,
+      }
+    }
+    try {
+      const params = { p: 2, page_size: 10, model_name: 'model/a b' }
+      await getAllLogs(params)
+      await getUserLogs(params)
+      const prefix = basepath === '/' ? '' : basepath
+      expect(urls).toHaveLength(2)
+      for (const [index, route] of ['/api/log/', '/api/log/self'].entries()) {
+        const url = new URL(urls[index], 'https://console.example')
+        expect(url.pathname).toBe(`${prefix}${route}`)
+        expect(Object.fromEntries(url.searchParams)).toEqual({
+          p: '2',
+          page_size: '10',
+          model_name: 'model/a b',
+        })
+      }
+    } finally {
+      api.defaults.baseURL = previousBaseURL
+      api.defaults.adapter = previousAdapter
+    }
+  }
+)
 
 test('log export beneath /api requests /api/api before ingress stripping', async () => {
   vi.stubEnv('VITE_REACT_APP_BASE_PATH', '/api')
