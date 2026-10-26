@@ -277,13 +277,36 @@ def check_oauth_provider(api, source_root):
     assert schemas['OAuthProviderLoginDecision']['properties']['decision']['enum'] == ['continue', 'deny']
     consent = schemas['OAuthProviderConsentDecision']
     assert consent['properties']['decision']['enum'] == ['approve', 'deny']
+    consent_scopes = ['openid', 'profile', 'email', 'offline_access',
+                      'balance:read', 'usage:read', 'tokens:read', 'tokens:write']
     assert consent['properties']['selected_scopes'] == {
-        'type': 'array', 'maxItems': 6, 'uniqueItems': True,
-        'items': {'type': 'string', 'enum': ['openid', 'profile', 'email', 'offline_access', 'balance:read', 'usage:read']}}
+        'type': 'array', 'maxItems': len(consent_scopes), 'uniqueItems': True,
+        'items': {'type': 'string', 'enum': consent_scopes}}
     assert consent['oneOf'] == [
         {'properties': {'decision': {'enum': ['approve']},
-                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': ['openid', 'email', 'offline_access', 'balance:read', 'usage:read']}}}}},
+                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': [
+                            scope for scope in consent_scopes if scope != 'profile']}}}}},
         {'properties': {'decision': {'enum': ['deny']}, 'selected_scopes': {'maxItems': 0}}}]
+    # Requested/registered scope intersection and conditional openid requirements
+    # depend on the trusted runtime preview, not this standalone request schema.
+    decision_fixture = {'challenge': 'schema-only-challenge', 'preview_token': 'x' * 43}
+    for decision, selected in [
+            ('approve', ['profile']), ('approve', ['profile', 'tokens:read']),
+            ('approve', ['profile', 'tokens:write']), ('approve', consent_scopes),
+            ('deny', [])]:
+        validate_value(api, consent, dict(decision_fixture, decision=decision, selected_scopes=selected))
+    validator = OAS30Validator(consent, resolver=RefResolver.from_schema(api))
+    for decision, selected, keyword in [
+            ('approve', ['profile', 'unknown:scope'], 'enum'),
+            ('approve', ['profile', 'tokens:write', 'tokens:write'], 'uniqueItems'),
+            ('approve', consent_scopes + ['profile'], 'maxItems'),
+            ('approve', [], 'oneOf'),
+            ('approve', ['tokens:read'], 'oneOf'),
+            ('approve', ['tokens:write'], 'oneOf'),
+            ('approve', [scope for scope in consent_scopes if scope != 'profile'], 'oneOf'),
+            ('deny', ['profile'], 'oneOf'), ('deny', ['tokens:write'], 'oneOf')]:
+        errors = list(validator.iter_errors(dict(decision_fixture, decision=decision, selected_scopes=selected)))
+        assert any(error.validator == keyword for error in errors), (decision, selected, keyword)
     assert schemas['OAuthProviderError']['properties'] == {'error': {'type': 'string', 'enum': [
         'invalid_request', 'invalid_token', 'access_denied', 'invalid_grant', 'temporarily_unavailable']}}
     routes = (source_root / 'router/oauth_provider_router.go').read_text()
