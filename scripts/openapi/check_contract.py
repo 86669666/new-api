@@ -1531,9 +1531,13 @@ def check_site_description(api):
               'token_creation_endpoint': 'api/v1/oauth/tokens'}
     for field, route in oauth_routes.items():
         assert props[field] == {'type': 'string', 'pattern': r'^https://[^/?#@\s\\]+/' + route.replace('.', r'\.') + r'$(?![\s\S])'}
-    scopes = ['openid', 'profile', 'offline_access', 'tokens:write']
-    assert props['scopes'] == {'type': 'array', 'minItems': 4, 'maxItems': 4, 'uniqueItems': True,
-                               'items': {'type': 'string', 'enum': scopes}, 'enum': [scopes]}
+    core_scopes = ['openid', 'profile', 'offline_access', 'tokens:write']
+    scopes = ['openid', 'profile', 'email', 'offline_access',
+              'balance:read', 'usage:read', 'tokens:read', 'tokens:write']
+    assert props['scopes'] == {'type': 'array', 'minItems': 4, 'maxItems': 8, 'uniqueItems': True,
+                               'items': {'type': 'string', 'enum': scopes},
+                               'allOf': [{'not': {'items': {'enum': [scope for scope in scopes if scope != core]}}}
+                                         for core in core_scopes]}
     assert props['token_creation_method'] == {'type': 'string', 'enum': ['POST']}
     for control in ['OAUTH_PROVIDER_DESKTOP_CLIENT_ID', 'boxnai://oauth/callback', 'GitHub/OIDC', 'no positive cache', 'not activation']:
         assert control in desktop['description']
@@ -1542,16 +1546,27 @@ def check_site_description(api):
                 'scopes': scopes, 'token_creation_method': 'POST'}
     validate_value(api, desktop, {'enabled': False})
     validate_value(api, desktop, positive)
+    # Every optional subset is compatible with the four readiness prerequisites.
+    optional_scopes = [scope for scope in scopes if scope not in core_scopes]
+    for mask in range(1 << len(optional_scopes)):
+        registered = core_scopes + [scope for i, scope in enumerate(optional_scopes) if mask & (1 << i)]
+        validate_value(api, desktop, {**positive, 'scopes': [scope for scope in scopes if scope in registered]})
     negatives = [{**positive, 'enabled': False}, {'enabled': True},
                  {**positive, 'desktop_client_id': ''}, {**positive, 'admin_endpoint': 'https://private.invalid/'},
                  {**positive, 'scopes': ['openid', 'profile', 'offline_access', 'tokens:read']},
                  {**positive, 'token_creation_method': 'GET'},
                  {**positive, 'token_creation_endpoint': 'https://issuer.example/admin/clients'},
                  {**positive, 'issuer': 'http://issuer.example/'}]
+    negatives += [{**positive, 'scopes': [scope for scope in scopes if scope != core]}
+                  for core in core_scopes]
+    negatives += [{**positive, 'scopes': value} for value in [
+        core_scopes + ['unsupported'], core_scopes + ['profile'], scopes + ['profile'],
+        [], 'openid profile offline_access tokens:write', None]]
     validator = OAS30Validator(desktop, resolver=RefResolver.from_schema(api))
     assert all(list(validator.iter_errors(value)) for value in negatives)
     return {'anonymous': True, 'additive_fields': list(fields), 'links': routes,
-            'desktop_qualification': True, 'negative_fixtures': len(negatives), 'live_http': False}
+            'desktop_qualification': True, 'registered_scope_subsets': 16,
+            'negative_fixtures': len(negatives), 'live_http': False}
 
 
 def main():

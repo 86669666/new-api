@@ -138,11 +138,17 @@ func CurrentOAuthDesktopStatus(ctx context.Context) OAuthDesktopStatus {
 	if err != nil || !slices.Contains(client.Redirects, "boxnai://oauth/callback") {
 		return OAuthDesktopStatus{}
 	}
-	scopes := []string{"openid", "profile", "offline_access", "tokens:write"}
+	requiredScopes := []string{"openid", "profile", "offline_access", "tokens:write"}
 	registered := strings.Fields(*client.Scope)
-	for _, scope := range scopes {
+	for _, scope := range requiredScopes {
 		if !slices.Contains(registered, scope) {
 			return OAuthDesktopStatus{}
+		}
+	}
+	scopes := make([]string, 0, len(registered))
+	for _, scope := range oauthPublicScopes {
+		if slices.Contains(registered, scope) {
+			scopes = append(scopes, scope)
 		}
 	}
 	// ServerAddress is updated under OptionMapRWMutex. Snapshot topology only

@@ -32807,7 +32807,7 @@
         "description": "Operator-configured navigation discovery, not current-user permission or payment availability. Invalid effective frontend URL or an explicitly disabled page yields null. FRONTEND_BASE_URL is effective only on non-master nodes; otherwise ServerAddress is used. No Host/Forwarded fallback. Configured path prefixes are preserved. Sidebar section.enabled plus strict item===true governs wallet/usage logs/keys; pricing uses HeaderNavModules.pricing independently of requireAuth or the console top-nav toggle."
       },
       "DesktopOAuthDiscovery": {
-        "description": "Public desktop protocol capability, not activation/effective or a complete remote-health guarantee. Missing/invalid OAUTH_PROVIDER_DESKTOP_CLIENT_ID returns only enabled:false and leaves generic OAuth unchanged. A true projection requires the exact allowed public client, openid profile offline_access tokens:write, registered boxnai://oauth/callback, initialized current bridge/resource and public topology. Each status request makes at most one context/HTTP-timeout-bounded registration GET with no positive cache or background polling. Only public issuer-derived endpoints are returned; no Hydra admin address or credentials. GitHub/OIDC login-provider flags are independent. Issuance still needs explicit consent; tokens:read is not implied.",
+        "description": "Public desktop protocol capability, not activation/effective or a complete remote-health guarantee. Missing/invalid OAUTH_PROVIDER_DESKTOP_CLIENT_ID returns only enabled:false and leaves generic OAuth unchanged. A true projection requires the exact allowed public client, openid profile offline_access tokens:write, registered boxnai://oauth/callback, initialized current bridge/resource and public topology. Each status request makes at most one context/HTTP-timeout-bounded registration GET with no positive cache or background polling. Only public issuer-derived endpoints are returned; no Hydra admin address or credentials. GitHub/OIDC login-provider flags are independent. Issuance still needs explicit consent; tokens:read is not implied. Advertised scopes are the selected validated client registration intersected with supported public scopes in canonical discovery order. email, balance:read, usage:read and tokens:read are optional and appear only while registered; narrowing optional scopes does not disable a core-qualified client.",
         "oneOf": [
           {
             "type": "object",
@@ -32873,24 +32873,82 @@
               "scopes": {
                 "type": "array",
                 "minItems": 4,
-                "maxItems": 4,
+                "maxItems": 8,
                 "uniqueItems": true,
                 "items": {
                   "type": "string",
                   "enum": [
                     "openid",
                     "profile",
+                    "email",
                     "offline_access",
+                    "balance:read",
+                    "usage:read",
+                    "tokens:read",
                     "tokens:write"
                   ]
                 },
-                "enum": [
-                  [
-                    "openid",
-                    "profile",
-                    "offline_access",
-                    "tokens:write"
-                  ]
+                "allOf": [
+                  {
+                    "not": {
+                      "items": {
+                        "enum": [
+                          "profile",
+                          "email",
+                          "offline_access",
+                          "balance:read",
+                          "usage:read",
+                          "tokens:read",
+                          "tokens:write"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "not": {
+                      "items": {
+                        "enum": [
+                          "openid",
+                          "email",
+                          "offline_access",
+                          "balance:read",
+                          "usage:read",
+                          "tokens:read",
+                          "tokens:write"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "not": {
+                      "items": {
+                        "enum": [
+                          "openid",
+                          "profile",
+                          "email",
+                          "balance:read",
+                          "usage:read",
+                          "tokens:read",
+                          "tokens:write"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "not": {
+                      "items": {
+                        "enum": [
+                          "openid",
+                          "profile",
+                          "email",
+                          "offline_access",
+                          "balance:read",
+                          "usage:read",
+                          "tokens:read"
+                        ]
+                      }
+                    }
+                  }
                 ]
               },
               "token_creation_method": {

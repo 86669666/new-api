@@ -3312,7 +3312,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			require.NoError(t, db.Callback().Update().Before("gorm:update").Register("status_no_sql", func(*gorm.DB) { sqlCalls.Add(1) }))
 			require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("status_no_sql", func(*gorm.DB) { sqlCalls.Add(1) }))
 			require.NoError(t, db.Callback().Raw().Before("gorm:raw").Register("status_no_sql", func(*gorm.DB) { sqlCalls.Add(1) }))
-			request := func(enabled bool, expectedCalls int64) {
+			request := func(enabled bool, expectedCalls int64, expectedScopes ...string) {
 				before := calls.Load()
 				req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, statusServer.URL+"/api/status", nil)
 				require.NoError(t, err)
@@ -3331,7 +3331,14 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 				require.NoError(t, common.Unmarshal(data, &body))
 				want := map[string]any{"enabled": false}
 				if enabled {
-					want = map[string]any{"enabled": true, "desktop_client_id": selected, "issuer": issuer, "discovery_endpoint": issuer + ".well-known/oauth-authorization-server", "authorization_endpoint": issuer + "oauth2/auth", "token_endpoint": issuer + "oauth2/token", "scopes": []any{"openid", "profile", "offline_access", "tokens:write"}, "token_creation_endpoint": issuer + "api/v1/oauth/tokens", "token_creation_method": "POST"}
+					if expectedScopes == nil {
+						expectedScopes = []string{"openid", "profile", "offline_access", "tokens:write"}
+					}
+					scopes := make([]any, len(expectedScopes))
+					for i, scope := range expectedScopes {
+						scopes[i] = scope
+					}
+					want = map[string]any{"enabled": true, "desktop_client_id": selected, "issuer": issuer, "discovery_endpoint": issuer + ".well-known/oauth-authorization-server", "authorization_endpoint": issuer + "oauth2/auth", "token_endpoint": issuer + "oauth2/token", "scopes": scopes, "token_creation_endpoint": issuer + "api/v1/oauth/tokens", "token_creation_method": "POST"}
 				}
 				assert.Equal(t, want, body.Data["oauth"])
 				assert.Equal(t, map[string]any{"token_usage_logs": common.LogConsumeEnabled, "model_metadata": false, "oauth": enabled}, body.Data["client_features"])
@@ -3349,6 +3356,25 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			request(false, 0)
 			initialize(selected)
 			request(true, 1)
+			// Registration order is not advertisement order; optional narrowing is
+			// observed on the very next GET without changing core-only readiness.
+			for _, tc := range []struct {
+				name, registered string
+				want             []string
+			}{
+				{"all_supported", "tokens:write tokens:read usage:read balance:read offline_access email profile openid", []string{"openid", "profile", "email", "offline_access", "balance:read", "usage:read", "tokens:read", "tokens:write"}},
+				{"without_email", "openid profile offline_access balance:read usage:read tokens:read tokens:write", []string{"openid", "profile", "offline_access", "balance:read", "usage:read", "tokens:read", "tokens:write"}},
+				{"without_balance", "openid profile offline_access usage:read tokens:read tokens:write", []string{"openid", "profile", "offline_access", "usage:read", "tokens:read", "tokens:write"}},
+				{"without_usage", "openid profile offline_access tokens:read tokens:write", []string{"openid", "profile", "offline_access", "tokens:read", "tokens:write"}},
+				{"core_only", "openid profile offline_access tokens:write", []string{"openid", "profile", "offline_access", "tokens:write"}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					mu.Lock()
+					registration["scope"] = tc.registered
+					mu.Unlock()
+					request(true, 1, tc.want...)
+				})
+			}
 			common.LogConsumeEnabled = true
 			request(true, 1)
 			initialize("")
@@ -3360,6 +3386,9 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 				value       any
 				code        int
 			}{
+				{"missing_openid", "scope", "profile email offline_access balance:read usage:read tokens:read tokens:write", 200},
+				{"missing_profile", "scope", "openid email offline_access balance:read usage:read tokens:read tokens:write", 200},
+				{"unsupported_scope", "scope", "openid profile offline_access tokens:write admin", 200},
 				{"missing_write", "scope", "openid profile offline_access", 200},
 				{"missing_offline", "scope", "openid profile tokens:write", 200},
 				{"wrong_callback", "redirect_uris", []string{"http://127.0.0.1:29873/oauth/callback"}, 200},
