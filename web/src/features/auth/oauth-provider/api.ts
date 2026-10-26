@@ -63,6 +63,7 @@ export async function requestAuthorization(
     balance: boolean
     usage: boolean
     tokens: boolean
+    tokensWrite: boolean
   }
 ): Promise<AuthorizationPreview | string> {
   try {
@@ -94,6 +95,11 @@ export async function requestAuthorization(
               decision.preview.requested_scopes.includes('tokens:read') &&
               decision.preview.allowed_scopes.includes('tokens:read')
                 ? ['tokens:read']
+                : []),
+              ...(decision.tokensWrite &&
+              decision.preview.requested_scopes.includes('tokens:write') &&
+              decision.preview.allowed_scopes.includes('tokens:write')
+                ? ['tokens:write']
                 : []),
               ...(decision.usage &&
               decision.preview.requested_scopes.includes('usage:read') &&
@@ -163,6 +169,7 @@ export async function requestAuthorization(
             'balance:read',
             'usage:read',
             'tokens:read',
+            'tokens:write',
           ].includes(scope) &&
           (record.requested_scopes as string[]).includes(scope)
       ) ||
