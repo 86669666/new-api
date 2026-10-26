@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -541,6 +542,104 @@ func TestTokenUsageReadOnlyHTTP(t *testing.T) {
 				assert.Equal(t, http.StatusUnauthorized, recorder.Code, "mismatched %s cannot replace trusted identity", field)
 			}
 		}
+	})
+	t.Run("critical_rate_isolation", func(t *testing.T) {
+		// Reuse the formal runner's private Redis; never reset shared limiter state.
+		organizationTrustedRedis(t)
+		client := redis.NewClient(&redis.Options{Addr: os.Getenv("NEWAPI_TOKEN_STATE_REDIS_ADDR"), MaxRetries: -1})
+		require.NoError(t, client.Ping(t.Context()).Err())
+		oldRedis, oldRDB := common.RedisEnabled, common.RDB
+		oldGlobal, oldGlobalNum, oldGlobalDuration := common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration
+		oldCritical, oldCriticalNum, oldCriticalDuration := common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration
+		t.Cleanup(func() {
+			common.RedisEnabled, common.RDB = oldRedis, oldRDB
+			common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = oldGlobal, oldGlobalNum, oldGlobalDuration
+			common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration = oldCritical, oldCriticalNum, oldCriticalDuration
+			require.NoError(t, client.Close())
+		})
+		common.RedisEnabled, common.RDB = true, client
+		common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = true, 32, 60
+		common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration = true, 2, 60
+		ips := []string{"192.0.2.122", "192.0.2.123"}
+		var limiterKeys []string
+		for _, ip := range ips {
+			for _, bucket := range []string{"GA", "CT"} {
+				limiterKeys = append(limiterKeys, "rateLimit:v2:ip:"+bucket+":"+ip)
+			}
+		}
+		count, err := client.Exists(t.Context(), limiterKeys...).Result()
+		require.NoError(t, err)
+		require.Zero(t, count, "dedicated fixture addresses must start with untouched buckets")
+		t.Cleanup(func() {
+			require.NoError(t, client.Del(context.Background(), limiterKeys...).Err())
+			count, err := client.Exists(context.Background(), limiterKeys...).Result()
+			require.NoError(t, err)
+			assert.Zero(t, count)
+		})
+		engine := gin.New()
+		require.NoError(t, engine.SetTrustedProxies(nil))
+		SetApiRouter(engine)
+		request := func(method, path, credential, ip string) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(method, path, strings.NewReader("{}"))
+			req.RemoteAddr = ip + ":12345"
+			req.Header.Set("Content-Type", "application/json")
+			if credential != "" {
+				req.Header.Set("Authorization", "Bearer "+credential)
+			}
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, req)
+			return recorder
+		}
+		paths := []string{"/api/usage/token/", "/api/usage/token/logs?" + window, "/api/usage/token/stat?" + window}
+		for _, path := range paths {
+			response := request(http.MethodGet, path, f.bearer["A"], ips[0])
+			require.Equal(t, http.StatusOK, response.Code, path)
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+			if path == "/api/usage/token/" {
+				assert.Equal(t, true, body["code"], path) // Legacy summary response contract.
+			} else {
+				assert.Equal(t, true, body["success"], path)
+			}
+		}
+		// Three usage reads exceed the critical limit of two, yet both sensitive
+		// endpoints still reach their real invalid-input rejection handlers.
+		for _, path := range []string{"/api/user/login", "/api/oauth/state"} {
+			response := request(http.MethodPost, path, "", ips[0])
+			require.Equal(t, http.StatusOK, response.Code, path)
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+			assert.Equal(t, false, body["success"], "invalid input must not create a session or OAuth flow")
+		}
+		for _, path := range []string{"/api/user/login", "/api/oauth/state"} {
+			response := request(http.MethodPost, path, "", ips[0])
+			assert.Equal(t, http.StatusTooManyRequests, response.Code, path)
+			assert.NotEmpty(t, response.Header().Get("Retry-After"))
+		}
+		for _, path := range paths {
+			response := request(http.MethodGet, path, f.bearer["A"], ips[0])
+			assert.Equal(t, http.StatusOK, response.Code, "critical exhaustion must not block usage: %s", path)
+			for _, credential := range []string{"", "sk-invalid-isolated-usage"} {
+				response := request(http.MethodGet, path, credential, ips[0])
+				assert.Equal(t, http.StatusUnauthorized, response.Code, path)
+			}
+		}
+		for _, path := range paths[1:] {
+			response := request(http.MethodGet, path, f.bearer["owner"], ips[0])
+			assert.Equal(t, http.StatusUnauthorized, response.Code, "management session cannot replace an ordinary key")
+		}
+		// Re-register the official routes so the global middleware captures two;
+		// a fresh fixture address separates this control from the critical case.
+		common.GlobalApiRateLimitNum = 2
+		engine = gin.New()
+		require.NoError(t, engine.SetTrustedProxies(nil))
+		SetApiRouter(engine)
+		for _, path := range paths[:2] {
+			assert.Equal(t, http.StatusOK, request(http.MethodGet, path, f.bearer["A"], ips[1]).Code)
+		}
+		response := request(http.MethodGet, paths[2], f.bearer["A"], ips[1])
+		assert.Equal(t, http.StatusTooManyRequests, response.Code)
+		assert.NotEmpty(t, response.Header().Get("Retry-After"))
 	})
 	// Query parse failures and the public projection must never disclose seeded
 	// metadata; raw credentials are also absent from server logs.
