@@ -3244,7 +3244,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			var calls atomic.Int64
 			var registration map[string]any
 			statusCode := http.StatusOK
-			var entered, release chan struct{}
+			var entered, release, handlerDone chan struct{}
 			admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				assert.Equal(t, http.MethodGet, r.Method)
@@ -3252,8 +3252,11 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 				assert.Empty(t, r.Header.Get("Authorization"))
 				mu.Lock()
 				doc := maps.Clone(registration)
-				code, barrier, resume := statusCode, entered, release
+				code, barrier, resume, finished := statusCode, entered, release, handlerDone
 				mu.Unlock()
+				if finished != nil {
+					defer close(finished)
+				}
 				if barrier != nil {
 					close(barrier)
 					select {
@@ -3508,6 +3511,45 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 				common.OptionMapRWMutex.Lock()
 				system_setting.ServerAddress = issuer
 				common.OptionMapRWMutex.Unlock()
+			})
+			t.Run("registration_response_timeout", func(t *testing.T) {
+				request(true, 1)
+				barrier, resume, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				mu.Lock()
+				entered, release, handlerDone = barrier, resume, finished
+				mu.Unlock()
+				defer func() {
+					close(resume)
+					mu.Lock()
+					entered, release, handlerDone = nil, nil, nil
+					mu.Unlock()
+					select {
+					case <-barrier:
+						select {
+						case <-finished:
+						case <-time.After(10 * time.Second):
+							t.Error("registration handler did not finish")
+						}
+					default:
+					}
+				}()
+				// No response or manual cancellation: the production transport's
+				// 3s response-header timeout precedes its 5s overall client timeout.
+				request(false, 1)
+				select {
+				case <-barrier:
+				default:
+					t.Fatal("registration handler was not entered")
+				}
+				select {
+				case <-finished:
+				case <-time.After(10 * time.Second):
+					t.Fatal("timed-out registration handler did not finish")
+				}
+				mu.Lock()
+				entered, release, handlerDone = nil, nil, nil
+				mu.Unlock()
+				request(true, 1) // Withheld-response failure must not remain sticky.
 			})
 			t.Run("registration_connection_refused", func(t *testing.T) {
 				// Prove the same selected registration and topology work immediately
