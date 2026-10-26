@@ -5425,6 +5425,9 @@ func oauthOrdinaryAuditProvision(t *testing.T) {
 			require.NoError(t, model.InitOAuthCleanupStore(true))
 			require.NoError(t, model.InitOAuthGrantStore(true))
 			common.IsMasterNode = false
+			if store.kind == "postgres" {
+				oauthCleanupMetadataControls(t, db)
+			}
 		} else {
 			require.NoError(t, model.MigrateAuditLogs())
 		}
@@ -5474,6 +5477,118 @@ func oauthOrdinaryAuditProvision(t *testing.T) {
 	t.Log("ordinary audit owned fixture " + mode + " complete; no shared grants changed")
 }
 
+// Installer-only faults in an owned database, rolled back before the ordinary
+// non-owner runtime starts. These are metadata tests, never owner HTTP business.
+func oauthCleanupMetadataControls(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.Zero(t, os.Getuid())
+	oldDB, oldMaster := model.DB, common.IsMasterNode
+	model.DB = db
+	common.IsMasterNode = false
+	defer func() { model.DB = oldDB; common.IsMasterNode = oldMaster }()
+	require.NoError(t, model.InitOAuthCleanupStore(true))
+	for _, tc := range []struct{ name, key, mutation string }{
+		{"missing", "", ""},
+		{"wrong", "PRIMARY KEY(user_id)", ""},
+		{"composite", "PRIMARY KEY(operation_ref,user_id)", ""},
+		{"reversed_composite", "PRIMARY KEY(user_id,operation_ref)", ""},
+		{"composite_hidden_nullable", "PRIMARY KEY(operation_ref,user_id)", "UPDATE pg_catalog.pg_attribute SET attnotnull=false WHERE attrelid='cleanup_probe.o_auth_operations'::regclass AND attname='user_id'"},
+		{"deferred", "PRIMARY KEY(operation_ref) DEFERRABLE INITIALLY DEFERRED", ""},
+		{"invalid", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indisvalid=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"not_ready", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indisready=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"not_live", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indislive=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"not_unique", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indisunique=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"not_primary", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indisprimary=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"nullable", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_attribute SET attnotnull=false WHERE attrelid='cleanup_probe.o_auth_operations'::regclass AND attname='operation_ref'"},
+		{"unvalidated", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_constraint SET convalidated=false WHERE conrelid='cleanup_probe.o_auth_operations'::regclass AND contype='p'"},
+		{"partial", "", "CREATE UNIQUE INDEX probe_key ON cleanup_probe.o_auth_operations(operation_ref) WHERE user_id>0"},
+		{"expression", "", "CREATE UNIQUE INDEX probe_key ON cleanup_probe.o_auth_operations(lower(operation_ref))"},
+	} {
+		t.Run("cleanup_metadata/"+tc.name, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer func() {
+				model.DB = db
+				require.NoError(t, tx.Rollback().Error)
+				require.NoError(t, model.InitOAuthCleanupStore(true))
+			}()
+			require.NoError(t, tx.Exec("CREATE SCHEMA cleanup_probe").Error)
+			require.NoError(t, tx.Exec("CREATE TABLE cleanup_probe.o_auth_operations (LIKE public.o_auth_operations INCLUDING DEFAULTS INCLUDING CONSTRAINTS)").Error)
+			if tc.key != "" {
+				require.NoError(t, tx.Exec("ALTER TABLE cleanup_probe.o_auth_operations ADD "+tc.key).Error)
+			}
+			if tc.mutation != "" {
+				require.NoError(t, tx.Exec(tc.mutation).Error)
+			}
+			model.DB = tx.Table("cleanup_probe.o_auth_operations")
+			require.ErrorContains(t, model.InitOAuthCleanupStore(true), "OAuth cleanup primary key unavailable")
+			assert.False(t, model.OAuthCleanupReady())
+		})
+	}
+	t.Run("cleanup_metadata/query_failure", func(t *testing.T) {
+		const name = "cleanup-metadata:catalog-unavailable"
+		require.NoError(t, db.Callback().Row().Before("gorm:row").Register(name, func(tx *gorm.DB) {
+			if strings.Contains(tx.Statement.SQL.String(), "pg_catalog.pg_index") {
+				tx.AddError(errors.New("controlled cleanup catalog unavailable"))
+			}
+		}))
+		defer func() {
+			require.NoError(t, db.Callback().Row().Remove(name))
+			require.NoError(t, model.InitOAuthCleanupStore(true))
+		}()
+		model.DB = db
+		require.ErrorContains(t, model.InitOAuthCleanupStore(true), "controlled cleanup catalog unavailable")
+		assert.False(t, model.OAuthCleanupReady())
+	})
+	require.NoError(t, model.InitOAuthCleanupStore(true))
+	var remains int64
+	require.NoError(t, db.Raw("SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname='cleanup_probe'").Scan(&remains).Error)
+	require.Zero(t, remains, "every fixture schema/catalog mutation was rolled back")
+}
+
+// Metadata only: no credentials, data rows, DSNs or raw driver errors.
+func oauthCleanupMetadataObservation(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, value := range []any{&model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}} {
+		statement := &gorm.Statement{DB: db}
+		require.NoError(t, statement.Parse(value))
+		var row struct {
+			RelationOID                                          int64 `gorm:"column:relation_oid"`
+			SchemaName, TableName, CurrentSchema, PrimaryColumns string
+			Owned, Valid, Ready, Live, Unique, Immediate         bool
+			ConstraintUsage, TableConstraints                    int64
+		}
+		require.NoError(t, db.Raw(`SELECT r.oid::bigint AS relation_oid,n.nspname AS schema_name,r.relname AS table_name,
+   current_schema() AS current_schema,pg_get_userbyid(r.relowner)=current_user AS owned,
+   i.indisvalid AS valid,i.indisready AS ready,i.indislive AS live,i.indisunique AS unique,i.indimmediate AS immediate,
+   COALESCE((SELECT string_agg(a.attname,',' ORDER BY k.position)
+    FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,position)
+    JOIN pg_attribute a ON a.attrelid=r.oid AND a.attnum=k.attnum),'') AS primary_columns,
+   (SELECT count(*) FROM information_schema.constraint_column_usage c WHERE c.table_schema=n.nspname AND c.table_name=r.relname) AS constraint_usage,
+   (SELECT count(*) FROM information_schema.table_constraints c WHERE c.table_schema=n.nspname AND c.table_name=r.relname AND c.constraint_type='PRIMARY KEY') AS table_constraints
+   FROM pg_class r JOIN pg_namespace n ON n.oid=r.relnamespace
+   LEFT JOIN pg_index i ON i.indrelid=r.oid AND i.indisprimary
+   WHERE r.oid=to_regclass(?)`, statement.Quote(statement.Table)).Scan(&row).Error)
+		require.Positive(t, row.RelationOID)
+		columns, err := db.Migrator().ColumnTypes(value)
+		require.NoError(t, err)
+		var reported []string
+		var expectedMetadata []map[string]any
+		for _, column := range columns {
+			yes, known := column.PrimaryKey()
+			if column.Name() == statement.Schema.PrioritizedPrimaryField.DBName {
+				expectedMetadata = append(expectedMetadata, map[string]any{"name": column.Name(), "primary": yes, "known": known})
+			}
+			if yes && known {
+				reported = append(reported, column.Name())
+			}
+		}
+		data, err := common.Marshal(map[string]any{"relation": row, "ColumnTypesPrimary": reported, "expected_key_metadata": expectedMetadata})
+		require.NoError(t, err)
+		t.Log("CLEANUP_PK_OBSERVATION " + string(data))
+	}
+}
+
 func oauthOrdinaryAuditFixture(t *testing.T) *organizationHTTPFixture {
 	t.Helper()
 	cfg := oauthOrdinaryAuditConfigRead(t)
@@ -5508,7 +5623,11 @@ func oauthOrdinaryAuditFixture(t *testing.T) *organizationHTTPFixture {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, logConnection.Close()) })
 	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
-	require.NoError(t, model.InitOAuthCleanupStore(true))
+	cleanupErr := model.InitOAuthCleanupStore(true)
+	if cfg.MainKind == "postgres" {
+		oauthCleanupMetadataObservation(t, db)
+	}
+	require.NoError(t, cleanupErr)
 	for _, store := range []struct {
 		db               *gorm.DB
 		kind, name, role string
