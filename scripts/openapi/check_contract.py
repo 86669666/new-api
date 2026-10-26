@@ -136,7 +136,7 @@ def check_oauth_userinfo(api, source_root):
     for status in ('200', '401', '403', '429', '503'):
         assert 'private, no-store' in operation['responses'][status]['headers']['Cache-Control']['description']
     assert 'Hydra does not generate this local binding' in operation['description']
-    assert 'status oauth.enabled and client_features.oauth remain false' in operation['description']
+    assert 'desktop OAuth advertisement requires the explicit selected client and current public topology' in operation['description']
     startup = go_function((source_root / 'main.go').read_text(), 'InitResources')
     assert startup.index('service.InitOAuthUserInfoResource()') < startup.index('model.InitDB()')
     routes = (source_root / 'router/oauth_resource_router.go').read_text()
@@ -262,7 +262,7 @@ def check_oauth_provider(api, source_root):
         for item in operation['responses'].values():
             assert 'private, no-store' in item['headers']['Cache-Control']['description']
         for phrase in ('both current versions', 'at least 24 hours', 'TTL <=30 minutes',
-                       'commit before one Admin PUT', 'status oauth.enabled and client_features.oauth remain false'):
+                       'commit before one Admin PUT', 'desktop OAuth advertisement requires the explicit selected client and current public topology'):
             assert phrase in operation['description']
     for name, fields in {
         'OAuthProviderPreviewInput': ['challenge'],
@@ -326,7 +326,7 @@ def check_oauth_revocation(api, source_root):
             'type': 'object', 'additionalProperties': False, 'required': ['error'],
             'properties': {'error': {'type': 'string', 'enum': [code]}}}
     for phrase in ('does not prove actual invalidation', 'mask wrong-client and internal storage failures',
-                   'status oauth.enabled and client_features.oauth remain false', 'GetBody=nil'):
+                   'desktop OAuth advertisement requires the explicit selected client and current public topology', 'GetBody=nil'):
         assert phrase in operation['description']
     return {'route': '/oauth2/revoke', 'default_off': True, 'database_changes': False,
             'fixed_issuer_ingress': True, 'actual_issuer_invalidation_proved': False}
@@ -1465,17 +1465,53 @@ def check_site_description(api):
         assert {k: v for k, v in link.items() if k != 'description'} == {
             'type': 'string', 'nullable': True, 'pattern': r'^https?://[^/?#@\s\\]+(?:/[^?#\s\\]*)?$(?![\s\S])'}
         assert route in link['description']
-    for name, flags in [('DesktopOAuthDiscovery', ['enabled']), ('ClientFeatureFlags', ['token_usage_logs', 'oauth', 'model_metadata'])]:
-        schema = schemas[name]
-        assert {k: v for k, v in schema.items() if k != 'description'} == {
-            'type': 'object', 'additionalProperties': False, 'required': flags,
-            'properties': {key: {'type': 'boolean', 'enum': [False]} for key in flags}}
-        assert schema['description']
-    assert all(path in schemas['ClientFeatureFlags']['description'] for path in
+    features = schemas['ClientFeatureFlags']
+    assert {k: v for k, v in features.items() if k != 'description'} == {
+        'type': 'object', 'additionalProperties': False,
+        'required': ['token_usage_logs', 'oauth', 'model_metadata'],
+        'properties': {'token_usage_logs': {'type': 'boolean', 'enum': [False]},
+                       'oauth': {'type': 'boolean'}, 'model_metadata': {'type': 'boolean', 'enum': [False]}}}
+    assert all(path in features['description'] for path in
                ('/api/log/token', '/api/log/self', '/api/data/self', '/api/pricing'))
-    assert 'GitHub/OIDC' in schemas['DesktopOAuthDiscovery']['description']
+    desktop = schemas['DesktopOAuthDiscovery']
+    assert set(desktop) == {'description', 'oneOf'} and len(desktop['oneOf']) == 2
+    disabled, enabled = desktop['oneOf']
+    assert disabled == {'type': 'object', 'additionalProperties': False, 'required': ['enabled'],
+                        'properties': {'enabled': {'type': 'boolean', 'enum': [False]}}}
+    fields = {'enabled', 'desktop_client_id', 'issuer', 'discovery_endpoint', 'authorization_endpoint',
+              'token_endpoint', 'scopes', 'token_creation_endpoint', 'token_creation_method'}
+    assert enabled['type'] == 'object' and enabled['additionalProperties'] is False
+    assert set(enabled['required']) == set(enabled['properties']) == fields
+    props = enabled['properties']
+    assert props['enabled'] == {'type': 'boolean', 'enum': [True]}
+    assert props['desktop_client_id'] == {'type': 'string', 'minLength': 1, 'maxLength': 256}
+    assert props['issuer'] == {'type': 'string', 'pattern': r'^https://[^/?#@\s\\]+/$(?![\s\S])'}
+    oauth_routes = {'discovery_endpoint': '.well-known/oauth-authorization-server',
+              'authorization_endpoint': 'oauth2/auth', 'token_endpoint': 'oauth2/token',
+              'token_creation_endpoint': 'api/v1/oauth/tokens'}
+    for field, route in oauth_routes.items():
+        assert props[field] == {'type': 'string', 'pattern': r'^https://[^/?#@\s\\]+/' + route.replace('.', r'\.') + r'$(?![\s\S])'}
+    scopes = ['openid', 'profile', 'offline_access', 'tokens:write']
+    assert props['scopes'] == {'type': 'array', 'minItems': 4, 'maxItems': 4, 'uniqueItems': True,
+                               'items': {'type': 'string', 'enum': scopes}, 'enum': [scopes]}
+    assert props['token_creation_method'] == {'type': 'string', 'enum': ['POST']}
+    for control in ['OAUTH_PROVIDER_DESKTOP_CLIENT_ID', 'boxnai://oauth/callback', 'GitHub/OIDC', 'no positive cache', 'not activation']:
+        assert control in desktop['description']
+    positive = {'enabled': True, 'desktop_client_id': 'registered-desktop', 'issuer': 'https://issuer.example/',
+                **{field: 'https://issuer.example/' + route for field, route in oauth_routes.items()},
+                'scopes': scopes, 'token_creation_method': 'POST'}
+    validate_value(api, desktop, {'enabled': False})
+    validate_value(api, desktop, positive)
+    negatives = [{**positive, 'enabled': False}, {'enabled': True},
+                 {**positive, 'desktop_client_id': ''}, {**positive, 'admin_endpoint': 'https://private.invalid/'},
+                 {**positive, 'scopes': ['openid', 'profile', 'offline_access', 'tokens:read']},
+                 {**positive, 'token_creation_method': 'GET'},
+                 {**positive, 'token_creation_endpoint': 'https://issuer.example/admin/clients'},
+                 {**positive, 'issuer': 'http://issuer.example/'}]
+    validator = OAS30Validator(desktop, resolver=RefResolver.from_schema(api))
+    assert all(list(validator.iter_errors(value)) for value in negatives)
     return {'anonymous': True, 'additive_fields': list(fields), 'links': routes,
-            'future_contracts_enabled': False, 'live_http': False}
+            'desktop_qualification': True, 'negative_fixtures': len(negatives), 'live_http': False}
 
 
 def main():
