@@ -3241,7 +3241,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			var calls atomic.Int64
 			var registration map[string]any
 			statusCode := http.StatusOK
-			var entered chan struct{}
+			var entered, release chan struct{}
 			admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				assert.Equal(t, http.MethodGet, r.Method)
@@ -3249,12 +3249,15 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 				assert.Empty(t, r.Header.Get("Authorization"))
 				mu.Lock()
 				doc := maps.Clone(registration)
-				code, barrier := statusCode, entered
+				code, barrier, resume := statusCode, entered, release
 				mu.Unlock()
 				if barrier != nil {
 					close(barrier)
-					<-r.Context().Done()
-					return
+					select {
+					case <-r.Context().Done():
+						return
+					case <-resume:
+					}
 				}
 				if r.URL.Path != "/admin/clients/"+selected && r.URL.Path != "/admin/clients/other-client" {
 					w.WriteHeader(http.StatusNotFound)
@@ -3372,7 +3375,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			mu.Unlock()
 			request(true, 1) // The prior failures are not sticky; no cached positive survives a change.
 			system_setting.ServerAddress = "https://wrong.example/"
-			request(false, 0)
+			request(false, 1) // Mutable topology is read only after the registration GET.
 			system_setting.ServerAddress = issuer
 			require.NoError(t, service.InitOAuthUserInfoResource())
 			request(false, 0) // A bridge cannot advertise using a replaced resource identity.
@@ -3418,7 +3421,57 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 				mu.Unlock()
 				assert.Zero(t, sqlCalls.Load())
 			})
-			fmt.Println("SITE_DESCRIPTION_OAUTH_CONTROLS=missing-selector,nonallowed,valid,missing-write,missing-offline,wrong-callback,callback-variant,wrong-client,confidential,type,deleted,restore,topology,resource-identity,cancel,lock-order,no-sql,no-secret")
+			t.Run("topology_reload_while_registration_blocked", func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				mu.Lock()
+				entered, release = make(chan struct{}), make(chan struct{})
+				barrier, resume := entered, release
+				mu.Unlock()
+				before := calls.Load()
+				w := httptest.NewRecorder()
+				done := make(chan struct{})
+				common.OptionMapRWMutex.Lock()
+				unlocked := false
+				defer func() {
+					if !unlocked {
+						common.OptionMapRWMutex.Unlock()
+					}
+				}()
+				go func() {
+					defer close(done)
+					engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/status", nil).WithContext(ctx))
+				}()
+				select {
+				case <-barrier:
+				case <-t.Context().Done():
+					t.Fatal("registration was not read before option reload")
+				}
+				// The remote registration read is parked while the real owner lock
+				// protects the same field written by a normal option reload.
+				system_setting.ServerAddress = "https://reloaded.example/"
+				common.OptionMapRWMutex.Unlock()
+				unlocked = true
+				close(resume)
+				<-done
+				assert.Equal(t, http.StatusOK, w.Code)
+				var body struct {
+					Data map[string]any `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &body))
+				assert.Equal(t, map[string]any{"enabled": false}, body.Data["oauth"])
+				assert.Equal(t, false, body.Data["client_features"].(map[string]any)["oauth"])
+				assert.Equal(t, int64(1), calls.Load()-before)
+				assert.Zero(t, sqlCalls.Load())
+				fmt.Println("SITE_DESCRIPTION_TOPOLOGY_RELOAD=GET1/OAUTH_FALSE/FEATURE_FALSE")
+				mu.Lock()
+				entered, release = nil, nil
+				mu.Unlock()
+				common.OptionMapRWMutex.Lock()
+				system_setting.ServerAddress = issuer
+				common.OptionMapRWMutex.Unlock()
+			})
+			fmt.Println("SITE_DESCRIPTION_OAUTH_CONTROLS=missing-selector,nonallowed,valid,missing-write,missing-offline,wrong-callback,callback-variant,wrong-client,confidential,type,deleted,restore,topology,resource-identity,cancel,lock-order,no-sql,no-secret,concurrent-topology")
 		}
 		fmt.Println("SITE_DESCRIPTION_ID=" + model.SiteInstanceID())
 		return
@@ -3488,6 +3541,13 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 		require.NoError(t, err, "independent initializer failed: %s", organizationChildDiagnostic(n.output.String(), organizationBudgetProcessInput{DSN: f.mainDSN, SessionSecret: common.SessionSecret}))
 		if n.mode == "closed" {
 			return ""
+		}
+		if n.mode == "oauth-discovery" {
+			for line := range strings.SplitSeq(n.output.String(), "\n") {
+				if strings.HasPrefix(line, "SITE_DESCRIPTION_TOPOLOGY_RELOAD=") {
+					t.Log(line)
+				}
+			}
 		}
 		match := regexp.MustCompile(`(?m)^SITE_DESCRIPTION_ID=([0-9a-f-]{36})$`).FindStringSubmatch(n.output.String())
 		require.Len(t, match, 2)

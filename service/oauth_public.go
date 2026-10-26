@@ -131,7 +131,7 @@ func (p *OAuthPublic) Available() bool { return p != nil && p.ready.Load() && p.
 func CurrentOAuthDesktopStatus(ctx context.Context) OAuthDesktopStatus {
 	b := CurrentOAuthProviderBridge()
 	p := b.Public()
-	if !p.Available() || p.desktopClientID == "" || b.resource != CurrentOAuthUserInfoResource() || ctx.Err() != nil {
+	if p == nil || !p.ready.Load() || p.desktopClientID == "" || b.resource != CurrentOAuthUserInfoResource() || ctx.Err() != nil {
 		return OAuthDesktopStatus{}
 	}
 	client, err := p.client(ctx, p.desktopClientID)
@@ -145,6 +145,10 @@ func CurrentOAuthDesktopStatus(ctx context.Context) OAuthDesktopStatus {
 			return OAuthDesktopStatus{}
 		}
 	}
+	// ServerAddress is updated under OptionMapRWMutex. Snapshot topology only
+	// after the registration GET, never holding the options lock across HTTP.
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
 	if ctx.Err() != nil || b != CurrentOAuthProviderBridge() || b.resource != CurrentOAuthUserInfoResource() || !p.Available() {
 		return OAuthDesktopStatus{}
 	}
