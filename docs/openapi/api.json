@@ -148,7 +148,7 @@
       "get": {
         "summary": "获取系统状态",
         "deprecated": false,
-        "description": "🔓 无需鉴权\n\nSite discovery adds instance_id, console_links, oauth and client_features without changing existing fields. UUID initialization must succeed before serving; GET performs no writes. Links preserve the configured frontend prefix and never trust request Host or forwarding headers. Feature flags describe the new desktop integration contracts, independently of existing token-log, pricing and login-provider APIs.",
+        "description": "🔓 无需鉴权\n\nSite discovery adds instance_id, console_links, oauth and client_features without changing existing fields. UUID initialization must succeed before serving; GET performs no writes. Links preserve the configured frontend prefix and never trust request Host or forwarding headers. Feature flags describe the new desktop integration contracts, independently of existing token-log, pricing and login-provider APIs. token_usage_logs equals LogConsumeEnabled for logs only, not database health or caller authorization. Stat also requires DataExportEnabled.",
         "tags": [
           "系统"
         ],
@@ -32914,9 +32914,7 @@
         "properties": {
           "token_usage_logs": {
             "type": "boolean",
-            "enum": [
-              false
-            ]
+            "description": "Configuration capability for GET /api/usage/token/logs only: equals LogConsumeEnabled. It is not a live database health check or an authorization grant. The stat endpoint separately requires both DataExportEnabled and LogConsumeEnabled and retains its 503 TOKEN_USAGE_STAT_UNAVAILABLE response when either is disabled."
           },
           "oauth": {
             "type": "boolean"
@@ -32928,7 +32926,7 @@
             ]
           }
         },
-        "description": "oauth equals oauth.enabled and advertises only the explicitly configured desktop OAuth protocol capability, not effective deployment. token_usage_logs and model_metadata retain their current false contracts. Existing /api/log/token, /api/log/self, /api/data/self, /api/pricing and GitHub/OIDC login-provider endpoints remain unchanged."
+        "description": "oauth equals oauth.enabled and advertises only the explicitly configured desktop OAuth protocol capability, not effective deployment. token_usage_logs reports logs configuration independently of dashboard export; model_metadata retains its separate false discovery contract. Existing /api/log/token, /api/log/self, /api/data/self, /api/pricing and GitHub/OIDC login-provider endpoints remain unchanged."
       },
       "SiteDescription": {
         "type": "object",

@@ -28,6 +28,9 @@ func TestUpdateOptionRejectsRetiredFrontendTheme(t *testing.T) {
 }
 
 func TestGetStatusAdvertisesDefaultDashboard(t *testing.T) {
+	previousConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = previousConsume })
 	previousMap := common.OptionMap
 	common.OptionMap = map[string]string{}
 	t.Cleanup(func() { common.OptionMap = previousMap })

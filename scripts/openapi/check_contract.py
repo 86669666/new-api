@@ -1489,13 +1489,30 @@ def check_site_description(api):
             'type': 'string', 'nullable': True, 'pattern': r'^https?://[^/?#@\s\\]+(?:/[^?#\s\\]*)?$(?![\s\S])'}
         assert route in link['description']
     features = schemas['ClientFeatureFlags']
+    logs = features['properties']['token_usage_logs']
+    assert {k: v for k, v in logs.items() if k != 'description'} == {'type': 'boolean'}
+    assert all(text in logs['description'] for text in ('GET /api/usage/token/logs only',
+        'equals LogConsumeEnabled', 'not a live database health check', 'or an authorization grant',
+        'both DataExportEnabled and LogConsumeEnabled', '503 TOKEN_USAGE_STAT_UNAVAILABLE'))
     assert {k: v for k, v in features.items() if k != 'description'} == {
         'type': 'object', 'additionalProperties': False,
         'required': ['token_usage_logs', 'oauth', 'model_metadata'],
-        'properties': {'token_usage_logs': {'type': 'boolean', 'enum': [False]},
+        'properties': {'token_usage_logs': logs,
                        'oauth': {'type': 'boolean'}, 'model_metadata': {'type': 'boolean', 'enum': [False]}}}
     assert all(path in features['description'] for path in
                ('/api/log/token', '/api/log/self', '/api/data/self', '/api/pricing'))
+    for logs_enabled in (False, True):
+        for oauth_enabled in (False, True):
+            validate_value(api, features, {'token_usage_logs': logs_enabled,
+                           'oauth': oauth_enabled, 'model_metadata': False})
+    feature_validator = OAS30Validator(features, resolver=RefResolver.from_schema(api))
+    invalid_features = [
+        {'oauth': False, 'model_metadata': False},
+        {'token_usage_logs': 'true', 'oauth': False, 'model_metadata': False},
+        {'token_usage_logs': None, 'oauth': False, 'model_metadata': False},
+        {'token_usage_logs': True, 'oauth': False, 'model_metadata': True},
+        {'token_usage_logs': True, 'oauth': False, 'model_metadata': False, 'extra': True}]
+    assert all(list(feature_validator.iter_errors(value)) for value in invalid_features)
     desktop = schemas['DesktopOAuthDiscovery']
     assert set(desktop) == {'description', 'oneOf'} and len(desktop['oneOf']) == 2
     disabled, enabled = desktop['oneOf']

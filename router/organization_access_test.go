@@ -3161,6 +3161,9 @@ func TestModelCapabilityMetadataHTTP(t *testing.T) {
 // One root covers the public HTTP contract and independent processes sharing
 // the owned database. Child mode reconnects only; it never migrates or drops it.
 func TestSiteDescriptionHTTP(t *testing.T) {
+	oldConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = oldConsume })
 	if mode := os.Getenv("NEWAPI_SITE_DESCRIPTION_NODE"); mode != "" {
 		require.Contains(t, []string{"compete", "reopen", "closed", "oauth-discovery"}, mode)
 		kind, dsn := os.Getenv("NEWAPI_S2_MAIN"), os.Getenv("NEWAPI_SITE_DESCRIPTION_DSN")
@@ -3331,7 +3334,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 					want = map[string]any{"enabled": true, "desktop_client_id": selected, "issuer": issuer, "discovery_endpoint": issuer + ".well-known/oauth-authorization-server", "authorization_endpoint": issuer + "oauth2/auth", "token_endpoint": issuer + "oauth2/token", "scopes": []any{"openid", "profile", "offline_access", "tokens:write"}, "token_creation_endpoint": issuer + "api/v1/oauth/tokens", "token_creation_method": "POST"}
 				}
 				assert.Equal(t, want, body.Data["oauth"])
-				assert.Equal(t, map[string]any{"token_usage_logs": false, "model_metadata": false, "oauth": enabled}, body.Data["client_features"])
+				assert.Equal(t, map[string]any{"token_usage_logs": common.LogConsumeEnabled, "model_metadata": false, "oauth": enabled}, body.Data["client_features"])
 				assert.Equal(t, model.SiteInstanceID(), body.Data["instance_id"])
 				assert.Equal(t, common.Version, body.Data["version"])
 				for _, private := range []string{admin.URL, upstream.URL, "private-registration-canary", "hostile.invalid"} {
@@ -3346,6 +3349,12 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			request(false, 0)
 			initialize(selected)
 			request(true, 1)
+			common.LogConsumeEnabled = true
+			request(true, 1)
+			initialize("")
+			request(false, 0)
+			common.LogConsumeEnabled = false
+			initialize(selected)
 			for _, tc := range []struct {
 				name, field string
 				value       any

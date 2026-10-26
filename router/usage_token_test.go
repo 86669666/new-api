@@ -307,6 +307,108 @@ func TestTokenUsageReadOnlyHTTP(t *testing.T) {
 			require.NoError(t, f.db.Model(f.users["owner"]).Update("status", common.UserStatusEnabled).Error)
 		}
 	})
+	t.Run("discovery_logs_only_collection_matrix", func(t *testing.T) {
+		oldConsume, oldExport := common.LogConsumeEnabled, common.DataExportEnabled
+		t.Cleanup(func() { common.LogConsumeEnabled, common.DataExportEnabled = oldConsume, oldExport })
+		// Status is configuration discovery, not a database health probe or a
+		// writer. Count every GORM operation on both independent databases.
+		var operations atomic.Int64
+		for _, db := range []*gorm.DB{f.db, model.LOG_DB} {
+			for _, callback := range []struct {
+				register func(string, func(*gorm.DB)) error
+				remove   func(string) error
+			}{
+				{db.Callback().Create().Before("*").Register, db.Callback().Create().Remove},
+				{db.Callback().Update().Before("*").Register, db.Callback().Update().Remove},
+				{db.Callback().Delete().Before("*").Register, db.Callback().Delete().Remove},
+				{db.Callback().Query().Before("*").Register, db.Callback().Query().Remove},
+				{db.Callback().Row().Before("*").Register, db.Callback().Row().Remove},
+				{db.Callback().Raw().Before("*").Register, db.Callback().Raw().Remove},
+			} {
+				const name = "test:usage-discovery-observe"
+				require.NoError(t, callback.register(name, func(*gorm.DB) { operations.Add(1) }))
+				t.Cleanup(func() { require.NoError(t, callback.remove(name)) })
+			}
+		}
+		for _, consume := range []bool{false, true} {
+			for _, export := range []bool{false, true} {
+				t.Run(fmt.Sprintf("consume_%t_export_%t", consume, export), func(t *testing.T) {
+					common.LogConsumeEnabled, common.DataExportEnabled = consume, export
+					before := operations.Load()
+					status, _, body := f.request(t, "GET", "/api/status", "", "", nil)
+					require.Equal(t, http.StatusOK, status)
+					data := body["data"].(map[string]any)
+					assert.Equal(t, map[string]any{"token_usage_logs": consume, "oauth": false, "model_metadata": false}, data["client_features"])
+					assert.Equal(t, map[string]any{"enabled": false}, data["oauth"])
+					request := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+					request.Host = "untrusted-discovery.invalid"
+					request.Header.Set("X-Forwarded-Host", "forwarded-discovery.invalid")
+					request.Header.Set("X-Forwarded-Proto", "http")
+					recorder := httptest.NewRecorder()
+					f.engine.ServeHTTP(recorder, request)
+					require.Equal(t, http.StatusOK, recorder.Code)
+					var forwarded map[string]any
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &forwarded))
+					forwardedData := forwarded["data"].(map[string]any)
+					for _, field := range []string{"client_features", "oauth", "instance_id", "console_links"} {
+						assert.Equal(t, data[field], forwardedData[field], field)
+					}
+					for _, secret := range []string{tokens["A"].Key, tokens["B"].Key, common.SessionSecret, "untrusted-discovery.invalid", "forwarded-discovery.invalid", "not-public"} {
+						assert.NotContains(t, recorder.Body.String(), secret)
+					}
+					assert.Equal(t, before, operations.Load(), "GET status must not read or write either DB")
+					for _, path := range []string{"logs", "stat"} {
+						status, _, result := f.request(t, "GET", "/api/usage/token/"+path+"?"+window, "A", "", nil)
+						want, code := http.StatusOK, ""
+						if !consume {
+							want, code = http.StatusServiceUnavailable, "TOKEN_USAGE_LOGS_DISABLED"
+						}
+						if path == "stat" && (!consume || !export) {
+							want, code = http.StatusServiceUnavailable, "TOKEN_USAGE_STAT_UNAVAILABLE"
+						}
+						assert.Equal(t, want, status)
+						if code != "" {
+							assert.Equal(t, code, result["code"])
+							assert.NotContains(t, result, "data")
+						}
+						for _, actor := range []string{"", "invalid-discovery"} {
+							f.bearer["invalid-discovery"] = "sk-invalid-discovery"
+							status, _, _ = f.request(t, "GET", "/api/usage/token/"+path+"?"+window, actor, "", nil)
+							assert.Equal(t, http.StatusUnauthorized, status, "discovery never grants access")
+						}
+					}
+				})
+			}
+		}
+	})
+	t.Run("discovery_survives_query_failure", func(t *testing.T) {
+		oldConsume, oldExport := common.LogConsumeEnabled, common.DataExportEnabled
+		common.LogConsumeEnabled, common.DataExportEnabled = true, true
+		t.Cleanup(func() { common.LogConsumeEnabled, common.DataExportEnabled = oldConsume, oldExport })
+		const callback = "test:usage-discovery-query-failure"
+		for _, db := range []*gorm.DB{f.db, model.LOG_DB} {
+			failQuery := func(tx *gorm.DB) {
+				if tx.Statement.Table == "logs" || tx.Statement.Table == "quota_data" {
+					tx.AddError(fmt.Errorf("injected usage query failure"))
+				}
+			}
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, failQuery))
+			require.NoError(t, db.Callback().Row().Before("gorm:row").Register(callback, failQuery))
+			t.Cleanup(func() {
+				require.NoError(t, db.Callback().Query().Remove(callback))
+				require.NoError(t, db.Callback().Row().Remove(callback))
+			})
+		}
+		for _, path := range []string{"logs", "stat"} {
+			status, _, body := f.request(t, "GET", "/api/usage/token/"+path+"?"+window, "A", "", nil)
+			assert.Equal(t, http.StatusInternalServerError, status)
+			assert.Equal(t, "TOKEN_USAGE_QUERY_FAILED", body["code"])
+			assert.NotContains(t, body, "data")
+		}
+		status, _, body := f.request(t, "GET", "/api/status", "", "", nil)
+		require.Equal(t, http.StatusOK, status)
+		assert.Equal(t, true, body["data"].(map[string]any)["client_features"].(map[string]any)["token_usage_logs"])
+	})
 	t.Run("collection_switches_preserve_legacy_history", func(t *testing.T) {
 		common.DataExportEnabled = false
 		status, _, _ := f.request(t, "GET", "/api/usage/token/logs?"+window, "A", "", nil)
