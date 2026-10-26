@@ -121,6 +121,8 @@ func InitOAuthCleanupStore(enabled bool) error {
 				return errors.New("OAuth cleanup primary key unavailable")
 			}
 			var columns []struct{ Name string }
+			// JSON field lookup keeps pre-INCLUDE catalogs compatible: before
+			// PostgreSQL11, every index attribute is a key attribute.
 			if err := DB.Raw(`SELECT a.attname AS name
 				FROM pg_catalog.pg_class r
 				JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
@@ -128,6 +130,7 @@ func InitOAuthCleanupStore(enabled bool) error {
 				JOIN pg_catalog.pg_class ix ON ix.oid = i.indexrelid AND ix.relnamespace = n.oid
 				JOIN pg_catalog.pg_constraint c ON c.conrelid = r.oid AND c.conindid = i.indexrelid
 					AND c.connamespace = n.oid
+				CROSS JOIN LATERAL (SELECT COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts) AS value) key_count
 				CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum, position)
 				JOIN pg_catalog.pg_attribute a ON a.attrelid = r.oid AND a.attnum = k.attnum
 					AND a.attnum > 0 AND NOT a.attisdropped AND a.attnotnull
@@ -135,7 +138,8 @@ func InitOAuthCleanupStore(enabled bool) error {
 				AND i.indisprimary AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive
 				AND i.indimmediate AND i.indpred IS NULL AND i.indexprs IS NULL
 				AND c.contype = 'p' AND c.convalidated AND NOT c.condeferrable AND NOT c.condeferred
-				AND i.indnatts = ? AND array_length(c.conkey, 1) = i.indnatts
+				AND key_count.value = ? AND k.position <= key_count.value
+				AND array_length(c.conkey, 1) = key_count.value
 				AND c.conkey[k.position::integer] = k.attnum
 				ORDER BY k.position`, relation, len(expected)).Scan(&columns).Error; err != nil {
 				return err

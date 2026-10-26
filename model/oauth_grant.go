@@ -87,20 +87,23 @@ func InitOAuthGrantStore(enabled bool) error {
 				IndexOID int64 `gorm:"column:index_oid"`
 				Name     string
 			}
+			// On pre-INCLUDE catalogs the absent JSON field falls back to
+			// indnatts; newer catalogs exclude payloads from the real key.
 			if err := DB.Raw(`SELECT i.indexrelid::bigint AS index_oid,a.attname AS name
 				FROM pg_catalog.pg_class r
 				JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
 				JOIN pg_catalog.pg_index i ON i.indrelid=r.oid
 				JOIN pg_catalog.pg_class ix ON ix.oid=i.indexrelid AND ix.relnamespace=n.oid
 				LEFT JOIN pg_catalog.pg_constraint c ON c.conrelid=r.oid AND c.conindid=i.indexrelid AND c.contype IN ('p','u')
+				CROSS JOIN LATERAL (SELECT COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts) AS value) key_count
 				CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,position)
 				JOIN pg_catalog.pg_attribute a ON a.attrelid=r.oid AND a.attnum=k.attnum
 					AND a.attnum>0 AND NOT a.attisdropped AND a.attnotnull
 				WHERE r.oid=pg_catalog.to_regclass(?) AND r.relkind='r' AND ix.relkind='i'
 				AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive AND i.indimmediate
-				AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnatts=?
+				AND i.indpred IS NULL AND i.indexprs IS NULL AND key_count.value=? AND k.position<=key_count.value
 				AND (c.oid IS NULL OR (c.connamespace=n.oid AND c.convalidated AND NOT c.condeferrable AND NOT c.condeferred
-					AND array_length(c.conkey,1)=i.indnatts AND c.conkey[k.position::integer]=k.attnum))
+					AND array_length(c.conkey,1)=key_count.value AND c.conkey[k.position::integer]=k.attnum))
 				ORDER BY i.indexrelid,k.position`, relation, len(expected)).Scan(&columns).Error; err != nil {
 				return err
 			}

@@ -2956,7 +2956,8 @@ def ordinary_audit_shared_run(bundle,tier):
         # Installer errors are never echoed: a server may quote SQL/credentials.
         print('ORDINARY_AUDIT_PROVISION '+json.dumps({'phase':mode,'exit':result.returncode,'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest(),
             'source_lines':sorted(set(re.findall(r'oauth_public_test.go:[0-9]+',(result.stdout+result.stderr).decode(errors='replace'))))[-8:],
-            'metadata_controls':re.findall(r'^\s*--- (PASS|FAIL|SKIP): (TestOAuthTokensConsumerHTTP/(?:cleanup|grant)_metadata/[a-z_]+) \(', result.stdout.decode(errors='replace'), re.M)}),flush=True)
+            'metadata_controls':re.findall(r'^\s*--- (PASS|FAIL|SKIP): (TestOAuthTokensConsumerHTTP/(?:cleanup|grant|include)_metadata/[a-z0-9_]+) \(', result.stdout.decode(errors='replace'), re.M),
+            'compatibility_controls':re.findall(r'PG96_ROW_SHAPE_CONTROL actual_server=([0-9]+) modified_queries=([0-9]+) actual_96_runtime=false',result.stdout.decode(errors='replace'))}),flush=True)
         if result.returncode:raise RuntimeError('ordinary audit fixture '+mode+' failed')
     try:
         result=subprocess.run([str(bundle/'new-api'),'db-bootstrap','fresh','--engine',main_kind,'--target',target,'--journal',str(journal)],env=env,capture_output=True,timeout=120)

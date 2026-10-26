@@ -5428,6 +5428,20 @@ func oauthOrdinaryAuditProvision(t *testing.T) {
 			if store.kind == "postgres" {
 				oauthCleanupMetadataControls(t, db)
 				oauthGrantMetadataControls(t, db)
+				oauthIncludeMetadataControls(t, db)
+				// This owned fixture covers INCLUDE in the actual non-owner
+				// POST/audit runtime too; this is not production migration.
+				require.NoError(t, db.Exec(`ALTER TABLE public.o_auth_operations DROP CONSTRAINT o_auth_operations_pkey;
+					ALTER TABLE public.o_auth_operations ADD PRIMARY KEY(operation_ref) INCLUDE(user_id);
+					ALTER TABLE public.o_auth_artifacts DROP CONSTRAINT o_auth_artifacts_pkey;
+					ALTER TABLE public.o_auth_artifacts ADD PRIMARY KEY(artifact_ref) INCLUDE(operation_ref);
+					ALTER TABLE public.o_auth_cleanup_jobs DROP CONSTRAINT o_auth_cleanup_jobs_pkey;
+					ALTER TABLE public.o_auth_cleanup_jobs ADD PRIMARY KEY(job_ref) INCLUDE(source_session_event_ref);
+					ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey;
+					ALTER TABLE public.oauth_grants ADD PRIMARY KEY(grant_ref) INCLUDE(user_id);
+					DROP INDEX public.idx_oauth_grants_consent;
+					CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(consent_ref) INCLUDE(user_id)`).Error)
+				require.NoError(t, model.InitOAuthGrantStore(true))
 			}
 		} else {
 			require.NoError(t, model.MigrateAuditLogs())
@@ -5556,15 +5570,18 @@ func oauthCleanupMetadataObservation(t *testing.T, db *gorm.DB) {
 		var row struct {
 			RelationOID                                          int64 `gorm:"column:relation_oid"`
 			SchemaName, TableName, CurrentSchema, PrimaryColumns string
+			KeyCount, TotalAttributes                            int
 			Owned, Valid, Ready, Live, Unique, Immediate         bool
 			ConstraintUsage, TableConstraints                    int64
 		}
 		require.NoError(t, db.Raw(`SELECT r.oid::bigint AS relation_oid,n.nspname AS schema_name,r.relname AS table_name,
    current_schema() AS current_schema,pg_get_userbyid(r.relowner)=current_user AS owned,
    i.indisvalid AS valid,i.indisready AS ready,i.indislive AS live,i.indisunique AS unique,i.indimmediate AS immediate,
+   i.indnatts AS total_attributes,COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts) AS key_count,
    COALESCE((SELECT string_agg(a.attname,',' ORDER BY k.position)
     FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,position)
-    JOIN pg_attribute a ON a.attrelid=r.oid AND a.attnum=k.attnum),'') AS primary_columns,
+    JOIN pg_attribute a ON a.attrelid=r.oid AND a.attnum=k.attnum
+    WHERE k.position<=COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts)),'') AS primary_columns,
    (SELECT count(*) FROM information_schema.constraint_column_usage c WHERE c.table_schema=n.nspname AND c.table_name=r.relname) AS constraint_usage,
    (SELECT count(*) FROM information_schema.table_constraints c WHERE c.table_schema=n.nspname AND c.table_name=r.relname AND c.constraint_type='PRIMARY KEY') AS table_constraints
    FROM pg_class r JOIN pg_namespace n ON n.oid=r.relnamespace
@@ -5686,6 +5703,89 @@ func oauthGrantMetadataControls(t *testing.T, db *gorm.DB) {
 	require.Zero(t, remains, "all synthetic relations and catalog faults rolled back")
 }
 
+// Real INCLUDE DDL on owned test tables; all substitutions roll back before
+// non-owner HTTP business. Payload columns are not part of a uniqueness tuple.
+func oauthIncludeMetadataControls(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.Zero(t, os.Getuid())
+	oldDB, oldMaster := model.DB, common.IsMasterNode
+	model.DB, common.IsMasterNode = db, false
+	defer func() { model.DB = oldDB; common.IsMasterNode = oldMaster }()
+	var version int
+	require.NoError(t, db.Raw("SELECT current_setting('server_version_num')::integer").Scan(&version).Error)
+	require.GreaterOrEqual(t, version, 110000, "this dedicated INCLUDE qualification requires PostgreSQL11+; no skip")
+	for _, tc := range []struct {
+		name, ddl       string
+		cleanup, reject bool
+	}{
+		{"cleanup_operation", "ALTER TABLE public.o_auth_operations DROP CONSTRAINT o_auth_operations_pkey; ALTER TABLE public.o_auth_operations ADD PRIMARY KEY(operation_ref) INCLUDE(user_id)", true, false},
+		{"cleanup_artifact", "ALTER TABLE public.o_auth_artifacts DROP CONSTRAINT o_auth_artifacts_pkey; ALTER TABLE public.o_auth_artifacts ADD PRIMARY KEY(artifact_ref) INCLUDE(operation_ref)", true, false},
+		{"cleanup_job_nullable_payload", "ALTER TABLE public.o_auth_cleanup_jobs DROP CONSTRAINT o_auth_cleanup_jobs_pkey; ALTER TABLE public.o_auth_cleanup_jobs ADD PRIMARY KEY(job_ref) INCLUDE(source_session_event_ref)", true, false},
+		{"grant_primary", "ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; ALTER TABLE public.oauth_grants ADD PRIMARY KEY(grant_ref) INCLUDE(user_id)", false, false},
+		{"grant_unique_index", "ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; CREATE UNIQUE INDEX probe_grant ON public.oauth_grants(grant_ref) INCLUDE(user_id)", false, false},
+		{"consent_unique_index", "DROP INDEX public.idx_oauth_grants_consent; CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(consent_ref) INCLUDE(user_id)", false, false},
+		{"consent_unique_constraint", "DROP INDEX public.idx_oauth_grants_consent; ALTER TABLE public.oauth_grants ADD CONSTRAINT probe_consent UNIQUE(consent_ref) INCLUDE(user_id)", false, false},
+		{"cleanup_required_only_payload", "ALTER TABLE public.o_auth_operations DROP CONSTRAINT o_auth_operations_pkey; ALTER TABLE public.o_auth_operations ADD PRIMARY KEY(user_id) INCLUDE(operation_ref)", true, true},
+		{"grant_required_only_payload", "ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; ALTER TABLE public.oauth_grants ADD PRIMARY KEY(user_id) INCLUDE(grant_ref)", false, true},
+		{"consent_required_only_payload", "DROP INDEX public.idx_oauth_grants_consent; CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(user_id) INCLUDE(consent_ref)", false, true},
+	} {
+		t.Run("include_metadata/"+tc.name, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer func() {
+				model.DB = db
+				require.NoError(t, tx.Rollback().Error)
+				require.NoError(t, model.InitOAuthGrantStore(true))
+			}()
+			require.NoError(t, tx.Exec(tc.ddl).Error)
+			model.DB = tx
+			var err error
+			if tc.cleanup {
+				err = model.InitOAuthCleanupStore(true)
+			} else {
+				err = model.InitOAuthGrantStore(true)
+			}
+			if tc.reject {
+				message := "OAuth grant uniqueness unavailable"
+				if tc.cleanup {
+					message = "OAuth cleanup primary key unavailable"
+				}
+				require.ErrorContains(t, err, message)
+			} else {
+				require.NoError(t, err, "INCLUDE payload must not change the actual required key")
+			}
+		})
+	}
+	t.Run("include_metadata/catalog_pre11_shape", func(t *testing.T) {
+		// Execute the production queries with the newer field absent from
+		// each row's JSON. This is not an actual PostgreSQL9.6 runtime.
+		const callback = "include-metadata:pre11-shape"
+		queries := 0
+		require.NoError(t, db.Callback().Row().Before("gorm:row").Register(callback, func(tx *gorm.DB) {
+			sql := tx.Statement.SQL.String()
+			if strings.Contains(sql, "pg_catalog.pg_index") && strings.Contains(sql, "pg_catalog.to_jsonb(i)") {
+				queries++
+				tx.Statement.SQL.Reset()
+				tx.Statement.SQL.WriteString(strings.ReplaceAll(sql, "pg_catalog.to_jsonb(i)", "(pg_catalog.to_jsonb(i)-'indnkeyatts')"))
+			}
+		}))
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer func() {
+			require.NoError(t, db.Callback().Row().Remove(callback))
+			model.DB = db
+			require.NoError(t, tx.Rollback().Error)
+			require.NoError(t, model.InitOAuthGrantStore(true))
+		}()
+		model.DB = tx
+		require.NoError(t, model.InitOAuthGrantStore(true))
+		require.GreaterOrEqual(t, queries, 5, "both real initializers must execute the absent-field fallback")
+		require.NoError(t, tx.Exec("ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; CREATE UNIQUE INDEX wrong_grant_key ON public.oauth_grants(user_id)").Error)
+		require.ErrorContains(t, model.InitOAuthGrantStore(true), "OAuth grant uniqueness unavailable")
+		t.Logf("PG96_ROW_SHAPE_CONTROL actual_server=%d modified_queries=%d actual_96_runtime=false", version, queries)
+	})
+}
+
 // Compare physical metadata and the actual driver reports without data or secrets.
 func oauthGrantMetadataObservation(t *testing.T, db *gorm.DB) {
 	t.Helper()
@@ -5706,16 +5806,18 @@ func oauthGrantMetadataObservation(t *testing.T, db *gorm.DB) {
 	var physical []struct {
 		IndexOID                                                                        int64 `gorm:"column:index_oid"`
 		IndexName, Columns, ConstraintType                                              string
-		KeyCount                                                                        int
+		KeyCount, TotalAttributes                                                       int
 		Primary, Unique, Valid, Ready, Live, Immediate, Partial, Expression, Deferrable bool
 	}
-	require.NoError(t, db.Raw(`SELECT ix.oid::bigint AS index_oid,ix.relname AS index_name,i.indnatts AS key_count,
+	require.NoError(t, db.Raw(`SELECT ix.oid::bigint AS index_oid,ix.relname AS index_name,
+		i.indnatts AS total_attributes,COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts) AS key_count,
 		i.indisprimary AS primary,i.indisunique AS unique,i.indisvalid AS valid,i.indisready AS ready,i.indislive AS live,
 		i.indimmediate AS immediate,i.indpred IS NOT NULL AS partial,i.indexprs IS NOT NULL AS expression,
 		COALESCE(c.contype::text,'') AS constraint_type,COALESCE(c.condeferrable,false) AS deferrable,
 		(SELECT string_agg(COALESCE(a.attname,'<expression>'),',' ORDER BY k.position)
 		 FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,position)
-		 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum) AS columns
+		 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+		 WHERE k.position<=COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts)) AS columns
 		FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ix ON ix.oid=i.indexrelid
 		LEFT JOIN pg_catalog.pg_constraint c ON c.conrelid=i.indrelid AND c.conindid=i.indexrelid AND c.contype IN ('p','u')
 		WHERE i.indrelid=? ORDER BY ix.oid`, relation.RelationOID).Scan(&physical).Error)
