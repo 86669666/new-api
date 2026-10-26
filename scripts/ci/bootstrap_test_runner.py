@@ -49,6 +49,7 @@ def wallet_selector(engine):
 METADATA_SELECTOR = '^TestOAuthTokensConsumerHTTP$'
 METADATA_CASES = ('bridge_only_rejected', 'empty_current_grant_no_writes', 'wrong_client', 'wrong_actor', 'wrong_audience', 'wrong_issuer', 'refresh_bearer', 'expired', 'future', 'write_scope_not_supported', 'old_grant_missing_read_scope', 'post_encoding_revocation_discards_empty_success', 'missing_store_is_not_empty')
 METADATA_TIERS = tuple('metadata-'+e for e in WALLET_ENGINES)
+ORDINARY_AUDIT_SELECTOR = '^TestOAuthTokensConsumerHTTP$/^ordinary_key_creation$'
 LIFECYCLE_SELECTOR = '^TestOAuthDerivedTokenOwnerLifecycle$'
 LIFECYCLE_CASES = ('owner_reveal_and_mutation', 'revoke_and_rollback', 'disable_delete_rollback',
                    'unknown_is_not_manual', 'same_user_creation_limit', 'registration_default_token',
@@ -78,6 +79,10 @@ def prepare(args):
         raise ValueError('trusted provenance test runner requires Linux')
     if args.tier == 'all' and (args.package or args.run != '.'):
         raise ValueError('bounded selectors require an explicit resource --tier')
+    if args.tier == 'ordinary-audit' or args.tier in ORDINARY_AUDIT_SHARED:
+        if args.package not in (None, ['./router']) or args.run not in ('.', ORDINARY_AUDIT_SELECTOR):
+            raise ValueError('ordinary audit tier requires its exact OAuth route inventory')
+        args.package, args.run = ['./router'], ORDINARY_AUDIT_SELECTOR
     if args.tier in LIFECYCLE_TIERS:
         if args.package not in (None, ['./controller']) or args.run not in ('.', LIFECYCLE_SELECTOR):
             raise ValueError('lifecycle tier requires the exact controller lifecycle inventory')
@@ -236,6 +241,9 @@ def verified_manifest(bundle):
 
 
 def required_leaves(tier):
+    if tier == 'ordinary-audit' or tier in ORDINARY_AUDIT_SHARED:
+        return ['TestOAuthTokensConsumerHTTP/ordinary_key_creation/audit_insert_failure/'+case
+                for case in ('success', 'authenticated_rejection')]
     if tier in LIFECYCLE_TIERS:
         return ['TestOAuthDerivedTokenOwnerLifecycle/'+case for case in LIFECYCLE_CASES]
     if tier in METADATA_TIERS:
@@ -279,8 +287,11 @@ def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
 
 def dispatch_tier(bundle, tier):
     metadata = verified_manifest(bundle)
-    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
+    if tier not in ('sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
         raise ValueError('dispatch tier mismatch')
+    if tier in ORDINARY_AUDIT_SHARED:
+        ordinary_audit_shared_dispatch(bundle,tier)
+        return
     if tier == 'admission':
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
         if available < 4*1024**3:raise RuntimeError('admission needs 1GiB tmpfs plus 3GiB process margin')
@@ -298,13 +309,13 @@ def dispatch_tier(bundle, tier):
                  'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && '+('ip link set lo up && ' if tier == 'metadata-sqlite' else '')+'exec "$@"',
                  'wallet-tests', sys.executable, str(bundle/'runner.py'), '_wallet_run', str(bundle), tier])
         return
-    if tier != 'sqlite':
+    if tier not in ('sqlite', 'ordinary-audit'):
         postgres_container(bundle, tier)
         return
     # Docker remains in the host controller, never this private net namespace.
     command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork',
              'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && ip link set lo up && exec "$@"',
-             'bootstrap-tests', sys.executable, str(bundle / 'runner.py'), '_run', str(bundle)])
+             'bootstrap-tests', sys.executable, str(bundle / 'runner.py'), '_run', str(bundle), tier])
 
 
 def execute_prepared(bundle, tier):
@@ -1372,8 +1383,12 @@ def trusted_run(bundle, tier="sqlite"):
     for required in ('new-api', 'runner.py'):
         if required not in metadata['files']:
             raise ValueError('missing producer input')
-    if tier not in ('sqlite', 'postgres', 'postgres-redis') or metadata.get('tier', 'sqlite') != tier:
+    if tier not in ('sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis') or metadata.get('tier', 'sqlite') != tier:
         raise ValueError('resource tier mismatch')
+    if tier == 'ordinary-audit' and (len(metadata['entries']) != 1 or
+            metadata['entries'][0]['cwd'] != 'router' or
+            metadata['entries'][0]['run'] != ORDINARY_AUDIT_SELECTOR):
+        raise ValueError('ordinary audit mandatory inventory mismatch')
     if tier in ('postgres', 'postgres-redis') and (len(metadata['entries']) != 1 or metadata['entries'][0]['cwd'] != 'router' or metadata['entries'][0]['run'] != (PG_SELECTOR if tier == 'postgres' else JOINT_SELECTOR)):
         raise ValueError('PG mandatory inventory mismatch')
     if tier in ('postgres', 'postgres-redis'):
@@ -1471,8 +1486,9 @@ def trusted_run(bundle, tier="sqlite"):
             print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='ordinary')), flush=True)
             if redis_resource:
                 redis_resource.verify()
-            if pg_resource:
-                pg_resource.verify()
+            if pg_resource or tier == 'ordinary-audit':
+                if pg_resource:
+                    pg_resource.verify()
                 installer.process_ready.clear()
                 with subprocess.Popen(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid), stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
                     installer.process = process
@@ -1487,7 +1503,8 @@ def trusted_run(bundle, tier="sqlite"):
                 output = result.stdout.decode(errors='replace')
                 print(output, end='', flush=True)
                 validate_required_output(tier, output, result.returncode)
-                pg_resource.verify()
+                if pg_resource:
+                    pg_resource.verify()
             else:
                 command(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid))
             if redis_resource:
@@ -1764,7 +1781,7 @@ class AdmissionFixture:
                 try:
                     os.setsid()
                     libc=ctypes.CDLL(None,use_errno=True)
-                    if libc.prctl(4,0,0,0,0):os._exit(1)
+                    if libc.prctl(4,0,0,0,0) or Path('/proc/sys/fs/suid_dumpable').read_text().strip()!='0':os._exit(1)
                     # No installer listener, journal, database, barrier or log
                     # descriptor may survive into a service-UID probe.
                     for fd in inherited:
@@ -2694,7 +2711,281 @@ assert os.getgroups()==[] and 'NoNewPrivs:\\t1' in open('/proc/self/status').rea
             'required_leaves':required_leaves(tier),'exit':status,'cleanup':True},sort_keys=True),flush=True)
 
 
+# These explicit daily audit jobs reuse shared engines, never the gate databases
+# or wallet owner protocol. The only mutable names have a generated W01/W82 prefix.
+ORDINARY_AUDIT_SHARED = ('ordinary-audit-mysql', 'ordinary-audit-postgres', 'ordinary-audit-clickhouse')
+ORDINARY_AUDIT_IMAGE = 'sha256:85b1ab67e7c7410b11da3f5b42913fc51b5b46f9cf5f07cc28a98e5f62083c5e'
+ORDINARY_AUDIT_RESOURCES = {
+ 'mysql': ('newapi-cherry-20261022-mysql', 'sha256:6cd09145362dfe6831b14545de3d5fd6cc75c37cfd6ef8561429c1fc73518b39', '/usr/sbin/mysqld', 3306),
+ 'postgres': ('newapi-cherry-20261022-postgres', 'sha256:20fd00b87c6f0a89c5defff2312154761c1d84580af196bcaac19dcb0bf51547', '/usr/lib/postgresql/15/bin/postgres', 5432),
+ 'clickhouse': ('newapi-cherry-20261022-clickhouse', 'sha256:21c0b0ead100ba822e65cb5d1e467824be8df4af88e5972ada0ab1556d47b8c3', '/usr/bin/clickhouse', 9000),
+}
+
+
+def ordinary_audit_shared_dispatch(bundle, tier):
+    # Docker control stays in the outer host controller. The test container gets
+    # neither a daemon socket nor host networking, and starts no database daemon.
+    metadata = verified_manifest(bundle)
+    expected = [{'binary': 'test-0', 'cwd': 'router', 'run': ORDINARY_AUDIT_SELECTOR}]
+    if tier not in ORDINARY_AUDIT_SHARED or metadata['tier'] != tier or metadata['entries'] != expected:
+        raise ValueError('ordinary audit shared inventory mismatch')
+    kind = tier.removeprefix('ordinary-audit-')
+    name, image, executable, port = ORDINARY_AUDIT_RESOURCES[kind]
+    info = json.loads(subprocess.check_output(['docker', 'inspect', name]))[0]
+    if info['Image'] != image or not info['State']['Running']:
+        raise ValueError('ordinary audit shared engine identity mismatch')
+    executable_hash=None
+    if kind=='clickhouse':
+        # The exec attach transport returned empty EOF for this large binary.
+        # Stream one fixed executable through Docker's archive API instead;
+        # never copy an image, retain a binary, or accept an external digest.
+        import tarfile
+        archive=subprocess.Popen(['docker','cp',info['Id']+':'+executable,'-'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            with tarfile.open(fileobj=archive.stdout,mode='r|') as stream:
+                member=stream.next()
+                if member is None or not member.isfile() or member.name!='clickhouse' or not 0<member.size<=2*1024**3:
+                    raise ValueError('ordinary audit daemon archive identity mismatch')
+                reader=stream.extractfile(member);hasher=hashlib.sha256();total=0
+                for block in iter(lambda:reader.read(1024**2),b''):
+                    total+=len(block);hasher.update(block)
+                if total!=member.size or stream.next() is not None:raise ValueError('ordinary audit daemon archive incomplete')
+                executable_hash=hasher.hexdigest()
+            archive.stdout.close()
+            if archive.wait(timeout=30):raise RuntimeError('ordinary audit daemon archive failed')
+        finally:
+            archive.stdout.close()
+            if archive.poll() is None:archive.kill();archive.wait(timeout=5)
+            archive.stderr.close()
+    else:
+        observed=subprocess.run(['docker','exec',info['Id'],'sha256sum',executable],capture_output=True)
+        match=re.fullmatch(rb'([0-9a-f]{64})  '+re.escape(executable.encode())+rb'\n',observed.stdout)
+        if observed.returncode==0 and match:executable_hash=match[1].decode()
+    if executable_hash is None:raise RuntimeError('ordinary audit daemon hash receipt unavailable')
+    env = dict(item.split('=', 1) for item in info['Config']['Env'] if '=' in item)
+    if kind == 'mysql':
+        if not env.get('MYSQL_ROOT_PASSWORD') and env.get('MYSQL_ALLOW_EMPTY_PASSWORD') not in ('yes','1','true'):raise ValueError('shared MySQL administrator credential unavailable')
+        admin = 'root:'+env.get('MYSQL_ROOT_PASSWORD','')+'@unix(/audit-sockets/mysql.sock)/mysql?parseTime=true'
+    elif kind == 'postgres':
+        from urllib.parse import quote
+        if not env.get('POSTGRES_PASSWORD') and env.get('POSTGRES_HOST_AUTH_METHOD')!='trust':raise ValueError('shared PostgreSQL administrator credential unavailable')
+        admin = 'postgresql://'+quote(env.get('POSTGRES_USER', 'postgres'), safe='')+':'+quote(env.get('POSTGRES_PASSWORD',''), safe='')+'@/postgres?host=/audit-sockets&sslmode=disable'
+    else:
+        from urllib.parse import urlencode
+        if not env.get('CLICKHOUSE_PASSWORD') and env.get('CLICKHOUSE_SKIP_USER_SETUP')!='1':raise ValueError('shared ClickHouse administrator credential unavailable')
+        admin = 'clickhouse://127.0.0.1:9000/default?'+urlencode({'username':env.get('CLICKHOUSE_USER','default'), 'password':env.get('CLICKHOUSE_PASSWORD','')})
+    size = sum((bundle/n).stat().st_size for n in metadata['files'])
+    available = int(re.search(r'^MemAvailable:\s+(\d+)', Path('/proc/meminfo').read_text(), re.M)[1])*1024
+    if size+1024**3 >= 4*1024**3 or available < size+1024**3+3*1024**3:
+        raise RuntimeError('ordinary audit memory budget unavailable')
+    subprocess.run(['docker','image','inspect',ORDINARY_AUDIT_IMAGE],check=True,stdout=subprocess.DEVNULL)
+    merged=info.get('GraphDriver',{}).get('Data',{}).get('MergedDir','')
+    if kind!='clickhouse' and not re.fullmatch(r'/var/lib/docker/overlay2/[0-9a-f]{64}/merged',merged):raise ValueError('shared engine socket mount substrate unsupported')
+    cid = None
+    try:
+        cid = subprocess.check_output(['docker','create','--pull=never','--network=container:'+info['Id'],
+            '--pid=container:'+info['Id'],'--read-only','--security-opt=no-new-privileges',
+            '--cap-drop=ALL','--cap-add=SETUID','--cap-add=SETGID','--cap-add=CHOWN','--cap-add=FOWNER',
+            '--cap-add=DAC_OVERRIDE','--cap-add=KILL','--memory=3g','--pids-limit=128',
+            '--tmpfs=/run:rw,exec,nosuid,nodev,size=4g,mode=0755',
+            '--tmpfs=/var/lib/postgresql/data:rw,noexec,nosuid,nodev,size=1m,mode=0700',
+            *(['--mount=type=bind,src='+merged+('/run/mysqld/mysqld.sock' if kind=='mysql' else '/run/postgresql/.s.PGSQL.5432')+',dst=/audit-sockets/'+('mysql.sock' if kind=='mysql' else '.s.PGSQL.5432')+',readonly'] if kind!='clickhouse' else []),
+            '--entrypoint=/bin/sleep',ORDINARY_AUDIT_IMAGE,'600'],text=True).strip()
+        command(['docker','start',cid],stdout=subprocess.DEVNULL)
+        command(['docker','exec',cid,'mkdir','/run/input'])
+        archive=subprocess.Popen(['tar','-C',str(bundle),'-cf','-','.'],stdout=subprocess.PIPE)
+        try:command(['docker','exec','-i',cid,'tar','-xf','-','-C','/run/input'],stdin=archive.stdout)
+        finally:
+            archive.stdout.close()
+            if archive.wait()!=0:raise RuntimeError('ordinary audit bundle stream failed')
+        control=json.dumps({'admin':admin,'exe_sha256':executable_hash,'port':port,'engine_image':image}).encode()
+        subprocess.run(['docker','exec','-i',cid,'sh','-c','umask 077; cat > /run/audit-control.json'],input=control,check=True)
+        command(['docker','exec','-d',cid,'sh','-c',
+            'umask 077; python3 /run/input/runner.py _ordinary_audit_shared /run/input '+tier+' < /run/audit-control.json > /run/audit-result.log 2>&1; printf "%s\\n" "$?" > /run/audit-result.exit'])
+        deadline=time.monotonic()+480
+        receipt=None
+        while receipt is None:
+            probe=subprocess.run(['docker','exec',cid,'sh','-c',
+                'if test -f /run/audit-result.exit; then printf "AUDIT_DONE:"; cat /run/audit-result.exit; sha256sum /run/audit-result.log; fi'],capture_output=True)
+            match=re.fullmatch(rb'AUDIT_DONE:([0-9]{1,3})\n([0-9a-f]{64})  /run/audit-result.log\n',probe.stdout)
+            if probe.returncode==0 and match:receipt=(int(match[1]),match[2].decode());break
+            if time.monotonic()>=deadline:raise RuntimeError('ordinary audit completion receipt unavailable')
+            time.sleep(0.2)
+        output=b''
+        while hashlib.sha256(output).hexdigest()!=receipt[1]:
+            read=subprocess.run(['docker','exec',cid,'cat','/run/audit-result.log'],capture_output=True)
+            if read.returncode==0:output=read.stdout
+            if hashlib.sha256(output).hexdigest()==receipt[1]:break
+            if time.monotonic()>=deadline:raise RuntimeError('ordinary audit retained output hash unavailable')
+            time.sleep(0.2)
+        exit_code=receipt[0]
+        print('ORDINARY_AUDIT_EXEC '+json.dumps({'exit':exit_code,'output_bytes':len(output),'output_sha256':hashlib.sha256(output).hexdigest()}),flush=True)
+        sys.stdout.buffer.write(output);sys.stdout.flush()
+        after = json.loads(subprocess.check_output(['docker','inspect',name]))[0]
+        if (after['Id'],after['Image'],after['State']['Pid'],after['State']['StartedAt']) != (info['Id'],info['Image'],info['State']['Pid'],info['State']['StartedAt']):
+            raise RuntimeError('ordinary audit shared engine changed')
+        validate_required_output(tier,output.decode(errors='replace'),exit_code)
+        print('ORDINARY_AUDIT_SHARED_RESOURCE '+json.dumps({'engine':kind,'container_id':info['Id'],'engine_image':image,
+            'tool_image':ORDINARY_AUDIT_IMAGE,'exe_sha256':executable_hash,'engine_unchanged':True}),flush=True)
+    finally:
+        if cid:
+            command(['docker','rm','-f',cid],stdout=subprocess.DEVNULL)
+            print('ORDINARY_AUDIT_TOOL_CLEANUP '+json.dumps({'container_id':cid,'removed':True,'shared_engine_touched':False}),flush=True)
+
+
+def ordinary_audit_shared_kernel(kind, expected):
+    # Shared engines are deliberately not claimed as owned Popen children.
+    # Observe their current executable and listener from their same PID/net NS.
+    # A fixed fork-only, nondumpable same-UID observer reads kernel metadata;
+    # only its root-held socketpair can carry a complete successful result.
+    comm = {'mysql':'mysqld','postgres':'postgres','clickhouse':'clickhouse-serv'}[kind]
+    listeners = set()
+    for name in ('tcp','tcp6'):
+        for line in Path('/proc/net/'+name).read_text().splitlines()[1:]:
+            row=line.split()
+            if row[3]=='0A' and int(row[1].split(':')[1],16)==expected['port']:listeners.add(row[9])
+    if kind!='clickhouse':
+        path='/var/run/mysqld/mysqld.sock' if kind=='mysql' else '/var/run/postgresql/.s.PGSQL.5432'
+        rows=[r.split() for r in Path('/proc/net/unix').read_text().splitlines()[1:]]
+        unix=[r[6] for r in rows if len(r)==8 and r[7]==path and r[3]=='00010000']
+        if len(unix)!=1:raise RuntimeError('ordinary audit Unix listener missing')
+        listeners.update(unix)
+    if not listeners:raise RuntimeError('ordinary audit listener missing')
+    candidates=[]
+    for p in Path('/proc').glob('[0-9]*'):
+        try:
+            if not (p/'comm').read_text().strip().startswith(comm):continue
+            status=dict(l.split(':',1) for l in (p/'status').read_text().splitlines() if ':' in l)
+            candidates.append((int(p.name),int(status['Uid'].split()[0]),(p/'stat').read_text().rsplit(')',1)[1].split()[19]))
+        except (FileNotFoundError,ProcessLookupError):continue
+    # PG backends may share the executable but only the postmaster owns every
+    # fixed-port listening socket. Require exactly one matching kernel result.
+    results=[]
+    for pid,uid,start in candidates:
+        if uid==0:raise RuntimeError('shared database daemon must be nonroot')
+        parent,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET);parent.settimeout(3)
+        inherited=[int(p.name) for p in Path('/proc/self/fd').iterdir()]
+        observer=os.fork()
+        if observer==0:
+            try:
+                parent.close();os.setsid();libc=ctypes.CDLL(None,use_errno=True)
+                if libc.prctl(4,0,0,0,0) or Path('/proc/sys/fs/suid_dumpable').read_text().strip()!='0':os._exit(1)
+                demote(uid)
+                if libc.prctl(4,0,0,0,0) or libc.prctl(3,0,0,0,0)!=0:os._exit(1)
+                for fd in inherited:
+                    if fd!=child.fileno():
+                        try:os.close(fd)
+                        except OSError:pass
+                p=Path('/proc')/str(pid)
+                before=(p/'stat').read_text().rsplit(')',1)[1].split()[19]
+                exe=p/'exe';st=exe.stat();exe_hash=digest(exe)
+                fds=set()
+                for fd in (p/'fd').iterdir():
+                    try:fds.add(os.readlink(fd))
+                    except FileNotFoundError:pass
+                after=(p/'stat').read_text().rsplit(')',1)[1].split()[19]
+                ns={n:os.readlink(p/'ns'/n) for n in ('pid','net')}
+                if before!=start or after!=start or exe_hash!=expected['exe_sha256'] or not all('socket:['+n+']' in fds for n in listeners) or ns!={n:os.readlink('/proc/self/ns/'+n) for n in ns}:os._exit(2)
+                child.sendall(json.dumps({'pid':pid,'uid':uid,'start':start,'exe_sha256':exe_hash,'device':st.st_dev,'inode':st.st_ino,'listeners':sorted(listeners),'namespaces':ns}).encode());os._exit(0)
+            except BaseException:os._exit(1)
+        child.close();packet=b'';normal=False
+        try:
+            # Child may not have demoted yet; packet is accepted only after exit,
+            # not from filesystem JSON, INFO, or a service-supplied claim.
+            packet,_,flags,_=parent.recvmsg(4096)
+            if flags&socket.MSG_TRUNC or parent.recv(1):raise RuntimeError('ordinary audit observer framing')
+        except (TimeoutError,ConnectionResetError):
+            os.kill(observer,9)
+        finally:
+            parent.close();_,status=os.waitpid(observer,0);normal=os.WIFEXITED(status) and os.WEXITSTATUS(status)==0
+        if normal and packet:results.append(json.loads(packet))
+    if len(results)!=1:raise RuntimeError('ordinary audit daemon/listener observation unavailable or ambiguous')
+    return results[0]
+
+
+def ordinary_audit_shared_run(bundle,tier):
+    if os.geteuid()!=0 or tier not in ORDINARY_AUDIT_SHARED:raise ValueError('ordinary audit installer denied')
+    metadata=verified_manifest(bundle)
+    if metadata['tier']!=tier or metadata['entries']!=[{'binary':'test-0','cwd':'router','run':ORDINARY_AUDIT_SELECTOR}]:raise ValueError('ordinary audit inventory changed')
+    mounts=[r.split() for r in Path('/proc/mounts').read_text().splitlines() if len(r.split())>3]
+    run=[r for r in mounts if r[1]=='/run']
+    status=dict(l.split(':',1) for l in Path('/proc/self/status').read_text().splitlines() if ':' in l)
+    if (not os.statvfs('/').f_flag&os.ST_RDONLY or len(run)!=1 or run[0][2]!='tmpfs' or 'noexec' in run[0][3].split(',') or
+        not {'nosuid','nodev'}.issubset(run[0][3].split(',')) or os.statvfs('/run').f_blocks*os.statvfs('/run').f_frsize>4*1024**3 or
+        status['NoNewPrivs'].strip()!='1' or int(status['CapBnd'],16)&((1<<19)|(1<<21))):raise ValueError('ordinary audit isolation missing')
+    expected=json.loads(sys.stdin.buffer.read(8193))
+    if set(expected)!={'admin','exe_sha256','port','engine_image'}:raise ValueError('ordinary audit control input mismatch')
+    kind=tier.removeprefix('ordinary-audit-');kernel=ordinary_audit_shared_kernel(kind,expected)
+    root=Path(tempfile.mkdtemp(prefix='ordinary-audit-',dir='/run'));root.chmod(0o755)
+    (root/'bundle').mkdir(mode=0o755);(root/'bundle').chmod(0o755)
+    shutil.copyfile(bundle/'manifest.json',root/'bundle/manifest.json');(root/'bundle/manifest.json').chmod(0o644)
+    uid=200000+secrets.randbelow(100000000)
+    try:pwd.getpwuid(uid);raise ValueError('ordinary audit UID occupied')
+    except KeyError:pass
+    for p in Path('/proc').glob('[0-9]*/status'):
+        try:
+            if re.search(r'^Uid:\s+'+str(uid)+r'\s',p.read_text(),re.M):raise ValueError('ordinary audit UID active')
+        except (FileNotFoundError,PermissionError):pass
+    ident=secrets.token_hex(12);password=secrets.token_hex(32)
+    main_kind=kind if kind!='clickhouse' else 'sqlite'
+    main_name='newapi_w01_w82_'+ident+'_main';log_name='newapi_w01_w82_'+ident+'_log'
+    main_role='w82_'+ident[:20]+'_main';log_role='w82_'+ident[:20]+'_log'
+    (root/'journals').mkdir(mode=0o755);(root/'journals').chmod(0o755);(root/'data').mkdir(mode=0o700)
+    (root/'tmp').mkdir(mode=0o700);os.chown(root/'tmp',uid,uid)
+    journal=root/'journals/birth.json'
+    env={'PATH':'/usr/bin:/bin','GOMAXPROCS':'2'}
+    if main_kind!='sqlite':env['BOOTSTRAP_ADMIN_DSN']=expected['admin']
+    target=str(root/'data/main.db') if main_kind=='sqlite' else main_name
+    cfg={'MainKind':main_kind,'LogKind':kind,'MainDatabase':main_name,'LogDatabase':log_name,'MainRole':main_role,'LogRole':log_role,'Password':password,
+         'MainDSN':'','LogDSN':'','MainAdminDSN':expected['admin'] if main_kind!='sqlite' else '', 'LogAdminDSN':expected['admin'],
+         'UID':uid,'Journal':str(journal),'BinarySHA256':metadata['files']['test-0'],'ManifestSHA256':digest(bundle/'manifest.json')}
+    if kind=='mysql':
+        cfg['MainDSN']=main_role+':'+password+'@unix(/audit-sockets/mysql.sock)/'+main_name+'?parseTime=true'
+        cfg['LogDSN']=log_role+':'+password+'@unix(/audit-sockets/mysql.sock)/'+log_name+'?parseTime=true'
+    elif kind=='postgres':
+        cfg['MainDSN']='postgresql://'+main_role+':'+password+'@/'+main_name+'?host=/audit-sockets&sslmode=disable'
+        cfg['LogDSN']='postgresql://'+log_role+':'+password+'@/'+log_name+'?host=/audit-sockets&sslmode=disable'
+    else:
+        cfg['MainDSN']=target;cfg['LogDSN']='clickhouse://127.0.0.1:9000/'+log_name+'?username='+log_role+'&password='+password
+    print('ORDINARY_AUDIT_IDENTITY '+json.dumps({'tier':tier,'main_database':main_name,'log_database':log_name,'main_role':main_role,'log_role':log_role,'uid':uid}),flush=True)
+    private=root/'admin.json';public=root/'service.json'
+    private.write_text(json.dumps(cfg));private.chmod(0o600)
+    def fixture(mode):
+        result=subprocess.run([str(bundle/'test-0'),'-test.v','-test.run=^TestOAuthTokensConsumerHTTP$'],
+            cwd=bundle/'source/router',env=dict(env,NEWAPI_ORDINARY_AUDIT_CONFIG=str(private),NEWAPI_ORDINARY_AUDIT_SETUP=mode),capture_output=True,timeout=90)
+        # Installer errors are never echoed: a server may quote SQL/credentials.
+        print('ORDINARY_AUDIT_PROVISION '+json.dumps({'phase':mode,'exit':result.returncode,'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest(),
+            'source_lines':sorted(set(re.findall(r'oauth_public_test.go:[0-9]+',(result.stdout+result.stderr).decode(errors='replace'))))[-8:]}),flush=True)
+        if result.returncode:raise RuntimeError('ordinary audit fixture '+mode+' failed')
+    try:
+        result=subprocess.run([str(bundle/'new-api'),'db-bootstrap','fresh','--engine',main_kind,'--target',target,'--journal',str(journal)],env=env,capture_output=True,timeout=120)
+        print('ORDINARY_AUDIT_BIRTH '+json.dumps({'engine':main_kind,'exit':result.returncode,'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest()}),flush=True)
+        if result.returncode:raise RuntimeError('ordinary audit permanent birth failed')
+        birth=json.loads(journal.read_text())
+        if birth['phase']!='READY' or birth['target']!=target or birth['engine']!=main_kind:raise RuntimeError('ordinary audit birth mismatch')
+        fixture('provision')
+        if main_kind=='sqlite':os.chown(root/'data',uid,uid);os.chown(target,uid,uid)
+        public_cfg=dict(cfg,MainAdminDSN='',LogAdminDSN='')
+        public.write_text(json.dumps(public_cfg));os.chown(public,0,uid);public.chmod(0o640)
+        before=digest(journal)
+        service_env={'PATH':'/usr/bin:/bin','HOME':str(root/'tmp'),'TMPDIR':str(root/'tmp'),'GOMAXPROCS':'2','NEWAPI_ORDINARY_AUDIT_CONFIG':str(public)}
+        result=subprocess.run([str(bundle/'test-0'),'-test.v','-test.count=1','-test.run='+ORDINARY_AUDIT_SELECTOR],cwd=bundle/'source/router',
+            env=service_env,preexec_fn=lambda:demote(uid),capture_output=True,timeout=180)
+        sys.stdout.buffer.write(result.stdout+result.stderr);sys.stdout.flush()
+        validate_required_output(tier,result.stdout.decode(errors='replace'),result.returncode)
+        if digest(journal)!=before or ordinary_audit_shared_kernel(kind,expected)!=kernel:raise RuntimeError('ordinary audit birth/kernel changed')
+        print('ORDINARY_AUDIT_RESULT '+json.dumps({'tier':tier,'main_database':main_name,'log_database':log_name,'uid':uid,'kernel':kernel,
+            'manifest_sha256':digest(bundle/'manifest.json'),'binary_sha256':metadata['files']['test-0'],'runner_sha256':metadata['files']['runner.py'],
+            'journal_sha256':before,'exit':0,'required_leaves':required_leaves(tier),'source':'permanent CLI fresh; synthetic actors only'}),flush=True)
+    finally:
+        try:fixture('cleanup')
+        finally:shutil.rmtree(root)
+        print('ORDINARY_AUDIT_DATABASE_CLEANUP '+json.dumps({'main':main_name,'log':log_name,'cleanup':True}),flush=True)
+
+
 def main():
+    if len(sys.argv)==4 and sys.argv[1]=="_ordinary_audit_shared":
+        ordinary_audit_shared_run(Path(sys.argv[2]),sys.argv[3]);return
     if len(sys.argv) == 4 and sys.argv[1] == '_wallet_run':
         with WalletObservationCollector():
             trusted_wallet_run(Path(sys.argv[2]), sys.argv[3])
@@ -2715,7 +3006,7 @@ def main():
         dispatch_tier(Path(sys.argv[2]), sys.argv[3])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; ordinary-audit uses SQLite and does not qualify external log stores')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')

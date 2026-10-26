@@ -53,6 +53,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/clickhouse"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -5276,8 +5277,294 @@ func oauthMetadataFixture(t *testing.T) *organizationHTTPFixture {
 	return f
 }
 
+// The explicit ordinary-audit tier provisions only its own synthetic databases.
+// The root-only setup branch is a test installer, never an HTTP/service action.
+type oauthOrdinaryAuditConfig struct {
+	MainKind, LogKind, MainDatabase, LogDatabase, MainRole, LogRole, Password         string
+	MainDSN, LogDSN, MainAdminDSN, LogAdminDSN, Journal, BinarySHA256, ManifestSHA256 string
+	UID                                                                               int
+}
+
+func oauthOrdinaryAuditConfigRead(t *testing.T) oauthOrdinaryAuditConfig {
+	t.Helper()
+	path := os.Getenv("NEWAPI_ORDINARY_AUDIT_CONFIG")
+	require.NotEmpty(t, path)
+	require.True(t, filepath.IsAbs(path))
+	for p := path; ; p = filepath.Dir(p) {
+		st, e := os.Lstat(p)
+		require.NoError(t, e)
+		require.Zero(t, st.Mode()&os.ModeSymlink)
+		require.Zero(t, st.Mode().Perm()&0o022)
+		require.Zero(t, reflect.Indirect(reflect.ValueOf(st.Sys())).FieldByName("Uid").Uint())
+		if p == "/" {
+			break
+		}
+	}
+	raw, e := os.ReadFile(path)
+	require.NoError(t, e)
+	var cfg oauthOrdinaryAuditConfig
+	require.NoError(t, common.Unmarshal(raw, &cfg))
+	require.Contains(t, []string{"sqlite", "mysql", "postgres"}, cfg.MainKind)
+	require.Contains(t, []string{"mysql", "postgres", "clickhouse"}, cfg.LogKind)
+	require.Regexp(t, `^newapi_w01_w82_[0-9a-f]{24}_main$`, cfg.MainDatabase)
+	require.Regexp(t, `^newapi_w01_w82_[0-9a-f]{24}_log$`, cfg.LogDatabase)
+	require.Regexp(t, `^w82_[0-9a-f]{20}_main$`, cfg.MainRole)
+	require.Regexp(t, `^w82_[0-9a-f]{20}_log$`, cfg.LogRole)
+	require.Regexp(t, `^[0-9a-f]{64}$`, cfg.Password)
+	exe, e := os.Executable()
+	require.NoError(t, e)
+	binary, e := os.ReadFile(exe)
+	require.NoError(t, e)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(binary)), cfg.BinarySHA256)
+	manifest, e := os.ReadFile(filepath.Join(filepath.Dir(path), "bundle/manifest.json"))
+	require.NoError(t, e)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(manifest)), cfg.ManifestSHA256)
+	return cfg
+}
+
+func oauthOrdinaryAuditOpen(t *testing.T, kind, dsn string) *gorm.DB {
+	t.Helper()
+	var dialect gorm.Dialector
+	switch kind {
+	case "sqlite":
+		dialect = sqlite.Open(dsn)
+	case "mysql":
+		dialect = mysql.Open(dsn)
+	case "postgres":
+		for _, key := range []string{"PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGSERVICE", "PGSERVICEFILE", "PGOPTIONS"} {
+			require.Empty(t, os.Getenv(key))
+		}
+		dialect = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+	case "clickhouse":
+		dialect = clickhouse.Open(dsn)
+	default:
+		t.Fatal("unsupported ordinary audit database")
+	}
+	db, e := gorm.Open(dialect, &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.True(t, e == nil, "ordinary audit database connection failed; details withheld")
+	conn, e := db.DB()
+	require.NoError(t, e)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	return db
+}
+
+func oauthOrdinaryAuditProvision(t *testing.T) {
+	require.Zero(t, os.Getuid(), "only the trusted fixture installer provisions databases")
+	cfg := oauthOrdinaryAuditConfigRead(t)
+	mode := os.Getenv("NEWAPI_ORDINARY_AUDIT_SETUP")
+	require.Contains(t, []string{"provision", "cleanup"}, mode)
+	// Main birth/seal already came from the permanent CLI. Root adds the same
+	// ordinary grant/session fixtures the existing route fixture needs, no source.
+	for _, store := range []struct {
+		kind, admin, name, role string
+		main                    bool
+	}{
+		{cfg.MainKind, cfg.MainAdminDSN, cfg.MainDatabase, cfg.MainRole, true},
+		{cfg.LogKind, cfg.LogAdminDSN, cfg.LogDatabase, cfg.LogRole, false},
+	} {
+		if store.kind == "sqlite" {
+			if mode == "provision" {
+				db := oauthOrdinaryAuditOpen(t, "sqlite", cfg.MainDSN)
+				model.DB = db
+				common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+				common.IsMasterNode = true
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}))
+				require.NoError(t, model.InitOAuthCleanupStore(true))
+				require.NoError(t, model.InitOAuthGrantStore(true))
+				common.IsMasterNode = false
+			}
+			continue
+		}
+		admin := oauthOrdinaryAuditOpen(t, store.kind, store.admin)
+		execSQL := func(q string) {
+			t.Helper()
+			require.True(t, admin.Exec(q).Error == nil, "owned audit fixture SQL failed; details withheld")
+		}
+		if mode == "cleanup" {
+			cleanupSQL := func(q string) {
+				t.Helper()
+				assert.True(t, admin.Exec(q).Error == nil, "owned audit cleanup SQL failed; details withheld")
+			}
+			cleanupSQL("DROP DATABASE IF EXISTS " + store.name)
+			if store.kind == "mysql" {
+				cleanupSQL("DROP USER IF EXISTS '" + store.role + "'@'127.0.0.1'")
+				cleanupSQL("DROP USER IF EXISTS '" + store.role + "'@'localhost'")
+			} else if store.kind == "postgres" {
+				cleanupSQL("DROP ROLE IF EXISTS " + store.role)
+			} else {
+				cleanupSQL("DROP USER IF EXISTS " + store.role)
+			}
+			continue
+		}
+		if !store.main {
+			execSQL("CREATE DATABASE " + store.name)
+		}
+		dsn := cfg.LogDSN
+		if store.main {
+			dsn = cfg.MainDSN
+		}
+		// Use administrator credentials only during this root setup phase.
+		if store.kind == "mysql" {
+			c, e := sqlmysql.ParseDSN(store.admin)
+			require.True(t, e == nil)
+			c.DBName = store.name
+			dsn = c.FormatDSN()
+		} else {
+			u, e := url.Parse(store.admin)
+			require.True(t, e == nil)
+			u.Path = "/" + store.name
+			dsn = u.String()
+		}
+		db := oauthOrdinaryAuditOpen(t, store.kind, dsn)
+		model.DB = db
+		model.LOG_DB = db
+		common.SetDatabaseTypes(common.DatabaseType(store.kind), common.DatabaseType(store.kind))
+		if store.main {
+			common.IsMasterNode = true
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}))
+			require.NoError(t, model.InitOAuthCleanupStore(true))
+			require.NoError(t, model.InitOAuthGrantStore(true))
+			common.IsMasterNode = false
+		} else {
+			require.NoError(t, model.MigrateAuditLogs())
+		}
+		mutable := []string{"users", "tokens", "user_sessions", "session_revocation_events", "oauth_grants", "o_auth_operations", "o_auth_artifacts", "o_auth_cleanup_jobs"}
+		if !store.main {
+			mutable = []string{"audit_logs"}
+		}
+		if store.kind == "mysql" {
+			for _, host := range []string{"127.0.0.1", "localhost"} {
+				execSQL("CREATE USER '" + store.role + "'@'" + host + "' IDENTIFIED BY '" + cfg.Password + "'")
+				for _, table := range mutable {
+					rights := "SELECT,INSERT"
+					if store.main {
+						rights += ",UPDATE,DELETE"
+					}
+					execSQL("GRANT " + rights + " ON " + store.name + "." + table + " TO '" + store.role + "'@'" + host + "'")
+				}
+				if store.main {
+					for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity", "oauth_derived_token_sources"} {
+						execSQL("GRANT SELECT ON " + store.name + "." + table + " TO '" + store.role + "'@'" + host + "'")
+					}
+				}
+			}
+		} else if store.kind == "postgres" {
+			execSQL("CREATE ROLE " + store.role + " LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '" + cfg.Password + "'")
+			execSQL("REVOKE ALL ON DATABASE " + store.name + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + store.name + " TO " + store.role)
+			require.NoError(t, db.Exec("REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE ON SCHEMA public TO "+store.role).Error)
+			for _, table := range mutable {
+				rights := "SELECT,INSERT"
+				if store.main {
+					rights += ",UPDATE,DELETE"
+				}
+				require.NoError(t, db.Exec("GRANT "+rights+" ON public."+table+" TO "+store.role).Error)
+			}
+			if store.main {
+				for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity", "oauth_derived_token_sources"} {
+					require.NoError(t, db.Exec("GRANT SELECT ON public."+table+" TO "+store.role).Error)
+				}
+			}
+			require.NoError(t, db.Exec("GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO "+store.role).Error)
+			execSQL("ALTER DATABASE " + store.name + " CONNECTION LIMIT 20")
+		} else {
+			execSQL("CREATE USER " + store.role + " IDENTIFIED WITH sha256_password BY '" + cfg.Password + "'")
+			execSQL("GRANT SELECT,INSERT ON " + store.name + ".audit_logs TO " + store.role)
+		}
+	}
+	t.Log("ordinary audit owned fixture " + mode + " complete; no shared grants changed")
+}
+
+func oauthOrdinaryAuditFixture(t *testing.T) *organizationHTTPFixture {
+	t.Helper()
+	cfg := oauthOrdinaryAuditConfigRead(t)
+	require.Equal(t, cfg.UID, os.Getuid())
+	require.NotZero(t, cfg.UID)
+	require.Empty(t, cfg.MainAdminDSN)
+	require.Empty(t, cfg.LogAdminDSN)
+	db := oauthOrdinaryAuditOpen(t, cfg.MainKind, cfg.MainDSN)
+	oldDB, oldLog := model.DB, model.LOG_DB
+	oldMain, oldLogKind := common.MainDatabaseType(), common.LogDatabaseType()
+	oldMaster, oldRedis, oldMemory, oldPath := common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.SQLitePath
+	oldReady := model.OAuthCleanupReady()
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLog
+		common.SetDatabaseTypes(oldMain, oldLogKind)
+		common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.SQLitePath = oldMaster, oldRedis, oldMemory, oldPath
+		require.NoError(t, model.InitOAuthCleanupStore(oldReady))
+	})
+	model.DB = db
+	common.SetDatabaseTypes(common.DatabaseType(cfg.MainKind), common.DatabaseType(cfg.LogKind))
+	common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled = false, false, false
+	t.Setenv("SQL_DSN", cfg.MainDSN)
+	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", cfg.Journal)
+	if cfg.MainKind == "sqlite" {
+		common.SQLitePath = cfg.MainDSN
+		t.Setenv("SQL_DSN", "")
+	}
+	t.Setenv("LOG_SQL_DSN", cfg.LogDSN)
+	require.NoError(t, model.InitLogDB())
+	model.LOG_DB.Logger = gormlogger.Default.LogMode(gormlogger.Silent)
+	logConnection, err := model.LOG_DB.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, logConnection.Close()) })
+	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+	require.NoError(t, model.InitOAuthCleanupStore(true))
+	for _, store := range []struct {
+		db               *gorm.DB
+		kind, name, role string
+	}{{db, cfg.MainKind, cfg.MainDatabase, cfg.MainRole}, {model.LOG_DB, cfg.LogKind, cfg.LogDatabase, cfg.LogRole}} {
+		if store.kind == "sqlite" {
+			continue
+		}
+		q := "SELECT DATABASE(),CURRENT_USER()"
+		if store.kind == "postgres" {
+			q = "SELECT current_database(),current_user"
+		}
+		if store.kind == "clickhouse" {
+			q = "SELECT currentDatabase(),currentUser()"
+		}
+		var name, role string
+		conn, e := store.db.DB()
+		require.NoError(t, e)
+		require.NoError(t, conn.QueryRow(q).Scan(&name, &role))
+		require.Equal(t, store.name, name)
+		require.True(t, role == store.role || role == store.role+"@127.0.0.1" || role == store.role+"@localhost")
+	}
+	if cfg.MainKind != "sqlite" {
+		for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity", "oauth_derived_token_sources"} {
+			require.Error(t, db.Exec("DELETE FROM "+table+" WHERE 1=0").Error)
+		}
+	}
+	for _, q := range []string{"DELETE FROM audit_logs WHERE 1=0", "CREATE TABLE forbidden_audit_table (id INTEGER)"} {
+		require.Error(t, model.LOG_DB.Exec(q).Error, "audit runtime has insert/readback only")
+	}
+	require.Error(t, os.Chmod(cfg.Journal, 0o666))
+	f := &organizationHTTPFixture{db: db, mainDSN: cfg.MainDSN, mainKind: cfg.MainKind, users: map[string]*model.User{}, sids: map[string]string{}}
+	for i, label := range []string{"owner", "foreign"} {
+		u := &model.User{Id: 61000 + i, Username: "metadata-" + label, Password: "fixture-not-login-password", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: fmt.Sprint(61000 + i)}
+		require.NoError(t, db.Create(u).Error)
+		f.users[label] = u
+		sid := "metadata-" + common.NewRequestId()
+		f.sids[label] = sid
+		require.NoError(t, model.CreateUserSession(&model.UserSession{SID: sid, UserID: u.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("a", 64), LoginMethod: "password", ExpiresAt: time.Now().Unix() + 3600}))
+	}
+	key, e := common.GenerateRandomCharsKey(40)
+	require.NoError(t, e)
+	require.NoError(t, db.Create(&model.Token{UserId: f.users["owner"].Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
+	return f
+}
+
 func TestOAuthTokensConsumerHTTP(t *testing.T) {
-	f := oauthMetadataFixture(t)
+	if os.Getenv("NEWAPI_ORDINARY_AUDIT_SETUP") != "" {
+		oauthOrdinaryAuditProvision(t)
+		return
+	}
+	var f *organizationHTTPFixture
+	if os.Getenv("NEWAPI_ORDINARY_AUDIT_CONFIG") != "" {
+		f = oauthOrdinaryAuditFixture(t)
+	} else {
+		f = oauthMetadataFixture(t)
+	}
 	// Bootstrap owns provenance; the existing grant-store startup initializes
 	// only its ordinary grant/cleanup schema, as in adjacent OAuth fixtures.
 	master := common.IsMasterNode
@@ -5428,26 +5715,59 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		assert.NotContains(t, w.Body.String(), "data")
 	})
 	t.Run("ordinary_key_creation", func(t *testing.T) {
-		// Keep audit storage distinct from primary/provenance and give this
-		// fixture only its own temporary log file, including external main tiers.
+		// Use a configured log store as-is. A missing external audit table is a
+		// fixture provisioning failure, never a reason to fall back to SQLite.
+		// The default SQLite fixture retains its separate, owned temporary file.
 		previousLog, previousMainKind, previousLogKind := model.LOG_DB, common.MainDatabaseType(), common.LogDatabaseType()
-		auditDB, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "ordinary-audit.db")), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
-		require.NoError(t, err)
-		auditConnection, err := auditDB.DB()
-		require.NoError(t, err)
-		require.NoError(t, auditDB.AutoMigrate(&model.AuditLog{}))
+		auditDB := previousLog
+		if previousLogKind == common.DatabaseTypeSQLite && os.Getenv("LOG_SQL_DSN") == "" {
+			var err error
+			auditDB, err = gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "ordinary-audit.db")), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+			require.NoError(t, err)
+			auditConnection, err := auditDB.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, auditConnection.Close()) })
+			require.NoError(t, auditDB.AutoMigrate(&model.AuditLog{}))
+		}
+		require.NotNil(t, auditDB)
 		model.LOG_DB = auditDB
-		common.SetDatabaseTypes(previousMainKind, common.DatabaseTypeSQLite)
 		t.Cleanup(func() {
 			model.LOG_DB = previousLog
 			common.SetDatabaseTypes(previousMainKind, previousLogKind)
-			require.NoError(t, auditConnection.Close())
+		})
+		var auditRows int64
+		require.NoError(t, auditDB.Model(&model.AuditLog{}).Count(&auditRows).Error, "installer must provision the selected audit store")
+		var mainVersion, logVersion string
+		versionQuery := "SELECT version()"
+		if previousMainKind == common.DatabaseTypeSQLite {
+			versionQuery = "SELECT sqlite_version()"
+		}
+		require.NoError(t, f.db.Raw(versionQuery).Scan(&mainVersion).Error)
+		if previousLogKind == common.DatabaseTypeSQLite {
+			versionQuery = "SELECT sqlite_version()"
+		} else {
+			versionQuery = "SELECT version()"
+		}
+		require.NoError(t, auditDB.Raw(versionQuery).Scan(&logVersion).Error)
+		t.Logf("ordinary audit main=%s version=%s log=%s version=%s separate=%t", previousMainKind, mainVersion, previousLogKind, logVersion, f.db != auditDB)
+		var errorOutput organizationLogBuffer
+		common.LogWriterMu.Lock()
+		previousErrorWriter := gin.DefaultErrorWriter
+		gin.DefaultErrorWriter = &errorOutput
+		common.LogWriterMu.Unlock()
+		t.Cleanup(func() {
+			common.LogWriterMu.Lock()
+			gin.DefaultErrorWriter = previousErrorWriter
+			common.LogWriterMu.Unlock()
 		})
 		const auditCanary = "W77_SECRET_REQUEST_CANARY"
 		assertAudit := func(w *httptest.ResponseRecorder, result, failure string, tokenID int) model.AuditLog {
 			t.Helper()
-			var row model.AuditLog
-			require.NoError(t, auditDB.Where("request_id = ?", w.Header().Get(common.RequestIdKey)).Take(&row).Error)
+			rows, total, err := model.GetAuditLogs(model.AuditLogFilter{RequestId: w.Header().Get(common.RequestIdKey)}, 0, 2, common.RoleRootUser)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			require.Len(t, rows, 1)
+			row := *rows[0]
 			assert.Equal(t, grant.UserID, row.UserId)
 			assert.Equal(t, f.users["owner"].Username, row.Username)
 			assert.Equal(t, common.RoleCommonUser, row.ActorRole)
@@ -5631,6 +5951,61 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		assert.Equal(t, 503, overLimit.Code)
 		assertAudit(overLimit, "rejected", "creation_unavailable", 0)
 		assert.Equal(t, initial+1, count())
+		operation_setting.GetTokenSetting().MaxUserTokens = oldLimit
+		t.Run("audit_insert_failure", func(t *testing.T) {
+			var inserts atomic.Int32
+			const callback = "ordinary-oauth:audit-unavailable"
+			require.NoError(t, auditDB.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "audit_logs" {
+					inserts.Add(1)
+					tx.AddError(errors.New("ordinary audit sink unavailable"))
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, auditDB.Callback().Create().Remove(callback)) })
+			before := count()
+			t.Run("success", func(t *testing.T) {
+				response := post(`{"name":"audit-unavailable"}`, "synthetic-metadata")
+				require.Equal(t, http.StatusOK, response.Code)
+				assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+				var body struct {
+					Success bool
+					Data    struct {
+						ID  int
+						Key string
+					}
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+				require.True(t, body.Success)
+				require.Positive(t, body.Data.ID)
+				require.True(t, len(body.Data.Key) > 20)
+				var stored model.Token
+				require.NoError(t, f.db.First(&stored, body.Data.ID).Error)
+				assert.True(t, body.Data.Key == stored.Key, "successful response retains its persisted ordinary key")
+				assert.Equal(t, grant.UserID, stored.UserId)
+				assert.True(t, stored.UnlimitedQuota)
+				assert.EqualValues(t, -1, stored.ExpiredTime)
+				assertNoAudit(response)
+				assert.Equal(t, before+1, count())
+				assert.False(t, strings.Contains(errorOutput.snapshot(), body.Data.Key), "audit error output excludes usable key")
+				assert.Contains(t, errorOutput.snapshot(), response.Header().Get(common.RequestIdKey))
+			})
+			t.Run("authenticated_rejection", func(t *testing.T) {
+				response := post(`{"name":"`+auditCanary+`","password":"`+auditCanary+`"}`, "synthetic-metadata")
+				assert.Equal(t, http.StatusBadRequest, response.Code)
+				assert.Contains(t, response.Body.String(), "invalid_request")
+				assert.NotContains(t, response.Body.String(), "data")
+				assertNoAudit(response)
+				assert.Equal(t, before+1, count(), "authenticated rejection creates no key even when audit is down")
+				assert.Contains(t, errorOutput.snapshot(), response.Header().Get(common.RequestIdKey))
+			})
+			assert.EqualValues(t, 2, inserts.Load(), "both new OAuth route outcomes attempt the real audit insert")
+			output := errorOutput.snapshot()
+			assert.Equal(t, 2, strings.Count(output, "ordinary audit sink unavailable"))
+			for _, secret := range []string{auditCanary, "synthetic-metadata", grant.GrantID, f.sids["owner"], created.Data.Key} {
+				assert.False(t, strings.Contains(output, secret), "audit error output excludes request capabilities")
+			}
+			t.Logf("ordinary audit failure attempts=%d output_sha256=%x credential_exposure=false", inserts.Load(), sha256.Sum256([]byte(output)))
+		})
 	})
 
 }
