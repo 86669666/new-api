@@ -5427,6 +5427,7 @@ func oauthOrdinaryAuditProvision(t *testing.T) {
 			common.IsMasterNode = false
 			if store.kind == "postgres" {
 				oauthCleanupMetadataControls(t, db)
+				oauthGrantMetadataControls(t, db)
 			}
 		} else {
 			require.NoError(t, model.MigrateAuditLogs())
@@ -5589,6 +5590,166 @@ func oauthCleanupMetadataObservation(t *testing.T, db *gorm.DB) {
 	}
 }
 
+// Installer-only synthetic relations/catalog faults are rolled back before the
+// non-owner business runtime starts. Valid keys on other relations cannot help.
+func oauthGrantMetadataControls(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.Zero(t, os.Getuid())
+	oldDB, oldMaster := model.DB, common.IsMasterNode
+	model.DB, common.IsMasterNode = db, false
+	defer func() { model.DB = oldDB; common.IsMasterNode = oldMaster }()
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	for _, tc := range []struct {
+		name, grantColumns, consentColumns, mutation, table string
+		searchPath                                          bool
+	}{
+		{name: "missing_grant", consentColumns: "consent_ref"},
+		{name: "missing_consent", grantColumns: "grant_ref"},
+		{name: "wrong_grant", grantColumns: "user_id", consentColumns: "consent_ref"},
+		{name: "wrong_consent", grantColumns: "grant_ref", consentColumns: "user_id"},
+		{name: "grant_composite", grantColumns: "grant_ref,user_id", consentColumns: "consent_ref"},
+		{name: "grant_reversed", grantColumns: "user_id,grant_ref", consentColumns: "consent_ref"},
+		{name: "consent_composite", grantColumns: "grant_ref", consentColumns: "consent_ref,user_id"},
+		{name: "consent_reversed", grantColumns: "grant_ref", consentColumns: "user_id,consent_ref"},
+		{name: "partial", grantColumns: "grant_ref", mutation: "CREATE UNIQUE INDEX idx_oauth_grants_consent ON grant_probe.oauth_grants(consent_ref) WHERE user_id>0"},
+		{name: "expression", grantColumns: "grant_ref", mutation: "CREATE UNIQUE INDEX idx_oauth_grants_consent ON grant_probe.oauth_grants(lower(consent_ref))"},
+		{name: "invalid", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indisvalid=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "not_ready", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indisready=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "not_live", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indislive=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "not_unique", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indisunique=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "not_immediate", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indimmediate=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "deferred", grantColumns: "grant_ref", mutation: "ALTER TABLE grant_probe.oauth_grants ADD CONSTRAINT deferred_consent UNIQUE(consent_ref) DEFERRABLE INITIALLY DEFERRED"},
+		{name: "unvalidated", grantColumns: "grant_ref", mutation: "ALTER TABLE grant_probe.oauth_grants ADD CONSTRAINT invalid_consent UNIQUE(consent_ref); UPDATE pg_catalog.pg_constraint SET convalidated=false WHERE conrelid='grant_probe.oauth_grants'::regclass AND contype='u'"},
+		{name: "nullable", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "ALTER TABLE grant_probe.oauth_grants ALTER COLUMN consent_ref DROP NOT NULL"},
+		{name: "search_path_shadow", consentColumns: "consent_ref", searchPath: true},
+		{name: "other_table", grantColumns: "grant_ref", consentColumns: "consent_ref", table: "other_grants"},
+	} {
+		t.Run("grant_metadata/"+tc.name, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer func() {
+				model.DB = db
+				require.NoError(t, tx.Rollback().Error)
+				require.NoError(t, model.InitOAuthGrantStore(true))
+			}()
+			require.NoError(t, tx.Exec("CREATE SCHEMA grant_probe").Error)
+			require.NoError(t, tx.Exec("CREATE TABLE grant_probe.oauth_grants (LIKE public.oauth_grants INCLUDING DEFAULTS INCLUDING CONSTRAINTS)").Error)
+			if tc.grantColumns != "" {
+				require.NoError(t, tx.Exec("CREATE UNIQUE INDEX oauth_grants_pkey ON grant_probe.oauth_grants("+tc.grantColumns+")").Error)
+			}
+			if tc.consentColumns != "" {
+				require.NoError(t, tx.Exec("CREATE UNIQUE INDEX idx_oauth_grants_consent ON grant_probe.oauth_grants("+tc.consentColumns+")").Error)
+			}
+			if tc.mutation != "" {
+				require.NoError(t, tx.Exec(tc.mutation).Error)
+			}
+			model.DB = tx.Table("grant_probe.oauth_grants")
+			if tc.table != "" {
+				require.NoError(t, tx.Exec("CREATE TABLE grant_probe.other_grants (LIKE public.oauth_grants INCLUDING DEFAULTS INCLUDING CONSTRAINTS)").Error)
+				model.DB = tx.Table("grant_probe.other_grants")
+			}
+			if tc.searchPath {
+				require.NoError(t, tx.Exec("SET LOCAL search_path TO grant_probe,public").Error)
+				model.DB = tx
+			}
+			require.ErrorContains(t, model.InitOAuthGrantStore(true), "OAuth grant uniqueness unavailable")
+		})
+	}
+	t.Run("grant_metadata/standalone_grant_constraint_consent", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer func() {
+			model.DB = db
+			require.NoError(t, tx.Rollback().Error)
+			require.NoError(t, model.InitOAuthGrantStore(true))
+		}()
+		require.NoError(t, tx.Exec("ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; CREATE UNIQUE INDEX probe_grant ON public.oauth_grants(grant_ref); DROP INDEX public.idx_oauth_grants_consent; ALTER TABLE public.oauth_grants ADD CONSTRAINT probe_consent UNIQUE(consent_ref)").Error)
+		model.DB = tx
+		require.NoError(t, model.InitOAuthGrantStore(true), "either immediate unique-index form satisfies the original contract")
+	})
+	t.Run("grant_metadata/query_failure", func(t *testing.T) {
+		const name = "grant-metadata:catalog-unavailable"
+		require.NoError(t, db.Callback().Row().Before("gorm:row").Register(name, func(tx *gorm.DB) {
+			if strings.Contains(tx.Statement.SQL.String(), "SELECT i.indexrelid::bigint AS index_oid") {
+				tx.AddError(errors.New("controlled grant catalog unavailable"))
+			}
+		}))
+		defer func() {
+			require.NoError(t, db.Callback().Row().Remove(name))
+			require.NoError(t, model.InitOAuthGrantStore(true))
+		}()
+		model.DB = db
+		require.ErrorContains(t, model.InitOAuthGrantStore(true), "controlled grant catalog unavailable")
+	})
+	var remains int64
+	require.NoError(t, db.Raw("SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname='grant_probe'").Scan(&remains).Error)
+	require.Zero(t, remains, "all synthetic relations and catalog faults rolled back")
+}
+
+// Compare physical metadata and the actual driver reports without data or secrets.
+func oauthGrantMetadataObservation(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	stmt := &gorm.Statement{DB: db}
+	require.NoError(t, stmt.Parse(&model.OAuthGrant{}))
+	var relation struct {
+		RelationOID                        int64 `gorm:"column:relation_oid"`
+		SchemaName, TableName, RuntimeRole string
+		Owned                              bool
+		ConstraintUsage                    int64
+	}
+	require.NoError(t, db.Raw(`SELECT r.oid::bigint AS relation_oid,n.nspname AS schema_name,r.relname AS table_name,
+		current_user AS runtime_role,pg_get_userbyid(r.relowner)=current_user AS owned,
+		(SELECT count(*) FROM information_schema.constraint_column_usage c WHERE c.table_schema=n.nspname AND c.table_name=r.relname) AS constraint_usage
+		FROM pg_catalog.pg_class r JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
+		WHERE r.oid=pg_catalog.to_regclass(?)`, stmt.Quote(stmt.Table)).Scan(&relation).Error)
+	require.Positive(t, relation.RelationOID)
+	var physical []struct {
+		IndexOID                                                                        int64 `gorm:"column:index_oid"`
+		IndexName, Columns, ConstraintType                                              string
+		KeyCount                                                                        int
+		Primary, Unique, Valid, Ready, Live, Immediate, Partial, Expression, Deferrable bool
+	}
+	require.NoError(t, db.Raw(`SELECT ix.oid::bigint AS index_oid,ix.relname AS index_name,i.indnatts AS key_count,
+		i.indisprimary AS primary,i.indisunique AS unique,i.indisvalid AS valid,i.indisready AS ready,i.indislive AS live,
+		i.indimmediate AS immediate,i.indpred IS NOT NULL AS partial,i.indexprs IS NOT NULL AS expression,
+		COALESCE(c.contype::text,'') AS constraint_type,COALESCE(c.condeferrable,false) AS deferrable,
+		(SELECT string_agg(COALESCE(a.attname,'<expression>'),',' ORDER BY k.position)
+		 FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,position)
+		 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum) AS columns
+		FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ix ON ix.oid=i.indexrelid
+		LEFT JOIN pg_catalog.pg_constraint c ON c.conrelid=i.indrelid AND c.conindid=i.indexrelid AND c.contype IN ('p','u')
+		WHERE i.indrelid=? ORDER BY ix.oid`, relation.RelationOID).Scan(&physical).Error)
+	columns, err := db.Migrator().ColumnTypes(&model.OAuthGrant{})
+	require.NoError(t, err)
+	var primaryColumns []string
+	var reportedColumns []map[string]any
+	for _, column := range columns {
+		primary, known := column.PrimaryKey()
+		if primary {
+			primaryColumns = append(primaryColumns, column.Name())
+		}
+		if column.Name() == "grant_ref" || column.Name() == "consent_ref" {
+			reportedColumns = append(reportedColumns, map[string]any{"name": column.Name(), "primary": primary, "known": known})
+		}
+	}
+	indexes, err := db.Migrator().GetIndexes(&model.OAuthGrant{})
+	require.NoError(t, err)
+	grantUnique, consentUnique := slices.Equal(primaryColumns, []string{"grant_ref"}), false
+	var reportedIndexes []map[string]any
+	for _, index := range indexes {
+		unique, _ := index.Unique()
+		primary, _ := index.PrimaryKey()
+		reportedIndexes = append(reportedIndexes, map[string]any{"name": index.Name(), "columns": index.Columns(), "unique": unique, "primary": primary})
+		if unique || primary {
+			grantUnique = grantUnique || slices.Equal(index.Columns(), []string{"grant_ref"})
+			consentUnique = consentUnique || slices.Equal(index.Columns(), []string{"consent_ref"})
+		}
+	}
+	data, err := common.Marshal(map[string]any{"relation": relation, "physical": physical, "ColumnTypes": reportedColumns, "GetIndexes": reportedIndexes, "grantUnique": grantUnique, "consentUnique": consentUnique})
+	require.NoError(t, err)
+	t.Log("GRANT_UNIQUE_OBSERVATION " + string(data))
+}
+
 func oauthOrdinaryAuditFixture(t *testing.T) *organizationHTTPFixture {
 	t.Helper()
 	cfg := oauthOrdinaryAuditConfigRead(t)
@@ -5626,6 +5787,7 @@ func oauthOrdinaryAuditFixture(t *testing.T) *organizationHTTPFixture {
 	cleanupErr := model.InitOAuthCleanupStore(true)
 	if cfg.MainKind == "postgres" {
 		oauthCleanupMetadataObservation(t, db)
+		oauthGrantMetadataObservation(t, db)
 	}
 	require.NoError(t, cleanupErr)
 	for _, store := range []struct {
