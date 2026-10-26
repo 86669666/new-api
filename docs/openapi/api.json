@@ -32980,11 +32980,12 @@
           "model_metadata": {
             "type": "boolean",
             "enum": [
-              false
-            ]
+              true
+            ],
+            "description": "Contract support for administrator-declared optional metadata projection in visible OpenAI-format model lists and pricing rows. Missing, empty or invalid declarations keep this true and omit metadata facts. Not provider health, caller authorization, model visibility or pricing navigation readiness; no runtime off switch."
           }
         },
-        "description": "oauth equals oauth.enabled and advertises only the explicitly configured desktop OAuth protocol capability, not effective deployment. token_usage_logs reports logs configuration independently of dashboard export; model_metadata retains its separate false discovery contract. Existing /api/log/token, /api/log/self, /api/data/self, /api/pricing and GitHub/OIDC login-provider endpoints remain unchanged."
+        "description": "oauth equals oauth.enabled and advertises only the explicitly configured desktop OAuth protocol capability, not effective deployment. token_usage_logs reports logs configuration independently of dashboard export; model_metadata advertises the supported optional declaration contract, not the presence of facts. Existing /api/log/token, /api/log/self, /api/data/self, /api/pricing and GitHub/OIDC login-provider endpoints remain unchanged."
       },
       "SiteDescription": {
         "type": "object",

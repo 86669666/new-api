@@ -137,6 +137,16 @@ func TestModelMetadataCatalogueHTTP(t *testing.T) {
 	}
 	read := func(t *testing.T, path, actor string) map[string]map[string]any {
 		t.Helper()
+		// Support is independent of declarations and of this caller's visible rows.
+		status, _, description := f.request(t, http.MethodGet, "/api/status", "", "", nil)
+		require.Equal(t, http.StatusOK, status)
+		require.Equal(t, true, description["success"])
+		data, ok := description["data"].(map[string]any)
+		require.True(t, ok)
+		features, ok := data["client_features"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, true, features["model_metadata"])
+
 		status, headers, result := f.request(t, http.MethodGet, path, actor, "", nil)
 		require.Equal(t, http.StatusOK, status)
 		require.Equal(t, true, result["success"])
@@ -163,6 +173,11 @@ func TestModelMetadataCatalogueHTTP(t *testing.T) {
 	baseline := make(map[string]map[string]map[string]any, len(paths))
 	for _, path := range paths {
 		baseline[path] = read(t, path, "relay")
+		for _, row := range baseline[path] {
+			for _, field := range []string{"context_length", "max_output_tokens", "capabilities", "vision", "reasoning", "tool_use", "input_modalities", "output_modalities", "display_name", "metadata_source"} {
+				assert.NotContains(t, row, field, "missing declarations omit facts, not support")
+			}
+		}
 	}
 	cached, err := common.Marshal(model.GetPricing())
 	require.NoError(t, err)
@@ -233,6 +248,12 @@ func TestModelMetadataCatalogueHTTP(t *testing.T) {
 	limited := read(t, "/v1/models", "limited")
 	assert.Len(t, limited, 1, "metadata cannot widen token model or group visibility")
 	assert.Contains(t, limited, "catalog-model")
+	// Pricing navigation is not a metadata-contract switch; relay visibility stays intact.
+	require.NoError(t, model.UpdateOption("HeaderNavModules", `{"pricing":false}`))
+	status, _, _ = f.request(t, http.MethodGet, "/api/pricing", "relay", "", nil)
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Equal(t, limited, read(t, "/v1/models", "limited"))
+	require.NoError(t, model.UpdateOption("HeaderNavModules", `{"pricing":true}`))
 	cacheAfter, err := common.Marshal(model.GetPricing())
 	require.NoError(t, err)
 	assert.Equal(t, cached, cacheAfter, "shared pricing data remains unchanged")

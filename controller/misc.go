@@ -59,8 +59,9 @@ func GetStatus(c *gin.Context) {
 			common.OptionMap["SidebarModulesAdmin"], common.OptionMap["HeaderNavModules"]),
 		// Logs describe configuration, not database health or caller authorization.
 		// Stat additionally requires DataExportEnabled; OAuth has its own readiness gate.
+		// Metadata advertises contract support, independent of configured declarations.
 		"oauth":                       desktopOAuth,
-		"client_features":             gin.H{"token_usage_logs": common.LogConsumeEnabled, "oauth": desktopOAuth.Enabled, "model_metadata": false},
+		"client_features":             gin.H{"token_usage_logs": common.LogConsumeEnabled, "oauth": desktopOAuth.Enabled, "model_metadata": true},
 		"version":                     common.Version,
 		"start_time":                  common.StartTime,
 		"email_verification":          common.EmailVerificationEnabled,

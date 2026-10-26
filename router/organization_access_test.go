@@ -3344,7 +3344,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 					want = map[string]any{"enabled": true, "desktop_client_id": selected, "issuer": issuer, "discovery_endpoint": issuer + ".well-known/oauth-authorization-server", "authorization_endpoint": issuer + "oauth2/auth", "token_endpoint": issuer + "oauth2/token", "scopes": scopes, "token_creation_endpoint": issuer + "api/v1/oauth/tokens", "token_creation_method": "POST"}
 				}
 				assert.Equal(t, want, body.Data["oauth"])
-				assert.Equal(t, map[string]any{"token_usage_logs": common.LogConsumeEnabled, "model_metadata": false, "oauth": enabled}, body.Data["client_features"])
+				assert.Equal(t, map[string]any{"token_usage_logs": common.LogConsumeEnabled, "model_metadata": true, "oauth": enabled}, body.Data["client_features"])
 				assert.Equal(t, model.SiteInstanceID(), body.Data["instance_id"])
 				assert.Equal(t, common.Version, body.Data["version"])
 				for _, private := range []string{admin.URL, upstream.URL, "private-registration-canary", "hostile.invalid"} {
@@ -3788,7 +3788,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			require.True(t, ok)
 			assert.Equal(t, model.SiteInstanceID(), data["instance_id"])
 			assert.Equal(t, map[string]any{"enabled": false}, data["oauth"])
-			assert.Equal(t, map[string]any{"token_usage_logs": false, "oauth": false, "model_metadata": false}, data["client_features"])
+			assert.Equal(t, map[string]any{"token_usage_logs": false, "oauth": false, "model_metadata": true}, data["client_features"])
 			assert.Equal(t, system_setting.ServerAddress, data["server_address"])
 			assert.Equal(t, common.Version, data["version"])
 			assert.Equal(t, common.SystemName, data["system_name"])

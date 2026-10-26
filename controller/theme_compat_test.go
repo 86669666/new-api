@@ -52,5 +52,5 @@ func TestGetStatusAdvertisesDefaultDashboard(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, false, features["oauth"])
 	assert.Equal(t, false, features["token_usage_logs"])
-	assert.Equal(t, false, features["model_metadata"])
+	assert.Equal(t, true, features["model_metadata"])
 }
