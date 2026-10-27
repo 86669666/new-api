@@ -213,5 +213,54 @@ class OuterControlClientTests(unittest.TestCase):
                 self.assertNotIn('command', request)
 
 
+class OuterDaemonProxyTests(unittest.TestCase):
+    def test_proxy_binds_same_socket_and_authenticated_host_record(self):
+        for failure in ('', 'inode', 'local-pid', 'uid', 'host-record'):
+            with self.subTest(failure=failure):
+                proxy = runner.OuterDaemonBinding.__new__(runner.OuterDaemonBinding)
+                proxy.engine = 'postgres'
+                proxy.socket_dir, proxy.socket_path = Path('/owned/socket'), Path('/owned/socket/.s.PGSQL.5432')
+                proxy.value = {'daemon_uid': 102}
+                proxy.identity = dict(directory_device=1,directory_inode=2,socket_device=1,socket_file_inode=3)
+                directory = SimpleNamespace(st_mode=stat.S_IFDIR|0o755,st_uid=102,st_dev=1,st_ino=2)
+                endpoint = SimpleNamespace(st_mode=stat.S_IFSOCK|0o777,st_uid=102,st_dev=1,
+                                           st_ino=4 if failure=='inode' else 3)
+                connection = Mock()
+                connection.getsockopt.return_value = struct.pack('3i',1 if failure=='local-pid' else 0,
+                                                                 997 if failure=='uid' else 102,102)
+                context = Mock();context.__enter__ = Mock(return_value=connection);context.__exit__ = Mock(return_value=False)
+                control = Mock()
+                import hashlib
+                expected = hashlib.sha256(json.dumps(proxy.identity,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+                control.request.return_value = {'binding':'wrong' if failure=='host-record' else expected}
+                with patch.object(Path,'lstat',side_effect=[directory,endpoint]), \
+                     patch.object(runner.socket,'socket',return_value=context),patch.object(runner,'OUTER_BIRTH',control):
+                    if failure:
+                        with self.assertRaises(ValueError):proxy.verify()
+                    else:
+                        self.assertEqual(proxy.identity,proxy.verify())
+                        control.request.assert_called_once_with('verify-daemon','postgres','')
+                    if failure in ('inode','local-pid','uid'):
+                        control.request.assert_not_called()
+
+    def test_selected_daemons_never_start_or_stop_legacy_child(self):
+        for cls in (runner.OwnedPostgres,runner.CombinedPostgres,runner.OwnedWalletMySQL):
+            with self.subTest(cls=cls.__name__):
+                daemon = cls.__new__(cls)
+                daemon.outer = Mock()
+                daemon.process = Mock()
+                daemon.outer.verify.return_value = {'same':'owned-resource'}
+                self.assertEqual({'same':'owned-resource'},daemon.verify())
+                daemon.close()
+                daemon.process.assert_not_called()
+                self.assertEqual([],daemon.process.mock_calls)
+                binding = Mock()
+                with patch.object(runner,'OUTER_BIRTH',Mock()),patch.object(runner,'OuterDaemonBinding',return_value=binding), \
+                     patch.object(runner.subprocess,'Popen') as launch,patch.object(runner.subprocess,'run') as run:
+                    daemon.start()
+                    binding.bind.assert_called_once_with(daemon)
+                    launch.assert_not_called();run.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

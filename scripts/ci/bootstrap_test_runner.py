@@ -127,6 +127,68 @@ class OuterBirthControlClient:
             raise ValueError('outer and service daemon observations differ')
 
 
+class OuterDaemonBinding:
+    """Read-only root descriptor plus a locally observed SAME Unix endpoint.
+
+    The host process PID is not visible in the controller PID namespace. The
+    root control peer revalidates it; inode/device and UID bind the local mount
+    to that process, rather than pretending that PID zero is a local child.
+    Administrator credentials remain in this root-only descriptor and are used
+    only by existing trusted SQL methods, never by candidate service processes.
+    """
+    def __init__(self, engine):
+        if OUTER_BIRTH is None or os.geteuid() != 0 or engine not in ('postgres', 'mysql'):
+            raise ValueError('selected outer daemon required')
+        path = Path('/run/newapi-formal-control/daemon.json')
+        for item in (path, *path.parents):
+            info = item.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError('outer daemon descriptor custody mismatch')
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 8192:
+            raise ValueError('invalid private daemon descriptor')
+        value = json.loads(path.read_text())
+        if (set(value) != {'attempt', 'engine', 'socket_dir', 'socket_path', 'daemon_uid', 'password', 'version', 'identity'} or
+                value['attempt'] != OUTER_BIRTH.attempt_id or value['engine'] != engine or
+                not re.fullmatch('[0-9a-f]{64}', value['password']) or
+                type(value['daemon_uid']) is not int or value['daemon_uid'] in (0, 997)):
+            raise ValueError('outer daemon descriptor binding mismatch')
+        directory = Path('/opt/newapi-box-formal/captures') / value['attempt'] / 'resources' / ('pg-socket' if engine == 'postgres' else 'mysql-socket')
+        endpoint = directory / ('.s.PGSQL.5432' if engine == 'postgres' else 'mysql.sock')
+        if value['socket_dir'] != str(directory) or value['socket_path'] != str(endpoint):
+            raise ValueError('outer daemon endpoint path mismatch')
+        self.engine, self.value = engine, value
+        self.socket_dir, self.socket_path = directory, endpoint
+        self.identity = value['identity']
+        self.verify()
+
+    def verify(self):
+        directory, endpoint = self.socket_dir.lstat(), self.socket_path.lstat()
+        uid = self.value['daemon_uid']
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_mode & 0o022 or directory.st_uid != uid or
+                not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != uid or
+                (directory.st_dev, directory.st_ino, endpoint.st_dev, endpoint.st_ino) !=
+                (self.identity['directory_device'], self.identity['directory_inode'],
+                 self.identity['socket_device'], self.identity['socket_file_inode'])):
+            raise ValueError('outer daemon mounted endpoint replaced')
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(2)
+            connection.connect(str(self.socket_path))
+            pid, peer_uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if pid != 0 or peer_uid != uid:
+                raise ValueError('outer daemon peer not in separate owned PID namespace')
+        expected = hashlib.sha256(json.dumps(self.identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if OUTER_BIRTH.request('verify-daemon', self.engine, '') != {'binding': expected}:
+            raise ValueError('outer daemon host identity changed')
+        return dict(self.identity)
+
+    def bind(self, daemon):
+        daemon.socket_dir, daemon.socket_path = self.socket_dir, self.socket_path
+        daemon.daemon_uid = self.value['daemon_uid']
+        daemon.password, daemon.version = self.value['password'], self.value['version']
+        daemon.identity = dict(self.identity)
+
+
 def outer_birth(engine, purpose, daemon=None):
     if OUTER_BIRTH is None:
         return None
@@ -1091,6 +1153,7 @@ class OwnedPostgres:
         self.password = secrets.token_hex(32)
         self.births = {}
         self.commands = []
+        self.outer = None
 
     def sql(self, database, statement):
         if not re.fullmatch(r'[a-z][a-z0-9_]{0,47}', database):
@@ -1106,6 +1169,8 @@ class OwnedPostgres:
         return q.stdout.decode().strip()
 
     def verify(self):
+        if self.outer is not None:
+            return self.outer.verify()
         if self.process is None or self.process.poll() is not None:
             raise RuntimeError('owned PG exited')
         # Container /proc is mounted in this PID namespace. Bind via peer PID,
@@ -1152,6 +1217,11 @@ class OwnedPostgres:
         return identity
 
     def start(self):
+        if OUTER_BIRTH is not None:
+            self.outer = OuterDaemonBinding('postgres')
+            self.outer.bind(self)
+            return {'NEWAPI_BOOTSTRAP_ENGINE': 'postgres', 'NEWAPI_S2_MAIN': 'postgres',
+                    'NEWAPI_W01_MAIN_KIND': 'postgres', 'NEWAPI_BOOTSTRAP_TIER': 'postgres'}
         for name in ('postgres', 'initdb', 'psql'):
             p = self.bin / name
             st = p.stat()
@@ -1263,6 +1333,9 @@ class OwnedPostgres:
         return receipt
 
     def close(self):
+        if self.outer is not None:
+            self.outer.verify()
+            return  # only the outer owner may stop the daemon
         if self.process is not None:
             if self.process.poll() is None:
                 self.process.send_signal(2)  # PostgreSQL fast shutdown, owns only this child.
@@ -1456,6 +1529,8 @@ class CombinedPostgres(OwnedPostgres):
         return result
 
     def verify(self):
+        if self.outer is not None:
+            return self.outer.verify()
         daemon_process_identity(self.process, self.daemon_uid)
         st = self.socket_dir.lstat()
         socket_stat = self.socket_path.lstat()
@@ -2404,6 +2479,7 @@ class OwnedWalletMySQL:
         self.process = self.log = self.identity = None
         self.password = secrets.token_hex(32)
         self.commands = []
+        self.outer = None
 
     def sql(self, database, statement, initial=False):
         if not re.fullmatch(r'[a-z][a-z0-9_]{0,47}', database):
@@ -2419,6 +2495,8 @@ class OwnedWalletMySQL:
         return q.stdout.decode().strip()
 
     def verify(self):
+        if self.outer is not None:
+            return self.outer.verify()
         with WalletObservation('wallet_mysql_verify'):
             daemon_process_identity(self.process, self.daemon_uid)
             st, endpoint = self.socket_dir.lstat(), self.socket_path.lstat()
@@ -2445,6 +2523,10 @@ class OwnedWalletMySQL:
             return identity
 
     def start(self):
+        if OUTER_BIRTH is not None:
+            self.outer = OuterDaemonBinding('mysql')
+            self.outer.bind(self)
+            return
         for executable in (self.executable, Path('/usr/bin/mysql')):
             st = executable.stat()
             if st.st_uid != 0 or st.st_mode & 0o022 or not stat.S_ISREG(st.st_mode):
@@ -2475,6 +2557,9 @@ class OwnedWalletMySQL:
         self.version = self.sql('mysql', 'SELECT VERSION();')
 
     def close(self):
+        if self.outer is not None:
+            self.outer.verify()
+            return  # only the outer owner may stop the daemon
         if self.process and self.process.poll() is None:
             self.process.terminate()
             try:self.process.wait(timeout=20)
@@ -3189,7 +3274,30 @@ def ordinary_audit_shared_run(bundle,tier):
         print('ORDINARY_AUDIT_DATABASE_CLEANUP '+json.dumps({'main':main_name,'log':log_name,'cleanup':True}),flush=True)
 
 
+def run_outer_controller(bundle, tier):
+    """Future admitted entry; not selected by legacy local/hosted commands."""
+    global OUTER_BIRTH
+    if os.geteuid() != 0 or OUTER_BIRTH is not None:
+        raise ValueError('fresh trusted outer controller required')
+    value = json.loads(Path('/run/newapi-formal-control/control.json').read_text())
+    control = OuterBirthControlClient(value['attempt'])
+    OUTER_BIRTH = control
+    try:
+        if tier.startswith('wallet-') or tier in METADATA_TIERS or tier in LIFECYCLE_TIERS:
+            with WalletObservationCollector():
+                trusted_wallet_run(Path(bundle), tier)
+        elif tier in ('sqlite', 'ordinary-audit', 'postgres', 'postgres-redis'):
+            trusted_run(Path(bundle), tier)
+        else:
+            raise ValueError('unsupported outer controller tier')
+    finally:
+        OUTER_BIRTH = None
+        control.close()
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '_outer_run':
+        run_outer_controller(sys.argv[2], sys.argv[3]);return
     if len(sys.argv)==4 and sys.argv[1]=="_ordinary_audit_shared":
         ordinary_audit_shared_run(Path(sys.argv[2]),sys.argv[3]);return
     if len(sys.argv) == 4 and sys.argv[1] == '_wallet_run':
