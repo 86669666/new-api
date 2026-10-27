@@ -24,7 +24,7 @@ import (
 
 const OAuthPublicCapabilityLimit = 16384
 
-var oauthPublicScopes = []string{"openid", "profile", "email", "offline_access", "balance:read", "usage:read", "tokens:read"}
+var oauthPublicScopes = []string{"openid", "profile", "email", "offline_access", "balance:read", "usage:read", "tokens:read", "tokens:write"}
 var oauthPublicCookieName = regexp.MustCompile(`^__Host-newapi_oauth_(login|consent)_csrf_[0-9]{1,10}$`)
 
 type OAuthPublicConfig struct {
@@ -71,7 +71,7 @@ func NewOAuthPublic(config OAuthPublicConfig, bridge *OAuthProviderBridge) (*OAu
 	bridge.public = p
 	bridge.resource.grantsRequired = true
 	// Invalidate older public previews; existing grants keep their exact consented scopes.
-	bridge.policy += ":public-v4:openid-profile-email-offline-balance-usage-tokens-read:7d"
+	bridge.policy += ":public-v5:openid-profile-email-offline-balance-usage-tokens-read-tokens-write:7d"
 	return p, nil
 }
 
@@ -109,6 +109,29 @@ func (p *OAuthPublic) ValidateTopology(ctx context.Context) error {
 	return nil
 }
 func (p *OAuthPublic) Available() bool { return p != nil && p.ready.Load() && p.topologyMatches() }
+
+// Status is the anonymous /api/status oauth object. Enabled is true only after
+// startup topology validation reached the private issuer and the public site
+// address still matches. A later issuer outage is not probed on each status read.
+// The first allowlisted public client id is desktop_client_id. Incomplete
+// configuration omits the issuer and client id.
+func (p *OAuthPublic) Status() map[string]any {
+	disabled := map[string]any{"enabled": false}
+	if !p.Available() {
+		return disabled
+	}
+	var desktop string
+	for _, id := range p.bridge.resource.clients {
+		if id != "" {
+			desktop = id
+			break
+		}
+	}
+	if desktop == "" {
+		return disabled
+	}
+	return map[string]any{"enabled": true, "issuer": p.bridge.resource.issuer, "desktop_client_id": desktop}
+}
 
 func (p *OAuthPublic) client(ctx context.Context, id string) (*oauthProviderClient, error) {
 	if !slices.Contains(p.bridge.resource.clients, id) {

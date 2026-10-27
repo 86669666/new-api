@@ -675,6 +675,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 			require.Equal(t, 200, status)
 		}()
 		registered := strings.Fields(registration["scope"].(string))
+		registered = slices.DeleteFunc(registered, func(scope string) bool { return scope == "tokens:write" })
 		if !slices.Contains(registered, "tokens:read") {
 			registered = append(registered, "tokens:read")
 		}
@@ -687,7 +688,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		challenge := sha256.Sum256([]byte(strings.Repeat("a", 43)))
 		writeRequest := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {"http://127.0.0.1:29873/oauth/callback"}, "scope": {"profile tokens:write"}, "state": {strings.Repeat("b", 43)}, "code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"}}
 		status, writeHeaders, _ := c.request("GET", input.Issuer+"oauth2/auth?"+writeRequest.Encode(), "", "", "")
-		assert.Equal(t, 400, status, "tokens:write has no public producer")
+		assert.Equal(t, 400, status, "tokens:write is advertised but this fixture client is not registered for it")
 		assert.Empty(t, writeHeaders.Get("Location"))
 		journal, e := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
 		require.NoError(t, e)
@@ -773,7 +774,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		}
 		require.NoError(t, common.Unmarshal(raw, &metadata))
 		assert.Contains(t, metadata.Scopes, "tokens:read")
-		assert.NotContains(t, metadata.Scopes, "tokens:write")
+		assert.Contains(t, metadata.Scopes, "tokens:write")
 		status, headers, _ := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", "{}", "")
 		assert.Equal(t, 400, status)
 		assert.Empty(t, headers.Get("Location"))
@@ -964,8 +965,8 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		var binding map[string]any
 		require.NoError(t, common.UnmarshalJsonStr(flow.Payload, &binding))
 		policy := binding["policy_hash"].(string)
-		require.Contains(t, policy, ":public-v4:")
-		legacyPolicy := strings.Split(policy, ":public-v4:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
+		require.Contains(t, policy, ":public-v5:")
+		legacyPolicy := strings.Split(policy, ":public-v5:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
 		legacyPolicyHash := fmt.Sprintf("%x", sha256.Sum256([]byte(legacyPolicy)))
 
 		// Reconstructed pre-upgrade local fixture: real Hydra issued this
@@ -1767,6 +1768,48 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 		system_setting.ServerAddress, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = oldAddress, oldGlobal, oldCritical
 	})
 	require.NoError(t, public.ValidateTopology(t.Context()))
+	t.Run("status_follows_validated_public_issuer", func(t *testing.T) {
+		previous := service.SwapOAuthProviderBridge(bridge)
+		t.Cleanup(func() { service.SwapOAuthProviderBridge(previous) })
+		read := func() (map[string]any, map[string]any) {
+			t.Helper()
+			response := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(response)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/api/status", nil)
+			controller.GetStatus(ctx)
+			var payload struct {
+				Success bool           `json:"success"`
+				Data    map[string]any `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+			require.True(t, payload.Success)
+			oauthStatus, _ := payload.Data["oauth"].(map[string]any)
+			features, _ := payload.Data["client_features"].(map[string]any)
+			return oauthStatus, features
+		}
+		oauthStatus, features := read()
+		assert.Equal(t, map[string]any{"enabled": true, "issuer": issuer, "desktop_client_id": "boundary-client"}, oauthStatus)
+		assert.Equal(t, true, features["oauth"])
+		assert.Equal(t, false, features["token_usage_logs"])
+		assert.Equal(t, false, features["model_metadata"])
+		encoded, err := common.Marshal(oauthStatus)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), "127.0.0.1")
+		assert.NotContains(t, string(encoded), admin.URL)
+		assert.NotContains(t, string(encoded), upstream.URL)
+		t.Setenv("FRONTEND_BASE_URL", "https://console.example")
+		oauthStatus, features = read()
+		assert.Equal(t, map[string]any{"enabled": false}, oauthStatus)
+		assert.Equal(t, false, features["oauth"])
+		t.Setenv("FRONTEND_BASE_URL", "")
+		system_setting.ServerAddress = "https://other.example"
+		oauthStatus, features = read()
+		assert.Equal(t, map[string]any{"enabled": false}, oauthStatus)
+		assert.Equal(t, false, features["oauth"])
+		system_setting.ServerAddress = issuer
+		oauthStatus, _ = read()
+		assert.Equal(t, true, oauthStatus["enabled"])
+	})
 	engine := gin.New()
 	SetOAuthProviderRouter(engine, bridge)
 	serve := func(t *testing.T, redirect, state string, headers http.Header, params url.Values) *httptest.ResponseRecorder {
@@ -1997,7 +2040,7 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			assert.Equal(t, issuer+"oauth2/auth", document["authorization_endpoint"])
 			assert.Equal(t, issuer+"oauth2/token", document["token_endpoint"])
 			assert.NotContains(t, recorded.Body.String(), "attacker.example")
-			assert.NotContains(t, recorded.Body.String(), "tokens:write")
+			assert.Equal(t, []any{"openid", "profile", "email", "offline_access", "balance:read", "usage:read", "tokens:read", "tokens:write"}, document["scopes_supported"])
 		}
 		unknown := httptest.NewRecorder()
 		engine.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/oauth2/not-whitelisted", nil))

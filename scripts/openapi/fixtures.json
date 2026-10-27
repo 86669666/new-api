@@ -14486,7 +14486,7 @@
     "valid": false
   },
   {
-    "name": "oauth public discovery six scopes",
+    "name": "oauth public discovery scopes",
     "document": "api",
     "schema": "#/components/schemas/OAuthPublicMetadata",
     "value": {
@@ -14502,7 +14502,9 @@
         "email",
         "offline_access",
         "balance:read",
-        "usage:read"
+        "usage:read",
+        "tokens:read",
+        "tokens:write"
       ],
       "response_types_supported": [
         "code"

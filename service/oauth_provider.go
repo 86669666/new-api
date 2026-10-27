@@ -143,6 +143,12 @@ func InitOAuthProviderBridge() error {
 
 func CurrentOAuthProviderBridge() *OAuthProviderBridge { return currentOAuthProvider.Load() }
 
+// SwapOAuthProviderBridge replaces the process bridge and returns the previous value.
+// A caller that installs a temporary bridge must restore the returned value.
+func SwapOAuthProviderBridge(next *OAuthProviderBridge) *OAuthProviderBridge {
+	return currentOAuthProvider.Swap(next)
+}
+
 func NewOAuthProviderBridge(config OAuthProviderConfig, resource *OAuthUserInfoResource) (*OAuthProviderBridge, error) {
 	if config.RevocationEnabled && (!config.Enabled || resource == nil) {
 		return nil, ErrOAuthProviderConfiguration
