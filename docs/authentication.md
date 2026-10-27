@@ -197,3 +197,46 @@ Proof 同时绑定用户、登录会话、用户鉴权版本、会话版本和 s
 - 旧版 PAT 保留在 `users.access_token` 中，自新版首次启动起 30 天内照常可用，之后自动停用并返回 401 `ACCESS_TOKEN_LEGACY_RETIRED`。停用日期记录在 `options` 表的 `LegacyAccessTokenRetireAt`，由服务端写入，不能通过设置接口修改。过渡期内不能再生成旧版令牌，但可以撤销。
 - 删除了 `/api/user/token*` 接口，改为 `/api/user/access_tokens`。
 - 降级到旧版本后，新令牌不可用；未撤销的旧版令牌会重新可用，因为旧版本不认停用日期。
+
+## 可选外部 OAuth Provider 部署契约
+
+本节描述以 Hydra 为授权服务器、由 new-api 提供公开 OAuth 入口的部署要求，与上文面板 Access Token、Refresh Cookie 和 PAT 的生命周期分开。它不是可直接运行的 Hydra 配置，也不表示任何现有部署已通过生产验收。开关示例见 [`.env.example`](../.env.example)；仅填写样例不会创建客户端注册或验证 PKCE。
+
+### 授权服务器与管理边界
+
+- 固定 Hydra 版本及镜像摘要，不使用 `--dev`。使用独立、持久化的数据库，并为该版本另行验证迁移、备份恢复及服务启动顺序；不得用临时测试数据库代替。
+- `URLS_SELF_ISSUER` 必须是对外 HTTPS 根地址，例如 `https://auth.example.com/`。`URLS_LOGIN` 和 `URLS_CONSENT` 分别使用同一 issuer 下的 `/oauth/provider/login`、`/oauth/provider/consent`，不是后台决策 API `/api/oauth/provider/*`。
+- 本实现要求 `ServerAddress` 与 issuer 一致（比较时忽略末尾斜杠），`FRONTEND_BASE_URL` 为空。`OAUTH_PROVIDER_PUBLIC_BASE_URL` 指向 Hydra 公共服务的 HTTPS 根地址，其 host 必须不同于对外 issuer，且不能使用 Admin 地址。公开入口启用前还需满足已有 userinfo、provider bridge、revocation 配置及客户端注册校验；不要通过放宽校验或关闭 TLS 验证绕过启动失败。
+- Hydra Admin 仅供私有管理边界访问，使用可信 TLS，不能发布到公开入口。系统密钥、数据库凭据和管理凭据由仓库外的密钥管理机制提供，限制读取权限；不得写入样例、日志、截图或版本库。
+- 公开客户端必须强制 S256 PKCE：部署要求 `OAUTH2_PKCE_ENFORCED_FOR_PUBLIC_CLIENTS=true`，并验证授权码兑换拒绝缺失或错误的 verifier。客户端使用精确注册的回调地址并验证 issuer、state/nonce；不能以公开客户端身份或 discovery 中出现 S256 代替服务端强制校验。
+- 部署要求 `STRATEGIES_ACCESS_TOKEN=opaque`。OAuth access token 与 OIDC ID token 用途不同；发现文档中的 ID token 签名算法不能证明 access token 是 opaque，也不能用 ID token 代替 API access token。
+- 操作人员必须依据固定 Hydra 版本的配置契约，显式选择并记录 access token 与 refresh token 的 TTL、单位、生效配置及该版本的刷新/过期语义。本文不提供未经验证的数值默认值；不得借用上文面板会话或 PAT 的 TTL。需要可运行配置时，先补齐该固定版本的配置依据，再核对实际生效值。
+
+拓扑、客户端及 discovery 校验由 [`service/oauth_public.go`](../service/oauth_public.go) 的 `NewOAuthPublic`、`ValidateTopology`、`CurrentOAuthDesktopStatus` 和 `metadata` 实现；环境变量装配见 [`service/oauth_provider.go`](../service/oauth_provider.go)。上述 Hydra 部署要求仍需部署者验证，不能从 gateway 配置校验推定全部已生效。
+
+### 公开路径与关闭边界
+
+[`SetOAuthPublicRouter`](../router/oauth_public_router.go) 只开放以下精确入口，不是对 Hydra 任意路径的透明代理：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/oauth2/auth` | 授权码授权 |
+| POST | `/oauth2/token` | `authorization_code`、`refresh_token` |
+| GET | `/.well-known/openid-configuration` | OIDC discovery |
+| GET | `/.well-known/oauth-authorization-server` | OAuth discovery |
+| GET | `/.well-known/jwks.json` | 签名公钥 |
+| GET | `/oauth2/error` | 本地固定错误响应，不透传上游错误页 |
+
+公开代理默认关闭；关闭时上述入口返回 404，其他被保留的非白名单公开路径也返回 404，已启用入口的方法不匹配返回 405。`/oauth2/revoke` 由 [`SetOAuthProviderRouter`](../router/oauth_provider_router.go) 的独立 revocation 开关控制，不因本节 public 开关关闭而自动关闭。这里描述 HTTP 边界，不承诺路由注册或数据库迁移快照不变。
+
+Discovery 和授权跳转校验使用配置的 issuer；不得根据请求 `Host` 或 `X-Forwarded-Host` 生成 issuer 或放宽跳转目标。`service/oauth_public.go` 的 `metadata`、`oauthPublicJSON` 及授权跳转校验约束公开元数据、允许的错误码和目标地址；上游原始错误内容不作为公开错误返回。
+
+### 安全依据与验收范围
+
+部署与客户端验收应保留以下控制（参考资料查阅于 2026-10-27）：
+
+- [OWASP Authentication：凭据仅经 TLS 传输](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#transmit-passwords-only-over-tls-or-other-strong-transport)：登录和凭据传输保持受验证的加密通道。
+- [OWASP Session Management：Transport Layer Security](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#transport-layer-security)：整个会话使用 HTTPS，保留安全 Cookie 和服务端会话失效控制，不因反向代理部署而绕过。
+- [OWASP OAuth2：Essential Basics 与 PKCE](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html#oauth-20-essential-basics)：限制重定向目标，校验 issuer 与事务绑定，使用 S256 并拒绝 PKCE 降级；保留正常登录、同意和回调校验。
+
+这些引用不是完整 OWASP 合规声明。样例、`/api/status` 的 readiness 或一次本地协议成功，都不能证明生产数据库耐久性、密钥管理、自动启动或重启恢复。`client_features.model_metadata` 表示可选元数据投影契约受支持，不表示声明非空或 OAuth/部署健康；该含义不随本节要求改变。生产持久性、有效 TTL 和 opaque 策略应分别留存不含凭据的部署验收记录。
