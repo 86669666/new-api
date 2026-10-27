@@ -290,3 +290,13 @@ func TestOAuthBirthBrokerSealEncoding(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, seal, changed)
 }
+
+// Selecting broker mode never falls back to privileged local provisioning when
+// the independently owned endpoint is absent.
+func TestOAuthBootstrapBrokerUnavailableFailsClosed(t *testing.T) {
+	t.Setenv("NEWAPI_BOOTSTRAP_BROKER", filepath.Join(t.TempDir(), "missing.sock"))
+	for _, mode := range []string{"fresh", "resume"} {
+		var out bytes.Buffer
+		require.Equal(t, 1, RunOAuthDatabaseBootstrap([]string{mode, "--engine", "sqlite", "--target", filepath.Join(t.TempDir(), "new.db"), "--journal", filepath.Join(t.TempDir(), "birth.json")}, &out))
+	}
+}

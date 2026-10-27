@@ -143,6 +143,9 @@ func oauthSocketEndpoint(path string) (string, error) {
 }
 
 func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, out io.Writer) error {
+	if os.Getenv("NEWAPI_BOOTSTRAP_BROKER") != "" {
+		return oauthBootstrapThroughBroker(mode, engine, target, out)
+	}
 	if os.Geteuid() != 0 || oauthProtectedPath(filepath.Dir(journal), false) != nil {
 		return errOAuthBootstrap
 	}
@@ -331,6 +334,12 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 			return errOAuthBootstrap
 		}
 	}
+	return completeOAuthBirth(db, j, engine, func(j *oauthBirthJournal) error { return writeOAuthBirthJournal(journal, j) }, out)
+}
+
+// Both privilege modes use the same migration and seal validation.
+func completeOAuthBirth(db *gorm.DB, j *oauthBirthJournal, engine string, persist func(*oauthBirthJournal) error, out io.Writer) error {
+	var err error
 	if validateOAuthBirth(db, j, false) != nil {
 		return errOAuthBootstrap
 	}
@@ -357,7 +366,7 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 			}
 		}
 		j.Phase = "MIGRATING"
-		if writeOAuthBirthJournal(journal, j) != nil {
+		if persist(j) != nil {
 			return errOAuthBootstrap
 		}
 		oldDB := DB
@@ -388,7 +397,7 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 			return errOAuthBootstrap
 		}
 		j.Phase = "SEAL_PENDING"
-		if writeOAuthBirthJournal(journal, j) != nil {
+		if persist(j) != nil {
 			return errOAuthBootstrap
 		}
 	}
@@ -422,17 +431,16 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 	if validateOAuthBirth(db, j, true) != nil {
 		return errOAuthBootstrap
 	}
-	if writeOAuthBirthJournal(journal, j) != nil {
+	if persist(j) != nil {
 		return errOAuthBootstrap
 	}
 	fmt.Fprintln(out, j.OperationID, "READY")
 	return nil
 }
 
-// oauthBirthBrokerClient is the staged, unprivileged side of the named birth
-// protocol. It is deliberately not selected by RunOAuthDatabaseBootstrap until
-// the privileged filesystem/database adapter and all Installer calls are wired.
-// The existing root-only production path remains unchanged.
+// oauthBirthBrokerClient is the unprivileged side of the named birth protocol.
+// Selection requires an explicit broker socket and kernel-authenticated root peer.
+// The legacy root-only path is unchanged when no broker is configured.
 type oauthBirthBrokerClient struct {
 	conn     net.Conn
 	reader   *bufio.Reader
@@ -477,7 +485,7 @@ func (c *oauthBirthBrokerClient) request(operation string) (result *oauthBirthJo
 		}
 	}()
 	switch operation {
-	case "created", "bound", "migrating", "seal_pending", "ready", "fault_pending", "fault_intent", "fault_restore":
+	case "fresh", "resume", "created", "bound", "migrating", "seal_pending", "ready", "fault_pending", "fault_intent", "fault_restore":
 	default:
 		return nil, errOAuthBootstrap
 	}
@@ -511,6 +519,15 @@ func (c *oauthBirthBrokerClient) request(operation string) (result *oauthBirthJo
 		return nil, errOAuthBootstrap
 	}
 	phase := map[string]string{"created": "INTENT", "bound": "CREATED_BOUND", "migrating": "MIGRATING", "seal_pending": "SEAL_PENDING", "ready": "READY", "fault_pending": "SEAL_PENDING", "fault_intent": "INTENT", "fault_restore": "READY"}[operation]
+	if operation == "fresh" {
+		phase = "INTENT"
+	}
+	if operation == "resume" {
+		switch j.Phase {
+		case "CREATED_BOUND", "MIGRATING", "SEAL_PENDING", "READY":
+			phase = j.Phase
+		}
+	}
 	if j.Phase != phase {
 		return nil, errOAuthBootstrap
 	}
@@ -534,4 +551,81 @@ func (c *oauthBirthBrokerClient) request(operation string) (result *oauthBirthJo
 	snapshot := j
 	c.previous = &snapshot
 	return &j, nil
+}
+
+func oauthBootstrapThroughBroker(mode, engine, target string, out io.Writer) error {
+	if engine != "sqlite" && !bootstrapName.MatchString(target) {
+		return errOAuthBootstrap
+	}
+	schema, err := oauthBirthSchemaDigest()
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	file, err := os.Open(executable)
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	hash := sha256.New()
+	_, err = io.Copy(hash, file)
+	file.Close()
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	client, err := dialOAuthBirthBroker(os.Getenv("NEWAPI_BOOTSTRAP_BROKER"), target, schema, hex.EncodeToString(hash.Sum(nil)))
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	defer client.conn.Close()
+	j, err := client.request(mode)
+	if err != nil || j.Engine != engine {
+		return errOAuthBootstrap
+	}
+	dsn := target
+	if engine != "sqlite" {
+		var endpoint string
+		dsn, endpoint, err = oauthBootstrapDSN(engine, os.Getenv("BOOTSTRAP_OWNED_DSN"), target)
+		if err != nil || endpoint != j.Endpoint {
+			return errOAuthBootstrap
+		}
+	}
+	db, err := openOAuthBootstrapDB(engine, dsn)
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	connection, err := db.DB()
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	defer connection.Close()
+	persist := func(j *oauthBirthJournal) error {
+		operation := map[string]string{"CREATED_BOUND": "bound", "MIGRATING": "migrating", "SEAL_PENDING": "seal_pending", "READY": "ready"}[j.Phase]
+		if operation == "" {
+			return errOAuthBootstrap
+		}
+		observed, e := client.request(operation)
+		if e != nil {
+			return e
+		}
+		*j = *observed
+		return nil
+	}
+	if mode == "fresh" {
+		binding, e := oauthLiveBinding(db, j)
+		if e != nil || binding != j.Binding || db.AutoMigrate(&OAuthDerivedTokenBootstrapIdentity{}) != nil {
+			return errOAuthBootstrap
+		}
+		marker := oauthBirthMarker(j)
+		if db.Create(&marker).Error != nil || validateOAuthBirth(db, j, false) != nil {
+			return errOAuthBootstrap
+		}
+		j.Phase = "CREATED_BOUND"
+		if persist(j) != nil {
+			return errOAuthBootstrap
+		}
+	}
+	return completeOAuthBirth(db, j, engine, persist, out)
 }
