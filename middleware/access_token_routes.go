@@ -157,6 +157,8 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/user/checkin":                       accessTokenScopeRule("wallet:write"),
 	"GET /api/user/oauth/bindings":                 accessTokenScopeRule("account_security:read"),
 	"DELETE /api/user/oauth/bindings/:provider_id": accessTokenScopeRule("account_security:write"),
+	"GET /api/user/oauth/apps":                     accessTokenSessionRule,
+	"DELETE /api/user/oauth/apps/:client_id":       accessTokenSessionRule,
 
 	// router/api-router.go: /api/user (admin)
 	"GET /api/user/":                                   accessTokenScopeRule("user:read"),
@@ -217,6 +219,12 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/option/waffo-pancake/subscription-product-options": accessTokenScopeRule("option:read"),
 
 	// router/api-router.go: /api/custom-oauth-provider, /api/ratio_sync
+	"GET /api/oauth/public-clients/presets": accessTokenSessionRule,
+	"GET /api/oauth/public-clients/":        accessTokenSessionRule,
+	"POST /api/oauth/public-clients/":       accessTokenSessionRule,
+	"PUT /api/oauth/public-clients/:id":     accessTokenSessionRule,
+	"DELETE /api/oauth/public-clients/:id":  accessTokenSessionRule,
+
 	"POST /api/custom-oauth-provider/discovery": accessTokenScopeRule("option:write"),
 	"GET /api/custom-oauth-provider/":           accessTokenScopeRule("option:read"),
 	"GET /api/custom-oauth-provider/:id":        accessTokenScopeRule("option:read"),

@@ -223,6 +223,8 @@ export type SecurityProofScope =
   | 'admin.user.passkey.reset'
   | 'admin.user.2fa.disable'
   | 'admin.user.binding.clear'
+  | 'oauth.public_client.manage'
+  | 'oauth.app.revoke'
 
 /** ManageUser actions that change a user's status or role and need step-up. */
 export type AdminUserManageAction = 'disable' | 'enable' | 'promote' | 'demote'
@@ -268,6 +270,14 @@ export type VerificationOperation =
       context: { token_id: number } | { legacy: true }
     }
   | {
+      scope: 'oauth.public_client.manage'
+      context: {
+        action: 'create' | 'update' | 'delete'
+        client_id: string
+      }
+    }
+  | { scope: 'oauth.app.revoke'; context: { client_id: string } }
+  | {
       scope: Exclude<
         SecurityProofScope,
         | 'channel.key.read'
@@ -277,6 +287,8 @@ export type VerificationOperation =
         | 'access_token.generate'
         | 'access_token.update'
         | 'access_token.revoke'
+        | 'oauth.public_client.manage'
+        | 'oauth.app.revoke'
         | `admin.user.${string}`
         | OrganizationVerificationScope
       >

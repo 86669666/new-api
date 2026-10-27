@@ -23,6 +23,7 @@ import { BotProtectionSection } from './bot-protection-section'
 import { CustomOAuthSection } from './custom-oauth/custom-oauth-section'
 import { OAuthSection } from './oauth-section'
 import { PasskeySection } from './passkey-section'
+import { PublicOAuthSection } from './public-oauth/public-oauth-section'
 
 const AUTH_SECTIONS = [
   {
@@ -114,6 +115,11 @@ const AUTH_SECTIONS = [
         }}
       />
     ),
+  },
+  {
+    id: 'public-oauth',
+    titleKey: 'Public OAuth clients',
+    build: () => <PublicOAuthSection />,
   },
   {
     id: 'custom-oauth',
