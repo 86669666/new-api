@@ -30,13 +30,13 @@ DIALECT_TESTS = {
     'controller': ('TestOAuthDerivedSelectedHTTP',),
 }
 PRODUCER_TEST = 'TestOAuthBootstrapProducer'
-PG_IMAGE = 'sha256:ba9938eb70de48e82a511ea812eef26cc1399b0b072d6f2f7dc22a977e783401'
+PG_IMAGE = 'sha256:85b1ab67e7c7410b11da3f5b42913fc51b5b46f9cf5f07cc28a98e5f62083c5e'
 PG_SELECTOR = '^TestSessionRevocationS1Namespace$'
-JOINT_IMAGE = 'sha256:894680346c8e75455a0a6c969b7b8241aeb9b6e9c0d0d95689669153d4627c4d'
+JOINT_IMAGE = 'sha256:85b1ab67e7c7410b11da3f5b42913fc51b5b46f9cf5f07cc28a98e5f62083c5e'
 JOINT_SELECTOR = '^TestSessionRevocationS1RealRedis$'
-MYSQL_IMAGE = 'sha256:6ec0af605b45e088e789150f865fc1ad92434f6aab0e3f3ab27688312be19000'
+MYSQL_IMAGE = 'sha256:d78bbb8f2cfdeb362aff7fcbea6b7954bef6429bef26b308f0e65ca5d9410482'
 # Same MySQL base plus signed, pinned Redis runtime closure; lifecycle alone requires both.
-LIFECYCLE_MYSQL_IMAGE = 'sha256:029f948eedb0182550fa11bc4249927cc17970788230d999a8eb35909e48b131'
+LIFECYCLE_MYSQL_IMAGE = 'sha256:d78bbb8f2cfdeb362aff7fcbea6b7954bef6429bef26b308f0e65ca5d9410482'
 WALLET_TESTS = ('TestBillingSessionSQLAdmission', 'TestBillingLegacySQLRegressions')
 WALLET_ENGINES = ('sqlite', 'mysql', 'postgres')
 WALLET_SCENARIOS = ('arrears_retry', 'arrears_retry_held', 'arrears_retry_claimed', 'arrears_settle', 'held_refund', 'image_available', 'search_available', 'zero_held', 'trusted_held', 'task_zero_held', 'task_trusted_held')
