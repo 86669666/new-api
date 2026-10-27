@@ -165,6 +165,11 @@ func validateCustomOAuthProvider(provider *CustomOAuthProvider) error {
 		return errors.New("the telegram slug is reserved for built-in Telegram OAuth; rename this custom provider")
 	}
 
+	switch slug {
+	case "login", "consent", "logout", "admin", "provider":
+		return errors.New("provider slug is reserved for OAuth routes; rename this custom provider")
+	}
+
 	if provider.ClientId == "" {
 		return errors.New("client ID is required")
 	}
