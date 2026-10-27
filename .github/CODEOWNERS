@@ -1,0 +1,4 @@
+# Box formal receipt consumer — maintainer lock (t500u Option A continue)
+.github/workflows/box-formal-receipt.yml @woncc
+.github/actions/box-formal-consumer/** @woncc
+.github/CODEOWNERS @woncc
