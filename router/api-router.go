@@ -197,6 +197,8 @@ func SetApiRouter(router *gin.Engine) {
 				// Custom OAuth bindings
 				selfRoute.GET("/oauth/bindings", controller.GetUserOAuthBindings)
 				selfRoute.DELETE("/oauth/bindings/:provider_id", controller.UnbindCustomOAuth)
+				selfRoute.GET("/oauth/apps", controller.ListAuthorizedOAuthApps)
+				selfRoute.DELETE("/oauth/apps/:client_id", controller.RevokeAuthorizedOAuthApp)
 			}
 
 			adminRoute := userRoute.Group("/")
@@ -280,6 +282,17 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.POST("/waffo-pancake/save", controller.SaveWaffoPancake)
 			optionRoute.POST("/waffo-pancake/subscription-product", controller.CreateWaffoPancakeSubscriptionProduct)
 			optionRoute.GET("/waffo-pancake/subscription-product-options", controller.ListWaffoPancakeSubscriptionProductOptions)
+		}
+
+		// Public OAuth clients this server offers to native apps (root only).
+		publicClientRoute := apiRouter.Group("/oauth/public-clients")
+		publicClientRoute.Use(middleware.RootAuth())
+		{
+			publicClientRoute.GET("/presets", controller.GetOAuthPublicClientPresets)
+			publicClientRoute.GET("/", controller.ListOAuthPublicClients)
+			publicClientRoute.POST("/", controller.CreateOAuthPublicClient)
+			publicClientRoute.PUT("/:id", controller.UpdateOAuthPublicClient)
+			publicClientRoute.DELETE("/:id", controller.DeleteOAuthPublicClient)
 		}
 
 		// Custom OAuth provider management (root only)
