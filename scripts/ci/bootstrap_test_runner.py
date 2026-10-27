@@ -240,6 +240,25 @@ def verified_manifest(bundle):
     return metadata
 
 
+def broker_inventory(bundle):
+    """Unprivileged inventory only; never evidence of completed formal tiers."""
+    if os.geteuid() != 997 or os.getegid() != 990 or os.getgroups():
+        raise ValueError('broker inventory requires isolated executor 997:990 without groups')
+    status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+    if status['NoNewPrivs'].strip() != '1' or int(status['CapEff'].strip(), 16) != 0:
+        raise ValueError('broker inventory forbids elevation and effective capabilities')
+    bundle = Path(bundle).absolute()
+    metadata = verified_manifest(bundle)
+    if metadata['tier'] != 'all':
+        raise ValueError('broker inventory requires full prepared manifest')
+    inventory = compiled_inventory(bundle, metadata['entries'])
+    partitions = resource_partitions(metadata['entries'], inventory)
+    if inventory != metadata.get('inventory') or partitions != metadata.get('partitions'):
+        raise ValueError('broker inventory differs from admitted full plan')
+    return {'scope': 'inventory-only', 'manifest_sha256': digest(bundle / 'manifest.json'),
+            'inventory': inventory, 'partitions': partitions}
+
+
 def required_leaves(tier):
     if tier == 'ordinary-audit' or tier in ORDINARY_AUDIT_SHARED:
         return ['TestOAuthTokensConsumerHTTP/ordinary_key_creation/audit_insert_failure/'+case
@@ -3011,12 +3030,17 @@ def main():
     parser.add_argument('--tier', choices=('all', 'sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; ordinary-audit uses SQLite and does not qualify external log stores')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
+    parser.add_argument('--broker-inventory', action='store_true', help='uid997 isolated inventory only; not formal execution')
     parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')
     parser.add_argument('--prepare-only', action='store_true', help='prepare for an isolated root container instead of local sudo')
     parser.add_argument('--package', action='append', help='bounded root-package check; default retains all three Go modules')
     parser.add_argument('--run', default='.', help='Go test selector; defaults to every test')
     args = parser.parse_args()
-    if args.execute_prepared:
+    if args.broker_inventory:
+        if args.execute_prepared or args.prepare_only or args.package or args.run != '.' or args.tier != 'all':
+            parser.error('--broker-inventory cannot change full-plan selectors or execute tiers')
+        print(json.dumps(broker_inventory(args.bundle), sort_keys=True))
+    elif args.execute_prepared:
         if args.prepare_only or args.package or args.run != '.':
             parser.error('--execute-prepared cannot change compiled selectors')
         execute_prepared(args.bundle, args.tier)
