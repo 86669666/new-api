@@ -1,6 +1,8 @@
 """Offline runner adapter tests; no binaries, namespaces or databases execute."""
 import copy
 import json
+import io
+import threading
 import stat
 import struct
 from types import SimpleNamespace
@@ -142,6 +144,51 @@ class OuterBirthTests(unittest.TestCase):
             adapter.assert_not_called()
             resource.sql.assert_not_called()
             launch.assert_not_called()
+
+
+class OuterControlClientTests(unittest.TestCase):
+    def client(self, replies):
+        client = runner.OuterBirthControlClient.__new__(runner.OuterBirthControlClient)
+        client.attempt_id, client.nonce = 'attempt', 'a' * 64
+        client.sequence, client.failed = 0, False
+        client.lock = threading.Lock()
+        client.connection = Mock()
+        client.reader = io.BytesIO(replies)
+        return client
+
+    def test_framed_sequence_and_ambiguous_request_never_retries(self):
+        client = self.client(b'{"sequence":0,"result":{"id":"synthetic"}}\n')
+        self.assertEqual({'id': 'synthetic'}, client('sqlite', 'installer'))
+        sent = json.loads(client.connection.sendall.call_args.args[0])
+        self.assertEqual({'attempt', 'nonce', 'sequence', 'operation', 'engine', 'purpose'}, set(sent))
+        self.assertEqual('birth', sent['operation'])
+        with self.assertRaisesRegex(ValueError, 'frame'):
+            client('sqlite', 'installer')
+        self.assertTrue(client.failed)
+        self.assertEqual(2, client.connection.sendall.call_count)
+        with self.assertRaisesRegex(ValueError, 'no retry'):
+            client('sqlite', 'installer')
+        self.assertEqual(2, client.connection.sendall.call_count)
+        client.connection.close.assert_called_once()
+        for reply in (b'{"sequence":1,"result":{}}\n', b'{"sequence":true,"result":{}}\n',
+                      b'{"sequence":0,"result":{},"private":"extra"}\n'):
+            with self.subTest(reply=reply):
+                client = self.client(reply)
+                with self.assertRaises(ValueError):
+                    client('sqlite', 'installer')
+                self.assertTrue(client.failed)
+
+    def test_daemon_mismatch_closes_transport(self):
+        client = self.client(b'{"sequence":0,"result":{"binding":"different"}}\n')
+        daemon = Mock()
+        daemon.verify.return_value = {'pid': 42, 'startticks': 50}
+        with self.assertRaisesRegex(ValueError, 'observations differ'):
+            client.verify_daemon('postgres', daemon)
+        self.assertTrue(client.failed)
+        request = json.loads(client.connection.sendall.call_args.args[0])
+        self.assertEqual('verify-daemon', request['operation'])
+        self.assertNotIn('pid', request)
+        self.assertNotIn('statement', request)
 
 
 if __name__ == '__main__':

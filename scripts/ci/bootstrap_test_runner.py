@@ -32,6 +32,91 @@ import time
 OUTER_BIRTH = None
 
 
+class OuterBirthControlClient:
+    """Root-only constrained-controller transport; never exposed to test UID997.
+
+    The outer launcher must mount its control directory read-only at the fixed
+    path below and supply the root-custodied descriptor. This class does not
+    activate a hook, register a runner or create any namespaces/containers.
+    """
+    def __init__(self, attempt):
+        if os.geteuid() != 0 or not re.fullmatch('[a-zA-Z0-9_-]{1,80}', attempt):
+            raise ValueError('root controller required')
+        directory = Path('/run/newapi-formal-control')
+        descriptor = directory / 'control.json'
+        for path in (descriptor, *descriptor.parents):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError('outer control custody mismatch')
+        info = descriptor.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4096 or info.st_mode & 0o077:
+            raise ValueError('invalid outer control descriptor')
+        value = json.loads(descriptor.read_text())
+        if (set(value) != {'attempt', 'socket_device', 'socket_inode', 'nonce'} or value['attempt'] != attempt or
+                not re.fullmatch('[0-9a-f]{64}', value['nonce'])):
+            raise ValueError('outer control descriptor mismatch')
+        endpoint = directory / 'control.sock'
+        info = endpoint.lstat()
+        if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or
+                (info.st_dev, info.st_ino) != (value['socket_device'], value['socket_inode'])):
+            raise ValueError('outer control socket replaced')
+        self.attempt_id, self.nonce = attempt, value['nonce']
+        self.sequence, self.failed = 0, False
+        self.lock = threading.Lock()
+        self.connection = socket.socket(socket.AF_UNIX)
+        self.connection.settimeout(240)
+        try:
+            self.connection.connect(str(endpoint))
+            _, uid, gid = struct.unpack('3i', self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if (uid, gid) != (0, 0):
+                raise ValueError('outer server is not root')
+            self.reader = self.connection.makefile('rb')
+        except BaseException:
+            self.connection.close()
+            raise
+
+    def close(self):
+        self.failed = True
+        self.reader.close()
+        self.connection.close()
+
+    def request(self, operation, engine, purpose):
+        with self.lock:
+            if self.failed:
+                raise ValueError('outer control connection closed; no retry')
+            try:
+                message = dict(attempt=self.attempt_id, nonce=self.nonce, sequence=self.sequence,
+                               operation=operation, engine=engine, purpose=purpose)
+                self.connection.sendall(json.dumps(message, separators=(',', ':')).encode() + b'\n')
+                line = self.reader.readline(65537)
+                if not line.endswith(b'\n') or len(line) > 65536:
+                    raise ValueError('invalid outer control frame')
+                reply = json.loads(line)
+                if (type(reply) is not dict or set(reply) != {'sequence', 'result'} or
+                        type(reply['sequence']) is not int or reply['sequence'] != self.sequence):
+                    raise ValueError('outer control sequence or result mismatch')
+                self.sequence += 1
+                return reply['result']
+            except BaseException:
+                # An interrupted birth is ambiguous. Never reconnect/retry or
+                # fall back to executing a candidate producer as root.
+                self.close()
+                raise
+
+    def __call__(self, engine, purpose):
+        return self.request('birth', engine, purpose)
+
+    def verify_daemon(self, engine, daemon):
+        if daemon is None:
+            raise ValueError('same owned daemon required')
+        observed = daemon.verify()
+        binding = hashlib.sha256(json.dumps(observed, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        remote = self.request('verify-daemon', engine, '')
+        if remote != {'binding': binding}:
+            self.close()
+            raise ValueError('outer and service daemon observations differ')
+
+
 def outer_birth(engine, purpose, daemon=None):
     if OUTER_BIRTH is None:
         return None
