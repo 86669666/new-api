@@ -25,6 +25,53 @@ import tempfile
 import threading
 import time
 
+# Installed-controller injection point, not a candidate CLI/environment option.
+# The outer controller owns producer isolation and returns a completed named
+# namespace. The constrained PG tier must use a root-authenticated proxy to it;
+# it must never acquire a Docker socket or create nested namespaces.
+OUTER_BIRTH = None
+
+
+def outer_birth(engine, purpose, daemon=None):
+    if OUTER_BIRTH is None:
+        return None
+    allowed = {'installer': ('sqlite',), 'postgres': ('postgres',),
+               'admission': ('sqlite',), 'wallet': ('sqlite', 'postgres', 'mysql')}
+    if os.geteuid() != 0 or engine not in allowed.get(purpose, ()):
+        raise ValueError('unadmitted outer birth operation')
+    # Only names cross the operation boundary: never commands, credentials,
+    # target paths or producer-supplied database observations.
+    if engine != 'sqlite':
+        OUTER_BIRTH.verify_daemon(engine, daemon)
+    result = OUTER_BIRTH(engine, purpose)
+    if (type(result) is not dict or set(result) != {'id', 'engine', 'target', 'journal', 'output_sha256'} or
+            result['engine'] != engine or not re.fullmatch('[0-9a-f]{32}', result['id']) or
+            not re.fullmatch('[0-9a-f]{64}', result['output_sha256'])):
+        raise ValueError('invalid completed outer birth')
+    attempt = OUTER_BIRTH.attempt_id
+    if not re.fullmatch('[a-zA-Z0-9_-]{1,80}', attempt):
+        raise ValueError('invalid outer attempt')
+    publication = Path('/opt/newapi-box-formal/work') / attempt
+    target, journal = Path(result['target']), Path(result['journal'])
+    if journal != publication / 'journals' / (result['id'] + '.json'):
+        raise ValueError('invalid outer journal path')
+    if engine == 'sqlite':
+        if target != publication / ('birth-' + result['id']) / 'new.db':
+            raise ValueError('invalid outer SQLite path')
+    elif result['target'] != 'birth_' + result['id']:
+        raise ValueError('outer SQL namespace mismatch')
+    # Root publication is checked independently of the transport response. The
+    # broker must mount this exact sealed journal read-only before returning.
+    for path in (journal, *journal.parents):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('outer journal custody mismatch')
+    state = json.loads(journal.read_text())
+    if state['phase'] != 'READY' or state['engine'] != engine or state['target'] != result['target']:
+        raise ValueError('outer birth not published READY')
+    return result
+
+
 DIALECT_TESTS = {
     'service': ('TestOAuthDerivedTextRawUsageRejection', 'TestOAuthDerivedTransportDatabaseCASWire'),
     'controller': ('TestOAuthDerivedSelectedHTTP',),
@@ -689,22 +736,31 @@ class Installer:
                             outcome = 'success'
                             continue
                         phase = 'data_create'
-                        ident = secrets.token_hex(16)
-                        data = self.root / ('data-' + ident)
-                        data.mkdir(mode=0o755)
-                        target = data / 'new.db'
-                        journal = self.root / 'journals' / (ident + '.json')
-                        argv = [str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(target), '--journal', str(journal)]
-                        phase = 'cli_begin'
-                        bootstrap_observation('installer', phase, started, pid, label=label)
-                        proc = subprocess.run(argv, env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
-                        cli_exit = proc.returncode
-                        phase = 'cli_return'
-                        bootstrap_observation('installer', phase, started, pid, label=label, cli_exit=cli_exit)
-                        self.receipts.append({'argv': argv, 'exit': proc.returncode, 'output_sha256': hashlib.sha256(proc.stdout).hexdigest(), 'peer_uid': peer_uid})
-                        if proc.returncode:
-                            outcome = 'cli_nonzero'
-                            continue
+                        completed_birth = outer_birth('sqlite', 'installer')
+                        if completed_birth is not None:
+                            ident = completed_birth['id']
+                            target = Path(completed_birth['target'])
+                            data = target.parent
+                            journal = Path(completed_birth['journal'])
+                            self.receipts.append({'operation': 'outer-birth', 'id': ident, 'exit': 0,
+                                'output_sha256': completed_birth['output_sha256'], 'peer_uid': peer_uid})
+                        else:
+                            ident = secrets.token_hex(16)
+                            data = self.root / ('data-' + ident)
+                            data.mkdir(mode=0o755)
+                            target = data / 'new.db'
+                            journal = self.root / 'journals' / (ident + '.json')
+                            argv = [str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(target), '--journal', str(journal)]
+                            phase = 'cli_begin'
+                            bootstrap_observation('installer', phase, started, pid, label=label)
+                            proc = subprocess.run(argv, env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+                            cli_exit = proc.returncode
+                            phase = 'cli_return'
+                            bootstrap_observation('installer', phase, started, pid, label=label, cli_exit=cli_exit)
+                            self.receipts.append({'argv': argv, 'exit': proc.returncode, 'output_sha256': hashlib.sha256(proc.stdout).hexdigest(), 'peer_uid': peer_uid})
+                            if proc.returncode:
+                                outcome = 'cli_nonzero'
+                                continue
                         phase = 'file_owner'
                         os.chown(target, self.uid, self.uid)
                         phase = 'file_mode'
@@ -1048,27 +1104,36 @@ class OwnedPostgres:
 
     def birth(self):
         self.verify()
-        ident = secrets.token_hex(16)
-        database, role, restricted = 'birth_'+ident, 'svc_'+ident, 'limited_'+ident
-        journal = self.root / 'journals' / (ident+'.json')
-        # URL syntax is the permanent product CLI contract. Password only in env.
-        admin = 'postgresql://bootstrap:'+self.password+'@/postgres?host='+str(self.socket_dir)+'&sslmode=disable'
-        q = subprocess.run([str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'postgres',
-                            '--target', database, '--journal', str(journal)],
-                           env={'PATH': '/usr/bin:/bin', 'GOMAXPROCS': '2', 'BOOTSTRAP_ADMIN_DSN': admin},
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-        self.commands.append({'operation': 'permanent CLI fresh', 'database': database, 'exit': q.returncode,
-                              'output_sha256': hashlib.sha256(q.stdout+q.stderr).hexdigest(), 'journal_phase': json.loads(journal.read_text()).get('phase') if journal.exists() else None, 'error': (q.stdout+q.stderr).decode(errors='replace').replace(self.password, '[redacted]') if q.returncode else None})
-        if q.returncode:
-            self.commands.append({'operation': 'birth failure boundary',
-                                  'lock_exists': Path(str(journal)+'.lock').exists(),
-                                  'protected_ancestors': [{'path': str(p), 'uid': p.stat().st_uid, 'mode': oct(p.stat().st_mode & 0o777)} for p in (journal.parent, self.root, Path('/run'), Path('/'))],
-                                  'admin_superuser': self.sql('postgres', 'SELECT rolsuper FROM pg_roles WHERE rolname=current_user;'),
-                                  'pg_error_categories': [category for category in ('password authentication failed', 'role does not exist', 'database does not exist', 'no pg_hba.conf entry', 'unsupported frontend protocol', 'invalid startup packet') if category in (self.root/'postgres.log').read_text()]})
-            raise RuntimeError('permanent PG birth failed')
-        j = json.loads(journal.read_text())
-        if j['phase'] != 'READY' or j['target'] != database or j['engine'] != 'postgres':
-            raise RuntimeError('PG birth journal mismatch')
+        completed_birth = outer_birth('postgres', 'postgres', self)
+        if completed_birth is not None:
+            ident = completed_birth['id']
+            database = completed_birth['target']
+            journal = Path(completed_birth['journal'])
+            role, restricted = 'svc_' + ident, 'limited_' + ident
+            self.commands.append({'operation': 'outer-birth', 'database': database, 'exit': 0,
+                                  'output_sha256': completed_birth['output_sha256']})
+        else:
+            ident = secrets.token_hex(16)
+            database, role, restricted = 'birth_'+ident, 'svc_'+ident, 'limited_'+ident
+            journal = self.root / 'journals' / (ident+'.json')
+            # URL syntax is the permanent product CLI contract. Password only in env.
+            admin = 'postgresql://bootstrap:'+self.password+'@/postgres?host='+str(self.socket_dir)+'&sslmode=disable'
+            q = subprocess.run([str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'postgres',
+                                '--target', database, '--journal', str(journal)],
+                               env={'PATH': '/usr/bin:/bin', 'GOMAXPROCS': '2', 'BOOTSTRAP_ADMIN_DSN': admin},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            self.commands.append({'operation': 'permanent CLI fresh', 'database': database, 'exit': q.returncode,
+                                  'output_sha256': hashlib.sha256(q.stdout+q.stderr).hexdigest(), 'journal_phase': json.loads(journal.read_text()).get('phase') if journal.exists() else None, 'error': (q.stdout+q.stderr).decode(errors='replace').replace(self.password, '[redacted]') if q.returncode else None})
+            if q.returncode:
+                self.commands.append({'operation': 'birth failure boundary',
+                                      'lock_exists': Path(str(journal)+'.lock').exists(),
+                                      'protected_ancestors': [{'path': str(p), 'uid': p.stat().st_uid, 'mode': oct(p.stat().st_mode & 0o777)} for p in (journal.parent, self.root, Path('/run'), Path('/'))],
+                                      'admin_superuser': self.sql('postgres', 'SELECT rolsuper FROM pg_roles WHERE rolname=current_user;'),
+                                      'pg_error_categories': [category for category in ('password authentication failed', 'role does not exist', 'database does not exist', 'no pg_hba.conf entry', 'unsupported frontend protocol', 'invalid startup packet') if category in (self.root/'postgres.log').read_text()]})
+                raise RuntimeError('permanent PG birth failed')
+            j = json.loads(journal.read_text())
+            if j['phase'] != 'READY' or j['target'] != database or j['engine'] != 'postgres':
+                raise RuntimeError('PG birth journal mismatch')
         password = secrets.token_hex(32)
         self.sql(database, f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}'; CREATE ROLE {restricted} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; GRANT {restricted} TO {role}; REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE,CREATE ON SCHEMA public TO {role}; CREATE SCHEMA app; GRANT USAGE,CREATE ON SCHEMA app TO {role}; GRANT USAGE ON SCHEMA app TO {restricted};")
         # Exactly the existing organization fixture's mutable tables. History and
@@ -1690,13 +1755,21 @@ class AdmissionFixture:
         self.identity = root.stat()
         for name, gid, mode in [('data', broker_uid, 0o750), ('socket', broker_uid, 0o771), ('control', 0, 0o755)]:
             p = root/name; p.mkdir(); os.chown(p, 0, gid); p.chmod(mode)
-        self.db, self.journal = root/'data/main.db', root/'control/birth.json'
-        producer = root.parent/'bundle/new-api'
-        birth = subprocess.run([str(producer), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(self.db), '--journal', str(self.journal)],
-                               env={'PATH':'/usr/bin:/bin'}, capture_output=True, timeout=90)
-        print(json.dumps({'admission_birth': case, 'exit': birth.returncode, 'output_sha256': hashlib.sha256(birth.stdout+birth.stderr).hexdigest()}), flush=True)
-        if birth.returncode or json.loads(self.journal.read_text())['phase'] != 'READY':
-            raise ValueError('permanent birth failed')
+        completed_birth = outer_birth('sqlite', 'admission')
+        if completed_birth is not None:
+            self.db, self.journal = Path(completed_birth['target']), Path(completed_birth['journal'])
+            print(json.dumps({'admission_birth': case, 'exit': 0,
+                              'output_sha256': completed_birth['output_sha256']}), flush=True)
+        else:
+            self.db, self.journal = root/'data/main.db', root/'control/birth.json'
+            producer = root.parent/'bundle/new-api'
+            birth = subprocess.run([str(producer), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(self.db), '--journal', str(self.journal)],
+                                   env={'PATH':'/usr/bin:/bin'}, capture_output=True, timeout=90)
+            print(json.dumps({'admission_birth': case, 'exit': birth.returncode, 'output_sha256': hashlib.sha256(birth.stdout+birth.stderr).hexdigest()}), flush=True)
+            if birth.returncode or json.loads(self.journal.read_text())['phase'] != 'READY':
+                raise ValueError('permanent birth failed')
+        if completed_birth is not None:
+            os.chown(self.db.parent, 0, broker_uid); self.db.parent.chmod(0o770)
         os.chown(self.db, 0, broker_uid); self.db.chmod(0o660); (root/'data').chmod(0o770)
         os.chown(self.journal,0,broker_uid);self.journal.chmod(0o640)
         conn = sqlite3.connect(self.db)
@@ -2405,28 +2478,38 @@ class WalletInstaller:
 
     def birth(self):
         if self.resource:self.resource.verify()
-        ident = secrets.token_hex(16)
-        journal = self.root/'journals'/(ident+'.json')
-        env = {'PATH':'/usr/bin:/bin', 'GOMAXPROCS':'2'}
-        role, password = 'owner_'+ident[:20], secrets.token_hex(32)
-        if self.engine == 'sqlite':
-            data = self.root/('data-'+ident);data.mkdir(mode=0o700)
-            database = str(data/'main.db')
+        completed_birth = outer_birth(self.engine, 'wallet', self.resource)
+        if completed_birth is not None:
+            ident, database = completed_birth['id'], completed_birth['target']
+            journal = Path(completed_birth['journal'])
+            role, password = 'owner_' + ident[:20], secrets.token_hex(32)
+            if self.engine == 'sqlite':
+                data = Path(database).parent
+            print(json.dumps({'wallet_birth': ident, 'engine': self.engine, 'exit': 0,
+                              'output_sha256': completed_birth['output_sha256']}), flush=True)
         else:
-            database = 'birth_'+ident
-            if self.engine == 'postgres':
-                env['BOOTSTRAP_ADMIN_DSN'] = 'postgresql://bootstrap:'+self.resource.password+'@/postgres?host='+str(self.resource.socket_dir)+'&sslmode=disable'
+            ident = secrets.token_hex(16)
+            journal = self.root/'journals'/(ident+'.json')
+            env = {'PATH':'/usr/bin:/bin', 'GOMAXPROCS':'2'}
+            role, password = 'owner_'+ident[:20], secrets.token_hex(32)
+            if self.engine == 'sqlite':
+                data = self.root/('data-'+ident);data.mkdir(mode=0o700)
+                database = str(data/'main.db')
             else:
-                env['BOOTSTRAP_ADMIN_DSN'] = 'root:'+self.resource.password+'@unix('+str(self.resource.socket_path)+')/mysql?parseTime=true'
-        result = subprocess.run([str(self.root/'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', self.engine,
-            '--target', database, '--journal', str(journal)], env=env, capture_output=True, timeout=120)
-        print(json.dumps({'wallet_birth':ident, 'engine':self.engine, 'exit':result.returncode,
-            'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest()}),flush=True)
-        if result.returncode:
-            raise RuntimeError('permanent wallet birth failed')
-        j = json.loads(journal.read_text())
-        if j['phase'] != 'READY' or j['engine'] != self.engine or j['target'] != database:
-            raise RuntimeError('wallet birth identity mismatch')
+                database = 'birth_'+ident
+                if self.engine == 'postgres':
+                    env['BOOTSTRAP_ADMIN_DSN'] = 'postgresql://bootstrap:'+self.resource.password+'@/postgres?host='+str(self.resource.socket_dir)+'&sslmode=disable'
+                else:
+                    env['BOOTSTRAP_ADMIN_DSN'] = 'root:'+self.resource.password+'@unix('+str(self.resource.socket_path)+')/mysql?parseTime=true'
+            result = subprocess.run([str(self.root/'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', self.engine,
+                '--target', database, '--journal', str(journal)], env=env, capture_output=True, timeout=120)
+            print(json.dumps({'wallet_birth':ident, 'engine':self.engine, 'exit':result.returncode,
+                'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest()}),flush=True)
+            if result.returncode:
+                raise RuntimeError('permanent wallet birth failed')
+            j = json.loads(journal.read_text())
+            if j['phase'] != 'READY' or j['engine'] != self.engine or j['target'] != database:
+                raise RuntimeError('wallet birth identity mismatch')
         provenance = self.snapshot(database)
         file_identity = None
         if self.engine == 'sqlite':
