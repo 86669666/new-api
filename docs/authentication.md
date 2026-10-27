@@ -214,6 +214,25 @@ Proof 同时绑定用户、登录会话、用户鉴权版本、会话版本和 s
 
 拓扑、客户端及 discovery 校验由 [`service/oauth_public.go`](../service/oauth_public.go) 的 `NewOAuthPublic`、`ValidateTopology`、`CurrentOAuthDesktopStatus` 和 `metadata` 实现；环境变量装配见 [`service/oauth_provider.go`](../service/oauth_provider.go)。上述 Hydra 部署要求仍需部署者验证，不能从 gateway 配置校验推定全部已生效。
 
+### 公开客户端注册与回调核对
+
+公开客户端应在私有 issuer 管理边界登记：`token_endpoint_auth_method=none`、`subject_type=public`，`grant_types` 恰为 `authorization_code` 与 `refresh_token`，`response_types` 恰为 `code`，`skip_consent=false`，audience 包含 gateway 配置的 audience。公开客户端不使用 client secret。登记 scopes 只能来自支持列表且包含 `profile`；登记后还须纳入 gateway 的客户端允许列表。此处是 operator 登记契约，不表示 gateway 已提供公开客户端 CRUD UI/API、管理二次验证或客户端变更审计；外部身份提供商配置也不是这类客户端注册入口。
+
+下表对应 [`validOAuthProviderRedirect`](../service/oauth_provider.go) 与 [`OAuthPublic.client`](../service/oauth_public.go)。后者会用每个登记 URI 自身调用校验，因此登记值也必须满足规则。示例域名及回环端口仅说明协议，不指向真实部署。
+
+| 回调类型 | 当前匹配规则 | 示例与边界 |
+| --- | --- | --- |
+| HTTPS | 解析后为 `https` 且 hostname 非空；请求 URI 与登记的原始字符串完全相等 | 如 `https://client.example.com/oauth/callback`；不做通配符展开、路径前缀匹配或大小写等价替换 |
+| Boxnai | 原始请求与登记值均须恰为 `boxnai://oauth/callback` | 不接受其他 host、端口、路径、查询参数或大小写变体 |
+| Cherry Studio 兼容回调 | 解析后的 scheme 为 `cherrystudio`、Host 恰为 `oauth`、Path 恰为 `/callback`，且请求与登记的原始字符串完全相等 | 基本形式为 `cherrystudio://oauth/callback`；代码没有额外禁止查询参数，但任何查询串也必须与登记值原样相同。不能套用 Boxnai 的固定字符串规则，也不承诺其他原始字符串的大小写等价 |
+| HTTP 数字回环 | hostname 只能是 `127.0.0.1` 或 `::1`，请求与登记地址相同；登记和请求均需显式有效端口（1–65535）。比较时只允许替换数字回环端口，其余路径与查询保持精确登记匹配 | 例如登记 `http://127.0.0.1:49152/oauth/callback`，请求可使用同地址的 `:49153`；IPv6 示例为 `http://[::1]:49152/oauth/callback`。不接受无端口登记、`localhost`、非回环地址或地址族切换 |
+
+所有类型都拒绝用户信息、opaque URI 和 fragment（包括空的 `#`）；任意其他自定义 scheme 不在允许范围内。不要把 URI 解析后的字段比较理解成对整个原始 URI 的规范化或大小写折叠，也不要把回环端口例外扩大为路径、查询或 host 的通配匹配。
+
+通用登记通过不等于桌面状态 ready。`CurrentOAuthDesktopStatus` 还要求显式选择的 `OAUTH_PROVIDER_DESKTOP_CLIENT_ID` 对应有效登记、包含精确 `boxnai://oauth/callback`，以及 `openid profile offline_access tokens:write` 四个核心 scopes；公开服务和拓扑也必须有效。仅有回环或 Cherry Studio 回调的客户端不会因此满足桌面状态要求。可选 scopes 只按该已验证客户端的实际登记范围发布，不扩大同意或授权。
+
+本表保留下文 OWASP 引用所要求的受限重定向、事务绑定和 PKCE 控制；HTTP 回环是原生客户端回调的限定规则，不是降低 issuer、管理连接或面板会话 TLS 要求的建议。它不构成新的运行验证或合规认证。
+
 ### 公开路径与关闭边界
 
 [`SetOAuthPublicRouter`](../router/oauth_public_router.go) 只开放以下精确入口，不是对 Hydra 任意路径的透明代理：
