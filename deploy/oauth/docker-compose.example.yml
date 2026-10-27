@@ -1,0 +1,86 @@
+# Private Ory Hydra for the new-api public whitelist.
+# Merge the network into the existing gateway, or attach that gateway to oauth-private.
+# Do not publish the Hydra listeners. TLS files and passwords come from a secret manager.
+# This file was not started in CI. Hydra image tag v26.2.0 matches the upstream release of 2026-03-20.
+# Command `migrate sql up -e --yes` is the non-interactive form in that tag's cmd/migrate_sql.go.
+
+services:
+  hydra-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: ${HYDRA_DB_PASSWORD:?set from the secret manager}
+      POSTGRES_DB: hydra
+    volumes:
+      - hydra_db:/var/lib/postgresql/data
+    networks:
+      - oauth-private
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra -d hydra"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  hydra-migrate:
+    image: oryd/hydra:v26.2.0
+    restart: "no"
+    depends_on:
+      hydra-db:
+        condition: service_healthy
+    environment: &hydra-env
+      DSN: postgres://hydra:${HYDRA_DB_PASSWORD}@hydra-db:5432/hydra?sslmode=disable
+      SECRETS_SYSTEM: ${HYDRA_SYSTEM_SECRET:?set from the secret manager}
+    command: ["migrate", "sql", "up", "-e", "--yes"]
+    networks:
+      - oauth-private
+
+  hydra:
+    image: oryd/hydra:v26.2.0
+    restart: unless-stopped
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *hydra-env
+      # Public issuer. Leave URLS_SELF_PUBLIC unset so discovery follows this issuer,
+      # not the private dial hostname.
+      URLS_SELF_ISSUER: https://auth.example.com/
+      URLS_LOGIN: https://auth.example.com/oauth/provider/login
+      URLS_CONSENT: https://auth.example.com/oauth/provider/consent
+      URLS_ERROR: https://auth.example.com/oauth2/error
+      # Listen on all interfaces inside oauth-private. Dial names are network aliases,
+      # public :4444 and admin :4445, not published outside this network.
+      SERVE_TLS_CERT_PATH: /run/secrets/hydra.crt
+      SERVE_TLS_KEY_PATH: /run/secrets/hydra.key
+      SERVE_COOKIES_SAME_SITE_MODE: Lax
+      STRATEGIES_ACCESS_TOKEN: opaque
+      OAUTH2_PKCE_ENFORCED_FOR_PUBLIC_CLIENTS: "true"
+      OAUTH2_EXPOSE_INTERNAL_ERRORS: "false"
+      TTL_LOGIN_CONSENT_REQUEST: 30m
+      TTL_ACCESS_TOKEN: 15m
+      TTL_REFRESH_TOKEN: 168h
+      TTL_AUTH_CODE: 10m
+      TTL_ID_TOKEN: 15m
+      LOG_LEAK_SENSITIVE_VALUES: "false"
+    command: ["serve", "all"]
+    secrets:
+      - hydra.crt
+      - hydra.key
+    networks:
+      oauth-private:
+        aliases:
+          - hydra-public.example
+          - hydra-admin.example
+
+networks:
+  oauth-private:
+    internal: true
+
+volumes:
+  hydra_db:
+
+secrets:
+  hydra.crt:
+    file: ${HYDRA_TLS_CERT_FILE:?mount a certificate with both dial-name SANs}
+  hydra.key:
+    file: ${HYDRA_TLS_KEY_FILE:?mount the matching key from the secret manager}
