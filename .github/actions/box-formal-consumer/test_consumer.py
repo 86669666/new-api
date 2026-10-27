@@ -1,6 +1,6 @@
 import copy
 import unittest
-from consumer import APP, INSTALLATION, REPOSITORY, CHECK, PINS, digest, validate_check, validate_receipt
+from consumer import APP, INSTALLATION, REPOSITORY, CHECK, PINS, digest, validate_check, validate_receipt, validate_environment
 
 
 def fixture():
@@ -25,6 +25,24 @@ def fixture():
 
 
 class ReceiptTests(unittest.TestCase):
+    def test_protected_environment_binding_before_network(self):
+        _, admission, _ = fixture()
+        environment = dict(GITHUB_REPOSITORY=REPOSITORY, GITHUB_EVENT_NAME='workflow_dispatch',
+                           GITHUB_REF='refs/heads/main', BOX_FORMAL_CONSUMER_SHA='a' * 40,
+                           GITHUB_WORKFLOW_SHA='a' * 40)
+        validate_environment(environment, admission, 200)
+        for key, value in [('GITHUB_REF', 'refs/heads/candidate'),
+                           ('GITHUB_EVENT_NAME', 'pull_request'),
+                           ('BOX_FORMAL_CONSUMER_SHA', 'main'),
+                           ('GITHUB_WORKFLOW_SHA', 'f' * 40)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_environment(dict(environment, **{key: value}), admission, 200)
+        for key, value in [('active', False), ('check_run_id', 0), ('receipt_sha256', '')]:
+            with self.subTest(admission=key), self.assertRaises(ValueError):
+                validate_environment(environment, dict(admission, **{key: value}), 200)
+        with self.assertRaises(ValueError):
+            validate_environment(environment, admission, 301)
+
     def test_exact_authenticated_receipt(self):
         receipt, admission, check = fixture()
         self.assertEqual(digest(receipt), validate_check(check, receipt, admission, 200))

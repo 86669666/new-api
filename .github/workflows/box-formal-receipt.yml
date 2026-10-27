@@ -25,5 +25,6 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/box-formal-consumer
         with:
+          trusted-sha: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
           admission: ${{ vars.BOX_FORMAL_ADMISSION }}
           token: ${{ github.token }}

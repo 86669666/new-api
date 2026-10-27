@@ -91,11 +91,29 @@ def api(path, token, method='GET', payload=None):
         return json.load(response)
 
 
+def validate_environment(environment, admission, now):
+    require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong repository')
+    require(environment['GITHUB_EVENT_NAME'] == 'workflow_dispatch', 'manual admission only')
+    require(environment['GITHUB_REF'] == 'refs/heads/main', 'protected main required')
+    trusted = environment['BOX_FORMAL_CONSUMER_SHA']
+    require(re.fullmatch('[0-9a-f]{40}', trusted) is not None, 'immutable consumer SHA required')
+    require(trusted == environment['GITHUB_WORKFLOW_SHA'] == admission['expected']['consumer_sha'],
+            'unapproved workflow revision')
+    require(admission['active'] is True and admission['repository'] == REPOSITORY,
+            'inactive or foreign admission')
+    require(admission['app_id'] == APP and admission['installation_id'] == INSTALLATION,
+            'wrong admitted publisher')
+    require(admission['expected']['not_before'] <= now <= admission['expected']['expires_at'],
+            'expired or future admission')
+    require(type(admission['check_run_id']) is int and admission['check_run_id'] > 0,
+            'published check ID required')
+    require(re.fullmatch('[0-9a-f]{64}', admission['receipt_sha256']) is not None,
+            'finalized receipt hash required')
+
+
 def main():
     admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'])
-    require(os.environ['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong repository')
-    require(os.environ['GITHUB_WORKFLOW_SHA'] == admission['expected']['consumer_sha'],
-            'unapproved workflow revision')
+    validate_environment(os.environ, admission, int(time.time()))
     token = os.environ['GITHUB_TOKEN']
     check_id = admission['check_run_id']
     require(type(check_id) is int and check_id > 0, 'invalid check ID')
