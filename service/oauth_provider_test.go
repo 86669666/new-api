@@ -3,7 +3,9 @@ package service
 import (
 	"testing"
 
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestOAuthProviderRedirectFragments(t *testing.T) {
@@ -39,4 +41,48 @@ func TestOAuthProviderRedirectFragments(t *testing.T) {
 			assert.Equal(t, tc.allowed, validOAuthProviderRedirect(tc.requested, tc.registered))
 		})
 	}
+}
+
+func TestDesktopOAuthStatusFollowsReadiness(t *testing.T) {
+	const issuer = "https://auth.example.com/"
+	assert.Equal(t, map[string]any{"enabled": false}, (*OAuthPublic)(nil).Status())
+
+	resource, err := NewOAuthUserInfoResource(OAuthUserInfoConfig{
+		Enabled: true, IntrospectionURL: "https://hydra-admin.example:4445/admin/oauth2/introspect",
+		Issuer: issuer, Audience: "status-userinfo", ClientIDs: []string{"desktop-client", "second-client"},
+	}, nil)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	bridge, err := NewOAuthProviderBridge(OAuthProviderConfig{
+		Enabled: true, RevocationEnabled: true, AdminBaseURL: "https://hydra-admin.example:4445/",
+		AuthorizationURL: issuer + "oauth2/auth",
+	}, resource)
+	require.NoError(t, err)
+	public, err := NewOAuthPublic(OAuthPublicConfig{Enabled: true, BaseURL: "https://hydra-public.example:4444/"}, bridge)
+	require.NoError(t, err)
+	previous := SwapOAuthProviderBridge(bridge)
+	t.Cleanup(func() { SwapOAuthProviderBridge(previous) })
+	oldAddress := system_setting.ServerAddress
+	system_setting.ServerAddress = issuer
+	t.Setenv("FRONTEND_BASE_URL", "")
+	t.Cleanup(func() { system_setting.ServerAddress = oldAddress })
+
+	assert.Equal(t, map[string]any{"enabled": false}, public.Status())
+	assert.Equal(t, public.Status(), CurrentOAuthProviderBridge().Public().Status())
+
+	public.ready.Store(true)
+	assert.Equal(t, map[string]any{"enabled": true, "issuer": issuer, "desktop_client_id": "desktop-client"}, public.Status())
+
+	resource.clients = nil
+	assert.Equal(t, map[string]any{"enabled": false}, public.Status())
+	resource.clients = []string{"desktop-client", "second-client"}
+
+	t.Setenv("FRONTEND_BASE_URL", "https://console.example")
+	assert.Equal(t, map[string]any{"enabled": false}, public.Status())
+	t.Setenv("FRONTEND_BASE_URL", "")
+	system_setting.ServerAddress = "https://other.example"
+	disabled := public.Status()
+	assert.Equal(t, map[string]any{"enabled": false}, disabled)
+	assert.NotContains(t, disabled, "issuer")
+	assert.NotContains(t, disabled, "desktop_client_id")
 }

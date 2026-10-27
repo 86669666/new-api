@@ -51,15 +51,16 @@ func GetStatus(c *gin.Context) {
 	defer common.OptionMapRWMutex.RUnlock()
 
 	legalSetting := system_setting.GetLegalSettings()
+	oauthStatus := service.CurrentOAuthProviderBridge().Public().Status()
 
 	data := gin.H{
 		"instance_id": model.SiteInstanceID(),
 		"console_links": publicConsoleLinks(system_setting.ServerAddress,
 			common.OptionMap["SidebarModulesAdmin"], common.OptionMap["HeaderNavModules"]),
-		// These describe the new desktop integration contracts, independently
-		// of existing login providers, legacy token logs and pricing APIs.
-		"oauth":                       gin.H{"enabled": false},
-		"client_features":             gin.H{"token_usage_logs": false, "oauth": false, "model_metadata": false},
+		// Desktop OAuth follows public-issuer readiness. Token-usage and model
+		// metadata contracts stay false until their own acceptance.
+		"oauth":                       oauthStatus,
+		"client_features":             gin.H{"token_usage_logs": false, "oauth": oauthStatus["enabled"], "model_metadata": false},
 		"version":                     common.Version,
 		"start_time":                  common.StartTime,
 		"email_verification":          common.EmailVerificationEnabled,

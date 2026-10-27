@@ -1264,7 +1264,7 @@ for (const operation of publicOAuthOperations.slice(1)) {
   responseStatus = 200;
   responseBody = operation.method === 'getOAuthPublicJwks' ? { keys: [{ kty: 'RSA', kid: 'fixture', use: 'sig', alg: 'RS256', n: 'fixture-n', e: 'AQAB' }] } : {
     issuer: 'https://issuer.example.invalid/', authorization_endpoint: 'https://issuer.example.invalid/oauth2/auth', token_endpoint: 'https://issuer.example.invalid/oauth2/token', revocation_endpoint: 'https://issuer.example.invalid/oauth2/revoke', jwks_uri: 'https://issuer.example.invalid/.well-known/jwks.json', userinfo_endpoint: 'https://issuer.example.invalid/api/v1/oauth/userinfo',
-    scopes_supported: ['openid', 'profile', 'email', 'offline_access'], response_types_supported: ['code'], response_modes_supported: ['query'], grant_types_supported: ['authorization_code', 'refresh_token'], token_endpoint_auth_methods_supported: ['none'], subject_types_supported: ['public'], id_token_signing_alg_values_supported: ['RS256'], code_challenge_methods_supported: ['S256'], authorization_response_iss_parameter_supported: true,
+    scopes_supported: ['openid', 'profile', 'email', 'offline_access', 'balance:read', 'usage:read', 'tokens:read', 'tokens:write'], response_types_supported: ['code'], response_modes_supported: ['query'], grant_types_supported: ['authorization_code', 'refresh_token'], token_endpoint_auth_methods_supported: ['none'], subject_types_supported: ['public'], id_token_signing_alg_values_supported: ['RS256'], code_challenge_methods_supported: ['S256'], authorization_response_iss_parameter_supported: true,
   };
   assert.deepEqual(await api[operation.service][operation.method](), responseBody);
   assert.equal(calls.at(-1).init.body, undefined);

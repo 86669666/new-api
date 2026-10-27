@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -88,6 +89,30 @@ func TestOAuthPublicHTTP(t *testing.T) {
 		assert.NotContains(t, w.Body.String(), "frontend")
 	}
 	assert.NotContains(t, logs.String(), "SECRET")
+}
+
+func TestOAuthDeployDocsOmitSecrets(t *testing.T) {
+	root := ".."
+	files := []string{"deploy/oauth/README.md", "deploy/oauth/docker-compose.example.yml", "deploy/oauth/check-discovery.sh"}
+	forbidden := regexp.MustCompile(`(?i)(?:\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b|123456|InsecureSkipVerify|--dev\b|boxnai-desktop|dev-api\.grok\.fan|BEGIN (?:RSA |OPENSSH )?PRIVATE KEY)`)
+	for _, name := range files {
+		data, err := os.ReadFile(filepath.Join(root, name))
+		require.NoError(t, err, name)
+		assert.NotRegexp(t, forbidden, string(data), name)
+	}
+	script, err := os.ReadFile(filepath.Join(root, "deploy/oauth/check-discovery.sh"))
+	require.NoError(t, err)
+	text := string(script)
+	assert.Contains(t, text, "curl")
+	assert.NotContains(t, text, "--head")
+	assert.NotContains(t, text, "-I")
+	assert.NotContains(t, text, "HEAD")
+	compose, err := os.ReadFile(filepath.Join(root, "deploy/oauth/docker-compose.example.yml"))
+	require.NoError(t, err)
+	assert.Contains(t, string(compose), "oryd/hydra:v26.2.0")
+	assert.Contains(t, string(compose), "STRATEGIES_ACCESS_TOKEN: opaque")
+	assert.Contains(t, string(compose), "OAUTH2_PKCE_ENFORCED_FOR_PUBLIC_CLIENTS: \"true\"")
+	assert.NotContains(t, string(compose), "ports:")
 }
 
 type oauthHydraInput struct {
@@ -650,6 +675,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 			require.Equal(t, 200, status)
 		}()
 		registered := strings.Fields(registration["scope"].(string))
+		registered = slices.DeleteFunc(registered, func(scope string) bool { return scope == "tokens:write" })
 		if !slices.Contains(registered, "tokens:read") {
 			registered = append(registered, "tokens:read")
 		}
@@ -662,7 +688,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		challenge := sha256.Sum256([]byte(strings.Repeat("a", 43)))
 		writeRequest := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {"http://127.0.0.1:29873/oauth/callback"}, "scope": {"profile tokens:write"}, "state": {strings.Repeat("b", 43)}, "code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"}}
 		status, writeHeaders, _ := c.request("GET", input.Issuer+"oauth2/auth?"+writeRequest.Encode(), "", "", "")
-		assert.Equal(t, 400, status, "tokens:write has no public producer")
+		assert.Equal(t, 400, status, "tokens:write is advertised but this fixture client is not registered for it")
 		assert.Empty(t, writeHeaders.Get("Location"))
 		journal, e := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
 		require.NoError(t, e)
@@ -748,7 +774,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		}
 		require.NoError(t, common.Unmarshal(raw, &metadata))
 		assert.Contains(t, metadata.Scopes, "tokens:read")
-		assert.NotContains(t, metadata.Scopes, "tokens:write")
+		assert.Contains(t, metadata.Scopes, "tokens:write")
 		status, headers, _ := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", "{}", "")
 		assert.Equal(t, 400, status)
 		assert.Empty(t, headers.Get("Location"))
@@ -939,8 +965,8 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		var binding map[string]any
 		require.NoError(t, common.UnmarshalJsonStr(flow.Payload, &binding))
 		policy := binding["policy_hash"].(string)
-		require.Contains(t, policy, ":public-v4:")
-		legacyPolicy := strings.Split(policy, ":public-v4:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
+		require.Contains(t, policy, ":public-v5:")
+		legacyPolicy := strings.Split(policy, ":public-v5:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
 		legacyPolicyHash := fmt.Sprintf("%x", sha256.Sum256([]byte(legacyPolicy)))
 
 		// Reconstructed pre-upgrade local fixture: real Hydra issued this
@@ -1690,6 +1716,16 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			headers http.Header
 			query   url.Values
 		}{r.Header.Clone(), query}
+		switch query.Get("state") {
+		case "issuer-login-page":
+			w.Header().Set("Location", issuer+"oauth/provider/login?login_challenge=login-challenge-value")
+			w.WriteHeader(http.StatusSeeOther)
+			return
+		case "upstream-uses-attacker-host":
+			w.Header().Set("Location", "https://attacker.example/oauth/provider/login?login_challenge=login-challenge-value")
+			w.WriteHeader(http.StatusSeeOther)
+			return
+		}
 		target, err := url.Parse(query.Get("redirect_uri"))
 		if err != nil {
 			w.WriteHeader(500)
@@ -1732,6 +1768,48 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 		system_setting.ServerAddress, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = oldAddress, oldGlobal, oldCritical
 	})
 	require.NoError(t, public.ValidateTopology(t.Context()))
+	t.Run("status_follows_validated_public_issuer", func(t *testing.T) {
+		previous := service.SwapOAuthProviderBridge(bridge)
+		t.Cleanup(func() { service.SwapOAuthProviderBridge(previous) })
+		read := func() (map[string]any, map[string]any) {
+			t.Helper()
+			response := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(response)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/api/status", nil)
+			controller.GetStatus(ctx)
+			var payload struct {
+				Success bool           `json:"success"`
+				Data    map[string]any `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+			require.True(t, payload.Success)
+			oauthStatus, _ := payload.Data["oauth"].(map[string]any)
+			features, _ := payload.Data["client_features"].(map[string]any)
+			return oauthStatus, features
+		}
+		oauthStatus, features := read()
+		assert.Equal(t, map[string]any{"enabled": true, "issuer": issuer, "desktop_client_id": "boundary-client"}, oauthStatus)
+		assert.Equal(t, true, features["oauth"])
+		assert.Equal(t, false, features["token_usage_logs"])
+		assert.Equal(t, false, features["model_metadata"])
+		encoded, err := common.Marshal(oauthStatus)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), "127.0.0.1")
+		assert.NotContains(t, string(encoded), admin.URL)
+		assert.NotContains(t, string(encoded), upstream.URL)
+		t.Setenv("FRONTEND_BASE_URL", "https://console.example")
+		oauthStatus, features = read()
+		assert.Equal(t, map[string]any{"enabled": false}, oauthStatus)
+		assert.Equal(t, false, features["oauth"])
+		t.Setenv("FRONTEND_BASE_URL", "")
+		system_setting.ServerAddress = "https://other.example"
+		oauthStatus, features = read()
+		assert.Equal(t, map[string]any{"enabled": false}, oauthStatus)
+		assert.Equal(t, false, features["oauth"])
+		system_setting.ServerAddress = issuer
+		oauthStatus, _ = read()
+		assert.Equal(t, true, oauthStatus["enabled"])
+	})
 	engine := gin.New()
 	SetOAuthProviderRouter(engine, bridge)
 	serve := func(t *testing.T, redirect, state string, headers http.Header, params url.Values) *httptest.ResponseRecorder {
@@ -1914,6 +1992,60 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 				}
 			})
 		}
+	})
+	t.Run("forwarded_host_does_not_select_redirect", func(t *testing.T) {
+		spoofed := http.Header{"Host": {"attacker.example"}, "X-Forwarded-Host": {"attacker.example"}, "Forwarded": {"host=attacker.example;proto=https"}}
+		response := serve(t, callback, "issuer-login-page", spoofed, nil)
+		request := <-forwarded
+		require.Equal(t, http.StatusSeeOther, response.Code)
+		assert.Equal(t, issuer+"oauth/provider/login?login_challenge=login-challenge-value", response.Header().Get("Location"))
+		assert.NotContains(t, response.Header().Get("Location"), "attacker.example")
+		assert.Empty(t, request.headers.Get("X-Forwarded-Host"))
+		assert.Empty(t, request.headers.Get("Forwarded"))
+		assert.NotContains(t, request.headers.Get("Host"), "attacker.example")
+		response = serve(t, callback, "keep-callback-host", spoofed, nil)
+		<-forwarded
+		require.Equal(t, http.StatusSeeOther, response.Code)
+		target, err := url.Parse(response.Header().Get("Location"))
+		require.NoError(t, err)
+		assert.Equal(t, "client.example", target.Host)
+		assert.Equal(t, issuer, target.Query().Get("iss"))
+		assert.NotContains(t, response.Header().Get("Location"), "attacker.example")
+		response = serve(t, callback, "upstream-uses-attacker-host", spoofed, nil)
+		<-forwarded
+		assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+		assert.Empty(t, response.Header().Get("Location"))
+		assert.NotContains(t, response.Body.String(), "attacker.example")
+		assert.Contains(t, response.Body.String(), "temporarily_unavailable")
+		for _, method := range []string{http.MethodHead, http.MethodPost, http.MethodOptions} {
+			discovery := httptest.NewRequest(method, "/.well-known/openid-configuration", nil)
+			discovery.Host = "attacker.example"
+			discovery.Header.Set("X-Forwarded-Host", "attacker.example")
+			recorded := httptest.NewRecorder()
+			engine.ServeHTTP(recorded, discovery)
+			assert.Equal(t, http.StatusMethodNotAllowed, recorded.Code, method)
+			assert.Contains(t, recorded.Body.String(), "invalid_request")
+			assert.NotContains(t, recorded.Body.String(), "attacker.example")
+		}
+		for _, path := range []string{"/.well-known/openid-configuration", "/.well-known/oauth-authorization-server"} {
+			discovery := httptest.NewRequest(http.MethodGet, path, nil)
+			discovery.Host = "attacker.example"
+			discovery.Header.Set("X-Forwarded-Host", "attacker.example")
+			recorded := httptest.NewRecorder()
+			engine.ServeHTTP(recorded, discovery)
+			require.Equal(t, http.StatusOK, recorded.Code, path)
+			var document map[string]any
+			require.NoError(t, common.Unmarshal(recorded.Body.Bytes(), &document))
+			assert.Equal(t, issuer, document["issuer"])
+			assert.Equal(t, issuer+"oauth2/auth", document["authorization_endpoint"])
+			assert.Equal(t, issuer+"oauth2/token", document["token_endpoint"])
+			assert.NotContains(t, recorded.Body.String(), "attacker.example")
+			assert.Equal(t, []any{"openid", "profile", "email", "offline_access", "balance:read", "usage:read", "tokens:read", "tokens:write"}, document["scopes_supported"])
+		}
+		unknown := httptest.NewRecorder()
+		engine.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/oauth2/not-whitelisted", nil))
+		assert.Equal(t, http.StatusNotFound, unknown.Code)
+		assert.Contains(t, unknown.Body.String(), "not_found")
 	})
 	t.Run("cookie_headers", func(t *testing.T) {
 		allowed := "__Host-newapi_oauth_login_csrf_1=login"

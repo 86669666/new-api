@@ -20205,7 +20205,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server; the separately enabled public issuer mode adds login/consent/issuance, while delegated key/usage resources remain incomplete; the separate balance resource requires public grant mode; status oauth.enabled and client_features.oauth remain false. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: the optional trusted producer bridge must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Legacy bridge-only mode does not claim source-session logout revocation. Public grants are bound to the originating current sign-in session. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent. Public grant mode additionally validates grant identity and absolute grant expiry on both introspections and includes sub.",
+        "description": "Startup-only OAUTH_USERINFO_ENABLED=false by default: the route is absent when disabled. This is a personal resource server; the separately enabled public issuer mode adds login/consent/issuance, while delegated key/usage resources remain incomplete; the separate balance resource requires public grant mode; status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds. Require one unambiguous Bearer header, exact profile scope and current user/AuthVersion. Email is omitted without email scope. URL access_token credentials are rejected. The trusted HTTPS introspection endpoint receives form token only. Its stronger integration contract requires active=true, token_use=access_token, token_type=Bearer, exact configured iss, resource aud, allowed client_id, canonical positive local-user sub, exp/optional nbf and ext.newapi_auth_version as a canonical positive int64 decimal string. Hydra does not generate this local binding: the optional trusted producer bridge must derive sub and AuthVersion itself and set session.access_token; clients must never choose them. Missing, malformed or refresh-token claims reject. After initial authorization, live introspection and current uncached local state are checked again, including expiry after DB waits. Only the final profile projection is published. This is a request-level observation boundary, not atomic cross-system revocation. No session, account, key or grant is created. Legacy bridge-only mode does not claim source-session logout revocation. Public grants are bound to the originating current sign-in session. The Admin endpoint must be separately protected by the operator; no deployment is supplied. Errors never include upstream causes or credentials. GET slash variant rejects without redirect; other methods are absent. Public grant mode additionally validates grant identity and absolute grant expiry on both introspections and includes sub.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -20344,7 +20344,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth remain false. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
+        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
         "security": [
           {
             "DashboardJWT": []
@@ -20535,7 +20535,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth remain false. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
+        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
         "security": [
           {
             "DashboardJWT": []
@@ -20726,7 +20726,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth remain false. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
+        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
         "security": [
           {
             "DashboardJWT": []
@@ -20917,7 +20917,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth remain false. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
+        "description": "Startup-only provider bridge, off by default; status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds. A current real dashboard Bearer session is required; PAT, legacy, relay, OAuth access and cookie-only requests cannot decide. Public mode adds the login/consent UI and fixed root HTTPS issuer; it supports openid/profile/email/offline_access, while bridge-only mode retains profile/email. Explicit approval must contain profile, and openid if originally requested; offline_access requires openid. Selection is a subset of requested, registered and server scopes. Body-only strict JSON, no duplicate/unknown/null fields or caller-chosen subject/AuthVersion. Public mode validates fixed-issuer Origin/Referer; missing origin follows existing native policy and cross-site Fetch Metadata rejects. Preview is valid at most five minutes and no later than session expiry. Decision re-fetches the challenge and binds actor, SID and both current versions. Local preview consumption and cross-preview challenge claim commit before one Admin PUT, with no database locks across HTTP. Unknown external outcomes are not retried; start a new challenge. Cleanup preserves at least 24 hours of local attempt exclusion. Effective Hydra challenge TTL <=30 minutes must include outstanding challenges. Current identity is checked immediately before PUT and before publishing the validated resume URL. Public grants have a first-approval absolute seven-day cap; refresh does not extend it. Derived key/balance/usage resources and complete local grant/session revocation are not yet delivered. Errors exclude upstream causes and capabilities. No consumer E2E or deployment is claimed.",
         "security": [
           {
             "DashboardJWT": []
@@ -21329,7 +21329,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Startup-only revocation, off by default; status oauth.enabled and client_features.oauth remain false. Body-only unique token/client_id and optional ignored hint,8192-byte form bound, no Authorization or query including bare ?. No caller cookies/headers, client secret, redirect or retry. Fixed issuer target; one bounded HTTPS POST with GetBody=nil. Bridge-only issuer200 does not prove actual invalidation: Hydra may mask wrong-client and internal storage failures as200. Public mode therefore requires a fresh private introspection after issuer200 and exact active:false; still-active, malformed, unknown or failed verification returns503. Clients must assume the target remains usable after503; no automatic replay. Family cascade is issuer-defined, not all grants for a subject/client. No local derived-key/session revocation is delivered. Global selector errors use the nested relay envelope before this handler. Use an unauthenticated client configuration with TOKEN/Authorization unset.",
+        "description": "Startup-only revocation, off by default; status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds. Body-only unique token/client_id and optional ignored hint,8192-byte form bound, no Authorization or query including bare ?. No caller cookies/headers, client secret, redirect or retry. Fixed issuer target; one bounded HTTPS POST with GetBody=nil. Bridge-only issuer200 does not prove actual invalidation: Hydra may mask wrong-client and internal storage failures as200. Public mode therefore requires a fresh private introspection after issuer200 and exact active:false; still-active, malformed, unknown or failed verification returns503. Clients must assume the target remains usable after503; no automatic replay. Family cascade is issuer-defined, not all grants for a subject/client. No local derived-key/session revocation is delivered. Global selector errors use the nested relay envelope before this handler. Use an unauthenticated client configuration with TOKEN/Authorization unset.",
         "security": [],
         "x-pat-policy": "unsupported",
         "x-credential-kind": "public-client-token-possession",
@@ -21937,7 +21937,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. Single, nonempty known query fields only, raw query <=32768 bytes. Scopes are distinct single-space members of openid/profile/email/offline_access; profile is mandatory and offline_access requires openid. Redirect must match registration exactly except a numeric port on a registered 127.0.0.1 or [::1] loopback callback. HTTP loopback permits only those IP literals, not localhost or wildcard hosts; HTTPS callbacks match exact registration. One Hydra phase verifier at most. Authorization is ignored and never forwarded. Across all case-insensitive Cookie header keys/values, total size including join separators is bounded at16384 before parsing; only whitelisted __Host-newapi_oauth login/consent CSRF cookies cross the boundary. Redirects preserve registered callback query values, state and fixed iss; unregistered error descriptions/hints/debug are stripped. Callback code XOR allowed OAuth error is enforced. Browser navigation and cookie handling are required, not a JSON fetch API.",
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. status oauth.enabled and client_features.oauth follow public issuer readiness; token_usage_logs and model_metadata stay false. Single, nonempty known query fields only, raw query <=32768 bytes. Scopes are distinct single-space members of openid, profile, email, offline_access, balance:read, usage:read, tokens:read and tokens:write; profile is mandatory and offline_access requires openid. Redirect must match registration exactly except a numeric port on a registered 127.0.0.1 or [::1] loopback callback. HTTP loopback permits only those IP literals, not localhost or wildcard hosts; HTTPS callbacks match exact registration. One Hydra phase verifier at most. Authorization is ignored and never forwarded. Across all case-insensitive Cookie header keys/values, total size including join separators is bounded at16384 before parsing; only whitelisted __Host-newapi_oauth login/consent CSRF cookies cross the boundary. Redirects preserve registered callback query values, state and fixed iss; unregistered error descriptions/hints/debug are stripped. Callback code XOR allowed OAuth error is enforced. Browser navigation and cookie handling are required, not a JSON fetch API.",
         "security": [],
         "x-default-off": true,
         "x-automatic-retry": false,
@@ -22404,7 +22404,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. Exactly one application/x-www-form-urlencoded Content-Type, optional charset=utf-8. Encoded body <=16384 bytes; reject query including bare ?, Authorization, duplicate/unknown/empty fields, client secrets and assertions. scope input is always rejected: unsupported scopes use invalid_scope, known-only scope uses invalid_request. No cookie/dashboard fallback or forwarding. One bounded issuer request, no automatic replay. A profile-only grant issues access only; openid adds ID token, selected offline_access adds refresh. Responses are validated before publication; refresh replay family invalidation depends on the pinned configured issuer.",
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. status oauth.enabled and client_features.oauth follow public issuer readiness; token_usage_logs and model_metadata stay false. Exactly one application/x-www-form-urlencoded Content-Type, optional charset=utf-8. Encoded body <=16384 bytes; reject query including bare ?, Authorization, duplicate/unknown/empty fields, client secrets and assertions. scope input is always rejected: unsupported scopes use invalid_scope, known-only scope uses invalid_request. No cookie/dashboard fallback or forwarding. One bounded issuer request, no automatic replay. A profile-only grant issues access only; openid adds ID token, selected offline_access adds refresh. Responses are validated before publication; refresh replay family invalidation depends on the pinned configured issuer.",
         "security": [],
         "x-default-off": true,
         "x-automatic-retry": false,
@@ -22700,7 +22700,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. status oauth.enabled and client_features.oauth follow public issuer readiness; token_usage_logs and model_metadata stay false. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
         "security": [],
         "x-default-off": true,
         "x-automatic-retry": false,
@@ -22985,7 +22985,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. status oauth.enabled and client_features.oauth follow public issuer readiness; token_usage_logs and model_metadata stay false. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
         "security": [],
         "x-default-off": true,
         "x-automatic-retry": false,
@@ -23270,7 +23270,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. status oauth.enabled and client_features.oauth follow public issuer readiness; token_usage_logs and model_metadata stay false. No query including bare ?. Incoming credentials/body are not used as authority or forwarded. Both discovery routes expose the same closed projection with fixed root endpoints; no Admin or introspection address. JWKS exposes only validated RSA signing public fields. No cookies are forwarded or emitted.",
         "security": [],
         "x-default-off": true,
         "x-automatic-retry": false,
@@ -23555,7 +23555,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. All oauth capability flags remain false until the complete delegated-resource and consumer acceptance gates pass. Local terminus; query ignored and never reflected or forwarded. No successful response or redirect.",
+        "description": "Default-off public issuer surface, fixed HTTPS issuer at root matching ServerAddress; split frontend and path-prefix OAuth are unsupported. No Host/Forwarded inference. Requires configured resource, provider bridge and revocation. Exact canonical routes only; no generic reverse proxy. Global organization selection may reject earlier with a nested relay error. Public handler failures expose only a fixed error code. status oauth.enabled and client_features.oauth follow public issuer readiness; token_usage_logs and model_metadata stay false. Local terminus; query ignored and never reflected or forwarded. No successful response or redirect.",
         "security": [],
         "x-default-off": true,
         "x-automatic-retry": false,
@@ -23817,7 +23817,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Requires the independently enabled public issuer and a live public grant with explicitly selected balance:read scope (unchecked by default); profile remains mandatory during consent. A dashboard JWT, PAT, relay key, cookie, refresh token or legacy bridge token cannot authorize this resource. Only the exact GET path is accepted: no query, organization selector or method override. Recheck live introspection, grant revision, current user and the originating sign-in session, including fresh time after database waits, before publishing quota and used_quota from the same final user row. This request-level observation is not an atomic cross-system snapshot. Absolute grant lifetime is at most seven days and ends with its source session. Negative JavaScript-safe integer quota values are preserved; invalid required numbers fail closed, optional display formatting may be omitted. No organization balance, subscription remaining quota, history or funding-source attribution. Errors are flat OAuth error objects; success uses the management success envelope. Even when disabled, the global boundary handles the canonical route with 401 rather than an SPA response. status oauth.enabled and client_features.oauth remain false.",
+        "description": "Requires the independently enabled public issuer and a live public grant with explicitly selected balance:read scope (unchecked by default); profile remains mandatory during consent. A dashboard JWT, PAT, relay key, cookie, refresh token or legacy bridge token cannot authorize this resource. Only the exact GET path is accepted: no query, organization selector or method override. Recheck live introspection, grant revision, current user and the originating sign-in session, including fresh time after database waits, before publishing quota and used_quota from the same final user row. This request-level observation is not an atomic cross-system snapshot. Absolute grant lifetime is at most seven days and ends with its source session. Negative JavaScript-safe integer quota values are preserved; invalid required numbers fail closed, optional display formatting may be omitted. No organization balance, subscription remaining quota, history or funding-source attribution. Errors are flat OAuth error objects; success uses the management success envelope. Even when disabled, the global boundary handles the canonical route with 401 rather than an SPA response. status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -24903,7 +24903,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Requires a live public OAuth grant with separately and explicitly selected usage:read, unchecked on every new consent preview; profile remains mandatory. Only new explicit consent grants this scope; existing grants and refresh tokens never gain it. The trusted subject user identifies all its persisted consumption history across API tokens, including token-zero and deleted-token history; this is neither a personal wallet statement nor organization spending. There is no client, token, grant or caller-supplied user filter. Only this exact GET path is accepted. Any organization selector (including zero or empty), identity selector, query bearer, method override, body or noncanonical path returns invalid_request before fallback. Other unknown or duplicate query parameters fail strict parsing. A dashboard JWT, PAT, relay key, cookie, refresh token or bridge-only token cannot authenticate. After querying and JSON pre-encoding, uncached issuer introspection and current local user, grant revision, full scope set, source session, cleanup fence and expiry are rechecked; failure discards all prepared data. COUNT and page, main and log databases, and issuer/local state are request-level observations, not an atomic cross-system snapshot. Every returned integer, selected source-hour SUM and intermediate day addition must be an exact JavaScript-safe signed number; overflow or unsafe values fail instead of rounding, saturating or stringifying. Collection-disabled requests fail; successful sparse results always state data_complete:false and finite positive quota_per_unit. The reserved namespace never falls back to SPA/plugins or redirects, even when disabled. Privacy headers precede authentication and rate limiting; query and suffix data are removed from access logs. OAuth errors use flat error objects; query/collection errors use the management error envelope. status oauth.enabled and client_features.oauth remain false; no public enable is authorized.",
+        "description": "Requires a live public OAuth grant with separately and explicitly selected usage:read, unchecked on every new consent preview; profile remains mandatory. Only new explicit consent grants this scope; existing grants and refresh tokens never gain it. The trusted subject user identifies all its persisted consumption history across API tokens, including token-zero and deleted-token history; this is neither a personal wallet statement nor organization spending. There is no client, token, grant or caller-supplied user filter. Only this exact GET path is accepted. Any organization selector (including zero or empty), identity selector, query bearer, method override, body or noncanonical path returns invalid_request before fallback. Other unknown or duplicate query parameters fail strict parsing. A dashboard JWT, PAT, relay key, cookie, refresh token or bridge-only token cannot authenticate. After querying and JSON pre-encoding, uncached issuer introspection and current local user, grant revision, full scope set, source session, cleanup fence and expiry are rechecked; failure discards all prepared data. COUNT and page, main and log databases, and issuer/local state are request-level observations, not an atomic cross-system snapshot. Every returned integer, selected source-hour SUM and intermediate day addition must be an exact JavaScript-safe signed number; overflow or unsafe values fail instead of rounding, saturating or stringifying. Collection-disabled requests fail; successful sparse results always state data_complete:false and finite positive quota_per_unit. The reserved namespace never falls back to SPA/plugins or redirects, even when disabled. Privacy headers precede authentication and rate limiting; query and suffix data are removed from access logs. OAuth errors use flat error objects; query/collection errors use the management error envelope. status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds; no public enable is authorized.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -25196,7 +25196,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Requires a live public OAuth grant with separately and explicitly selected usage:read, unchecked on every new consent preview; profile remains mandatory. Only new explicit consent grants this scope; existing grants and refresh tokens never gain it. The trusted subject user identifies all its persisted consumption history across API tokens, including token-zero and deleted-token history; this is neither a personal wallet statement nor organization spending. There is no client, token, grant or caller-supplied user filter. Only this exact GET path is accepted. Any organization selector (including zero or empty), identity selector, query bearer, method override, body or noncanonical path returns invalid_request before fallback. Other unknown or duplicate query parameters fail strict parsing. A dashboard JWT, PAT, relay key, cookie, refresh token or bridge-only token cannot authenticate. After querying and JSON pre-encoding, uncached issuer introspection and current local user, grant revision, full scope set, source session, cleanup fence and expiry are rechecked; failure discards all prepared data. COUNT and page, main and log databases, and issuer/local state are request-level observations, not an atomic cross-system snapshot. Every returned integer, selected source-hour SUM and intermediate day addition must be an exact JavaScript-safe signed number; overflow or unsafe values fail instead of rounding, saturating or stringifying. Collection-disabled requests fail; successful sparse results always state data_complete:false and finite positive quota_per_unit. The reserved namespace never falls back to SPA/plugins or redirects, even when disabled. Privacy headers precede authentication and rate limiting; query and suffix data are removed from access logs. OAuth errors use flat error objects; query/collection errors use the management error envelope. status oauth.enabled and client_features.oauth remain false; no public enable is authorized.",
+        "description": "Requires a live public OAuth grant with separately and explicitly selected usage:read, unchecked on every new consent preview; profile remains mandatory. Only new explicit consent grants this scope; existing grants and refresh tokens never gain it. The trusted subject user identifies all its persisted consumption history across API tokens, including token-zero and deleted-token history; this is neither a personal wallet statement nor organization spending. There is no client, token, grant or caller-supplied user filter. Only this exact GET path is accepted. Any organization selector (including zero or empty), identity selector, query bearer, method override, body or noncanonical path returns invalid_request before fallback. Other unknown or duplicate query parameters fail strict parsing. A dashboard JWT, PAT, relay key, cookie, refresh token or bridge-only token cannot authenticate. After querying and JSON pre-encoding, uncached issuer introspection and current local user, grant revision, full scope set, source session, cleanup fence and expiry are rechecked; failure discards all prepared data. COUNT and page, main and log databases, and issuer/local state are request-level observations, not an atomic cross-system snapshot. Every returned integer, selected source-hour SUM and intermediate day addition must be an exact JavaScript-safe signed number; overflow or unsafe values fail instead of rounding, saturating or stringifying. Collection-disabled requests fail; successful sparse results always state data_complete:false and finite positive quota_per_unit. The reserved namespace never falls back to SPA/plugins or redirects, even when disabled. Privacy headers precede authentication and rate limiting; query and suffix data are removed from access logs. OAuth errors use flat error objects; query/collection errors use the management error envelope. status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds; no public enable is authorized.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -25465,7 +25465,7 @@
         "tags": [
           "OAuth"
         ],
-        "description": "Default-off public OAuth only. Requires separately selected tokens:read, unchecked and reset on every new consent preview; profile remains mandatory. Only requested and registered scopes can be approved. Existing grants and refreshes never acquire this scope. Reads only the exact current issuer, user, client and grant binding; never searches other grants, manual keys or secret fields. A new read-only grant returns an empty data array because no key/source producer is enabled. GET never creates, reveals or changes a key, source, permit, history or wallet. tokens:write remains unsupported; POST is rejected and has no producer. Only the exact GET path is accepted: no query (including empty ?), body, organization selector or method override. JWT, PAT, relay key, cookie, refresh or bridge-only credentials cannot authenticate. Before publishing, live identity, consent scopes, grant revision, session, cleanup fence, source projection and expiry are checked again; database/provenance uncertainty discards prepared data. This is a request-level observation, not an atomic issuer/database snapshot. No fallback or redirects; reserved path suffix/query data are redacted from access logs. Privacy headers precede authentication and rate limiting. status oauth.enabled and client_features.oauth remain false. Empty metadata is not evidence of key issuance or relay authorization.",
+        "description": "Default-off public OAuth only. Requires separately selected tokens:read, unchecked and reset on every new consent preview; profile remains mandatory. Only requested and registered scopes can be approved. Existing grants and refreshes never acquire this scope. Reads only the exact current issuer, user, client and grant binding; never searches other grants, manual keys or secret fields. A new read-only grant returns an empty data array because no key/source producer is enabled. GET never creates, reveals or changes a key, source, permit, history or wallet. Discovery can advertise tokens:write, and consent can select it for a registered client. POST is still rejected and has no key producer. Only the exact GET path is accepted: no query (including empty ?), body, organization selector or method override. JWT, PAT, relay key, cookie, refresh or bridge-only credentials cannot authenticate. Before publishing, live identity, consent scopes, grant revision, session, cleanup fence, source projection and expiry are checked again; database/provenance uncertainty discards prepared data. This is a request-level observation, not an atomic issuer/database snapshot. No fallback or redirects; reserved path suffix/query data are redacted from access logs. Privacy headers precede authentication and rate limiting. status oauth.enabled and client_features.oauth follow public issuer readiness and stay false until that validation succeeds. Empty metadata is not evidence of key issuance or relay authorization.",
         "security": [
           {
             "OAuthResourceBearer": []
@@ -32590,20 +32590,51 @@
         "description": "Operator-configured navigation discovery, not current-user permission or payment availability. Invalid effective frontend URL or an explicitly disabled page yields null. FRONTEND_BASE_URL is effective only on non-master nodes; otherwise ServerAddress is used. No Host/Forwarded fallback. Configured path prefixes are preserved. Sidebar section.enabled plus strict item===true governs wallet/usage logs/keys; pricing uses HeaderNavModules.pricing independently of requireAuth or the console top-nav toggle."
       },
       "DesktopOAuthDiscovery": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "enabled"
-        ],
-        "properties": {
-          "enabled": {
-            "type": "boolean",
-            "enum": [
-              false
-            ]
+        "description": "Anonymous desktop OAuth discovery. enabled is true only after the public issuer routes are configured and Hydra topology validation has succeeded; issuer and desktop_client_id are then required. Incomplete configuration is exactly {\"enabled\": false} and omits the issuer and client id. The first allowlisted public client id is desktop_client_id. Existing inbound GitHub/OIDC and other login providers are independent and unchanged.",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "enabled"
+            ],
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "enum": [
+                  false
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "enabled",
+              "issuer",
+              "desktop_client_id"
+            ],
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "issuer": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https://[^/?#@\\s\\\\]+/$(?![\\s\\S])"
+              },
+              "desktop_client_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
           }
-        },
-        "description": "The desktop OAuth authorization-server contract (#19) is not implemented. Existing inbound GitHub/OIDC and other login providers are independent and unchanged."
+        ]
       },
       "ClientFeatureFlags": {
         "type": "object",
@@ -32621,10 +32652,7 @@
             ]
           },
           "oauth": {
-            "type": "boolean",
-            "enum": [
-              false
-            ]
+            "type": "boolean"
           },
           "model_metadata": {
             "type": "boolean",
@@ -32633,7 +32661,7 @@
             ]
           }
         },
-        "description": "False denotes incomplete new desktop integration contracts #16 (token usage logs), #17 (model metadata) and #19 (OAuth). Existing /api/log/token, /api/log/self, /api/data/self, /api/pricing and login-provider endpoints remain unchanged; their legacy availability is not denied by these flags."
+        "description": "oauth matches public issuer readiness and is false until Hydra topology validation has succeeded. token_usage_logs and model_metadata stay false while desktop contracts #16 and #17 are incomplete. Existing /api/log/token, /api/log/self, /api/data/self, /api/pricing and login-provider endpoints remain unchanged; their legacy availability is not denied by these flags."
       },
       "SiteDescription": {
         "type": "object",
@@ -33635,7 +33663,7 @@
           },
           "selected_scopes": {
             "type": "array",
-            "maxItems": 7,
+            "maxItems": 8,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -33646,7 +33674,8 @@
                 "offline_access",
                 "balance:read",
                 "usage:read",
-                "tokens:read"
+                "tokens:read",
+                "tokens:write"
               ]
             }
           }
@@ -33669,7 +33698,8 @@
                       "offline_access",
                       "balance:read",
                       "usage:read",
-                      "tokens:read"
+                      "tokens:read",
+                      "tokens:write"
                     ]
                   }
                 }
@@ -33742,7 +33772,7 @@
           },
           "allowed_scopes": {
             "type": "array",
-            "maxItems": 7,
+            "maxItems": 8,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -33753,7 +33783,8 @@
                 "offline_access",
                 "balance:read",
                 "usage:read",
-                "tokens:read"
+                "tokens:read",
+                "tokens:write"
               ]
             },
             "minItems": 1
@@ -34815,8 +34846,8 @@
           },
           "scopes_supported": {
             "type": "array",
-            "minItems": 7,
-            "maxItems": 7,
+            "minItems": 8,
+            "maxItems": 8,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -34827,7 +34858,8 @@
                 "offline_access",
                 "balance:read",
                 "usage:read",
-                "tokens:read"
+                "tokens:read",
+                "tokens:write"
               ]
             }
           },
@@ -37224,7 +37256,7 @@
       "OAuthResourceBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected. Account usage additionally requires public grant mode and the separately selected usage:read scope; existing profile/balance grants and their refreshes never acquire it. Current-grant key metadata additionally requires separately selected tokens:read in public grant mode; GET creates no key and returns no secret. Existing grants and refreshes never gain it; tokens:write remains unsupported."
+        "description": "Independent access-token resource credential validated with the configured trusted Hydra introspection endpoint. Never a dashboard JWT, PAT, relay key, cookie or refresh token. This resource-only opt-in does not enable an OAuth authorization/login provider. Balance additionally requires the independent public issuer grant mode; bridge-only tokens are rejected. Account usage additionally requires public grant mode and the separately selected usage:read scope; existing profile/balance grants and their refreshes never acquire it. Current-grant key metadata additionally requires separately selected tokens:read in public grant mode; GET creates no key and returns no secret. Existing grants and refreshes never gain tokens:read. Discovery may advertise tokens:write for consent; the key producer remains absent."
       },
       "ClientEventsBearer": {
         "type": "http",
