@@ -485,7 +485,7 @@ func (c *oauthBirthBrokerClient) request(operation string) (result *oauthBirthJo
 		}
 	}()
 	switch operation {
-	case "fresh", "resume", "created", "bound", "migrating", "seal_pending", "ready", "fault_pending", "fault_intent", "fault_restore":
+	case "fresh", "resume", "created", "bound", "migrating", "seal_pending", "ready", "snapshot", "fault_pending", "fault_intent", "fault_restore":
 	default:
 		return nil, errOAuthBootstrap
 	}
@@ -522,7 +522,7 @@ func (c *oauthBirthBrokerClient) request(operation string) (result *oauthBirthJo
 	if operation == "fresh" {
 		phase = "INTENT"
 	}
-	if operation == "resume" {
+	if operation == "resume" || operation == "snapshot" {
 		switch j.Phase {
 		case "CREATED_BOUND", "MIGRATING", "SEAL_PENDING", "READY":
 			phase = j.Phase
@@ -553,29 +553,52 @@ func (c *oauthBirthBrokerClient) request(operation string) (result *oauthBirthJo
 	return &j, nil
 }
 
-func oauthBootstrapThroughBroker(mode, engine, target string, out io.Writer) error {
-	if engine != "sqlite" && !bootstrapName.MatchString(target) {
-		return errOAuthBootstrap
-	}
+func dialCurrentOAuthBirthBroker(target string) (*oauthBirthBrokerClient, error) {
 	schema, err := oauthBirthSchemaDigest()
 	if err != nil {
-		return errOAuthBootstrap
+		return nil, errOAuthBootstrap
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return errOAuthBootstrap
+		return nil, errOAuthBootstrap
 	}
 	file, err := os.Open(executable)
 	if err != nil {
-		return errOAuthBootstrap
+		return nil, errOAuthBootstrap
 	}
 	hash := sha256.New()
 	_, err = io.Copy(hash, file)
 	file.Close()
 	if err != nil {
-		return errOAuthBootstrap
+		return nil, errOAuthBootstrap
 	}
 	client, err := dialOAuthBirthBroker(os.Getenv("NEWAPI_BOOTSTRAP_BROKER"), target, schema, hex.EncodeToString(hash.Sum(nil)))
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	return client, nil
+}
+
+// The root server admits these operations only for the exact producer regression binary.
+func oauthBootstrapRegressionJournal(operation, target string) (*oauthBirthJournal, error) {
+	switch operation {
+	case "snapshot", "fault_pending", "fault_intent", "fault_restore":
+	default:
+		return nil, errOAuthBootstrap
+	}
+	client, err := dialCurrentOAuthBirthBroker(target)
+	if err != nil {
+		return nil, err
+	}
+	defer client.conn.Close()
+	return client.request(operation)
+}
+
+func oauthBootstrapThroughBroker(mode, engine, target string, out io.Writer) error {
+	if engine != "sqlite" && !bootstrapName.MatchString(target) {
+		return errOAuthBootstrap
+	}
+	client, err := dialCurrentOAuthBirthBroker(target)
 	if err != nil {
 		return errOAuthBootstrap
 	}

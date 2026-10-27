@@ -191,5 +191,27 @@ class OuterControlClientTests(unittest.TestCase):
         self.assertNotIn('statement', request)
 
 
+    def test_producer_regression_requires_exact_completed_test_binding(self):
+        good = dict(test_sha256='b' * 64, output_sha256='c' * 64,
+                    observed_exit=0, regression_complete=True)
+        for change in ({}, {'test_sha256': 'd' * 64}, {'observed_exit': 1},
+                       {'observed_exit': False}, {'regression_complete': False},
+                       {'output_sha256': 'partial'}, {'extra': 'untrusted'}):
+            with self.subTest(change=change):
+                result = dict(good, **change)
+                client = self.client(json.dumps(dict(sequence=0, result=result)).encode() + b'\n')
+                if not change:
+                    self.assertEqual(good, client.producer_regression('b' * 64))
+                else:
+                    with self.assertRaises(ValueError):
+                        client.producer_regression('b' * 64)
+                    self.assertTrue(client.failed)
+                request = json.loads(client.connection.sendall.call_args.args[0])
+                self.assertEqual(('producer-regression', 'sqlite', ''),
+                                 (request['operation'], request['engine'], request['purpose']))
+                self.assertNotIn('binary', request)
+                self.assertNotIn('command', request)
+
+
 if __name__ == '__main__':
     unittest.main()

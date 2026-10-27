@@ -106,6 +106,16 @@ class OuterBirthControlClient:
     def __call__(self, engine, purpose):
         return self.request('birth', engine, purpose)
 
+    def producer_regression(self, expected_hash):
+        result = self.request('producer-regression', 'sqlite', '')
+        if (type(result) is not dict or set(result) != {'test_sha256', 'output_sha256', 'observed_exit', 'regression_complete'} or
+                result['test_sha256'] != expected_hash or type(result['observed_exit']) is not int or
+                result['observed_exit'] != 0 or result['regression_complete'] is not True or
+                not re.fullmatch('[0-9a-f]{64}', result['output_sha256'])):
+            self.close()
+            raise ValueError('outer producer regression incomplete or mismatched')
+        return result
+
     def verify_daemon(self, engine, daemon):
         if daemon is None:
             raise ValueError('same owned daemon required')
@@ -1639,7 +1649,14 @@ def trusted_run(bundle, tier="sqlite"):
         for entry in metadata['entries']:
             if entry['cwd'] == 'model':
                 print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='producer')), flush=True)
-                command([str(root / 'bundle' / entry['binary']), '-test.run=^' + PRODUCER_TEST + '$', '-test.v'], cwd=root / 'bundle/source/model', env=dict(env, NEWAPI_BOOTSTRAP_ROOT_TEST_DIR=str(root / 'producer-tests')))
+                if OUTER_BIRTH is not None:
+                    # The host observes the isolated uid997 test process. Never
+                    # launch a candidate producer/test as this controller's root.
+                    if tier != 'sqlite':
+                        raise ValueError('outer producer regression requires sqlite tier')
+                    OUTER_BIRTH.producer_regression(metadata['files'][entry['binary']])
+                else:
+                    command([str(root / 'bundle' / entry['binary']), '-test.run=^' + PRODUCER_TEST + '$', '-test.v'], cwd=root / 'bundle/source/model', env=dict(env, NEWAPI_BOOTSTRAP_ROOT_TEST_DIR=str(root / 'producer-tests')))
                 print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry, phase='producer', exit=0)), flush=True)
         installer = Installer(root, uid, redis_resource, pg_resource, metadata)
         thread = threading.Thread(target=installer.serve)
