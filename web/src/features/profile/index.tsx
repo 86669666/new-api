@@ -27,6 +27,7 @@ import { OrganizationTransfersCard } from '@/features/organizations/organization
 import { useStatus } from '@/hooks/use-status'
 import { useAuthStore } from '@/stores/auth-store'
 
+import { AuthorizedAppsCard } from './components/authorized-apps-card'
 import { CheckinCalendarCard } from './components/checkin-calendar-card'
 import { LanguagePreferencesCard } from './components/language-preferences-card'
 import { ProfileHeader } from './components/profile-header'
@@ -62,6 +63,7 @@ export function Profile() {
                   loading={loading}
                   onProfileUpdate={refreshProfile}
                 />
+                <AuthorizedAppsCard />
                 <MyOrganizationsCard />
                 <OrganizationInvitationsCard />
                 <OrganizationTransfersCard />

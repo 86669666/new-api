@@ -660,14 +660,29 @@ func validOAuthProviderRedirect(raw, registered string) bool {
 	if u.Scheme == "cherrystudio" {
 		return raw == registered && u.Host == "oauth" && u.Path == "/callback"
 	}
-	if u.Scheme != "http" || v.Scheme != "http" || u.Hostname() != v.Hostname() || u.Hostname() != "127.0.0.1" && u.Hostname() != "::1" {
+	// OWASP OAuth cheat sheet: http redirects are limited to native loopback
+	// clients (RFC 8252). A registered template may omit the port; any explicit
+	// ephemeral port on the same host, path, and query then matches.
+	if u.Scheme != "http" || v.Scheme != "http" || u.Hostname() != v.Hostname() || (u.Hostname() != "127.0.0.1" && u.Hostname() != "::1") || net.ParseIP(u.Hostname()) == nil {
 		return false
+	}
+	if u.Path == "" || u.Path == "/" || v.Path == "" || v.Path == "/" {
+		return false
+	}
+	if u.Port() == "" && v.Port() == "" {
+		return u.String() == registered
 	}
 	port, err := strconv.Atoi(u.Port())
 	if err != nil || port < 1 || port > 65535 {
 		return false
 	}
+	if v.Port() != "" {
+		registeredPort, regPortErr := strconv.Atoi(v.Port())
+		if regPortErr != nil || registeredPort < 1 || registeredPort > 65535 {
+			return false
+		}
+	}
 	u.Host = v.Host
 	// Replace only the numeric loopback port. Keep exact registered path/query.
-	return u.String() == registered && net.ParseIP(v.Hostname()) != nil
+	return u.String() == registered
 }

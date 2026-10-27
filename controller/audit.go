@@ -73,6 +73,11 @@ var auditContentTemplates = map[string]string{
 	"subscription.plan_reset":       "Reset active subscriptions for plan ${plan_id}",
 	"subscription.user_plan_reset":  "Reset active plan ${plan_id} subscriptions for user ${target_user_id}",
 	"subscription.user_quota_reset": "Administrator reset the quota of subscription plan ${plan_title} (ID: ${plan_id})",
+
+	"oauth.public_client.create": "Created public OAuth client ${name} (${client_id})",
+	"oauth.public_client.update": "Updated public OAuth client ${name} (${client_id})",
+	"oauth.public_client.delete": "Deleted public OAuth client ${name} (${client_id})",
+	"oauth.app.revoke":           "Revoked authorized application ${client_id}",
 }
 
 func recordPasskeyDomainAudit(c *gin.Context, change *model.PasskeyDomainChange, confirmed bool, err error) {

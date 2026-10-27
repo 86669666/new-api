@@ -501,6 +501,13 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   'option.reset_ratio': 'Reset model ratios',
   'option.clear_affinity_cache': 'Cleared channel affinity cache',
   // Custom OAuth
+  'oauth.public_client.create':
+    'Created public OAuth client {{name}} ({{client_id}})',
+  'oauth.public_client.update':
+    'Updated public OAuth client {{name}} ({{client_id}})',
+  'oauth.public_client.delete':
+    'Deleted public OAuth client {{name}} ({{client_id}})',
+  'oauth.app.revoke': 'Revoked authorized application {{client_id}}',
   'custom_oauth.create': 'Created a custom OAuth provider',
   'custom_oauth.update': 'Updated a custom OAuth provider',
   'custom_oauth.delete': 'Deleted a custom OAuth provider',

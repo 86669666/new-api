@@ -49,6 +49,10 @@ const (
 	VerificationScopeAdminUserTwoFADisable = "admin.user.2fa.disable"
 	VerificationScopeAdminUserBindingClear = "admin.user.binding.clear"
 	verificationScopeAdminUserPrefix       = "admin.user."
+	// Public-client management and app revocation bind the exact client_id so a
+	// proof cannot be replayed against a different registration or grant.
+	VerificationScopeOAuthPublicClientManage = "oauth.public_client.manage"
+	VerificationScopeOAuthAppRevoke          = "oauth.app.revoke"
 )
 
 // adminUserManageActions are the ManageUser actions that change a user's
@@ -108,6 +112,15 @@ type AdminUserBindingContext struct {
 
 type AdminUserCreateContext struct {
 	Role int `json:"role"`
+}
+
+type OAuthPublicClientManageContext struct {
+	Action   string `json:"action"`
+	ClientID string `json:"client_id"`
+}
+
+type OAuthAppRevokeContext struct {
+	ClientID string `json:"client_id"`
 }
 
 // AccessTokenGenerateContext binds a creation proof to the exact grant. Scopes
@@ -267,6 +280,18 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 		}
 		context.Scopes = scopes
 		normalized = context
+	case VerificationScopeOAuthPublicClientManage:
+		var context OAuthPublicClientManageContext
+		if len(fields) != 2 || common.Unmarshal(operation.Context, &context) != nil || !slices.Contains([]string{"create", "update", "delete"}, context.Action) || !validOAuthPublicClientID(context.ClientID) {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
+	case VerificationScopeOAuthAppRevoke:
+		var context OAuthAppRevokeContext
+		if len(fields) != 1 || common.Unmarshal(operation.Context, &context) != nil || !validOAuthClientIDProof(context.ClientID) {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
 	case VerificationScopeAccessTokenRevoke:
 		var context AccessTokenRevokeContext
 		if len(fields) != 1 || common.Unmarshal(operation.Context, &context) != nil || context.TokenID < 0 {
@@ -346,6 +371,7 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 		VerificationScopeAccessTokenGenerate, VerificationScopeAccessTokenUpdate, VerificationScopeAccessTokenRevoke,
 		VerificationScopeAccountBind, VerificationScopeAccountUnbind,
 		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete, VerificationScopeSessionRevoke, VerificationScopeSessionsRevokeOthers,
+		VerificationScopeOAuthPublicClientManage, VerificationScopeOAuthAppRevoke,
 		VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 		VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
 		VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
@@ -400,7 +426,7 @@ func GetVerificationRequirementsWithContext(ctx context.Context, identity AuthId
 	if state.Status != common.UserStatusEnabled || state.AuthVersion != identity.UserAuthVersion {
 		return nil, ErrAuthTokenInvalid
 	}
-	if scope == VerificationScopeChannelKeyRead && state.Role != common.RoleRootUser {
+	if (scope == VerificationScopeChannelKeyRead || scope == VerificationScopeOAuthPublicClientManage) && state.Role != common.RoleRootUser {
 		return nil, ErrVerificationForbidden
 	}
 	if strings.HasPrefix(scope, verificationScopeAdminUserPrefix) && state.Role < common.RoleAdminUser {
@@ -418,6 +444,7 @@ func GetVerificationRequirementsWithContext(ctx context.Context, identity AuthId
 		if methods[i].Method == VerificationMethodPassword && !common.PasswordLoginEnabled {
 			switch scope {
 			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete, VerificationScopeSessionRevoke, VerificationScopeSessionsRevokeOthers,
+				VerificationScopeOAuthPublicClientManage, VerificationScopeOAuthAppRevoke,
 				VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 				VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
 				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:

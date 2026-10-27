@@ -12,6 +12,14 @@ func TestOAuthProviderRedirectFragments(t *testing.T) {
 		allowed                     bool
 	}{
 		{"loopback different port", "http://127.0.0.1:39874/oauth/callback", "http://127.0.0.1:29873/oauth/callback", true},
+		{"loopback template any port", "http://127.0.0.1:39874/oauth/callback", "http://127.0.0.1/oauth/callback", true},
+		{"loopback template ipv6", "http://[::1]:9/oauth/callback", "http://[::1]/oauth/callback", true},
+		{"loopback template self", "http://127.0.0.1/oauth/callback", "http://127.0.0.1/oauth/callback", true},
+		{"loopback different path", "http://127.0.0.1:39874/oauth/other", "http://127.0.0.1/oauth/callback", false},
+		{"loopback root path", "http://127.0.0.1:39874/", "http://127.0.0.1:39874/", false},
+		{"loopback missing request port", "http://127.0.0.1/oauth/callback", "http://127.0.0.1:29873/oauth/callback", false},
+		{"non-loopback http", "http://192.0.2.1:39874/oauth/callback", "http://192.0.2.1:39874/oauth/callback", false},
+		{"non-loopback against template", "http://10.0.0.1:9/oauth/callback", "http://127.0.0.1/oauth/callback", false},
 		{"loopback empty fragment", "http://127.0.0.1:39874/oauth/callback#", "http://127.0.0.1:29873/oauth/callback", false},
 		{"loopback nonempty fragment", "http://127.0.0.1:39874/oauth/callback#fragment", "http://127.0.0.1:29873/oauth/callback", false},
 		{"registered loopback fragment", "http://127.0.0.1:39874/oauth/callback", "http://127.0.0.1:29873/oauth/callback#", false},
