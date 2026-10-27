@@ -3,6 +3,7 @@
 package model
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -426,4 +427,111 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 	}
 	fmt.Fprintln(out, j.OperationID, "READY")
 	return nil
+}
+
+// oauthBirthBrokerClient is the staged, unprivileged side of the named birth
+// protocol. It is deliberately not selected by RunOAuthDatabaseBootstrap until
+// the privileged filesystem/database adapter and all Installer calls are wired.
+// The existing root-only production path remains unchanged.
+type oauthBirthBrokerClient struct {
+	conn     net.Conn
+	reader   *bufio.Reader
+	sequence int
+	target   string
+	schema   string
+	producer string
+	previous *oauthBirthJournal
+}
+
+func dialOAuthBirthBroker(path, target, schema, producer string) (*oauthBirthBrokerClient, error) {
+	if os.Geteuid() != 997 || os.Getegid() != 990 || oauthProtectedPath(filepath.Dir(path), false) != nil {
+		return nil, errOAuthBootstrap
+	}
+	groups, err := os.Getgroups()
+	if err != nil || len(groups) != 0 || !oauthDerivedDigest(schema) || !oauthDerivedDigest(producer) {
+		return nil, errOAuthBootstrap
+	}
+	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	raw, err := conn.(*net.UnixConn).SyscallConn()
+	var peer *syscall.Ucred
+	var peerErr error
+	if err == nil {
+		err = raw.Control(func(fd uintptr) {
+			peer, peerErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+		})
+	}
+	if err != nil || peerErr != nil || peer == nil || peer.Uid != 0 {
+		conn.Close()
+		return nil, errOAuthBootstrap
+	}
+	return &oauthBirthBrokerClient{conn: conn, reader: bufio.NewReaderSize(conn, 16385), target: target, schema: schema, producer: producer}, nil
+}
+
+func (c *oauthBirthBrokerClient) request(operation string) (result *oauthBirthJournal, err error) {
+	defer func() {
+		if err != nil {
+			c.conn.Close()
+		}
+	}()
+	switch operation {
+	case "created", "bound", "migrating", "seal_pending", "ready", "fault_pending", "fault_intent", "fault_restore":
+	default:
+		return nil, errOAuthBootstrap
+	}
+	if c.conn.SetDeadline(time.Now().Add(30*time.Second)) != nil {
+		return nil, errOAuthBootstrap
+	}
+	message, err := common.Marshal(struct {
+		Sequence  int    `json:"sequence"`
+		Operation string `json:"operation"`
+	}{c.sequence, operation})
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	message = append(message, '\n')
+	if n, e := c.conn.Write(message); e != nil || n != len(message) {
+		return nil, errOAuthBootstrap
+	}
+	line, err := c.reader.ReadSlice('\n')
+	if err != nil || len(line) > 16384 {
+		return nil, errOAuthBootstrap
+	}
+	var reply struct {
+		Sequence int               `json:"sequence"`
+		Journal  oauthBirthJournal `json:"journal"`
+	}
+	if common.Unmarshal(line, &reply) != nil || reply.Sequence != c.sequence {
+		return nil, errOAuthBootstrap
+	}
+	j := reply.Journal
+	if j.Engine != "sqlite" && j.Engine != "postgres" && j.Engine != "mysql" {
+		return nil, errOAuthBootstrap
+	}
+	phase := map[string]string{"created": "INTENT", "bound": "CREATED_BOUND", "migrating": "MIGRATING", "seal_pending": "SEAL_PENDING", "ready": "READY", "fault_pending": "SEAL_PENDING", "fault_intent": "INTENT", "fault_restore": "READY"}[operation]
+	if j.Phase != phase {
+		return nil, errOAuthBootstrap
+	}
+	if j.Version != 1 || j.Kind != "fresh" || j.InstallerUID != 0 || j.Contract != oauthBootstrapContract ||
+		j.Target != c.target || j.SchemaDigest != c.schema || j.Producer != c.producer ||
+		!oauthDerivedDigest(j.OperationID) || !oauthDerivedDigest(j.CreationNonce) ||
+		!oauthDerivedDigest(j.Binding) || j.IntentAt <= 0 || j.CreatedAt < j.IntentAt {
+		return nil, errOAuthBootstrap
+	}
+	if old := c.previous; old != nil && (j.OperationID != old.OperationID || j.CreationNonce != old.CreationNonce ||
+		j.Engine != old.Engine || j.Endpoint != old.Endpoint || j.Binding != old.Binding || j.CreatedAt != old.CreatedAt || j.IntentAt != old.IntentAt) {
+		return nil, errOAuthBootstrap
+	}
+	if j.Phase == "SEAL_PENDING" || j.Phase == "READY" {
+		seal, e := j.seal()
+		if e != nil || seal != j.HistorySeal || j.SealedAt < j.CreatedAt {
+			return nil, errOAuthBootstrap
+		}
+	}
+	c.sequence++
+	snapshot := j
+	c.previous = &snapshot
+	return &j, nil
 }
