@@ -1,0 +1,17 @@
+name: Consume trusted box formal receipt
+description: Validate the exact App check against protected operator admission
+inputs:
+  admission:
+    description: Protected environment admission JSON, never PR input
+    required: true
+  token:
+    description: Read-only GitHub token
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BOX_FORMAL_ADMISSION: ${{ inputs.admission }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: python3 "$GITHUB_ACTION_PATH/consumer.py"

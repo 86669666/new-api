@@ -1,0 +1,29 @@
+name: Box formal receipt consumer
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  checks: read
+jobs:
+  consume:
+    name: Verify authenticated box receipt
+    runs-on: ubuntu-latest
+    environment: box-formal-consumer
+    timeout-minutes: 5
+    steps:
+      - name: Require approved immutable workflow revision
+        env:
+          TRUSTED_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_SHA" = "$TRUSTED_SHA"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: 86669666/new-api
+          ref: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/box-formal-consumer
+        with:
+          admission: ${{ vars.BOX_FORMAL_ADMISSION }}
+          token: ${{ github.token }}
