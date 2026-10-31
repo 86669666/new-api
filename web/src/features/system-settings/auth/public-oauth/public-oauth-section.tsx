@@ -145,7 +145,7 @@ export function PublicOAuthSection() {
         <AlertTitle>{t('Public OAuth clients')}</AlertTitle>
         <AlertDescription>
           {t(
-            'Saving a client here records it for this console. It does not register the client with the authorization server.'
+            'Saving a client here records it in this console. When the public OAuth provider is enabled, the same client is registered with the authorization server. If that registration fails, the save fails and the console record stays unchanged.'
           )}
         </AlertDescription>
       </Alert>

@@ -49,6 +49,7 @@ type oauthPublicClientView struct {
 	GrantTypes              []string  `json:"grant_types"`
 	TokenEndpointAuthMethod string    `json:"token_endpoint_auth_method"`
 	Enabled                 bool      `json:"enabled"`
+	HydraSynced             *bool     `json:"hydra_synced,omitempty"`
 	CreatedAt               time.Time `json:"created_at"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
@@ -114,16 +115,18 @@ func CreateOAuthPublicClient(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	if err := model.CreateOAuthPublicClient(client); err != nil {
-		common.ApiError(c, err)
+	synced, err := service.CommitOAuthPublicClient(c.Request.Context(), client, "create")
+	if err != nil {
+		writeOAuthPublicClientFailure(c, err)
 		return
 	}
-	recordManageAudit(c, "oauth.public_client.create", map[string]any{"client_id": client.ClientID, "name": client.Name, "enabled": client.Enabled})
+	recordManageAudit(c, "oauth.public_client.create", map[string]any{"client_id": client.ClientID, "name": client.Name, "enabled": client.Enabled, "hydra_synced": synced})
 	view, err := presentOAuthPublicClient(client)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	view.HydraSynced = &synced
 	common.ApiSuccessT(c, "Public OAuth client created", view)
 }
 
@@ -151,16 +154,18 @@ func UpdateOAuthPublicClient(c *gin.Context) {
 	client.RedirectURIs = normalized.RedirectURIs
 	client.Scopes = normalized.Scopes
 	client.Enabled = normalized.Enabled
-	if err := model.SaveOAuthPublicClient(client); err != nil {
-		common.ApiError(c, err)
+	synced, err := service.CommitOAuthPublicClient(c.Request.Context(), client, "update")
+	if err != nil {
+		writeOAuthPublicClientFailure(c, err)
 		return
 	}
-	recordManageAudit(c, "oauth.public_client.update", map[string]any{"client_id": client.ClientID, "name": client.Name, "enabled": client.Enabled})
+	recordManageAudit(c, "oauth.public_client.update", map[string]any{"client_id": client.ClientID, "name": client.Name, "enabled": client.Enabled, "hydra_synced": synced})
 	view, err := presentOAuthPublicClient(client)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	view.HydraSynced = &synced
 	common.ApiSuccessT(c, "Public OAuth client updated", view)
 }
 
@@ -175,12 +180,13 @@ func DeleteOAuthPublicClient(c *gin.Context) {
 	if requireAdminUserProof(c, service.VerificationScopeOAuthPublicClientManage, service.OAuthPublicClientManageContext{Action: "delete", ClientID: client.ClientID}) == nil {
 		return
 	}
-	if err := model.DeleteOAuthPublicClient(client.ID); err != nil {
-		common.ApiError(c, err)
+	synced, err := service.CommitOAuthPublicClient(c.Request.Context(), client, "delete")
+	if err != nil {
+		writeOAuthPublicClientFailure(c, err)
 		return
 	}
-	recordManageAudit(c, "oauth.public_client.delete", map[string]any{"client_id": client.ClientID, "name": client.Name, "enabled": client.Enabled})
-	common.ApiSuccessT(c, "Public OAuth client deleted", nil)
+	recordManageAudit(c, "oauth.public_client.delete", map[string]any{"client_id": client.ClientID, "name": client.Name, "enabled": client.Enabled, "hydra_synced": synced})
+	common.ApiSuccessT(c, "Public OAuth client deleted", gin.H{"hydra_synced": synced})
 }
 
 func ListAuthorizedOAuthApps(c *gin.Context) {
@@ -245,6 +251,15 @@ func RevokeAuthorizedOAuthApp(c *gin.Context) {
 	recordUserSecurityAudit(c, userID, "oauth.app.revoke", map[string]any{"client_id": clientID, "success": true})
 	markAuditLogged(c)
 	common.ApiSuccessT(c, "Authorized application revoked", nil)
+}
+
+func writeOAuthPublicClientFailure(c *gin.Context, err error) {
+	var syncErr *service.OAuthPublicClientSyncError
+	if errors.As(err, &syncErr) {
+		common.ApiErrorStatus(c, syncErr.HTTPStatus, common.NewMessage(syncErr.Error()), gin.H{"code": syncErr.Code})
+		return
+	}
+	common.ApiError(c, err)
 }
 
 func publicOAuthClientManager(c *gin.Context) bool {

@@ -25,6 +25,7 @@ export const PUBLIC_OAUTH_SCOPES = [
   'balance:read',
   'usage:read',
   'tokens:read',
+  'tokens:write',
 ] as const
 
 export type PublicOAuthScope = (typeof PUBLIC_OAUTH_SCOPES)[number]
@@ -86,6 +87,8 @@ export function publicOAuthScopeLabel(
       return t('Read usage')
     case 'tokens:read':
       return t('Read tokens')
+    case 'tokens:write':
+      return t('Write tokens')
     default:
       return scope
   }

@@ -19,10 +19,16 @@ For commercial licensing, please contact support@quantumnous.com
 package controller
 
 import (
+	"context"
+	"crypto/x509"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,6 +56,12 @@ func TestOAuthPublicClientManagementAndAuthorizedApps(t *testing.T) {
 		assert.Contains(t, response.Body.String(), "http://127.0.0.1/oauth/callback")
 		assert.Contains(t, response.Body.String(), "http://127.0.0.1:29873/oauth/callback")
 		assert.Contains(t, response.Body.String(), "boxnai://oauth/callback")
+		assert.Contains(t, response.Body.String(), "tokens:write")
+		assert.Contains(t, response.Body.String(), "openid")
+		assert.Contains(t, response.Body.String(), "offline_access")
+		assert.NotContains(t, response.Body.String(), "balance:read")
+		assert.NotContains(t, response.Body.String(), "usage:read")
+		assert.NotContains(t, response.Body.String(), "tokens:read")
 		assert.NotContains(t, response.Body.String(), "client_secret")
 		assert.NotContains(t, response.Body.String(), "boxnai-desktop-20261026")
 	})
@@ -202,9 +214,14 @@ func TestOAuthPublicClientManagementAndAuthorizedApps(t *testing.T) {
 
 func oauthPublicClientRequest(t *testing.T, method, path, body, proof string, identity service.AuthIdentity, role int, params gin.Params, handler gin.HandlerFunc) *httptest.ResponseRecorder {
 	t.Helper()
+	return oauthPublicClientRequestContext(t, context.Background(), method, path, body, proof, identity, role, params, handler)
+}
+
+func oauthPublicClientRequestContext(t *testing.T, ctx context.Context, method, path, body, proof string, identity service.AuthIdentity, role int, params gin.Params, handler gin.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
 	response := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(response)
-	c.Request = httptest.NewRequest(method, path, strings.NewReader(body))
+	c.Request = httptest.NewRequest(method, path, strings.NewReader(body)).WithContext(ctx)
 	c.Request.Header.Set("Content-Type", "application/json")
 	if proof != "" {
 		c.Request.Header.Set("X-Security-Proof", proof)
@@ -249,4 +266,309 @@ func mustMarshal(t *testing.T, value any) []byte {
 	payload, err := common.Marshal(value)
 	require.NoError(t, err)
 	return payload
+}
+
+type hydraAdminStub struct {
+	mu   sync.Mutex
+	docs map[string][]byte
+	hits atomic.Int32
+	mode atomic.Value
+	srv  *httptest.Server
+}
+
+func newHydraAdminStub() *hydraAdminStub {
+	stub := &hydraAdminStub{docs: map[string][]byte{}}
+	stub.mode.Store("ok")
+	return stub
+}
+
+func (s *hydraAdminStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.hits.Add(1)
+	mode, _ := s.mode.Load().(string)
+	if mode == "timeout" {
+		_, _ = io.Copy(io.Discard, r.Body)
+		// The client aborts on its own deadline. Cap the handler so server
+		// shutdown is not left waiting on a context that never cancels.
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-r.Context().Done():
+		case <-timer.C:
+		}
+		timer.Stop()
+		return
+	}
+	if mode == "reject" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"invalid_client","client_secret":"rejected-secret"}`)
+		return
+	}
+	if r.URL.Path == "/admin/clients" && r.Method == http.MethodPost {
+		s.store(w, r, "", http.StatusCreated)
+		return
+	}
+	id, ok := strings.CutPrefix(r.URL.Path, "/admin/clients/")
+	if !ok || id == "" || strings.Contains(id, "/") {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.Lock()
+		raw, found := s.docs[id]
+		s.mu.Unlock()
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(raw)
+	case http.MethodPut:
+		s.mu.Lock()
+		_, found := s.docs[id]
+		s.mu.Unlock()
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		s.store(w, r, id, http.StatusOK)
+	case http.MethodDelete:
+		s.mu.Lock()
+		_, found := s.docs[id]
+		delete(s.docs, id)
+		s.mu.Unlock()
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *hydraAdminStub) store(w http.ResponseWriter, r *http.Request, id string, status int) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 65536))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	var doc map[string]any
+	if common.Unmarshal(body, &doc) != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if id == "" {
+		rawID, _ := doc["client_id"].(string)
+		id = rawID
+	}
+	s.mu.Lock()
+	s.docs[id] = append([]byte(nil), body...)
+	s.mu.Unlock()
+	doc["client_secret"] = "echo-secret-value"
+	encoded, err := common.Marshal(doc)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(encoded)
+}
+
+func (s *hydraAdminStub) document(t *testing.T, id string) (int, string) {
+	t.Helper()
+	response, err := s.srv.Client().Get(s.srv.URL + "/admin/clients/" + url.PathEscape(id))
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	return response.StatusCode, string(body)
+}
+
+func installPublicClientHydra(t *testing.T, stub *hydraAdminStub, withPublic bool) {
+	t.Helper()
+	stub.srv = httptest.NewTLSServer(stub)
+	t.Cleanup(stub.srv.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(stub.srv.Certificate())
+	resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{
+		Enabled: true, IntrospectionURL: stub.srv.URL + "/admin/oauth2/introspect",
+		Issuer: "https://gateway.example/", Audience: "newapi-userinfo", ClientIDs: []string{"configured-client"},
+	}, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{
+		Enabled: true, RevocationEnabled: true, AdminBaseURL: stub.srv.URL,
+		AuthorizationURL: "https://gateway.example/oauth2/auth",
+	}, resource)
+	require.NoError(t, err)
+	if withPublic {
+		_, err = service.NewOAuthPublic(service.OAuthPublicConfig{Enabled: true, BaseURL: "https://hydra-public.example/"}, bridge)
+		require.NoError(t, err)
+	}
+	previous := service.SetCurrentOAuthProviderBridge(bridge)
+	t.Cleanup(func() { service.SetCurrentOAuthProviderBridge(previous) })
+}
+
+func TestOAuthPublicClientHydraSync(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.OAuthPublicClient{}))
+	require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+	previousPassword := common.PasswordLoginEnabled
+	common.PasswordLoginEnabled = true
+	t.Cleanup(func() { common.PasswordLoginEnabled = previousPassword })
+
+	t.Run("switch off does not call hydra", func(t *testing.T) {
+		stub := newHydraAdminStub()
+		installPublicClientHydra(t, stub, false)
+		body := publicClientSyncBody("switch-off-client", true)
+		proof := publicClientProof(t, identity, "create", "switch-off-client")
+		response := oauthPublicClientRequest(t, http.MethodPost, "/api/oauth/public-clients/", body, proof, identity, common.RoleRootUser, nil, CreateOAuthPublicClient)
+		assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"hydra_synced":false`)
+		assert.NotContains(t, response.Body.String(), `"hydra_synced":true`)
+		assert.NotContains(t, response.Body.String(), "OAUTH_PUBLIC_CLIENT_SYNC_")
+		assert.Zero(t, stub.hits.Load())
+		assert.Equal(t, int64(1), countPublicClients(t))
+	})
+
+	t.Run("admin accepts the same redirect and scope", func(t *testing.T) {
+		stub := newHydraAdminStub()
+		installPublicClientHydra(t, stub, true)
+		body := publicClientSyncBody("hydra-sync-client", true)
+		proof := publicClientProof(t, identity, "create", "hydra-sync-client")
+		response := oauthPublicClientRequest(t, http.MethodPost, "/api/oauth/public-clients/", body, proof, identity, common.RoleRootUser, nil, CreateOAuthPublicClient)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"hydra_synced":true`)
+		assert.NotContains(t, response.Body.String(), "echo-secret-value")
+		assert.NotContains(t, response.Body.String(), "client_secret")
+		status, document := stub.document(t, "hydra-sync-client")
+		require.Equal(t, http.StatusOK, status, document)
+		assert.Contains(t, document, "http://127.0.0.1/oauth/callback")
+		assert.Contains(t, document, "boxnai://oauth/callback")
+		assert.Contains(t, document, "tokens:write")
+		assert.Contains(t, document, "offline_access")
+		assert.Contains(t, document, `"token_endpoint_auth_method":"none"`)
+		assert.NotContains(t, document, "client_secret")
+		assert.NotContains(t, document, "echo-secret-value")
+
+		var created struct {
+			Data struct {
+				ID int `json:"id"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &created))
+		id := strconv.Itoa(created.Data.ID)
+		update := `{"name":"Boxnai Updated","redirect_uris":["http://127.0.0.1/oauth/callback"],"scopes":["profile","tokens:write"],"enabled":true}`
+		proof = publicClientProof(t, identity, "update", "hydra-sync-client")
+		response = oauthPublicClientRequest(t, http.MethodPut, "/api/oauth/public-clients/"+id, update, proof, identity, common.RoleRootUser, gin.Params{{Key: "id", Value: id}}, UpdateOAuthPublicClient)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"hydra_synced":true`)
+		_, document = stub.document(t, "hydra-sync-client")
+		assert.Contains(t, document, "Boxnai Updated")
+		assert.Contains(t, document, "tokens:write")
+		assert.NotContains(t, document, "boxnai://oauth/callback")
+		assert.NotContains(t, document, "offline_access")
+
+		proof = publicClientProof(t, identity, "delete", "hydra-sync-client")
+		response = oauthPublicClientRequest(t, http.MethodDelete, "/api/oauth/public-clients/"+id, "", proof, identity, common.RoleRootUser, gin.Params{{Key: "id", Value: id}}, DeleteOAuthPublicClient)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"hydra_synced":true`)
+		status, _ = stub.document(t, "hydra-sync-client")
+		assert.Equal(t, http.StatusNotFound, status)
+		var remaining model.OAuthPublicClient
+		err := model.DB.Where("client_id = ?", "hydra-sync-client").First(&remaining).Error
+		assert.Error(t, err)
+	})
+
+	t.Run("disabled client is removed from hydra and kept locally", func(t *testing.T) {
+		stub := newHydraAdminStub()
+		installPublicClientHydra(t, stub, true)
+		body := publicClientSyncBody("hydra-disabled-client", false)
+		proof := publicClientProof(t, identity, "create", "hydra-disabled-client")
+		response := oauthPublicClientRequest(t, http.MethodPost, "/api/oauth/public-clients/", body, proof, identity, common.RoleRootUser, nil, CreateOAuthPublicClient)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"hydra_synced":true`)
+		assert.Contains(t, response.Body.String(), `"enabled":false`)
+		status, _ := stub.document(t, "hydra-disabled-client")
+		assert.Equal(t, http.StatusNotFound, status)
+		var stored model.OAuthPublicClient
+		require.NoError(t, model.DB.Where("client_id = ?", "hydra-disabled-client").First(&stored).Error)
+		assert.False(t, stored.Enabled)
+	})
+
+	t.Run("admin 400 rolls the local row back", func(t *testing.T) {
+		stub := newHydraAdminStub()
+		installPublicClientHydra(t, stub, true)
+		before := countPublicClients(t)
+		stub.mode.Store("reject")
+		body := publicClientSyncBody("hydra-reject-client", true)
+		proof := publicClientProof(t, identity, "create", "hydra-reject-client")
+		response := oauthPublicClientRequest(t, http.MethodPost, "/api/oauth/public-clients/", body, proof, identity, common.RoleRootUser, nil, CreateOAuthPublicClient)
+		assert.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"code":"OAUTH_PUBLIC_CLIENT_SYNC_REJECTED"`)
+		assert.Contains(t, response.Body.String(), `"success":false`)
+		assert.NotContains(t, response.Body.String(), `"hydra_synced":true`)
+		assert.NotContains(t, response.Body.String(), "rejected-secret")
+		assert.NotContains(t, response.Body.String(), "echo-secret-value")
+		assert.Equal(t, before, countPublicClients(t))
+		assert.Positive(t, stub.hits.Load())
+		var audit int64
+		require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("action = ? AND content LIKE ?", "oauth.public_client.create", "%hydra-reject-client%").Count(&audit).Error)
+		assert.Zero(t, audit)
+
+		stub.mode.Store("ok")
+		keep := publicClientSyncBody("hydra-keep-client", true)
+		proof = publicClientProof(t, identity, "create", "hydra-keep-client")
+		response = oauthPublicClientRequest(t, http.MethodPost, "/api/oauth/public-clients/", keep, proof, identity, common.RoleRootUser, nil, CreateOAuthPublicClient)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		var created struct {
+			Data struct {
+				ID int `json:"id"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &created))
+		stub.mode.Store("reject")
+		id := strconv.Itoa(created.Data.ID)
+		update := `{"name":"Should Not Stick","redirect_uris":["https://client.example/callback"],"scopes":["profile"],"enabled":true}`
+		proof = publicClientProof(t, identity, "update", "hydra-keep-client")
+		response = oauthPublicClientRequest(t, http.MethodPut, "/api/oauth/public-clients/"+id, update, proof, identity, common.RoleRootUser, gin.Params{{Key: "id", Value: id}}, UpdateOAuthPublicClient)
+		assert.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), "OAUTH_PUBLIC_CLIENT_SYNC_REJECTED")
+		var stored model.OAuthPublicClient
+		require.NoError(t, model.DB.Where("client_id = ?", "hydra-keep-client").First(&stored).Error)
+		assert.Equal(t, "Boxnai Desktop", stored.Name)
+		assert.NotContains(t, stored.RedirectURIs, "client.example")
+		stub.mode.Store("ok")
+		_, document := stub.document(t, "hydra-keep-client")
+		assert.Contains(t, document, "boxnai://oauth/callback")
+		assert.NotContains(t, document, "client.example")
+	})
+
+	t.Run("admin timeout rolls the local row back", func(t *testing.T) {
+		stub := newHydraAdminStub()
+		installPublicClientHydra(t, stub, true)
+		stub.mode.Store("timeout")
+		before := countPublicClients(t)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		body := publicClientSyncBody("hydra-timeout-client", true)
+		proof := publicClientProof(t, identity, "create", "hydra-timeout-client")
+		response := oauthPublicClientRequestContext(t, ctx, http.MethodPost, "/api/oauth/public-clients/", body, proof, identity, common.RoleRootUser, nil, CreateOAuthPublicClient)
+		assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"code":"OAUTH_PUBLIC_CLIENT_SYNC_UNAVAILABLE"`)
+		assert.Contains(t, response.Body.String(), `"success":false`)
+		assert.NotContains(t, response.Body.String(), `"hydra_synced":true`)
+		assert.Equal(t, before, countPublicClients(t))
+		assert.Positive(t, stub.hits.Load())
+	})
+}
+
+func publicClientSyncBody(clientID string, enabled bool) string {
+	flag := "false"
+	if enabled {
+		flag = "true"
+	}
+	return `{"client_id":"` + clientID + `","name":"Boxnai Desktop","redirect_uris":["http://127.0.0.1/oauth/callback","boxnai://oauth/callback"],"scopes":["openid","profile","offline_access","tokens:write"],"enabled":` + flag + `}`
 }

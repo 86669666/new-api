@@ -658,6 +658,7 @@
   "no such user %s": "用户 %s 不存在",
   "no user exists, create a root user for you: username is root, password is 123456": "系统里还没有用户，已自动创建 root 账号：用户名 root，密码 123456",
   "non-200 from %s: %s": "%s 返回了非 200 状态: %s",
+  "oauth public client sync failed client_id=%s code=%s status=%d": "公开 OAuth 客户端同步失败 client_id=%s code=%s status=%d",
   "ollama stream json decode error: %s line=%s": "Ollama 流式响应 JSON 解析失败: %s line=%s",
   "ollama stream scan error: %s": "Ollama 流式响应读取出错: %s",
   "openrouter enterprise response success=false, data: %s": "OpenRouter Enterprise 响应 success=false, data: %s",
