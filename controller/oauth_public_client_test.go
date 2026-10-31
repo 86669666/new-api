@@ -365,6 +365,9 @@ func (s *hydraAdminStub) store(w http.ResponseWriter, r *http.Request, id string
 	s.mu.Lock()
 	s.docs[id] = append([]byte(nil), body...)
 	s.mu.Unlock()
+	if mode, _ := s.mode.Load().(string); mode == "scope-mismatch" {
+		doc["scope"] = "openid profile offline_access"
+	}
 	doc["client_secret"] = "echo-secret-value"
 	encoded, err := common.Marshal(doc)
 	if err != nil {
@@ -544,6 +547,26 @@ func TestOAuthPublicClientHydraSync(t *testing.T) {
 		_, document := stub.document(t, "hydra-keep-client")
 		assert.Contains(t, document, "boxnai://oauth/callback")
 		assert.NotContains(t, document, "client.example")
+	})
+
+	t.Run("admin success with mismatched scope rolls the local row back", func(t *testing.T) {
+		stub := newHydraAdminStub()
+		installPublicClientHydra(t, stub, true)
+		stub.mode.Store("scope-mismatch")
+		before := countPublicClients(t)
+		body := publicClientSyncBody("hydra-mismatch-client", true)
+		proof := publicClientProof(t, identity, "create", "hydra-mismatch-client")
+		response := oauthPublicClientRequest(t, http.MethodPost, "/api/oauth/public-clients/", body, proof, identity, common.RoleRootUser, nil, CreateOAuthPublicClient)
+		assert.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"code":"OAUTH_PUBLIC_CLIENT_SYNC_REJECTED"`)
+		assert.Contains(t, response.Body.String(), `"success":false`)
+		assert.NotContains(t, response.Body.String(), `"hydra_synced":true`)
+		assert.NotContains(t, response.Body.String(), "echo-secret-value")
+		assert.NotContains(t, response.Body.String(), "client_secret")
+		assert.Equal(t, before, countPublicClients(t))
+		var audit int64
+		require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("action = ? AND content LIKE ?", "oauth.public_client.create", "%hydra-mismatch-client%").Count(&audit).Error)
+		assert.Zero(t, audit)
 	})
 
 	t.Run("admin timeout rolls the local row back", func(t *testing.T) {
