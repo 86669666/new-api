@@ -24,17 +24,33 @@ import (
 
 const OAuthPublicCapabilityLimit = 16384
 
-var oauthPublicScopes = []string{"openid", "profile", "email", "offline_access", "balance:read", "usage:read", "tokens:read"}
+var oauthPublicScopes = []string{"openid", "profile", "email", "offline_access", "balance:read", "usage:read", "tokens:read", "tokens:write"}
 var oauthPublicCookieName = regexp.MustCompile(`^__Host-newapi_oauth_(login|consent)_csrf_[0-9]{1,10}$`)
 
 type OAuthPublicConfig struct {
-	Enabled bool
-	BaseURL string
+	Enabled         bool
+	BaseURL         string
+	DesktopClientID string
 }
 type OAuthPublic struct {
-	bridge *OAuthProviderBridge
-	base   string
-	ready  atomic.Bool
+	bridge          *OAuthProviderBridge
+	base            string
+	desktopClientID string
+	ready           atomic.Bool
+}
+
+// OAuthDesktopStatus advertises protocol capability, not deployment health or
+// permission to issue a key. Issuance still requires explicit user consent.
+type OAuthDesktopStatus struct {
+	Enabled               bool     `json:"enabled"`
+	DesktopClientID       string   `json:"desktop_client_id,omitempty"`
+	Issuer                string   `json:"issuer,omitempty"`
+	DiscoveryEndpoint     string   `json:"discovery_endpoint,omitempty"`
+	AuthorizationEndpoint string   `json:"authorization_endpoint,omitempty"`
+	TokenEndpoint         string   `json:"token_endpoint,omitempty"`
+	Scopes                []string `json:"scopes,omitempty"`
+	TokenCreationEndpoint string   `json:"token_creation_endpoint,omitempty"`
+	TokenCreationMethod   string   `json:"token_creation_method,omitempty"`
 }
 type OAuthPublicResponse struct {
 	Status   int
@@ -67,11 +83,11 @@ func NewOAuthPublic(config OAuthPublicConfig, bridge *OAuthProviderBridge) (*OAu
 			return nil, ErrOAuthProviderConfiguration
 		}
 	}
-	p := &OAuthPublic{bridge: bridge, base: strings.TrimSuffix(config.BaseURL, "/")}
+	p := &OAuthPublic{bridge: bridge, base: strings.TrimSuffix(config.BaseURL, "/"), desktopClientID: config.DesktopClientID}
 	bridge.public = p
 	bridge.resource.grantsRequired = true
 	// Invalidate older public previews; existing grants keep their exact consented scopes.
-	bridge.policy += ":public-v4:openid-profile-email-offline-balance-usage-tokens-read:7d"
+	bridge.policy += ":public-v5:openid-profile-email-offline-balance-usage-tokens-read-write:7d"
 	return p, nil
 }
 
@@ -109,6 +125,47 @@ func (p *OAuthPublic) ValidateTopology(ctx context.Context) error {
 	return nil
 }
 func (p *OAuthPublic) Available() bool { return p != nil && p.ready.Load() && p.topologyMatches() }
+
+// CurrentOAuthDesktopStatus makes at most one fixed, bounded registration GET.
+// No positive result is cached: deleted or narrowed registrations fail closed.
+func CurrentOAuthDesktopStatus(ctx context.Context) OAuthDesktopStatus {
+	b := CurrentOAuthProviderBridge()
+	p := b.Public()
+	if p == nil || !p.ready.Load() || p.desktopClientID == "" || b.resource != CurrentOAuthUserInfoResource() || ctx.Err() != nil {
+		return OAuthDesktopStatus{}
+	}
+	client, err := p.client(ctx, p.desktopClientID)
+	if err != nil || !slices.Contains(client.Redirects, "boxnai://oauth/callback") {
+		return OAuthDesktopStatus{}
+	}
+	requiredScopes := []string{"openid", "profile", "offline_access", "tokens:write"}
+	registered := strings.Fields(*client.Scope)
+	for _, scope := range requiredScopes {
+		if !slices.Contains(registered, scope) {
+			return OAuthDesktopStatus{}
+		}
+	}
+	scopes := make([]string, 0, len(registered))
+	for _, scope := range oauthPublicScopes {
+		if slices.Contains(registered, scope) {
+			scopes = append(scopes, scope)
+		}
+	}
+	// ServerAddress is updated under OptionMapRWMutex. Snapshot topology only
+	// after the registration GET, never holding the options lock across HTTP.
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	if ctx.Err() != nil || b != CurrentOAuthProviderBridge() || b.resource != CurrentOAuthUserInfoResource() || !p.Available() {
+		return OAuthDesktopStatus{}
+	}
+	issuer := b.resource.issuer
+	return OAuthDesktopStatus{
+		Enabled: true, DesktopClientID: client.ID, Issuer: issuer,
+		DiscoveryEndpoint:     issuer + ".well-known/oauth-authorization-server",
+		AuthorizationEndpoint: issuer + "oauth2/auth", TokenEndpoint: issuer + "oauth2/token",
+		Scopes: scopes, TokenCreationEndpoint: issuer + "api/v1/oauth/tokens", TokenCreationMethod: http.MethodPost,
+	}
+}
 
 func (p *OAuthPublic) client(ctx context.Context, id string) (*oauthProviderClient, error) {
 	if !slices.Contains(p.bridge.resource.clients, id) {

@@ -18,3 +18,7 @@ func oauthBootstrap(_ context.Context, _, _, _, _ string, out io.Writer) error {
 	fmt.Fprintln(out, "db-bootstrap unsupported on this platform; Linux provisioning is required")
 	return errOAuthBootstrap
 }
+
+func oauthBootstrapRegressionJournal(string, string) (*oauthBirthJournal, error) {
+	return nil, errOAuthBootstrap
+}

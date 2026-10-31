@@ -136,7 +136,7 @@ def check_oauth_userinfo(api, source_root):
     for status in ('200', '401', '403', '429', '503'):
         assert 'private, no-store' in operation['responses'][status]['headers']['Cache-Control']['description']
     assert 'Hydra does not generate this local binding' in operation['description']
-    assert 'status oauth.enabled and client_features.oauth remain false' in operation['description']
+    assert 'desktop OAuth advertisement requires the explicit selected client and current public topology' in operation['description']
     startup = go_function((source_root / 'main.go').read_text(), 'InitResources')
     assert startup.index('service.InitOAuthUserInfoResource()') < startup.index('model.InitDB()')
     routes = (source_root / 'router/oauth_resource_router.go').read_text()
@@ -262,7 +262,7 @@ def check_oauth_provider(api, source_root):
         for item in operation['responses'].values():
             assert 'private, no-store' in item['headers']['Cache-Control']['description']
         for phrase in ('both current versions', 'at least 24 hours', 'TTL <=30 minutes',
-                       'commit before one Admin PUT', 'status oauth.enabled and client_features.oauth remain false'):
+                       'commit before one Admin PUT', 'desktop OAuth advertisement requires the explicit selected client and current public topology'):
             assert phrase in operation['description']
     for name, fields in {
         'OAuthProviderPreviewInput': ['challenge'],
@@ -277,13 +277,36 @@ def check_oauth_provider(api, source_root):
     assert schemas['OAuthProviderLoginDecision']['properties']['decision']['enum'] == ['continue', 'deny']
     consent = schemas['OAuthProviderConsentDecision']
     assert consent['properties']['decision']['enum'] == ['approve', 'deny']
+    consent_scopes = ['openid', 'profile', 'email', 'offline_access',
+                      'balance:read', 'usage:read', 'tokens:read', 'tokens:write']
     assert consent['properties']['selected_scopes'] == {
-        'type': 'array', 'maxItems': 6, 'uniqueItems': True,
-        'items': {'type': 'string', 'enum': ['openid', 'profile', 'email', 'offline_access', 'balance:read', 'usage:read']}}
+        'type': 'array', 'maxItems': len(consent_scopes), 'uniqueItems': True,
+        'items': {'type': 'string', 'enum': consent_scopes}}
     assert consent['oneOf'] == [
         {'properties': {'decision': {'enum': ['approve']},
-                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': ['openid', 'email', 'offline_access', 'balance:read', 'usage:read']}}}}},
+                        'selected_scopes': {'minItems': 1, 'not': {'items': {'enum': [
+                            scope for scope in consent_scopes if scope != 'profile']}}}}},
         {'properties': {'decision': {'enum': ['deny']}, 'selected_scopes': {'maxItems': 0}}}]
+    # Requested/registered scope intersection and conditional openid requirements
+    # depend on the trusted runtime preview, not this standalone request schema.
+    decision_fixture = {'challenge': 'schema-only-challenge', 'preview_token': 'x' * 43}
+    for decision, selected in [
+            ('approve', ['profile']), ('approve', ['profile', 'tokens:read']),
+            ('approve', ['profile', 'tokens:write']), ('approve', consent_scopes),
+            ('deny', [])]:
+        validate_value(api, consent, dict(decision_fixture, decision=decision, selected_scopes=selected))
+    validator = OAS30Validator(consent, resolver=RefResolver.from_schema(api))
+    for decision, selected, keyword in [
+            ('approve', ['profile', 'unknown:scope'], 'enum'),
+            ('approve', ['profile', 'tokens:write', 'tokens:write'], 'uniqueItems'),
+            ('approve', consent_scopes + ['profile'], 'maxItems'),
+            ('approve', [], 'oneOf'),
+            ('approve', ['tokens:read'], 'oneOf'),
+            ('approve', ['tokens:write'], 'oneOf'),
+            ('approve', [scope for scope in consent_scopes if scope != 'profile'], 'oneOf'),
+            ('deny', ['profile'], 'oneOf'), ('deny', ['tokens:write'], 'oneOf')]:
+        errors = list(validator.iter_errors(dict(decision_fixture, decision=decision, selected_scopes=selected)))
+        assert any(error.validator == keyword for error in errors), (decision, selected, keyword)
     assert schemas['OAuthProviderError']['properties'] == {'error': {'type': 'string', 'enum': [
         'invalid_request', 'invalid_token', 'access_denied', 'invalid_grant', 'temporarily_unavailable']}}
     routes = (source_root / 'router/oauth_provider_router.go').read_text()
@@ -326,10 +349,35 @@ def check_oauth_revocation(api, source_root):
             'type': 'object', 'additionalProperties': False, 'required': ['error'],
             'properties': {'error': {'type': 'string', 'enum': [code]}}}
     for phrase in ('does not prove actual invalidation', 'mask wrong-client and internal storage failures',
-                   'status oauth.enabled and client_features.oauth remain false', 'GetBody=nil'):
+                   'desktop OAuth advertisement requires the explicit selected client and current public topology', 'GetBody=nil'):
         assert phrase in operation['description']
     return {'route': '/oauth2/revoke', 'default_off': True, 'database_changes': False,
             'fixed_issuer_ingress': True, 'actual_issuer_invalidation_proved': False}
+
+
+def check_oauth_ordinary_token(api, source_root):
+    path = api['paths']['/api/v1/oauth/tokens']
+    assert set(path) == {'get', 'post'}
+    operation = path['post']
+    assert operation['operationId'] == 'createOAuthOrdinaryToken'
+    assert operation['security'] == [{'OAuthResourceBearer': []}]
+    assert operation['x-required-scopes'] == ['tokens:write']
+    assert operation['x-default-off'] is True and operation['x-automatic-retry'] is False
+    assert operation['x-request-max-bytes'] == 4096
+    assert operation['x-query-policy'] == 'forbidden'
+    assert path['get']['x-required-scopes'] == ['tokens:read']
+    assert 'OAuth revocation does NOT reclaim' in operation['description']
+    assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OAuthOrdinaryTokenResult'}
+    request = api['components']['schemas']['OAuthOrdinaryTokenRequest']
+    assert request['additionalProperties'] is False and set(request['properties']) == {'name'}
+    validate_value(api, request, {'name': 'personal model key'})
+    for invalid in [{}, {'name': ''}, {'name': ' '}, {'name': 'a' * 31}, {'name': 1}, {'name': 'ok', 'group': 'vip'}, {'name': 'ok', 'user_id': 1}]:
+        assert list(OAS30Validator(request).iter_errors(invalid)), 'invalid ordinary-key request accepted'
+    source = (source_root / 'controller/oauth_ordinary_token.go').read_text()
+    assert 'common.ValidateStrictJSONObject(data)' in source and 'len(name) > 30' in source
+    assert 'CreateOrdinaryToken(c.Request.Context(), name)' in source
+    assert 'controller.CreateOAuthOrdinaryToken(c)' in (source_root / 'router/oauth_resource_router.go').read_text()
+    return {'post': True, 'metadata_get_unchanged': True, 'ordinary_lifecycle': True, 'live': False}
 
 
 def check_oauth_public(api):
@@ -1440,17 +1488,93 @@ def check_site_description(api):
         assert {k: v for k, v in link.items() if k != 'description'} == {
             'type': 'string', 'nullable': True, 'pattern': r'^https?://[^/?#@\s\\]+(?:/[^?#\s\\]*)?$(?![\s\S])'}
         assert route in link['description']
-    for name, flags in [('DesktopOAuthDiscovery', ['enabled']), ('ClientFeatureFlags', ['token_usage_logs', 'oauth', 'model_metadata'])]:
-        schema = schemas[name]
-        assert {k: v for k, v in schema.items() if k != 'description'} == {
-            'type': 'object', 'additionalProperties': False, 'required': flags,
-            'properties': {key: {'type': 'boolean', 'enum': [False]} for key in flags}}
-        assert schema['description']
-    assert all(path in schemas['ClientFeatureFlags']['description'] for path in
+    features = schemas['ClientFeatureFlags']
+    logs = features['properties']['token_usage_logs']
+    assert {k: v for k, v in logs.items() if k != 'description'} == {'type': 'boolean'}
+    assert all(text in logs['description'] for text in ('GET /api/usage/token/logs only',
+        'equals LogConsumeEnabled', 'not a live database health check', 'or an authorization grant',
+        'both DataExportEnabled and LogConsumeEnabled', '503 TOKEN_USAGE_STAT_UNAVAILABLE'))
+    metadata = features['properties']['model_metadata']
+    assert {k: v for k, v in metadata.items() if k != 'description'} == {'type': 'boolean', 'enum': [True]}
+    assert all(text in metadata['description'] for text in ('Contract support',
+        'Missing, empty or invalid declarations keep this true', 'omit metadata facts',
+        'Not provider health, caller authorization, model visibility or pricing navigation readiness',
+        'no runtime off switch'))
+    assert {k: v for k, v in features.items() if k != 'description'} == {
+        'type': 'object', 'additionalProperties': False,
+        'required': ['token_usage_logs', 'oauth', 'model_metadata'],
+        'properties': {'token_usage_logs': logs,
+                       'oauth': {'type': 'boolean'}, 'model_metadata': metadata}}
+    assert all(path in features['description'] for path in
                ('/api/log/token', '/api/log/self', '/api/data/self', '/api/pricing'))
-    assert 'GitHub/OIDC' in schemas['DesktopOAuthDiscovery']['description']
+    for logs_enabled in (False, True):
+        for oauth_enabled in (False, True):
+            validate_value(api, features, {'token_usage_logs': logs_enabled,
+                           'oauth': oauth_enabled, 'model_metadata': True})
+    feature_validator = OAS30Validator(features, resolver=RefResolver.from_schema(api))
+    invalid_features = [
+        {'oauth': False, 'model_metadata': True},
+        {'token_usage_logs': 'true', 'oauth': False, 'model_metadata': True},
+        {'token_usage_logs': None, 'oauth': False, 'model_metadata': True},
+        {'token_usage_logs': True, 'oauth': False, 'model_metadata': False},
+        {'token_usage_logs': True, 'oauth': False, 'model_metadata': 'true'},
+        {'token_usage_logs': True, 'oauth': False, 'model_metadata': None},
+        {'token_usage_logs': True, 'oauth': False, 'model_metadata': True, 'extra': True}]
+    assert all(list(feature_validator.iter_errors(value)) for value in invalid_features)
+    desktop = schemas['DesktopOAuthDiscovery']
+    assert set(desktop) == {'description', 'oneOf'} and len(desktop['oneOf']) == 2
+    disabled, enabled = desktop['oneOf']
+    assert disabled == {'type': 'object', 'additionalProperties': False, 'required': ['enabled'],
+                        'properties': {'enabled': {'type': 'boolean', 'enum': [False]}}}
+    fields = {'enabled', 'desktop_client_id', 'issuer', 'discovery_endpoint', 'authorization_endpoint',
+              'token_endpoint', 'scopes', 'token_creation_endpoint', 'token_creation_method'}
+    assert enabled['type'] == 'object' and enabled['additionalProperties'] is False
+    assert set(enabled['required']) == set(enabled['properties']) == fields
+    props = enabled['properties']
+    assert props['enabled'] == {'type': 'boolean', 'enum': [True]}
+    assert props['desktop_client_id'] == {'type': 'string', 'minLength': 1, 'maxLength': 256}
+    assert props['issuer'] == {'type': 'string', 'pattern': r'^https://[^/?#@\s\\]+/$(?![\s\S])'}
+    oauth_routes = {'discovery_endpoint': '.well-known/oauth-authorization-server',
+              'authorization_endpoint': 'oauth2/auth', 'token_endpoint': 'oauth2/token',
+              'token_creation_endpoint': 'api/v1/oauth/tokens'}
+    for field, route in oauth_routes.items():
+        assert props[field] == {'type': 'string', 'pattern': r'^https://[^/?#@\s\\]+/' + route.replace('.', r'\.') + r'$(?![\s\S])'}
+    core_scopes = ['openid', 'profile', 'offline_access', 'tokens:write']
+    scopes = ['openid', 'profile', 'email', 'offline_access',
+              'balance:read', 'usage:read', 'tokens:read', 'tokens:write']
+    assert props['scopes'] == {'type': 'array', 'minItems': 4, 'maxItems': 8, 'uniqueItems': True,
+                               'items': {'type': 'string', 'enum': scopes},
+                               'allOf': [{'not': {'items': {'enum': [scope for scope in scopes if scope != core]}}}
+                                         for core in core_scopes]}
+    assert props['token_creation_method'] == {'type': 'string', 'enum': ['POST']}
+    for control in ['OAUTH_PROVIDER_DESKTOP_CLIENT_ID', 'boxnai://oauth/callback', 'GitHub/OIDC', 'no positive cache', 'not activation']:
+        assert control in desktop['description']
+    positive = {'enabled': True, 'desktop_client_id': 'registered-desktop', 'issuer': 'https://issuer.example/',
+                **{field: 'https://issuer.example/' + route for field, route in oauth_routes.items()},
+                'scopes': scopes, 'token_creation_method': 'POST'}
+    validate_value(api, desktop, {'enabled': False})
+    validate_value(api, desktop, positive)
+    # Every optional subset is compatible with the four readiness prerequisites.
+    optional_scopes = [scope for scope in scopes if scope not in core_scopes]
+    for mask in range(1 << len(optional_scopes)):
+        registered = core_scopes + [scope for i, scope in enumerate(optional_scopes) if mask & (1 << i)]
+        validate_value(api, desktop, {**positive, 'scopes': [scope for scope in scopes if scope in registered]})
+    negatives = [{**positive, 'enabled': False}, {'enabled': True},
+                 {**positive, 'desktop_client_id': ''}, {**positive, 'admin_endpoint': 'https://private.invalid/'},
+                 {**positive, 'scopes': ['openid', 'profile', 'offline_access', 'tokens:read']},
+                 {**positive, 'token_creation_method': 'GET'},
+                 {**positive, 'token_creation_endpoint': 'https://issuer.example/admin/clients'},
+                 {**positive, 'issuer': 'http://issuer.example/'}]
+    negatives += [{**positive, 'scopes': [scope for scope in scopes if scope != core]}
+                  for core in core_scopes]
+    negatives += [{**positive, 'scopes': value} for value in [
+        core_scopes + ['unsupported'], core_scopes + ['profile'], scopes + ['profile'],
+        [], 'openid profile offline_access tokens:write', None]]
+    validator = OAS30Validator(desktop, resolver=RefResolver.from_schema(api))
+    assert all(list(validator.iter_errors(value)) for value in negatives)
     return {'anonymous': True, 'additive_fields': list(fields), 'links': routes,
-            'future_contracts_enabled': False, 'live_http': False}
+            'desktop_qualification': True, 'registered_scope_subsets': 16,
+            'negative_fixtures': len(negatives), 'live_http': False}
 
 
 def main():
@@ -1499,6 +1623,7 @@ def main():
     api, relay = documents['api'], documents['relay']
     results['no_available_channel_detail'] = check_no_available_channel_detail(relay)
     results['oauth_public'] = check_oauth_public(api)
+    results['oauth_ordinary_token'] = check_oauth_ordinary_token(api, source_root)
     results['oauth_usage'] = check_oauth_usage(api, source_root)
     results['native_search'] = check_native_search(relay)
     access = api['components']['schemas']['OrganizationAccess']['properties']['capabilities']

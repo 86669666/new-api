@@ -74,8 +74,14 @@ jobs:
         working-directory: tokenkit
         run: go build ./...
 
-      - name: Test root, relaykit, and tokenkit modules with isolated bootstrap authority
-        run: make test BOOTSTRAP_TEST_ARGS="--bundle $RUNNER_TEMP/newapi-test-build"
+      # Formal bootstrap tiers require the approved box-local fixed images.
+      # Keep this required result failing until a trusted, exact-candidate box
+      # verification route is wired. Hosted checks are not formal test evidence.
+      # Do not attach untrusted PR code to a self-hosted runner automatically.
+      - name: Require formal box verification (execution route not configured)
+        run: |
+          echo "::error::Formal box verification is required for this exact candidate. The trusted execution/evidence route is not configured; hosted vet/build cannot satisfy it."
+          exit 1
 
   frontend:
     name: Frontend typecheck and test

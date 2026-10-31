@@ -44,6 +44,7 @@ func TestStatus(c *gin.Context) {
 }
 
 func GetStatus(c *gin.Context) {
+	desktopOAuth := service.CurrentOAuthDesktopStatus(c.Request.Context())
 
 	cs := console_setting.GetConsoleSetting()
 	passkeySetting := system_setting.PasskeySettingsSnapshot()
@@ -56,10 +57,11 @@ func GetStatus(c *gin.Context) {
 		"instance_id": model.SiteInstanceID(),
 		"console_links": publicConsoleLinks(system_setting.ServerAddress,
 			common.OptionMap["SidebarModulesAdmin"], common.OptionMap["HeaderNavModules"]),
-		// These describe the new desktop integration contracts, independently
-		// of existing login providers, legacy token logs and pricing APIs.
-		"oauth":                       gin.H{"enabled": false},
-		"client_features":             gin.H{"token_usage_logs": false, "oauth": false, "model_metadata": false},
+		// Logs describe configuration, not database health or caller authorization.
+		// Stat additionally requires DataExportEnabled; OAuth has its own readiness gate.
+		// Metadata advertises contract support, independent of configured declarations.
+		"oauth":                       desktopOAuth,
+		"client_features":             gin.H{"token_usage_logs": common.LogConsumeEnabled, "oauth": desktopOAuth.Enabled, "model_metadata": true},
 		"version":                     common.Version,
 		"start_time":                  common.StartTime,
 		"email_verification":          common.EmailVerificationEnabled,

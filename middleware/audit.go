@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"net/http"
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
@@ -252,6 +253,50 @@ func TokenOperationAudit() gin.HandlerFunc {
 			entry.Success = entry.Status < 400 && common.GetContextKeyBool(c, constant.ContextKeyTokenAuditSucceeded)
 		}
 		model.RecordAuditLog(c, entry)
+	}
+}
+
+const oauthOrdinaryTokenAuditKey = "oauth_ordinary_token_request_audit"
+
+// OAuthOrdinaryTokenAudit records only verified public OAuth identities and
+// allowlisted outcomes. It never buffers the key-bearing response or request.
+func OAuthOrdinaryTokenAudit() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodPost || c.FullPath() != "/api/v1/oauth/tokens" {
+			c.Next()
+			return
+		}
+		c.Next()
+		stored, _ := c.Get(oauthOrdinaryTokenAuditKey)
+		entry, ok := stored.(model.AuditLog)
+		if !ok || entry.UserId == 0 {
+			return // No verified public actor: never adopt headers or body identity.
+		}
+		entry.Method, entry.Route = http.MethodPost, "/api/v1/oauth/tokens"
+		entry.RequestId, entry.Ip = c.GetString(common.RequestIdKey), c.ClientIP()
+		entry.Status = c.Writer.Status()
+		params := entry.Other.Op.Params
+		params["result"], params["failure_class"] = "rejected", "request_rejected"
+		switch entry.Status {
+		case http.StatusBadRequest:
+			params["failure_class"] = "invalid_request"
+		case http.StatusUnauthorized:
+			params["failure_class"] = "identity_revalidation_failed"
+		case http.StatusForbidden:
+			params["failure_class"] = "insufficient_scope"
+		case http.StatusServiceUnavailable:
+			params["failure_class"] = "creation_unavailable"
+		case http.StatusOK:
+			created, _ := common.GetContextKeyType[model.AuditFields](c, constant.ContextKeyTokenAuditParams)
+			id, _ := created["id"].(int)
+			if id > 0 && common.GetContextKeyBool(c, constant.ContextKeyTokenAuditSucceeded) {
+				entry.Success = true
+				params["id"], params["result"], params["failure_class"] = id, "created", "none"
+			}
+		}
+		// Supply an explicit safe projection. RecordAuditLog(c, ...) would also
+		// copy arbitrary User-Agent data; no caller-controlled header/body is needed.
+		model.RecordAuditLog(nil, entry)
 	}
 }
 

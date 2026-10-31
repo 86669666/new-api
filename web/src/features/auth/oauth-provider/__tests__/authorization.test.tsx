@@ -33,6 +33,13 @@ import { StrictMode } from 'react'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
+import zh from '@/i18n/locales/zh.json'
 import { Route as ApplicationRoute } from '@/routes/__root'
 import { Route as ConsentRoute } from '@/routes/oauth/provider/consent'
 import { Route as LoginRoute } from '@/routes/oauth/provider/login'
@@ -1265,6 +1272,7 @@ describe('explicit recorded-history consent', () => {
           balance: false,
           usage: true,
           tokens: false,
+          tokensWrite: false,
         }
       )
       expect(JSON.parse(String(requests[0].data)).selected_scopes).toEqual([
@@ -1395,6 +1403,7 @@ describe('explicit current-authorization metadata consent', () => {
           balance: false,
           usage: false,
           tokens: true,
+          tokensWrite: false,
         }
       )
       expect(JSON.parse(String(requests[0].data)).selected_scopes).toEqual([
@@ -1425,5 +1434,237 @@ describe('metadata consent lifecycle', () => {
         name: 'API key metadata (optional)',
       })
     ).not.toBeChecked()
+  })
+})
+
+describe('explicit ordinary model key consent', () => {
+  const label = 'Create model API keys (optional)'
+  const explanation =
+    'Allow this client to create API keys for model calls on your account.'
+  const revocation =
+    'Revoking OAuth access does not revoke keys already created. You can revoke them in API key management.'
+
+  it.each(['unselected', 'selected', 'unticked', 'denied'])(
+    'write choice %s stays separate from metadata and grants only explicit write access',
+    async (choice) => {
+      const user = userEvent.setup()
+      providerHTTP.defaults.adapter = async (config) => {
+        requests.push(config)
+        const value = preview('consent')
+        value.requested_scopes = ['profile', 'tokens:read', 'tokens:write']
+        value.allowed_scopes = [...value.requested_scopes]
+        return response(
+          config,
+          config.url?.endsWith('/preview')
+            ? value
+            : {
+                redirect_to:
+                  'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+              }
+        )
+      }
+      await mountPage('consent')
+      const write = await screen.findByRole('checkbox', { name: label })
+      const read = screen.getByRole('checkbox', {
+        name: 'API key metadata (optional)',
+      })
+      expect(write).not.toBeChecked()
+      expect(read).not.toBeChecked()
+      expect(write).toHaveAccessibleDescription(/model calls on your account/)
+      expect(write).toHaveAccessibleDescription(
+        /does not revoke keys already created/
+      )
+      expect(write).toHaveAccessibleDescription(/API key management/)
+      if (choice !== 'unselected') {
+        write.focus()
+        await user.keyboard(' ')
+        expect(write).toBeChecked()
+      }
+      if (choice === 'unticked') await user.click(write)
+      expect(read).not.toBeChecked()
+      await user.click(
+        screen.getByRole('button', {
+          name: choice === 'denied' ? 'Deny' : 'Approve',
+        })
+      )
+      await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+      expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual(
+        choice === 'denied'
+          ? []
+          : ['profile', ...(choice === 'selected' ? ['tokens:write'] : [])]
+      )
+      expect(requests).toHaveLength(2)
+    }
+  )
+
+  it('checking read metadata never selects key creation', async () => {
+    providerHTTP.defaults.adapter = async (config) => {
+      requests.push(config)
+      const value = preview('consent')
+      value.requested_scopes = ['profile', 'tokens:read', 'tokens:write']
+      value.allowed_scopes = [...value.requested_scopes]
+      return response(
+        config,
+        config.url?.endsWith('/preview')
+          ? value
+          : {
+              redirect_to:
+                'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+            }
+      )
+    }
+    await mountPage('consent')
+    await screen.findByRole('checkbox', { name: label })
+    await userEvent.click(
+      screen.getByRole('checkbox', { name: 'API key metadata (optional)' })
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+    expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual([
+      'profile',
+      'tokens:read',
+    ])
+  })
+
+  it.each(['requested', 'allowed'] as const)(
+    'a stale checked decision cannot send write when %s excludes it',
+    async (removed) => {
+      window.history.replaceState(null, '', '/oauth/provider/consent')
+      const identity = currentAuthorizationIdentity()
+      if (!identity) throw new Error('fixture_identity_missing')
+      const value = preview('consent')
+      value.requested_scopes =
+        removed === 'requested' ? ['profile'] : ['profile', 'tokens:write']
+      value.allowed_scopes =
+        removed === 'allowed' ? ['profile'] : ['profile', 'tokens:write']
+      await requestAuthorization(
+        identity,
+        'consent',
+        new AbortController().signal,
+        capability,
+        {
+          preview: value,
+          approve: true,
+          email: false,
+          offline: false,
+          balance: false,
+          usage: false,
+          tokens: false,
+          tokensWrite: true,
+        }
+      )
+      expect(JSON.parse(String(requests[0].data)).selected_scopes).toEqual([
+        'profile',
+      ])
+    }
+  )
+
+  it.each(['unrequested write', 'unknown scope', 'missing profile'])(
+    '%s preview fails closed without an approval control',
+    async (invalid) => {
+      providerHTTP.defaults.adapter = async (config) => {
+        requests.push(config)
+        const value = preview('consent')
+        value.allowed_scopes =
+          invalid === 'missing profile'
+            ? ['tokens:write']
+            : [
+                'profile',
+                invalid === 'unknown scope' ? 'tokens:admin' : 'tokens:write',
+              ]
+        return response(config, value)
+      }
+      await mountPage('consent')
+      await screen.findByText('Authorization could not be completed.')
+      expect(
+        screen.queryByRole('checkbox', { name: label })
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole('button', { name: 'Approve' })
+      ).not.toBeInTheDocument()
+      expect(requests).toHaveLength(1)
+    }
+  )
+
+  it('registration excluding write offers no write option and sends none', async () => {
+    providerHTTP.defaults.adapter = async (config) => {
+      requests.push(config)
+      const value = preview('consent')
+      value.requested_scopes = ['profile', 'tokens:write']
+      value.allowed_scopes = ['profile']
+      return response(
+        config,
+        config.url?.endsWith('/preview')
+          ? value
+          : {
+              redirect_to:
+                'https://issuer.example/oauth2/auth?consent_verifier=synthetic',
+            }
+      )
+    }
+    await mountPage('consent')
+    await screen.findByRole('button', { name: 'Approve' })
+    expect(
+      screen.queryByRole('checkbox', { name: label })
+    ).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1))
+    expect(JSON.parse(String(requests[1].data)).selected_scopes).toEqual([
+      'profile',
+    ])
+  })
+
+  it.each(['ceremony', 'client', 'identity'] as const)(
+    'a new %s cannot inherit the previous write selection',
+    async (change) => {
+      let clientID = 'first-client'
+      providerHTTP.defaults.adapter = async (config) => {
+        const value = preview('consent')
+        value.client_id = clientID
+        value.requested_scopes = ['profile', 'tokens:write']
+        value.allowed_scopes = [...value.requested_scopes]
+        return response(config, value)
+      }
+      const first = await mountPage('consent')
+      const write = await screen.findByRole('checkbox', { name: label })
+      await userEvent.click(write)
+      expect(write).toBeChecked()
+      if (change === 'identity') {
+        act(() =>
+          useAuthStore
+            .getState()
+            .auth.setBundle(bundle('new-session-token', 'new-session', 18))
+        )
+        await screen.findByText('Authorization could not be completed.')
+        expect(
+          screen.queryByRole('button', { name: 'Approve' })
+        ).not.toBeInTheDocument()
+      }
+      first.unmount()
+      if (change === 'client') clientID = 'second-client'
+      await mountPage('consent', '?consent_challenge=next-owned-challenge')
+      expect(
+        await screen.findByRole('checkbox', { name: label })
+      ).not.toBeChecked()
+    }
+  )
+
+  it('all seven languages explain creation and manual key revocation', () => {
+    const resources: Record<string, { translation: Record<string, string> }> = {
+      en,
+      zh,
+      'zh-TW': zhTW,
+      fr,
+      ru,
+      ja,
+      vi: viLocale,
+    }
+    expect(Object.keys(resources)).toHaveLength(7)
+    for (const [locale, resource] of Object.entries(resources)) {
+      for (const key of [label, explanation, revocation]) {
+        expect(resource.translation[key], `${locale}: ${key}`).toBeTruthy()
+        if (locale !== 'en') expect(resource.translation[key]).not.toBe(key)
+      }
+    }
   })
 })

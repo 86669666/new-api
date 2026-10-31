@@ -67,34 +67,85 @@ func InitOAuthGrantStore(enabled bool) error {
 	if err := stmt.Parse(&OAuthGrant{}); err != nil {
 		return err
 	}
-	if err := DB.Select(stmt.Schema.DBNames).Limit(1).Find(&[]OAuthGrant{}).Error; err != nil {
-		return err
+	query := DB.Select(stmt.Schema.DBNames).Limit(1).Find(&[]OAuthGrant{})
+	if query.Error != nil {
+		return query.Error
 	}
-	indexes, err := DB.Migrator().GetIndexes(&OAuthGrant{})
-	if err != nil {
-		return err
-	}
-	columns, err := DB.Migrator().ColumnTypes(&OAuthGrant{})
-	if err != nil {
-		return err
-	}
-	var primaryColumns []string
-	for _, column := range columns {
-		if primary, _ := column.PrimaryKey(); primary {
-			primaryColumns = append(primaryColumns, column.Name())
+	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+		// ColumnTypes hides constraint keys from non-owners, while GetIndexes
+		// omits constraint-backed indexes. Bind physical metadata to the same
+		// relation selected above, accepting immediate whole-column uniqueness.
+		relation := query.Statement.Quote(query.Statement.Table)
+		if query.Statement.TableExpr != nil {
+			if len(query.Statement.TableExpr.Vars) != 0 {
+				return errors.New("OAuth grant uniqueness unavailable")
+			}
+			relation = query.Statement.TableExpr.SQL
 		}
-	}
-	grantUnique, consentUnique := slices.Equal(primaryColumns, []string{"grant_ref"}), false
-	for _, index := range indexes {
-		unique, _ := index.Unique()
-		primary, _ := index.PrimaryKey()
-		if unique || primary {
-			grantUnique = grantUnique || slices.Equal(index.Columns(), []string{"grant_ref"})
-			consentUnique = consentUnique || slices.Equal(index.Columns(), []string{"consent_ref"})
+		for _, expected := range [][]string{{"grant_ref"}, {"consent_ref"}} {
+			var columns []struct {
+				IndexOID int64 `gorm:"column:index_oid"`
+				Name     string
+			}
+			// On pre-INCLUDE catalogs the absent JSON field falls back to
+			// indnatts; newer catalogs exclude payloads from the real key.
+			if err := DB.Raw(`SELECT i.indexrelid::bigint AS index_oid,a.attname AS name
+				FROM pg_catalog.pg_class r
+				JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
+				JOIN pg_catalog.pg_index i ON i.indrelid=r.oid
+				JOIN pg_catalog.pg_class ix ON ix.oid=i.indexrelid AND ix.relnamespace=n.oid
+				LEFT JOIN pg_catalog.pg_constraint c ON c.conrelid=r.oid AND c.conindid=i.indexrelid AND c.contype IN ('p','u')
+				CROSS JOIN LATERAL (SELECT COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts) AS value) key_count
+				CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,position)
+				JOIN pg_catalog.pg_attribute a ON a.attrelid=r.oid AND a.attnum=k.attnum
+					AND a.attnum>0 AND NOT a.attisdropped AND a.attnotnull
+				WHERE r.oid=pg_catalog.to_regclass(?) AND r.relkind='r' AND ix.relkind='i'
+				AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive AND i.indimmediate
+				AND i.indpred IS NULL AND i.indexprs IS NULL AND key_count.value=? AND k.position<=key_count.value
+				AND (c.oid IS NULL OR (c.connamespace=n.oid AND c.convalidated AND NOT c.condeferrable AND NOT c.condeferred
+					AND array_length(c.conkey,1)=key_count.value AND c.conkey[k.position::integer]=k.attnum))
+				ORDER BY i.indexrelid,k.position`, relation, len(expected)).Scan(&columns).Error; err != nil {
+				return err
+			}
+			keys := make(map[int64][]string)
+			for _, column := range columns {
+				keys[column.IndexOID] = append(keys[column.IndexOID], column.Name)
+			}
+			unique := false
+			for _, key := range keys {
+				unique = unique || slices.Equal(key, expected)
+			}
+			if !unique {
+				return errors.New("OAuth grant uniqueness unavailable")
+			}
 		}
-	}
-	if !grantUnique || !consentUnique {
-		return errors.New("OAuth grant uniqueness unavailable")
+	} else {
+		indexes, err := DB.Migrator().GetIndexes(&OAuthGrant{})
+		if err != nil {
+			return err
+		}
+		columns, err := DB.Migrator().ColumnTypes(&OAuthGrant{})
+		if err != nil {
+			return err
+		}
+		var primaryColumns []string
+		for _, column := range columns {
+			if primary, _ := column.PrimaryKey(); primary {
+				primaryColumns = append(primaryColumns, column.Name())
+			}
+		}
+		grantUnique, consentUnique := slices.Equal(primaryColumns, []string{"grant_ref"}), false
+		for _, index := range indexes {
+			unique, _ := index.Unique()
+			primary, _ := index.PrimaryKey()
+			if unique || primary {
+				grantUnique = grantUnique || slices.Equal(index.Columns(), []string{"grant_ref"})
+				consentUnique = consentUnique || slices.Equal(index.Columns(), []string{"consent_ref"})
+			}
+		}
+		if !grantUnique || !consentUnique {
+			return errors.New("OAuth grant uniqueness unavailable")
+		}
 	}
 	return InitOAuthCleanupStore(true)
 }

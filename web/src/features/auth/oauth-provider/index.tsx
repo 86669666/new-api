@@ -260,6 +260,38 @@ export function ProviderAuthorizationPage(props: {
                 </div>
               </div>
             )}
+            {state.preview.allowed_scopes.includes('tokens:write') && (
+              <div className='space-y-2'>
+                <div className='flex items-center gap-2'>
+                  <Checkbox
+                    id='provider-tokens-write'
+                    checked={authorization.tokensWrite}
+                    aria-describedby='provider-tokens-write-description'
+                    onCheckedChange={(checked) =>
+                      authorization.setTokensWrite(checked === true)
+                    }
+                  />
+                  <Label htmlFor='provider-tokens-write'>
+                    {t('Create model API keys (optional)')}
+                  </Label>
+                </div>
+                <div
+                  id='provider-tokens-write-description'
+                  className='text-muted-foreground space-y-1 text-sm'
+                >
+                  <p>
+                    {t(
+                      'Allow this client to create API keys for model calls on your account.'
+                    )}
+                  </p>
+                  <p>
+                    {t(
+                      'Revoking OAuth access does not revoke keys already created. You can revoke them in API key management.'
+                    )}
+                  </p>
+                </div>
+              </div>
+            )}
           </fieldset>
         )}
         <div className='flex flex-wrap gap-3'>

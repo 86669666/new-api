@@ -28,6 +28,9 @@ func TestUpdateOptionRejectsRetiredFrontendTheme(t *testing.T) {
 }
 
 func TestGetStatusAdvertisesDefaultDashboard(t *testing.T) {
+	previousConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = previousConsume })
 	previousMap := common.OptionMap
 	common.OptionMap = map[string]string{}
 	t.Cleanup(func() { common.OptionMap = previousMap })
@@ -49,5 +52,5 @@ func TestGetStatusAdvertisesDefaultDashboard(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, false, features["oauth"])
 	assert.Equal(t, false, features["token_usage_logs"])
-	assert.Equal(t, false, features["model_metadata"])
+	assert.Equal(t, true, features["model_metadata"])
 }

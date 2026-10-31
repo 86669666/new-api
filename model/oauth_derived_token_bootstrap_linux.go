@@ -3,6 +3,7 @@
 package model
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -142,6 +143,9 @@ func oauthSocketEndpoint(path string) (string, error) {
 }
 
 func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, out io.Writer) error {
+	if os.Getenv("NEWAPI_BOOTSTRAP_BROKER") != "" {
+		return oauthBootstrapThroughBroker(mode, engine, target, out)
+	}
 	if os.Geteuid() != 0 || oauthProtectedPath(filepath.Dir(journal), false) != nil {
 		return errOAuthBootstrap
 	}
@@ -330,6 +334,12 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 			return errOAuthBootstrap
 		}
 	}
+	return completeOAuthBirth(db, j, engine, func(j *oauthBirthJournal) error { return writeOAuthBirthJournal(journal, j) }, out)
+}
+
+// Both privilege modes use the same migration and seal validation.
+func completeOAuthBirth(db *gorm.DB, j *oauthBirthJournal, engine string, persist func(*oauthBirthJournal) error, out io.Writer) error {
+	var err error
 	if validateOAuthBirth(db, j, false) != nil {
 		return errOAuthBootstrap
 	}
@@ -356,7 +366,7 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 			}
 		}
 		j.Phase = "MIGRATING"
-		if writeOAuthBirthJournal(journal, j) != nil {
+		if persist(j) != nil {
 			return errOAuthBootstrap
 		}
 		oldDB := DB
@@ -387,7 +397,7 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 			return errOAuthBootstrap
 		}
 		j.Phase = "SEAL_PENDING"
-		if writeOAuthBirthJournal(journal, j) != nil {
+		if persist(j) != nil {
 			return errOAuthBootstrap
 		}
 	}
@@ -421,9 +431,224 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 	if validateOAuthBirth(db, j, true) != nil {
 		return errOAuthBootstrap
 	}
-	if writeOAuthBirthJournal(journal, j) != nil {
+	if persist(j) != nil {
 		return errOAuthBootstrap
 	}
 	fmt.Fprintln(out, j.OperationID, "READY")
 	return nil
+}
+
+// oauthBirthBrokerClient is the unprivileged side of the named birth protocol.
+// Selection requires an explicit broker socket and kernel-authenticated root peer.
+// The legacy root-only path is unchanged when no broker is configured.
+type oauthBirthBrokerClient struct {
+	conn     net.Conn
+	reader   *bufio.Reader
+	sequence int
+	target   string
+	schema   string
+	producer string
+	previous *oauthBirthJournal
+}
+
+func dialOAuthBirthBroker(path, target, schema, producer string) (*oauthBirthBrokerClient, error) {
+	if os.Geteuid() != 997 || os.Getegid() != 990 || oauthProtectedPath(filepath.Dir(path), false) != nil {
+		return nil, errOAuthBootstrap
+	}
+	groups, err := os.Getgroups()
+	if err != nil || len(groups) != 0 || !oauthDerivedDigest(schema) || !oauthDerivedDigest(producer) {
+		return nil, errOAuthBootstrap
+	}
+	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	raw, err := conn.(*net.UnixConn).SyscallConn()
+	var peer *syscall.Ucred
+	var peerErr error
+	if err == nil {
+		err = raw.Control(func(fd uintptr) {
+			peer, peerErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+		})
+	}
+	if err != nil || peerErr != nil || peer == nil || peer.Uid != 0 {
+		conn.Close()
+		return nil, errOAuthBootstrap
+	}
+	return &oauthBirthBrokerClient{conn: conn, reader: bufio.NewReaderSize(conn, 16385), target: target, schema: schema, producer: producer}, nil
+}
+
+func (c *oauthBirthBrokerClient) request(operation string) (result *oauthBirthJournal, err error) {
+	defer func() {
+		if err != nil {
+			c.conn.Close()
+		}
+	}()
+	switch operation {
+	case "fresh", "resume", "created", "bound", "migrating", "seal_pending", "ready", "snapshot", "fault_pending", "fault_intent", "fault_restore":
+	default:
+		return nil, errOAuthBootstrap
+	}
+	if c.conn.SetDeadline(time.Now().Add(30*time.Second)) != nil {
+		return nil, errOAuthBootstrap
+	}
+	message, err := common.Marshal(struct {
+		Sequence  int    `json:"sequence"`
+		Operation string `json:"operation"`
+	}{c.sequence, operation})
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	message = append(message, '\n')
+	if n, e := c.conn.Write(message); e != nil || n != len(message) {
+		return nil, errOAuthBootstrap
+	}
+	line, err := c.reader.ReadSlice('\n')
+	if err != nil || len(line) > 16384 {
+		return nil, errOAuthBootstrap
+	}
+	var reply struct {
+		Sequence int               `json:"sequence"`
+		Journal  oauthBirthJournal `json:"journal"`
+	}
+	if common.Unmarshal(line, &reply) != nil || reply.Sequence != c.sequence {
+		return nil, errOAuthBootstrap
+	}
+	j := reply.Journal
+	if j.Engine != "sqlite" && j.Engine != "postgres" && j.Engine != "mysql" {
+		return nil, errOAuthBootstrap
+	}
+	phase := map[string]string{"created": "INTENT", "bound": "CREATED_BOUND", "migrating": "MIGRATING", "seal_pending": "SEAL_PENDING", "ready": "READY", "fault_pending": "SEAL_PENDING", "fault_intent": "INTENT", "fault_restore": "READY"}[operation]
+	if operation == "fresh" {
+		phase = "INTENT"
+	}
+	if operation == "resume" || operation == "snapshot" {
+		switch j.Phase {
+		case "CREATED_BOUND", "MIGRATING", "SEAL_PENDING", "READY":
+			phase = j.Phase
+		}
+	}
+	if j.Phase != phase {
+		return nil, errOAuthBootstrap
+	}
+	if j.Version != 1 || j.Kind != "fresh" || j.InstallerUID != 0 || j.Contract != oauthBootstrapContract ||
+		j.Target != c.target || j.SchemaDigest != c.schema || j.Producer != c.producer ||
+		!oauthDerivedDigest(j.OperationID) || !oauthDerivedDigest(j.CreationNonce) ||
+		!oauthDerivedDigest(j.Binding) || j.IntentAt <= 0 || j.CreatedAt < j.IntentAt {
+		return nil, errOAuthBootstrap
+	}
+	if old := c.previous; old != nil && (j.OperationID != old.OperationID || j.CreationNonce != old.CreationNonce ||
+		j.Engine != old.Engine || j.Endpoint != old.Endpoint || j.Binding != old.Binding || j.CreatedAt != old.CreatedAt || j.IntentAt != old.IntentAt) {
+		return nil, errOAuthBootstrap
+	}
+	if j.Phase == "SEAL_PENDING" || j.Phase == "READY" {
+		seal, e := j.seal()
+		if e != nil || seal != j.HistorySeal || j.SealedAt < j.CreatedAt {
+			return nil, errOAuthBootstrap
+		}
+	}
+	c.sequence++
+	snapshot := j
+	c.previous = &snapshot
+	return &j, nil
+}
+
+func dialCurrentOAuthBirthBroker(target string) (*oauthBirthBrokerClient, error) {
+	schema, err := oauthBirthSchemaDigest()
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	file, err := os.Open(executable)
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	hash := sha256.New()
+	_, err = io.Copy(hash, file)
+	file.Close()
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	client, err := dialOAuthBirthBroker(os.Getenv("NEWAPI_BOOTSTRAP_BROKER"), target, schema, hex.EncodeToString(hash.Sum(nil)))
+	if err != nil {
+		return nil, errOAuthBootstrap
+	}
+	return client, nil
+}
+
+// The root server admits these operations only for the exact producer regression binary.
+func oauthBootstrapRegressionJournal(operation, target string) (*oauthBirthJournal, error) {
+	switch operation {
+	case "snapshot", "fault_pending", "fault_intent", "fault_restore":
+	default:
+		return nil, errOAuthBootstrap
+	}
+	client, err := dialCurrentOAuthBirthBroker(target)
+	if err != nil {
+		return nil, err
+	}
+	defer client.conn.Close()
+	return client.request(operation)
+}
+
+func oauthBootstrapThroughBroker(mode, engine, target string, out io.Writer) error {
+	if engine != "sqlite" && !bootstrapName.MatchString(target) {
+		return errOAuthBootstrap
+	}
+	client, err := dialCurrentOAuthBirthBroker(target)
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	defer client.conn.Close()
+	j, err := client.request(mode)
+	if err != nil || j.Engine != engine {
+		return errOAuthBootstrap
+	}
+	dsn := target
+	if engine != "sqlite" {
+		var endpoint string
+		dsn, endpoint, err = oauthBootstrapDSN(engine, os.Getenv("BOOTSTRAP_OWNED_DSN"), target)
+		if err != nil || endpoint != j.Endpoint {
+			return errOAuthBootstrap
+		}
+	}
+	db, err := openOAuthBootstrapDB(engine, dsn)
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	connection, err := db.DB()
+	if err != nil {
+		return errOAuthBootstrap
+	}
+	defer connection.Close()
+	persist := func(j *oauthBirthJournal) error {
+		operation := map[string]string{"CREATED_BOUND": "bound", "MIGRATING": "migrating", "SEAL_PENDING": "seal_pending", "READY": "ready"}[j.Phase]
+		if operation == "" {
+			return errOAuthBootstrap
+		}
+		observed, e := client.request(operation)
+		if e != nil {
+			return e
+		}
+		*j = *observed
+		return nil
+	}
+	if mode == "fresh" {
+		binding, e := oauthLiveBinding(db, j)
+		if e != nil || binding != j.Binding || db.AutoMigrate(&OAuthDerivedTokenBootstrapIdentity{}) != nil {
+			return errOAuthBootstrap
+		}
+		marker := oauthBirthMarker(j)
+		if db.Create(&marker).Error != nil || validateOAuthBirth(db, j, false) != nil {
+			return errOAuthBootstrap
+		}
+		j.Phase = "CREATED_BOUND"
+		if persist(j) != nil {
+			return errOAuthBootstrap
+		}
+	}
+	return completeOAuthBirth(db, j, engine, persist, out)
 }

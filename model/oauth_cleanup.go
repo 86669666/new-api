@@ -98,22 +98,74 @@ func InitOAuthCleanupStore(enabled bool) error {
 		if err := statement.Parse(value); err != nil {
 			return err
 		}
-		if err := DB.Model(value).Select(statement.Schema.DBNames).Limit(1).Find(value).Error; err != nil {
-			return err
+		query := DB.Model(value).Select(statement.Schema.DBNames).Limit(1).Find(value)
+		if query.Error != nil {
+			return query.Error
 		}
-		columns, err := DB.Migrator().ColumnTypes(value)
-		if err != nil {
-			return err
-		}
-		primary := false
-		for _, column := range columns {
-			yes, _ := column.PrimaryKey()
-			if yes && column.Name() == statement.Schema.PrioritizedPrimaryField.DBName {
-				primary = true
+		if DB.Dialector.Name() == "postgres" {
+			// ColumnTypes uses owner-filtered information_schema views. Resolve
+			// the exact relation used above, including a qualified Table override,
+			// and validate its physical primary key without requiring ownership.
+			relation := query.Statement.Quote(query.Statement.Table)
+			if query.Statement.TableExpr != nil {
+				if len(query.Statement.TableExpr.Vars) != 0 {
+					return errors.New("OAuth cleanup primary key unavailable")
+				}
+				relation = query.Statement.TableExpr.SQL
 			}
-		}
-		if !primary {
-			return errors.New("OAuth cleanup primary key unavailable")
+			var expected []string
+			for _, field := range statement.Schema.PrimaryFields {
+				expected = append(expected, field.DBName)
+			}
+			if len(expected) == 0 {
+				return errors.New("OAuth cleanup primary key unavailable")
+			}
+			var columns []struct{ Name string }
+			// JSON field lookup keeps pre-INCLUDE catalogs compatible: before
+			// PostgreSQL11, every index attribute is a key attribute.
+			if err := DB.Raw(`SELECT a.attname AS name
+				FROM pg_catalog.pg_class r
+				JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+				JOIN pg_catalog.pg_index i ON i.indrelid = r.oid
+				JOIN pg_catalog.pg_class ix ON ix.oid = i.indexrelid AND ix.relnamespace = n.oid
+				JOIN pg_catalog.pg_constraint c ON c.conrelid = r.oid AND c.conindid = i.indexrelid
+					AND c.connamespace = n.oid
+				CROSS JOIN LATERAL (SELECT COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts) AS value) key_count
+				CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum, position)
+				JOIN pg_catalog.pg_attribute a ON a.attrelid = r.oid AND a.attnum = k.attnum
+					AND a.attnum > 0 AND NOT a.attisdropped AND a.attnotnull
+				WHERE r.oid = pg_catalog.to_regclass(?) AND r.relkind = 'r' AND ix.relkind = 'i'
+				AND i.indisprimary AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive
+				AND i.indimmediate AND i.indpred IS NULL AND i.indexprs IS NULL
+				AND c.contype = 'p' AND c.convalidated AND NOT c.condeferrable AND NOT c.condeferred
+				AND key_count.value = ? AND k.position <= key_count.value
+				AND array_length(c.conkey, 1) = key_count.value
+				AND c.conkey[k.position::integer] = k.attnum
+				ORDER BY k.position`, relation, len(expected)).Scan(&columns).Error; err != nil {
+				return err
+			}
+			var actual []string
+			for _, column := range columns {
+				actual = append(actual, column.Name)
+			}
+			if !slices.Equal(actual, expected) {
+				return errors.New("OAuth cleanup primary key unavailable")
+			}
+		} else {
+			columns, err := DB.Migrator().ColumnTypes(value)
+			if err != nil {
+				return err
+			}
+			primary := false
+			for _, column := range columns {
+				yes, _ := column.PrimaryKey()
+				if yes && column.Name() == statement.Schema.PrioritizedPrimaryField.DBName {
+					primary = true
+				}
+			}
+			if !primary {
+				return errors.New("OAuth cleanup primary key unavailable")
+			}
 		}
 		for _, index := range statement.Schema.ParseIndexes() {
 			if !DB.Migrator().HasIndex(value, index.Name) {

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -3160,8 +3161,11 @@ func TestModelCapabilityMetadataHTTP(t *testing.T) {
 // One root covers the public HTTP contract and independent processes sharing
 // the owned database. Child mode reconnects only; it never migrates or drops it.
 func TestSiteDescriptionHTTP(t *testing.T) {
+	oldConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = oldConsume })
 	if mode := os.Getenv("NEWAPI_SITE_DESCRIPTION_NODE"); mode != "" {
-		require.Contains(t, []string{"compete", "reopen", "closed"}, mode)
+		require.Contains(t, []string{"compete", "reopen", "closed", "oauth-discovery"}, mode)
 		kind, dsn := os.Getenv("NEWAPI_S2_MAIN"), os.Getenv("NEWAPI_SITE_DESCRIPTION_DSN")
 		trusted := os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != ""
 		if trusted {
@@ -3231,6 +3235,347 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			}))
 		}
 		require.NoError(t, model.InitSiteInstanceID())
+
+		if mode == "oauth-discovery" {
+			// Keep TLS root caching and startup globals in this dedicated process.
+			const issuer = "https://public.example/"
+			const selected = "selected-desktop"
+			var mu sync.Mutex
+			var calls atomic.Int64
+			var registration map[string]any
+			statusCode := http.StatusOK
+			var entered, release, handlerDone chan struct{}
+			admin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Empty(t, r.URL.RawQuery)
+				assert.Empty(t, r.Header.Get("Authorization"))
+				mu.Lock()
+				doc := maps.Clone(registration)
+				code, barrier, resume, finished := statusCode, entered, release, handlerDone
+				mu.Unlock()
+				if finished != nil {
+					defer close(finished)
+				}
+				if barrier != nil {
+					close(barrier)
+					select {
+					case <-r.Context().Done():
+						return
+					case <-resume:
+					}
+				}
+				if r.URL.Path != "/admin/clients/"+selected && r.URL.Path != "/admin/clients/other-client" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				if doc["client_id"] == nil {
+					doc["client_id"] = strings.TrimPrefix(r.URL.Path, "/admin/clients/")
+				}
+				data, err := common.Marshal(doc)
+				assert.NoError(t, err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(code)
+				_, _ = w.Write(data)
+			}))
+			defer admin.Close()
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, "/.well-known/openid-configuration", r.URL.Path)
+				data, err := common.Marshal(map[string]any{"issuer": issuer, "authorization_endpoint": issuer + "oauth2/auth", "token_endpoint": issuer + "oauth2/token", "revocation_endpoint": issuer + "oauth2/revoke", "jwks_uri": issuer + ".well-known/jwks.json", "id_token_signing_alg_values_supported": []string{"RS256"}})
+				assert.NoError(t, err)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(data)
+			}))
+			defer upstream.Close()
+			cert := filepath.Join(t.TempDir(), "issuer-ca.pem")
+			require.NoError(t, os.WriteFile(cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: admin.Certificate().Raw}), 0o600))
+			t.Setenv("SSL_CERT_FILE", cert)
+			t.Setenv("FRONTEND_BASE_URL", "")
+			for key, value := range map[string]string{"OAUTH_USERINFO_ENABLED": "true", "OAUTH_USERINFO_ISSUER": issuer, "OAUTH_USERINFO_INTROSPECTION_URL": admin.URL + "/admin/oauth2/introspect", "OAUTH_USERINFO_AUDIENCE": "newapi-userinfo", "OAUTH_USERINFO_CLIENT_IDS": "other-client," + selected, "OAUTH_PROVIDER_BRIDGE_ENABLED": "true", "OAUTH_PROVIDER_REVOCATION_ENABLED": "true", "OAUTH_PROVIDER_ADMIN_BASE_URL": admin.URL, "OAUTH_PROVIDER_AUTHORIZATION_URL": issuer + "oauth2/auth", "OAUTH_PROVIDER_PUBLIC_ENABLED": "true", "OAUTH_PROVIDER_PUBLIC_BASE_URL": upstream.URL} {
+				t.Setenv(key, value)
+			}
+			system_setting.ServerAddress = issuer
+			valid := map[string]any{"token_endpoint_auth_method": "none", "subject_type": "public", "grant_types": []string{"authorization_code", "refresh_token"}, "response_types": []string{"code"}, "scope": "openid profile offline_access tokens:write", "audience": []string{"newapi-userinfo"}, "redirect_uris": []string{"boxnai://oauth/callback"}, "skip_consent": false, "client_secret": "private-registration-canary"}
+			registration = maps.Clone(valid)
+			initialize := func(id string) {
+				t.Setenv("OAUTH_PROVIDER_DESKTOP_CLIENT_ID", id)
+				require.NoError(t, service.InitOAuthUserInfoResource())
+				require.NoError(t, service.InitOAuthProviderBridge())
+				require.NoError(t, service.ValidateOAuthPublicTopology(t.Context()))
+			}
+			gin.SetMode(gin.TestMode)
+			engine := gin.New()
+			SetApiRouter(engine)
+			statusServer := httptest.NewServer(engine)
+			defer statusServer.Close()
+			var sqlCalls atomic.Int64
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register("status_no_sql", func(*gorm.DB) { sqlCalls.Add(1) }))
+			require.NoError(t, db.Callback().Create().Before("gorm:create").Register("status_no_sql", func(*gorm.DB) { sqlCalls.Add(1) }))
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register("status_no_sql", func(*gorm.DB) { sqlCalls.Add(1) }))
+			require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("status_no_sql", func(*gorm.DB) { sqlCalls.Add(1) }))
+			require.NoError(t, db.Callback().Raw().Before("gorm:raw").Register("status_no_sql", func(*gorm.DB) { sqlCalls.Add(1) }))
+			request := func(enabled bool, expectedCalls int64, expectedScopes ...string) {
+				before := calls.Load()
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, statusServer.URL+"/api/status", nil)
+				require.NoError(t, err)
+				req.Host = "hostile.invalid"
+				req.Header.Set("X-Forwarded-Host", "hostile.invalid")
+				resp, err := http.DefaultClient.Do(req)
+				require.NoError(t, err)
+				data, err := io.ReadAll(resp.Body)
+				require.NoError(t, resp.Body.Close())
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, resp.StatusCode)
+				assert.Empty(t, resp.Header.Values("Set-Cookie"))
+				var body struct {
+					Data map[string]any `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(data, &body))
+				want := map[string]any{"enabled": false}
+				if enabled {
+					if expectedScopes == nil {
+						expectedScopes = []string{"openid", "profile", "offline_access", "tokens:write"}
+					}
+					scopes := make([]any, len(expectedScopes))
+					for i, scope := range expectedScopes {
+						scopes[i] = scope
+					}
+					want = map[string]any{"enabled": true, "desktop_client_id": selected, "issuer": issuer, "discovery_endpoint": issuer + ".well-known/oauth-authorization-server", "authorization_endpoint": issuer + "oauth2/auth", "token_endpoint": issuer + "oauth2/token", "scopes": scopes, "token_creation_endpoint": issuer + "api/v1/oauth/tokens", "token_creation_method": "POST"}
+				}
+				assert.Equal(t, want, body.Data["oauth"])
+				assert.Equal(t, map[string]any{"token_usage_logs": common.LogConsumeEnabled, "model_metadata": true, "oauth": enabled}, body.Data["client_features"])
+				assert.Equal(t, model.SiteInstanceID(), body.Data["instance_id"])
+				assert.Equal(t, common.Version, body.Data["version"])
+				for _, private := range []string{admin.URL, upstream.URL, "private-registration-canary", "hostile.invalid"} {
+					assert.NotContains(t, string(data), private)
+				}
+				assert.Equal(t, expectedCalls, calls.Load()-before)
+				assert.Zero(t, sqlCalls.Load())
+			}
+			initialize("")
+			request(false, 0) // No first/singleton/label inference; generic OAuth is still initialized.
+			initialize("not-allowed")
+			request(false, 0)
+			initialize(selected)
+			request(true, 1)
+			// Registration order is not advertisement order; optional narrowing is
+			// observed on the very next GET without changing core-only readiness.
+			for _, tc := range []struct {
+				name, registered string
+				want             []string
+			}{
+				{"all_supported", "tokens:write tokens:read usage:read balance:read offline_access email profile openid", []string{"openid", "profile", "email", "offline_access", "balance:read", "usage:read", "tokens:read", "tokens:write"}},
+				{"without_email", "openid profile offline_access balance:read usage:read tokens:read tokens:write", []string{"openid", "profile", "offline_access", "balance:read", "usage:read", "tokens:read", "tokens:write"}},
+				{"without_balance", "openid profile offline_access usage:read tokens:read tokens:write", []string{"openid", "profile", "offline_access", "usage:read", "tokens:read", "tokens:write"}},
+				{"without_usage", "openid profile offline_access tokens:read tokens:write", []string{"openid", "profile", "offline_access", "tokens:read", "tokens:write"}},
+				{"core_only", "openid profile offline_access tokens:write", []string{"openid", "profile", "offline_access", "tokens:write"}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					mu.Lock()
+					registration["scope"] = tc.registered
+					mu.Unlock()
+					request(true, 1, tc.want...)
+				})
+			}
+			common.LogConsumeEnabled = true
+			request(true, 1)
+			initialize("")
+			request(false, 0)
+			common.LogConsumeEnabled = false
+			initialize(selected)
+			for _, tc := range []struct {
+				name, field string
+				value       any
+				code        int
+			}{
+				{"missing_openid", "scope", "profile email offline_access balance:read usage:read tokens:read tokens:write", 200},
+				{"missing_profile", "scope", "openid email offline_access balance:read usage:read tokens:read tokens:write", 200},
+				{"unsupported_scope", "scope", "openid profile offline_access tokens:write admin", 200},
+				{"missing_write", "scope", "openid profile offline_access", 200},
+				{"missing_offline", "scope", "openid profile tokens:write", 200},
+				{"wrong_callback", "redirect_uris", []string{"http://127.0.0.1:29873/oauth/callback"}, 200},
+				{"callback_variant", "redirect_uris", []string{"boxnai://oauth/callback?other=1"}, 200},
+				{"wrong_client", "client_id", "different-client", 200},
+				{"confidential", "token_endpoint_auth_method", "client_secret_basic", 200},
+				{"invalid_type", "subject_type", "pairwise", 200},
+				{"deleted", "scope", "openid profile offline_access tokens:write", 404},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					mu.Lock()
+					registration = maps.Clone(valid)
+					registration[tc.field] = tc.value
+					statusCode = tc.code
+					mu.Unlock()
+					request(false, 1)
+				})
+			}
+			mu.Lock()
+			registration = maps.Clone(valid)
+			statusCode = 200
+			mu.Unlock()
+			request(true, 1) // The prior failures are not sticky; no cached positive survives a change.
+			system_setting.ServerAddress = "https://wrong.example/"
+			request(false, 1) // Mutable topology is read only after the registration GET.
+			system_setting.ServerAddress = issuer
+			require.NoError(t, service.InitOAuthUserInfoResource())
+			request(false, 0) // A bridge cannot advertise using a replaced resource identity.
+			initialize(selected)
+			request(true, 1)
+			t.Run("request_cancel_and_option_lock_order", func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				mu.Lock()
+				entered = make(chan struct{})
+				barrier := entered
+				mu.Unlock()
+				common.OptionMapRWMutex.Lock()
+				unlocked := false
+				defer func() {
+					if !unlocked {
+						common.OptionMapRWMutex.Unlock()
+					}
+				}()
+				w := httptest.NewRecorder()
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/status", nil).WithContext(ctx))
+				}()
+				select {
+				case <-barrier:
+				case <-t.Context().Done():
+					t.Fatal("registration was not read before option lock")
+				}
+				common.OptionMapRWMutex.Unlock()
+				unlocked = true
+				cancel()
+				<-done
+				assert.Equal(t, http.StatusOK, w.Code)
+				var body struct {
+					Data map[string]any `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &body))
+				assert.Equal(t, map[string]any{"enabled": false}, body.Data["oauth"])
+				mu.Lock()
+				entered = nil
+				mu.Unlock()
+				assert.Zero(t, sqlCalls.Load())
+			})
+			t.Run("topology_reload_while_registration_blocked", func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				mu.Lock()
+				entered, release = make(chan struct{}), make(chan struct{})
+				barrier, resume := entered, release
+				mu.Unlock()
+				before := calls.Load()
+				w := httptest.NewRecorder()
+				done := make(chan struct{})
+				common.OptionMapRWMutex.Lock()
+				unlocked := false
+				defer func() {
+					if !unlocked {
+						common.OptionMapRWMutex.Unlock()
+					}
+				}()
+				go func() {
+					defer close(done)
+					engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/status", nil).WithContext(ctx))
+				}()
+				select {
+				case <-barrier:
+				case <-t.Context().Done():
+					t.Fatal("registration was not read before option reload")
+				}
+				// The remote registration read is parked while the real owner lock
+				// protects the same field written by a normal option reload.
+				system_setting.ServerAddress = "https://reloaded.example/"
+				common.OptionMapRWMutex.Unlock()
+				unlocked = true
+				close(resume)
+				<-done
+				assert.Equal(t, http.StatusOK, w.Code)
+				var body struct {
+					Data map[string]any `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &body))
+				assert.Equal(t, map[string]any{"enabled": false}, body.Data["oauth"])
+				assert.Equal(t, false, body.Data["client_features"].(map[string]any)["oauth"])
+				assert.Equal(t, int64(1), calls.Load()-before)
+				assert.Zero(t, sqlCalls.Load())
+				fmt.Println("SITE_DESCRIPTION_TOPOLOGY_RELOAD=GET1/OAUTH_FALSE/FEATURE_FALSE")
+				mu.Lock()
+				entered, release = nil, nil
+				mu.Unlock()
+				common.OptionMapRWMutex.Lock()
+				system_setting.ServerAddress = issuer
+				common.OptionMapRWMutex.Unlock()
+			})
+			t.Run("registration_response_timeout", func(t *testing.T) {
+				request(true, 1)
+				barrier, resume, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				mu.Lock()
+				entered, release, handlerDone = barrier, resume, finished
+				mu.Unlock()
+				defer func() {
+					close(resume)
+					mu.Lock()
+					entered, release, handlerDone = nil, nil, nil
+					mu.Unlock()
+					select {
+					case <-barrier:
+						select {
+						case <-finished:
+						case <-time.After(10 * time.Second):
+							t.Error("registration handler did not finish")
+						}
+					default:
+					}
+				}()
+				// No response or manual cancellation: the production transport's
+				// 3s response-header timeout precedes its 5s overall client timeout.
+				request(false, 1)
+				select {
+				case <-barrier:
+				default:
+					t.Fatal("registration handler was not entered")
+				}
+				select {
+				case <-finished:
+				case <-time.After(10 * time.Second):
+					t.Fatal("timed-out registration handler did not finish")
+				}
+				mu.Lock()
+				entered, release, handlerDone = nil, nil, nil
+				mu.Unlock()
+				request(true, 1) // Withheld-response failure must not remain sticky.
+			})
+			t.Run("registration_connection_refused", func(t *testing.T) {
+				// Prove the same selected registration and topology work immediately
+				// before closing only this fixture's listener, not a real issuer.
+				request(true, 1)
+				address := admin.Listener.Addr().String()
+				admin.Close()
+				conn, err := net.DialTimeout("tcp", address, time.Second)
+				if conn != nil {
+					_ = conn.Close()
+				}
+				require.Error(t, err)
+				var dialError *net.OpError
+				require.ErrorAs(t, err, &dialError)
+				assert.Equal(t, "dial", dialError.Op)
+				var connectError *os.SyscallError
+				require.ErrorAs(t, err, &connectError)
+				assert.Equal(t, "connect", connectError.Syscall)
+				require.Equal(t, "connection refused", connectError.Err.Error())
+				// No registration handler can run. The public HTTP route must
+				// discard the preceding positive result and preserve no-SQL/privacy.
+				request(false, 0)
+				fmt.Println("SITE_DESCRIPTION_CONNECTION_REFUSED=CONNECT_REFUSED/HTTP200/OAUTH_FALSE/FEATURE_FALSE/NO_SQL")
+			})
+			fmt.Println("SITE_DESCRIPTION_OAUTH_CONTROLS=missing-selector,nonallowed,valid,missing-write,missing-offline,wrong-callback,callback-variant,wrong-client,confidential,type,deleted,restore,topology,resource-identity,cancel,lock-order,no-sql,no-secret,concurrent-topology")
+		}
 		fmt.Println("SITE_DESCRIPTION_ID=" + model.SiteInstanceID())
 		return
 	}
@@ -3299,6 +3644,13 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 		require.NoError(t, err, "independent initializer failed: %s", organizationChildDiagnostic(n.output.String(), organizationBudgetProcessInput{DSN: f.mainDSN, SessionSecret: common.SessionSecret}))
 		if n.mode == "closed" {
 			return ""
+		}
+		if n.mode == "oauth-discovery" {
+			for line := range strings.SplitSeq(n.output.String(), "\n") {
+				if strings.HasPrefix(line, "SITE_DESCRIPTION_TOPOLOGY_RELOAD=") {
+					t.Log(line)
+				}
+			}
 		}
 		match := regexp.MustCompile(`(?m)^SITE_DESCRIPTION_ID=([0-9a-f-]{36})$`).FindStringSubmatch(n.output.String())
 		require.Len(t, match, 2)
@@ -3410,6 +3762,11 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 		assert.Equal(t, id, model.SiteInstanceID())
 	})
 
+	t.Run("oauth_desktop_discovery", func(t *testing.T) {
+		require.NoError(t, model.InitSiteInstanceID())
+		assert.Equal(t, model.SiteInstanceID(), finishNode(t, startNode(t, "oauth-discovery")))
+	})
+
 	t.Run("anonymous_links_and_navigation", func(t *testing.T) {
 		request := func() map[string]any {
 			req, err := http.NewRequest(http.MethodGet, f.server.URL+"/api/status", nil)
@@ -3431,7 +3788,7 @@ func TestSiteDescriptionHTTP(t *testing.T) {
 			require.True(t, ok)
 			assert.Equal(t, model.SiteInstanceID(), data["instance_id"])
 			assert.Equal(t, map[string]any{"enabled": false}, data["oauth"])
-			assert.Equal(t, map[string]any{"token_usage_logs": false, "oauth": false, "model_metadata": false}, data["client_features"])
+			assert.Equal(t, map[string]any{"token_usage_logs": false, "oauth": false, "model_metadata": true}, data["client_features"])
 			assert.Equal(t, system_setting.ServerAddress, data["server_address"])
 			assert.Equal(t, common.Version, data["version"])
 			assert.Equal(t, common.SystemName, data["system_name"])

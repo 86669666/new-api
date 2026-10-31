@@ -36,12 +36,14 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
@@ -51,6 +53,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/clickhouse"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -633,6 +636,136 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		assert.Empty(t, withoutOffline.Refresh)
 	})
 
+	t.Run("ordinary_tokens_write", func(t *testing.T) {
+		c.t = t
+		clientURL := input.Admin + "/admin/clients/" + url.PathEscape(c.clientID)
+		status, _, raw := c.request("GET", clientURL, "", "", "")
+		require.Equal(t, 200, status)
+		var registration map[string]any
+		require.NoError(t, common.Unmarshal(raw, &registration))
+		original, err := common.Marshal(registration)
+		require.NoError(t, err)
+		defer func() {
+			status, _, _ = c.request("PUT", clientURL, "application/json", string(original), "")
+			require.Equal(t, 200, status)
+		}()
+		registration["scope"] = registration["scope"].(string) + " tokens:write"
+		updated, err := common.Marshal(registration)
+		require.NoError(t, err)
+		status, _, _ = c.request("PUT", clientURL, "application/json", string(updated), "")
+		require.Equal(t, 200, status)
+		journal, err := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+		require.NoError(t, err)
+		var before model.User
+		require.NoError(t, f.db.First(&before, f.users["owner"].Id).Error)
+		// The requested write scope must also be explicitly selected. A refresh
+		// preserves the omission instead of granting the newly registered scope.
+		status, omitted := c.exchange(c.code("openid profile offline_access tokens:read tokens:write", "openid", "profile", "offline_access", "tokens:read"))
+		require.Equal(t, 200, status)
+		for range 2 {
+			status, _, body := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", `{"name":"not-consented"}`, omitted.Access)
+			assert.Equal(t, 403, status)
+			assert.NotContains(t, string(body), `"key"`)
+			status, omitted = c.refresh(omitted)
+			require.Equal(t, 200, status)
+		}
+		status, grant := c.exchange(c.code("openid profile offline_access tokens:read tokens:write"))
+		require.Equal(t, 200, status)
+		status, headers, body := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", `{"name":"Hydra ordinary"}`, grant.Access)
+		require.Equal(t, 200, status)
+		assert.Contains(t, headers.Get("Cache-Control"), "no-store")
+		var created struct {
+			Success bool
+			Data    struct {
+				ID        int
+				Name, Key string
+			}
+		}
+		require.NoError(t, common.Unmarshal(body, &created))
+		require.True(t, created.Success)
+		require.True(t, len(created.Data.Key) > 20)
+		c.secrets = append(c.secrets, created.Data.Key)
+		var token model.Token
+		require.NoError(t, f.db.First(&token, created.Data.ID).Error)
+		assert.True(t, token.Key == created.Data.Key)
+		assert.Equal(t, before.Id, token.UserId)
+		assert.True(t, token.UnlimitedQuota)
+		assert.EqualValues(t, -1, token.ExpiredTime)
+		assert.Empty(t, token.Group)
+		kind, err := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+		require.NoError(t, err)
+		assert.Equal(t, model.OAuthDerivedTokenManualProven, kind)
+		t.Run("ordinary_model_call_and_user_budget", func(t *testing.T) {
+			oldCount, oldBatch, oldExport := constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled
+			oldQuota := *operation_setting.GetQuotaSetting()
+			oldPrices := ratio_setting.ModelPrice2JSONString()
+			t.Cleanup(func() {
+				constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled = oldCount, oldBatch, oldExport
+				*operation_setting.GetQuotaSetting() = oldQuota
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrices))
+			})
+			constant.CountToken, common.BatchUpdateEnabled, common.DataExportEnabled = false, false, false
+			*operation_setting.GetQuotaSetting() = operation_setting.QuotaSetting{TrustQuotaUSD: 0, PreConsumeMultiplier: 1}
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"gpt-4o-mini":0.001}`))
+			require.NoError(t, f.db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				assert.Equal(t, "/v1/chat/completions", r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"isolated-model-response","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"isolated reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+			}))
+			t.Cleanup(upstream.Close)
+			base := upstream.URL
+			channel := &model.Channel{Type: constant.ChannelTypeOpenAI, Name: "ordinary OAuth isolated model", Key: "synthetic-upstream-only", Status: common.ChannelStatusEnabled, BaseURL: &base, Models: "gpt-4o-mini", Group: "default"}
+			require.NoError(t, channel.Insert())
+			t.Cleanup(func() { require.NoError(t, channel.Delete()) })
+			payload := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"test"}],"max_tokens":1}`
+			// The new unlimited token cannot bypass a zero user balance.
+			status, _, response := f.request(t, "POST", "/v1/chat/completions", "sk-"+created.Data.Key, payload, http.Header{"Content-Type": {"application/json"}})
+			assert.Equal(t, 403, status)
+			assert.Equal(t, "insufficient_user_quota", response["error"].(map[string]any)["code"])
+			assert.Zero(t, calls.Load())
+			t.Cleanup(func() {
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", before.Id).Updates(map[string]any{"quota": before.Quota, "used_quota": before.UsedQuota}).Error)
+			})
+			// Only the isolated fixture owner funds this test; creation itself did not.
+			require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", before.Id).UpdateColumn("quota", 100000).Error)
+			status, _, response = f.request(t, "POST", "/v1/chat/completions", "sk-"+created.Data.Key, payload, http.Header{"Content-Type": {"application/json"}})
+			require.Equal(t, 200, status)
+			assert.EqualValues(t, 1, calls.Load())
+			assert.Equal(t, "isolated-model-response", response["id"])
+			var billed model.User
+			require.NoError(t, f.db.First(&billed, before.Id).Error)
+			assert.Less(t, billed.Quota, 100000)
+			assert.Greater(t, billed.UsedQuota, before.UsedQuota)
+			status, _, _ = f.request(t, "POST", "/v1/chat/completions", "sk-"+created.Data.Key, strings.Replace(payload, "gpt-4o-mini", "unavailable-model", 1), http.Header{"Content-Type": {"application/json"}})
+			assert.NotEqual(t, 200, status)
+			assert.EqualValues(t, 1, calls.Load(), "key cannot select an unavailable model")
+			require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", before.Id).Updates(map[string]any{"quota": before.Quota, "used_quota": before.UsedQuota}).Error)
+			assert.False(t, strings.Contains(f.logs.snapshot(), created.Data.Key), "usable key must not enter logs")
+		})
+		c.t = t
+		metadata := c.tokenMetadata(grant.Access, 200)
+		assert.Empty(t, metadata["data"])
+		status, _, _ = c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", `{"name":"refresh-is-not-access"}`, grant.Refresh)
+		assert.Equal(t, 401, status)
+		status, _, _ = c.request("POST", input.Issuer+"oauth2/revoke", "application/x-www-form-urlencoded", url.Values{"token": {grant.Access}, "client_id": {c.clientID}}.Encode(), "")
+		require.Equal(t, 200, status)
+		status, _, _ = c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", `{"name":"revoked"}`, grant.Access)
+		assert.Equal(t, 401, status)
+		// Explicit ordinary-key debt: revoking OAuth does not revoke the issued key.
+		require.NoError(t, f.db.First(&token, token.Id).Error)
+		assert.Equal(t, common.TokenStatusEnabled, token.Status)
+		var after model.User
+		require.NoError(t, f.db.First(&after, before.Id).Error)
+		assert.Equal(t, before.Quota, after.Quota)
+		assert.Equal(t, before.UsedQuota, after.UsedQuota)
+		journalAfter, err := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+		require.NoError(t, err)
+		assert.Equal(t, journal, journalAfter)
+	})
+
 	t.Run("explicit_tokens_read_empty_and_refresh", func(t *testing.T) {
 		c.t = t
 		// The permanent CLI must have born this very database. The test never adopts
@@ -662,7 +795,7 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		challenge := sha256.Sum256([]byte(strings.Repeat("a", 43)))
 		writeRequest := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {"http://127.0.0.1:29873/oauth/callback"}, "scope": {"profile tokens:write"}, "state": {strings.Repeat("b", 43)}, "code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"}}
 		status, writeHeaders, _ := c.request("GET", input.Issuer+"oauth2/auth?"+writeRequest.Encode(), "", "", "")
-		assert.Equal(t, 400, status, "tokens:write has no public producer")
+		assert.Equal(t, 400, status, "unregistered write scope is rejected")
 		assert.Empty(t, writeHeaders.Get("Location"))
 		journal, e := os.ReadFile(os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
 		require.NoError(t, e)
@@ -748,9 +881,9 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		}
 		require.NoError(t, common.Unmarshal(raw, &metadata))
 		assert.Contains(t, metadata.Scopes, "tokens:read")
-		assert.NotContains(t, metadata.Scopes, "tokens:write")
+		assert.Contains(t, metadata.Scopes, "tokens:write")
 		status, headers, _ := c.request("POST", input.Issuer+"api/v1/oauth/tokens", "application/json", "{}", "")
-		assert.Equal(t, 400, status)
+		assert.Equal(t, 401, status)
 		assert.Empty(t, headers.Get("Location"))
 	})
 
@@ -4937,7 +5070,7 @@ func TestOAuthTokensNamespacePrivacy(t *testing.T) {
 		{"GET", "/api/v1/oauth/%252574okens/TOKENS_PATH_CANARY", "", "", 400},
 		{"GET", "/api//v1/oauth/tokens", "", "", 400},
 		{"GET", "/API/V1/OAUTH/TOKENS", "", "", 400},
-		{"POST", "/api/v1/oauth/tokens", "", "", 400},
+		{"POST", "/api/v1/oauth/tokens", "", "", 401},
 		{"HEAD", "/api/v1/oauth/tokens", "", "", 400},
 		{"GET", "/api/v1/oauth/tokens", "{}", "", 400},
 		{"GET", "/api/v1/oauth/tokens", "", "X-Organization-Id", 400},
@@ -5144,8 +5277,677 @@ func oauthMetadataFixture(t *testing.T) *organizationHTTPFixture {
 	return f
 }
 
+// The explicit ordinary-audit tier provisions only its own synthetic databases.
+// The root-only setup branch is a test installer, never an HTTP/service action.
+type oauthOrdinaryAuditConfig struct {
+	MainKind, LogKind, MainDatabase, LogDatabase, MainRole, LogRole, Password         string
+	MainDSN, LogDSN, MainAdminDSN, LogAdminDSN, Journal, BinarySHA256, ManifestSHA256 string
+	UID                                                                               int
+}
+
+func oauthOrdinaryAuditConfigRead(t *testing.T) oauthOrdinaryAuditConfig {
+	t.Helper()
+	path := os.Getenv("NEWAPI_ORDINARY_AUDIT_CONFIG")
+	require.NotEmpty(t, path)
+	require.True(t, filepath.IsAbs(path))
+	for p := path; ; p = filepath.Dir(p) {
+		st, e := os.Lstat(p)
+		require.NoError(t, e)
+		require.Zero(t, st.Mode()&os.ModeSymlink)
+		require.Zero(t, st.Mode().Perm()&0o022)
+		require.Zero(t, reflect.Indirect(reflect.ValueOf(st.Sys())).FieldByName("Uid").Uint())
+		if p == "/" {
+			break
+		}
+	}
+	raw, e := os.ReadFile(path)
+	require.NoError(t, e)
+	var cfg oauthOrdinaryAuditConfig
+	require.NoError(t, common.Unmarshal(raw, &cfg))
+	require.Contains(t, []string{"sqlite", "mysql", "postgres"}, cfg.MainKind)
+	require.Contains(t, []string{"mysql", "postgres", "clickhouse"}, cfg.LogKind)
+	require.Regexp(t, `^newapi_w01_w82_[0-9a-f]{24}_main$`, cfg.MainDatabase)
+	require.Regexp(t, `^newapi_w01_w82_[0-9a-f]{24}_log$`, cfg.LogDatabase)
+	require.Regexp(t, `^w82_[0-9a-f]{20}_main$`, cfg.MainRole)
+	require.Regexp(t, `^w82_[0-9a-f]{20}_log$`, cfg.LogRole)
+	require.Regexp(t, `^[0-9a-f]{64}$`, cfg.Password)
+	exe, e := os.Executable()
+	require.NoError(t, e)
+	binary, e := os.ReadFile(exe)
+	require.NoError(t, e)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(binary)), cfg.BinarySHA256)
+	manifest, e := os.ReadFile(filepath.Join(filepath.Dir(path), "bundle/manifest.json"))
+	require.NoError(t, e)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(manifest)), cfg.ManifestSHA256)
+	return cfg
+}
+
+func oauthOrdinaryAuditOpen(t *testing.T, kind, dsn string) *gorm.DB {
+	t.Helper()
+	var dialect gorm.Dialector
+	switch kind {
+	case "sqlite":
+		dialect = sqlite.Open(dsn)
+	case "mysql":
+		dialect = mysql.Open(dsn)
+	case "postgres":
+		for _, key := range []string{"PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGSERVICE", "PGSERVICEFILE", "PGOPTIONS"} {
+			require.Empty(t, os.Getenv(key))
+		}
+		dialect = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+	case "clickhouse":
+		dialect = clickhouse.Open(dsn)
+	default:
+		t.Fatal("unsupported ordinary audit database")
+	}
+	db, e := gorm.Open(dialect, &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.True(t, e == nil, "ordinary audit database connection failed; details withheld")
+	conn, e := db.DB()
+	require.NoError(t, e)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	return db
+}
+
+func oauthOrdinaryAuditProvision(t *testing.T) {
+	require.Zero(t, os.Getuid(), "only the trusted fixture installer provisions databases")
+	cfg := oauthOrdinaryAuditConfigRead(t)
+	mode := os.Getenv("NEWAPI_ORDINARY_AUDIT_SETUP")
+	require.Contains(t, []string{"provision", "cleanup"}, mode)
+	// Main birth/seal already came from the permanent CLI. Root adds the same
+	// ordinary grant/session fixtures the existing route fixture needs, no source.
+	for _, store := range []struct {
+		kind, admin, name, role string
+		main                    bool
+	}{
+		{cfg.MainKind, cfg.MainAdminDSN, cfg.MainDatabase, cfg.MainRole, true},
+		{cfg.LogKind, cfg.LogAdminDSN, cfg.LogDatabase, cfg.LogRole, false},
+	} {
+		if store.kind == "sqlite" {
+			if mode == "provision" {
+				db := oauthOrdinaryAuditOpen(t, "sqlite", cfg.MainDSN)
+				model.DB = db
+				common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+				common.IsMasterNode = true
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}))
+				require.NoError(t, model.InitOAuthCleanupStore(true))
+				require.NoError(t, model.InitOAuthGrantStore(true))
+				common.IsMasterNode = false
+			}
+			continue
+		}
+		admin := oauthOrdinaryAuditOpen(t, store.kind, store.admin)
+		execSQL := func(q string) {
+			t.Helper()
+			require.True(t, admin.Exec(q).Error == nil, "owned audit fixture SQL failed; details withheld")
+		}
+		if mode == "cleanup" {
+			cleanupSQL := func(q string) {
+				t.Helper()
+				assert.True(t, admin.Exec(q).Error == nil, "owned audit cleanup SQL failed; details withheld")
+			}
+			cleanupSQL("DROP DATABASE IF EXISTS " + store.name)
+			if store.kind == "mysql" {
+				cleanupSQL("DROP USER IF EXISTS '" + store.role + "'@'127.0.0.1'")
+				cleanupSQL("DROP USER IF EXISTS '" + store.role + "'@'localhost'")
+			} else if store.kind == "postgres" {
+				cleanupSQL("DROP ROLE IF EXISTS " + store.role)
+			} else {
+				cleanupSQL("DROP USER IF EXISTS " + store.role)
+			}
+			continue
+		}
+		if !store.main {
+			execSQL("CREATE DATABASE " + store.name)
+		}
+		dsn := cfg.LogDSN
+		if store.main {
+			dsn = cfg.MainDSN
+		}
+		// Use administrator credentials only during this root setup phase.
+		if store.kind == "mysql" {
+			c, e := sqlmysql.ParseDSN(store.admin)
+			require.True(t, e == nil)
+			c.DBName = store.name
+			dsn = c.FormatDSN()
+		} else {
+			u, e := url.Parse(store.admin)
+			require.True(t, e == nil)
+			u.Path = "/" + store.name
+			dsn = u.String()
+		}
+		db := oauthOrdinaryAuditOpen(t, store.kind, dsn)
+		model.DB = db
+		model.LOG_DB = db
+		common.SetDatabaseTypes(common.DatabaseType(store.kind), common.DatabaseType(store.kind))
+		if store.main {
+			common.IsMasterNode = true
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}))
+			require.NoError(t, model.InitOAuthCleanupStore(true))
+			require.NoError(t, model.InitOAuthGrantStore(true))
+			common.IsMasterNode = false
+			if store.kind == "postgres" {
+				oauthCleanupMetadataControls(t, db)
+				oauthGrantMetadataControls(t, db)
+				oauthIncludeMetadataControls(t, db)
+				// This owned fixture covers INCLUDE in the actual non-owner
+				// POST/audit runtime too; this is not production migration.
+				require.NoError(t, db.Exec(`ALTER TABLE public.o_auth_operations DROP CONSTRAINT o_auth_operations_pkey;
+					ALTER TABLE public.o_auth_operations ADD PRIMARY KEY(operation_ref) INCLUDE(user_id);
+					ALTER TABLE public.o_auth_artifacts DROP CONSTRAINT o_auth_artifacts_pkey;
+					ALTER TABLE public.o_auth_artifacts ADD PRIMARY KEY(artifact_ref) INCLUDE(operation_ref);
+					ALTER TABLE public.o_auth_cleanup_jobs DROP CONSTRAINT o_auth_cleanup_jobs_pkey;
+					ALTER TABLE public.o_auth_cleanup_jobs ADD PRIMARY KEY(job_ref) INCLUDE(source_session_event_ref);
+					ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey;
+					ALTER TABLE public.oauth_grants ADD PRIMARY KEY(grant_ref) INCLUDE(user_id);
+					DROP INDEX public.idx_oauth_grants_consent;
+					CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(consent_ref) INCLUDE(user_id)`).Error)
+				require.NoError(t, model.InitOAuthGrantStore(true))
+			}
+		} else {
+			require.NoError(t, model.MigrateAuditLogs())
+		}
+		mutable := []string{"users", "tokens", "user_sessions", "session_revocation_events", "oauth_grants", "o_auth_operations", "o_auth_artifacts", "o_auth_cleanup_jobs"}
+		if !store.main {
+			mutable = []string{"audit_logs"}
+		}
+		if store.kind == "mysql" {
+			for _, host := range []string{"127.0.0.1", "localhost"} {
+				execSQL("CREATE USER '" + store.role + "'@'" + host + "' IDENTIFIED BY '" + cfg.Password + "'")
+				for _, table := range mutable {
+					rights := "SELECT,INSERT"
+					if store.main {
+						rights += ",UPDATE,DELETE"
+					}
+					execSQL("GRANT " + rights + " ON " + store.name + "." + table + " TO '" + store.role + "'@'" + host + "'")
+				}
+				if store.main {
+					for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity", "oauth_derived_token_sources"} {
+						execSQL("GRANT SELECT ON " + store.name + "." + table + " TO '" + store.role + "'@'" + host + "'")
+					}
+				}
+			}
+		} else if store.kind == "postgres" {
+			execSQL("CREATE ROLE " + store.role + " LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '" + cfg.Password + "'")
+			execSQL("REVOKE ALL ON DATABASE " + store.name + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + store.name + " TO " + store.role)
+			require.NoError(t, db.Exec("REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE ON SCHEMA public TO "+store.role).Error)
+			for _, table := range mutable {
+				rights := "SELECT,INSERT"
+				if store.main {
+					rights += ",UPDATE,DELETE"
+				}
+				require.NoError(t, db.Exec("GRANT "+rights+" ON public."+table+" TO "+store.role).Error)
+			}
+			if store.main {
+				for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity", "oauth_derived_token_sources"} {
+					require.NoError(t, db.Exec("GRANT SELECT ON public."+table+" TO "+store.role).Error)
+				}
+			}
+			require.NoError(t, db.Exec("GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO "+store.role).Error)
+			execSQL("ALTER DATABASE " + store.name + " CONNECTION LIMIT 20")
+		} else {
+			execSQL("CREATE USER " + store.role + " IDENTIFIED WITH sha256_password BY '" + cfg.Password + "'")
+			execSQL("GRANT SELECT,INSERT ON " + store.name + ".audit_logs TO " + store.role)
+		}
+	}
+	t.Log("ordinary audit owned fixture " + mode + " complete; no shared grants changed")
+}
+
+// Installer-only faults in an owned database, rolled back before the ordinary
+// non-owner runtime starts. These are metadata tests, never owner HTTP business.
+func oauthCleanupMetadataControls(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.Zero(t, os.Getuid())
+	oldDB, oldMaster := model.DB, common.IsMasterNode
+	model.DB = db
+	common.IsMasterNode = false
+	defer func() { model.DB = oldDB; common.IsMasterNode = oldMaster }()
+	require.NoError(t, model.InitOAuthCleanupStore(true))
+	for _, tc := range []struct{ name, key, mutation string }{
+		{"missing", "", ""},
+		{"wrong", "PRIMARY KEY(user_id)", ""},
+		{"composite", "PRIMARY KEY(operation_ref,user_id)", ""},
+		{"reversed_composite", "PRIMARY KEY(user_id,operation_ref)", ""},
+		{"composite_hidden_nullable", "PRIMARY KEY(operation_ref,user_id)", "UPDATE pg_catalog.pg_attribute SET attnotnull=false WHERE attrelid='cleanup_probe.o_auth_operations'::regclass AND attname='user_id'"},
+		{"deferred", "PRIMARY KEY(operation_ref) DEFERRABLE INITIALLY DEFERRED", ""},
+		{"invalid", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indisvalid=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"not_ready", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indisready=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"not_live", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indislive=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"not_unique", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indisunique=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"not_primary", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_index SET indisprimary=false WHERE indrelid='cleanup_probe.o_auth_operations'::regclass AND indisprimary"},
+		{"nullable", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_attribute SET attnotnull=false WHERE attrelid='cleanup_probe.o_auth_operations'::regclass AND attname='operation_ref'"},
+		{"unvalidated", "PRIMARY KEY(operation_ref)", "UPDATE pg_catalog.pg_constraint SET convalidated=false WHERE conrelid='cleanup_probe.o_auth_operations'::regclass AND contype='p'"},
+		{"partial", "", "CREATE UNIQUE INDEX probe_key ON cleanup_probe.o_auth_operations(operation_ref) WHERE user_id>0"},
+		{"expression", "", "CREATE UNIQUE INDEX probe_key ON cleanup_probe.o_auth_operations(lower(operation_ref))"},
+	} {
+		t.Run("cleanup_metadata/"+tc.name, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer func() {
+				model.DB = db
+				require.NoError(t, tx.Rollback().Error)
+				require.NoError(t, model.InitOAuthCleanupStore(true))
+			}()
+			require.NoError(t, tx.Exec("CREATE SCHEMA cleanup_probe").Error)
+			require.NoError(t, tx.Exec("CREATE TABLE cleanup_probe.o_auth_operations (LIKE public.o_auth_operations INCLUDING DEFAULTS INCLUDING CONSTRAINTS)").Error)
+			if tc.key != "" {
+				require.NoError(t, tx.Exec("ALTER TABLE cleanup_probe.o_auth_operations ADD "+tc.key).Error)
+			}
+			if tc.mutation != "" {
+				require.NoError(t, tx.Exec(tc.mutation).Error)
+			}
+			model.DB = tx.Table("cleanup_probe.o_auth_operations")
+			require.ErrorContains(t, model.InitOAuthCleanupStore(true), "OAuth cleanup primary key unavailable")
+			assert.False(t, model.OAuthCleanupReady())
+		})
+	}
+	t.Run("cleanup_metadata/query_failure", func(t *testing.T) {
+		const name = "cleanup-metadata:catalog-unavailable"
+		require.NoError(t, db.Callback().Row().Before("gorm:row").Register(name, func(tx *gorm.DB) {
+			if strings.Contains(tx.Statement.SQL.String(), "pg_catalog.pg_index") {
+				tx.AddError(errors.New("controlled cleanup catalog unavailable"))
+			}
+		}))
+		defer func() {
+			require.NoError(t, db.Callback().Row().Remove(name))
+			require.NoError(t, model.InitOAuthCleanupStore(true))
+		}()
+		model.DB = db
+		require.ErrorContains(t, model.InitOAuthCleanupStore(true), "controlled cleanup catalog unavailable")
+		assert.False(t, model.OAuthCleanupReady())
+	})
+	require.NoError(t, model.InitOAuthCleanupStore(true))
+	var remains int64
+	require.NoError(t, db.Raw("SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname='cleanup_probe'").Scan(&remains).Error)
+	require.Zero(t, remains, "every fixture schema/catalog mutation was rolled back")
+}
+
+// Metadata only: no credentials, data rows, DSNs or raw driver errors.
+func oauthCleanupMetadataObservation(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, value := range []any{&model.OAuthOperation{}, &model.OAuthArtifact{}, &model.OAuthCleanupJob{}} {
+		statement := &gorm.Statement{DB: db}
+		require.NoError(t, statement.Parse(value))
+		var row struct {
+			RelationOID                                          int64 `gorm:"column:relation_oid"`
+			SchemaName, TableName, CurrentSchema, PrimaryColumns string
+			KeyCount, TotalAttributes                            int
+			Owned, Valid, Ready, Live, Unique, Immediate         bool
+			ConstraintUsage, TableConstraints                    int64
+		}
+		require.NoError(t, db.Raw(`SELECT r.oid::bigint AS relation_oid,n.nspname AS schema_name,r.relname AS table_name,
+   current_schema() AS current_schema,pg_get_userbyid(r.relowner)=current_user AS owned,
+   i.indisvalid AS valid,i.indisready AS ready,i.indislive AS live,i.indisunique AS unique,i.indimmediate AS immediate,
+   i.indnatts AS total_attributes,COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts) AS key_count,
+   COALESCE((SELECT string_agg(a.attname,',' ORDER BY k.position)
+    FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,position)
+    JOIN pg_attribute a ON a.attrelid=r.oid AND a.attnum=k.attnum
+    WHERE k.position<=COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts)),'') AS primary_columns,
+   (SELECT count(*) FROM information_schema.constraint_column_usage c WHERE c.table_schema=n.nspname AND c.table_name=r.relname) AS constraint_usage,
+   (SELECT count(*) FROM information_schema.table_constraints c WHERE c.table_schema=n.nspname AND c.table_name=r.relname AND c.constraint_type='PRIMARY KEY') AS table_constraints
+   FROM pg_class r JOIN pg_namespace n ON n.oid=r.relnamespace
+   LEFT JOIN pg_index i ON i.indrelid=r.oid AND i.indisprimary
+   WHERE r.oid=to_regclass(?)`, statement.Quote(statement.Table)).Scan(&row).Error)
+		require.Positive(t, row.RelationOID)
+		columns, err := db.Migrator().ColumnTypes(value)
+		require.NoError(t, err)
+		var reported []string
+		var expectedMetadata []map[string]any
+		for _, column := range columns {
+			yes, known := column.PrimaryKey()
+			if column.Name() == statement.Schema.PrioritizedPrimaryField.DBName {
+				expectedMetadata = append(expectedMetadata, map[string]any{"name": column.Name(), "primary": yes, "known": known})
+			}
+			if yes && known {
+				reported = append(reported, column.Name())
+			}
+		}
+		data, err := common.Marshal(map[string]any{"relation": row, "ColumnTypesPrimary": reported, "expected_key_metadata": expectedMetadata})
+		require.NoError(t, err)
+		t.Log("CLEANUP_PK_OBSERVATION " + string(data))
+	}
+}
+
+// Installer-only synthetic relations/catalog faults are rolled back before the
+// non-owner business runtime starts. Valid keys on other relations cannot help.
+func oauthGrantMetadataControls(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.Zero(t, os.Getuid())
+	oldDB, oldMaster := model.DB, common.IsMasterNode
+	model.DB, common.IsMasterNode = db, false
+	defer func() { model.DB = oldDB; common.IsMasterNode = oldMaster }()
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	for _, tc := range []struct {
+		name, grantColumns, consentColumns, mutation, table string
+		searchPath                                          bool
+	}{
+		{name: "missing_grant", consentColumns: "consent_ref"},
+		{name: "missing_consent", grantColumns: "grant_ref"},
+		{name: "wrong_grant", grantColumns: "user_id", consentColumns: "consent_ref"},
+		{name: "wrong_consent", grantColumns: "grant_ref", consentColumns: "user_id"},
+		{name: "grant_composite", grantColumns: "grant_ref,user_id", consentColumns: "consent_ref"},
+		{name: "grant_reversed", grantColumns: "user_id,grant_ref", consentColumns: "consent_ref"},
+		{name: "consent_composite", grantColumns: "grant_ref", consentColumns: "consent_ref,user_id"},
+		{name: "consent_reversed", grantColumns: "grant_ref", consentColumns: "user_id,consent_ref"},
+		{name: "partial", grantColumns: "grant_ref", mutation: "CREATE UNIQUE INDEX idx_oauth_grants_consent ON grant_probe.oauth_grants(consent_ref) WHERE user_id>0"},
+		{name: "expression", grantColumns: "grant_ref", mutation: "CREATE UNIQUE INDEX idx_oauth_grants_consent ON grant_probe.oauth_grants(lower(consent_ref))"},
+		{name: "invalid", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indisvalid=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "not_ready", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indisready=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "not_live", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indislive=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "not_unique", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indisunique=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "not_immediate", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "UPDATE pg_catalog.pg_index SET indimmediate=false WHERE indexrelid='grant_probe.idx_oauth_grants_consent'::regclass"},
+		{name: "deferred", grantColumns: "grant_ref", mutation: "ALTER TABLE grant_probe.oauth_grants ADD CONSTRAINT deferred_consent UNIQUE(consent_ref) DEFERRABLE INITIALLY DEFERRED"},
+		{name: "unvalidated", grantColumns: "grant_ref", mutation: "ALTER TABLE grant_probe.oauth_grants ADD CONSTRAINT invalid_consent UNIQUE(consent_ref); UPDATE pg_catalog.pg_constraint SET convalidated=false WHERE conrelid='grant_probe.oauth_grants'::regclass AND contype='u'"},
+		{name: "nullable", grantColumns: "grant_ref", consentColumns: "consent_ref", mutation: "ALTER TABLE grant_probe.oauth_grants ALTER COLUMN consent_ref DROP NOT NULL"},
+		{name: "search_path_shadow", consentColumns: "consent_ref", searchPath: true},
+		{name: "other_table", grantColumns: "grant_ref", consentColumns: "consent_ref", table: "other_grants"},
+	} {
+		t.Run("grant_metadata/"+tc.name, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer func() {
+				model.DB = db
+				require.NoError(t, tx.Rollback().Error)
+				require.NoError(t, model.InitOAuthGrantStore(true))
+			}()
+			require.NoError(t, tx.Exec("CREATE SCHEMA grant_probe").Error)
+			require.NoError(t, tx.Exec("CREATE TABLE grant_probe.oauth_grants (LIKE public.oauth_grants INCLUDING DEFAULTS INCLUDING CONSTRAINTS)").Error)
+			if tc.grantColumns != "" {
+				require.NoError(t, tx.Exec("CREATE UNIQUE INDEX oauth_grants_pkey ON grant_probe.oauth_grants("+tc.grantColumns+")").Error)
+			}
+			if tc.consentColumns != "" {
+				require.NoError(t, tx.Exec("CREATE UNIQUE INDEX idx_oauth_grants_consent ON grant_probe.oauth_grants("+tc.consentColumns+")").Error)
+			}
+			if tc.mutation != "" {
+				require.NoError(t, tx.Exec(tc.mutation).Error)
+			}
+			model.DB = tx.Table("grant_probe.oauth_grants")
+			if tc.table != "" {
+				require.NoError(t, tx.Exec("CREATE TABLE grant_probe.other_grants (LIKE public.oauth_grants INCLUDING DEFAULTS INCLUDING CONSTRAINTS)").Error)
+				model.DB = tx.Table("grant_probe.other_grants")
+			}
+			if tc.searchPath {
+				require.NoError(t, tx.Exec("SET LOCAL search_path TO grant_probe,public").Error)
+				model.DB = tx
+			}
+			require.ErrorContains(t, model.InitOAuthGrantStore(true), "OAuth grant uniqueness unavailable")
+		})
+	}
+	t.Run("grant_metadata/standalone_grant_constraint_consent", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer func() {
+			model.DB = db
+			require.NoError(t, tx.Rollback().Error)
+			require.NoError(t, model.InitOAuthGrantStore(true))
+		}()
+		require.NoError(t, tx.Exec("ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; CREATE UNIQUE INDEX probe_grant ON public.oauth_grants(grant_ref); DROP INDEX public.idx_oauth_grants_consent; ALTER TABLE public.oauth_grants ADD CONSTRAINT probe_consent UNIQUE(consent_ref)").Error)
+		model.DB = tx
+		require.NoError(t, model.InitOAuthGrantStore(true), "either immediate unique-index form satisfies the original contract")
+	})
+	t.Run("grant_metadata/query_failure", func(t *testing.T) {
+		const name = "grant-metadata:catalog-unavailable"
+		require.NoError(t, db.Callback().Row().Before("gorm:row").Register(name, func(tx *gorm.DB) {
+			if strings.Contains(tx.Statement.SQL.String(), "SELECT i.indexrelid::bigint AS index_oid") {
+				tx.AddError(errors.New("controlled grant catalog unavailable"))
+			}
+		}))
+		defer func() {
+			require.NoError(t, db.Callback().Row().Remove(name))
+			require.NoError(t, model.InitOAuthGrantStore(true))
+		}()
+		model.DB = db
+		require.ErrorContains(t, model.InitOAuthGrantStore(true), "controlled grant catalog unavailable")
+	})
+	var remains int64
+	require.NoError(t, db.Raw("SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname='grant_probe'").Scan(&remains).Error)
+	require.Zero(t, remains, "all synthetic relations and catalog faults rolled back")
+}
+
+// Real INCLUDE DDL on owned test tables; all substitutions roll back before
+// non-owner HTTP business. Payload columns are not part of a uniqueness tuple.
+func oauthIncludeMetadataControls(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.Zero(t, os.Getuid())
+	oldDB, oldMaster := model.DB, common.IsMasterNode
+	model.DB, common.IsMasterNode = db, false
+	defer func() { model.DB = oldDB; common.IsMasterNode = oldMaster }()
+	var version int
+	require.NoError(t, db.Raw("SELECT current_setting('server_version_num')::integer").Scan(&version).Error)
+	require.GreaterOrEqual(t, version, 110000, "this dedicated INCLUDE qualification requires PostgreSQL11+; no skip")
+	for _, tc := range []struct {
+		name, ddl       string
+		cleanup, reject bool
+	}{
+		{"cleanup_operation", "ALTER TABLE public.o_auth_operations DROP CONSTRAINT o_auth_operations_pkey; ALTER TABLE public.o_auth_operations ADD PRIMARY KEY(operation_ref) INCLUDE(user_id)", true, false},
+		{"cleanup_artifact", "ALTER TABLE public.o_auth_artifacts DROP CONSTRAINT o_auth_artifacts_pkey; ALTER TABLE public.o_auth_artifacts ADD PRIMARY KEY(artifact_ref) INCLUDE(operation_ref)", true, false},
+		{"cleanup_job_nullable_payload", "ALTER TABLE public.o_auth_cleanup_jobs DROP CONSTRAINT o_auth_cleanup_jobs_pkey; ALTER TABLE public.o_auth_cleanup_jobs ADD PRIMARY KEY(job_ref) INCLUDE(source_session_event_ref)", true, false},
+		{"grant_primary", "ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; ALTER TABLE public.oauth_grants ADD PRIMARY KEY(grant_ref) INCLUDE(user_id)", false, false},
+		{"grant_unique_index", "ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; CREATE UNIQUE INDEX probe_grant ON public.oauth_grants(grant_ref) INCLUDE(user_id)", false, false},
+		{"consent_unique_index", "DROP INDEX public.idx_oauth_grants_consent; CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(consent_ref) INCLUDE(user_id)", false, false},
+		{"consent_unique_constraint", "DROP INDEX public.idx_oauth_grants_consent; ALTER TABLE public.oauth_grants ADD CONSTRAINT probe_consent UNIQUE(consent_ref) INCLUDE(user_id)", false, false},
+		{"cleanup_required_only_payload", "ALTER TABLE public.o_auth_operations DROP CONSTRAINT o_auth_operations_pkey; ALTER TABLE public.o_auth_operations ADD PRIMARY KEY(user_id) INCLUDE(operation_ref)", true, true},
+		{"grant_required_only_payload", "ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; ALTER TABLE public.oauth_grants ADD PRIMARY KEY(user_id) INCLUDE(grant_ref)", false, true},
+		{"consent_required_only_payload", "DROP INDEX public.idx_oauth_grants_consent; CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(user_id) INCLUDE(consent_ref)", false, true},
+	} {
+		t.Run("include_metadata/"+tc.name, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer func() {
+				model.DB = db
+				require.NoError(t, tx.Rollback().Error)
+				require.NoError(t, model.InitOAuthGrantStore(true))
+			}()
+			require.NoError(t, tx.Exec(tc.ddl).Error)
+			model.DB = tx
+			var err error
+			if tc.cleanup {
+				err = model.InitOAuthCleanupStore(true)
+			} else {
+				err = model.InitOAuthGrantStore(true)
+			}
+			if tc.reject {
+				message := "OAuth grant uniqueness unavailable"
+				if tc.cleanup {
+					message = "OAuth cleanup primary key unavailable"
+				}
+				require.ErrorContains(t, err, message)
+			} else {
+				require.NoError(t, err, "INCLUDE payload must not change the actual required key")
+			}
+		})
+	}
+	t.Run("include_metadata/catalog_pre11_shape", func(t *testing.T) {
+		// Execute the production queries with the newer field absent from
+		// each row's JSON. This is not an actual PostgreSQL9.6 runtime.
+		const callback = "include-metadata:pre11-shape"
+		queries := 0
+		require.NoError(t, db.Callback().Row().Before("gorm:row").Register(callback, func(tx *gorm.DB) {
+			sql := tx.Statement.SQL.String()
+			if strings.Contains(sql, "pg_catalog.pg_index") && strings.Contains(sql, "pg_catalog.to_jsonb(i)") {
+				queries++
+				tx.Statement.SQL.Reset()
+				tx.Statement.SQL.WriteString(strings.ReplaceAll(sql, "pg_catalog.to_jsonb(i)", "(pg_catalog.to_jsonb(i)-'indnkeyatts')"))
+			}
+		}))
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer func() {
+			require.NoError(t, db.Callback().Row().Remove(callback))
+			model.DB = db
+			require.NoError(t, tx.Rollback().Error)
+			require.NoError(t, model.InitOAuthGrantStore(true))
+		}()
+		model.DB = tx
+		require.NoError(t, model.InitOAuthGrantStore(true))
+		require.GreaterOrEqual(t, queries, 5, "both real initializers must execute the absent-field fallback")
+		require.NoError(t, tx.Exec("ALTER TABLE public.oauth_grants DROP CONSTRAINT oauth_grants_pkey; CREATE UNIQUE INDEX wrong_grant_key ON public.oauth_grants(user_id)").Error)
+		require.ErrorContains(t, model.InitOAuthGrantStore(true), "OAuth grant uniqueness unavailable")
+		t.Logf("PG96_ROW_SHAPE_CONTROL actual_server=%d modified_queries=%d actual_96_runtime=false", version, queries)
+	})
+}
+
+// Compare physical metadata and the actual driver reports without data or secrets.
+func oauthGrantMetadataObservation(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	stmt := &gorm.Statement{DB: db}
+	require.NoError(t, stmt.Parse(&model.OAuthGrant{}))
+	var relation struct {
+		RelationOID                        int64 `gorm:"column:relation_oid"`
+		SchemaName, TableName, RuntimeRole string
+		Owned                              bool
+		ConstraintUsage                    int64
+	}
+	require.NoError(t, db.Raw(`SELECT r.oid::bigint AS relation_oid,n.nspname AS schema_name,r.relname AS table_name,
+		current_user AS runtime_role,pg_get_userbyid(r.relowner)=current_user AS owned,
+		(SELECT count(*) FROM information_schema.constraint_column_usage c WHERE c.table_schema=n.nspname AND c.table_name=r.relname) AS constraint_usage
+		FROM pg_catalog.pg_class r JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
+		WHERE r.oid=pg_catalog.to_regclass(?)`, stmt.Quote(stmt.Table)).Scan(&relation).Error)
+	require.Positive(t, relation.RelationOID)
+	var physical []struct {
+		IndexOID                                                                        int64 `gorm:"column:index_oid"`
+		IndexName, Columns, ConstraintType                                              string
+		KeyCount, TotalAttributes                                                       int
+		Primary, Unique, Valid, Ready, Live, Immediate, Partial, Expression, Deferrable bool
+	}
+	require.NoError(t, db.Raw(`SELECT ix.oid::bigint AS index_oid,ix.relname AS index_name,
+		i.indnatts AS total_attributes,COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts) AS key_count,
+		i.indisprimary AS primary,i.indisunique AS unique,i.indisvalid AS valid,i.indisready AS ready,i.indislive AS live,
+		i.indimmediate AS immediate,i.indpred IS NOT NULL AS partial,i.indexprs IS NOT NULL AS expression,
+		COALESCE(c.contype::text,'') AS constraint_type,COALESCE(c.condeferrable,false) AS deferrable,
+		(SELECT string_agg(COALESCE(a.attname,'<expression>'),',' ORDER BY k.position)
+		 FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,position)
+		 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+		 WHERE k.position<=COALESCE((pg_catalog.to_jsonb(i)->>'indnkeyatts')::integer,i.indnatts)) AS columns
+		FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ix ON ix.oid=i.indexrelid
+		LEFT JOIN pg_catalog.pg_constraint c ON c.conrelid=i.indrelid AND c.conindid=i.indexrelid AND c.contype IN ('p','u')
+		WHERE i.indrelid=? ORDER BY ix.oid`, relation.RelationOID).Scan(&physical).Error)
+	columns, err := db.Migrator().ColumnTypes(&model.OAuthGrant{})
+	require.NoError(t, err)
+	var primaryColumns []string
+	var reportedColumns []map[string]any
+	for _, column := range columns {
+		primary, known := column.PrimaryKey()
+		if primary {
+			primaryColumns = append(primaryColumns, column.Name())
+		}
+		if column.Name() == "grant_ref" || column.Name() == "consent_ref" {
+			reportedColumns = append(reportedColumns, map[string]any{"name": column.Name(), "primary": primary, "known": known})
+		}
+	}
+	indexes, err := db.Migrator().GetIndexes(&model.OAuthGrant{})
+	require.NoError(t, err)
+	grantUnique, consentUnique := slices.Equal(primaryColumns, []string{"grant_ref"}), false
+	var reportedIndexes []map[string]any
+	for _, index := range indexes {
+		unique, _ := index.Unique()
+		primary, _ := index.PrimaryKey()
+		reportedIndexes = append(reportedIndexes, map[string]any{"name": index.Name(), "columns": index.Columns(), "unique": unique, "primary": primary})
+		if unique || primary {
+			grantUnique = grantUnique || slices.Equal(index.Columns(), []string{"grant_ref"})
+			consentUnique = consentUnique || slices.Equal(index.Columns(), []string{"consent_ref"})
+		}
+	}
+	data, err := common.Marshal(map[string]any{"relation": relation, "physical": physical, "ColumnTypes": reportedColumns, "GetIndexes": reportedIndexes, "grantUnique": grantUnique, "consentUnique": consentUnique})
+	require.NoError(t, err)
+	t.Log("GRANT_UNIQUE_OBSERVATION " + string(data))
+}
+
+func oauthOrdinaryAuditFixture(t *testing.T) *organizationHTTPFixture {
+	t.Helper()
+	cfg := oauthOrdinaryAuditConfigRead(t)
+	require.Equal(t, cfg.UID, os.Getuid())
+	require.NotZero(t, cfg.UID)
+	require.Empty(t, cfg.MainAdminDSN)
+	require.Empty(t, cfg.LogAdminDSN)
+	db := oauthOrdinaryAuditOpen(t, cfg.MainKind, cfg.MainDSN)
+	oldDB, oldLog := model.DB, model.LOG_DB
+	oldMain, oldLogKind := common.MainDatabaseType(), common.LogDatabaseType()
+	oldMaster, oldRedis, oldMemory, oldPath := common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.SQLitePath
+	oldReady := model.OAuthCleanupReady()
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLog
+		common.SetDatabaseTypes(oldMain, oldLogKind)
+		common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled, common.SQLitePath = oldMaster, oldRedis, oldMemory, oldPath
+		require.NoError(t, model.InitOAuthCleanupStore(oldReady))
+	})
+	model.DB = db
+	common.SetDatabaseTypes(common.DatabaseType(cfg.MainKind), common.DatabaseType(cfg.LogKind))
+	common.IsMasterNode, common.RedisEnabled, common.MemoryCacheEnabled = false, false, false
+	t.Setenv("SQL_DSN", cfg.MainDSN)
+	t.Setenv("OAUTH_BOOTSTRAP_JOURNAL", cfg.Journal)
+	if cfg.MainKind == "sqlite" {
+		common.SQLitePath = cfg.MainDSN
+		t.Setenv("SQL_DSN", "")
+	}
+	t.Setenv("LOG_SQL_DSN", cfg.LogDSN)
+	require.NoError(t, model.InitLogDB())
+	model.LOG_DB.Logger = gormlogger.Default.LogMode(gormlogger.Silent)
+	logConnection, err := model.LOG_DB.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, logConnection.Close()) })
+	require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+	cleanupErr := model.InitOAuthCleanupStore(true)
+	if cfg.MainKind == "postgres" {
+		oauthCleanupMetadataObservation(t, db)
+		oauthGrantMetadataObservation(t, db)
+	}
+	require.NoError(t, cleanupErr)
+	for _, store := range []struct {
+		db               *gorm.DB
+		kind, name, role string
+	}{{db, cfg.MainKind, cfg.MainDatabase, cfg.MainRole}, {model.LOG_DB, cfg.LogKind, cfg.LogDatabase, cfg.LogRole}} {
+		if store.kind == "sqlite" {
+			continue
+		}
+		q := "SELECT DATABASE(),CURRENT_USER()"
+		if store.kind == "postgres" {
+			q = "SELECT current_database(),current_user"
+		}
+		if store.kind == "clickhouse" {
+			q = "SELECT currentDatabase(),currentUser()"
+		}
+		var name, role string
+		conn, e := store.db.DB()
+		require.NoError(t, e)
+		require.NoError(t, conn.QueryRow(q).Scan(&name, &role))
+		require.Equal(t, store.name, name)
+		require.True(t, role == store.role || role == store.role+"@127.0.0.1" || role == store.role+"@localhost")
+	}
+	if cfg.MainKind != "sqlite" {
+		for _, table := range []string{"oauth_derived_token_history", "oauth_derived_token_bootstrap_identity", "oauth_derived_token_sources"} {
+			require.Error(t, db.Exec("DELETE FROM "+table+" WHERE 1=0").Error)
+		}
+	}
+	for _, q := range []string{"DELETE FROM audit_logs WHERE 1=0", "CREATE TABLE forbidden_audit_table (id INTEGER)"} {
+		require.Error(t, model.LOG_DB.Exec(q).Error, "audit runtime has insert/readback only")
+	}
+	require.Error(t, os.Chmod(cfg.Journal, 0o666))
+	f := &organizationHTTPFixture{db: db, mainDSN: cfg.MainDSN, mainKind: cfg.MainKind, users: map[string]*model.User{}, sids: map[string]string{}}
+	for i, label := range []string{"owner", "foreign"} {
+		u := &model.User{Id: 61000 + i, Username: "metadata-" + label, Password: "fixture-not-login-password", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: fmt.Sprint(61000 + i)}
+		require.NoError(t, db.Create(u).Error)
+		f.users[label] = u
+		sid := "metadata-" + common.NewRequestId()
+		f.sids[label] = sid
+		require.NoError(t, model.CreateUserSession(&model.UserSession{SID: sid, UserID: u.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("a", 64), LoginMethod: "password", ExpiresAt: time.Now().Unix() + 3600}))
+	}
+	key, e := common.GenerateRandomCharsKey(40)
+	require.NoError(t, e)
+	require.NoError(t, db.Create(&model.Token{UserId: f.users["owner"].Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
+	return f
+}
+
 func TestOAuthTokensConsumerHTTP(t *testing.T) {
-	f := oauthMetadataFixture(t)
+	if os.Getenv("NEWAPI_ORDINARY_AUDIT_SETUP") != "" {
+		oauthOrdinaryAuditProvision(t)
+		return
+	}
+	var f *organizationHTTPFixture
+	if os.Getenv("NEWAPI_ORDINARY_AUDIT_CONFIG") != "" {
+		f = oauthOrdinaryAuditFixture(t)
+	} else {
+		f = oauthMetadataFixture(t)
+	}
 	// Bootstrap owns provenance; the existing grant-store startup initializes
 	// only its ordinary grant/cleanup schema, as in adjacent OAuth fixtures.
 	master := common.IsMasterNode
@@ -5190,7 +5992,7 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 	bridge, err := service.NewOAuthProviderBridge(service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: admin.URL, AuthorizationURL: grant.Issuer + "oauth2/auth"}, resource)
 	require.NoError(t, err)
 	engine := gin.New()
-	engine.Use(middleware.OAuthTokensBoundary)
+	engine.Use(middleware.RequestId(), middleware.OAuthTokensBoundary)
 	SetOAuthResourceRouter(engine, resource)
 	request := func() *httptest.ResponseRecorder {
 		calls.Store(0)
@@ -5295,6 +6097,300 @@ func TestOAuthTokensConsumerHTTP(t *testing.T) {
 		assert.Equal(t, 503, w.Code)
 		assert.NotContains(t, w.Body.String(), "data")
 	})
+	t.Run("ordinary_key_creation", func(t *testing.T) {
+		// Use a configured log store as-is. A missing external audit table is a
+		// fixture provisioning failure, never a reason to fall back to SQLite.
+		// The default SQLite fixture retains its separate, owned temporary file.
+		previousLog, previousMainKind, previousLogKind := model.LOG_DB, common.MainDatabaseType(), common.LogDatabaseType()
+		auditDB := previousLog
+		if previousLogKind == common.DatabaseTypeSQLite && os.Getenv("LOG_SQL_DSN") == "" {
+			var err error
+			auditDB, err = gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "ordinary-audit.db")), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+			require.NoError(t, err)
+			auditConnection, err := auditDB.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, auditConnection.Close()) })
+			require.NoError(t, auditDB.AutoMigrate(&model.AuditLog{}))
+		}
+		require.NotNil(t, auditDB)
+		model.LOG_DB = auditDB
+		t.Cleanup(func() {
+			model.LOG_DB = previousLog
+			common.SetDatabaseTypes(previousMainKind, previousLogKind)
+		})
+		var auditRows int64
+		require.NoError(t, auditDB.Model(&model.AuditLog{}).Count(&auditRows).Error, "installer must provision the selected audit store")
+		var mainVersion, logVersion string
+		versionQuery := "SELECT version()"
+		if previousMainKind == common.DatabaseTypeSQLite {
+			versionQuery = "SELECT sqlite_version()"
+		}
+		require.NoError(t, f.db.Raw(versionQuery).Scan(&mainVersion).Error)
+		if previousLogKind == common.DatabaseTypeSQLite {
+			versionQuery = "SELECT sqlite_version()"
+		} else {
+			versionQuery = "SELECT version()"
+		}
+		require.NoError(t, auditDB.Raw(versionQuery).Scan(&logVersion).Error)
+		t.Logf("ordinary audit main=%s version=%s log=%s version=%s separate=%t", previousMainKind, mainVersion, previousLogKind, logVersion, f.db != auditDB)
+		var errorOutput organizationLogBuffer
+		common.LogWriterMu.Lock()
+		previousErrorWriter := gin.DefaultErrorWriter
+		gin.DefaultErrorWriter = &errorOutput
+		common.LogWriterMu.Unlock()
+		t.Cleanup(func() {
+			common.LogWriterMu.Lock()
+			gin.DefaultErrorWriter = previousErrorWriter
+			common.LogWriterMu.Unlock()
+		})
+		const auditCanary = "W77_SECRET_REQUEST_CANARY"
+		assertAudit := func(w *httptest.ResponseRecorder, result, failure string, tokenID int) model.AuditLog {
+			t.Helper()
+			rows, total, err := model.GetAuditLogs(model.AuditLogFilter{RequestId: w.Header().Get(common.RequestIdKey)}, 0, 2, common.RoleRootUser)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, total)
+			require.Len(t, rows, 1)
+			row := *rows[0]
+			assert.Equal(t, grant.UserID, row.UserId)
+			assert.Equal(t, f.users["owner"].Username, row.Username)
+			assert.Equal(t, common.RoleCommonUser, row.ActorRole)
+			assert.Equal(t, model.AuditCategorySecurity, row.Category)
+			assert.Equal(t, "token.create", row.Action)
+			assert.Equal(t, "oauth_access_token", row.AuthMethod)
+			assert.Equal(t, w.Code, row.Status)
+			assert.Equal(t, tokenID > 0, row.Success)
+			assert.Equal(t, "POST", row.Method)
+			assert.Equal(t, "/api/v1/oauth/tokens", row.Route)
+			assert.NotEmpty(t, row.EventId)
+			assert.NotEmpty(t, row.RequestId)
+			assert.NotEqual(t, auditCanary, row.RequestId)
+			require.NotNil(t, row.Other.Op)
+			params, err := common.Marshal(row.Other.Op.Params)
+			require.NoError(t, err)
+			var fields struct {
+				ClientID string `json:"oauth_client_id"`
+				GrantRef string `json:"oauth_grant_ref"`
+				Result   string `json:"result"`
+				Failure  string `json:"failure_class"`
+				ID       int    `json:"id"`
+			}
+			require.NoError(t, common.Unmarshal(params, &fields))
+			assert.Equal(t, grant.ClientID, fields.ClientID)
+			assert.Equal(t, grant.GrantRef, fields.GrantRef)
+			assert.Equal(t, result, fields.Result)
+			assert.Equal(t, failure, fields.Failure)
+			assert.Equal(t, tokenID, fields.ID)
+			keys := []string{"oauth_client_id", "oauth_grant_ref", "result", "failure_class"}
+			if tokenID > 0 {
+				keys = append(keys, "id")
+			}
+			assert.ElementsMatch(t, keys, slices.Collect(maps.Keys(row.Other.Op.Params)))
+			raw, err := common.Marshal(row)
+			require.NoError(t, err)
+			for _, secret := range []string{auditCanary, "synthetic-metadata", grant.GrantID, f.sids["owner"]} {
+				assert.False(t, strings.Contains(string(raw), secret), "audit excludes request secrets and raw capabilities")
+			}
+			return row
+		}
+		assertNoAudit := func(w *httptest.ResponseRecorder) {
+			t.Helper()
+			var n int64
+			require.NoError(t, auditDB.Model(&model.AuditLog{}).Where("request_id = ?", w.Header().Get(common.RequestIdKey)).Count(&n).Error)
+			assert.Zero(t, n, "unverified claims cannot manufacture an attributed actor")
+		}
+		post := func(body, bearer string) *httptest.ResponseRecorder {
+			r := httptest.NewRequest("POST", "/api/v1/oauth/tokens", strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("User-Agent", auditCanary)
+			r.Header.Set(common.RequestIdKey, auditCanary)
+			r.Header.Set("X-User-ID", strconv.Itoa(f.users["foreign"].Id))
+			r.Header.Set("Cookie", "attacker_identity="+auditCanary)
+			if bearer != "" {
+				r.Header.Set("Authorization", "Bearer "+bearer)
+			}
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, r)
+			return w
+		}
+		count := func() int64 { var n int64; require.NoError(t, f.db.Model(&model.Token{}).Count(&n).Error); return n }
+		initial := count()
+		denied := post(`{"name":"ordinary"}`, "synthetic-metadata")
+		assert.Equal(t, 403, denied.Code)
+		assertAudit(denied, "rejected", "insufficient_scope", 0)
+		unauthenticated := post(`{"name":"ordinary"}`, "")
+		assert.Equal(t, 401, unauthenticated.Code)
+		assertNoAudit(unauthenticated)
+		writeScopes := `["profile","tokens:read","tokens:write"]`
+		require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", writeScopes).Error)
+		claims["scope"] = "profile tokens:read tokens:write"
+		defer func() {
+			claims["scope"] = "profile tokens:read"
+			require.NoError(t, f.db.Model(grant).UpdateColumn("scopes", string(encoded)).Error)
+		}()
+		for _, body := range []string{`{}`, `{"name":""}`, `{"name":" "}`, `{"name":null}`, `{"name":1}`, `{"name":"` + auditCanary + `","password":"` + auditCanary + `"}`, `{"name":"a","user_id":1}`, `{"name":"a","organization_id":1}`, `{"name":"a","unlimited_quota":true}`, `{"name":"a","group":"vip"}`, `{"name":"a","quota":999}`, `{"name":"a","name":"b"}`, `{"name":"a"} {}`, `{"Name":"a"}`, `{"name":"` + strings.Repeat("a", 31) + `"}`} {
+			denied := post(body, "synthetic-metadata")
+			assert.Equal(t, 400, denied.Code)
+			assertAudit(denied, "rejected", "invalid_request", 0)
+		}
+		for _, path := range []string{"/api/v1/oauth/tokens/", "/api/v1/oauth/tokens?", "/api/v1/oauth/tokens?name=other", "/api/v1/oauth/%74okens"} {
+			r := httptest.NewRequest("POST", path, strings.NewReader(`{"name":"boundary"}`))
+			r.Header.Set("Authorization", "Bearer synthetic-metadata")
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, r)
+			assert.Equal(t, 400, w.Code)
+			assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+		}
+		for _, header := range []string{"X-Organization-ID", "X-HTTP-Method-Override"} {
+			r := httptest.NewRequest("POST", "/api/v1/oauth/tokens", strings.NewReader(`{"name":"boundary"}`))
+			r.Header.Set("Authorization", "Bearer synthetic-metadata")
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set(header, "1")
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, r)
+			assert.Equal(t, 400, w.Code)
+		}
+		for _, mismatch := range []struct {
+			field string
+			value any
+		}{{"client_id", "other-client"}, {"iss", "https://wrong-issuer.example"}, {"token_use", "refresh_token"}} {
+			old := claims[mismatch.field]
+			claims[mismatch.field] = mismatch.value
+			assert.Equal(t, 401, post(`{"name":"binding"}`, "synthetic-metadata").Code)
+			claims[mismatch.field] = old
+		}
+		oldActor := claims["sub"]
+		claims["sub"] = strconv.Itoa(f.users["foreign"].Id)
+		wrongActor := post(`{"name":"ordinary"}`, "synthetic-metadata")
+		assert.Equal(t, 401, wrongActor.Code)
+		assertNoAudit(wrongActor)
+		claims["sub"] = oldActor
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).UpdateColumn("status", common.UserStatusDisabled).Error)
+		disabled := post(`{"name":"ordinary"}`, "synthetic-metadata")
+		assert.Equal(t, 401, disabled.Code)
+		assertNoAudit(disabled)
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", grant.UserID).UpdateColumn("status", common.UserStatusEnabled).Error)
+		assert.Equal(t, initial, count(), "all rejected requests leave token table unchanged")
+		w := post(`{"name":"ordinary"}`, "synthetic-metadata")
+		require.Equal(t, 200, w.Code)
+		assert.Contains(t, w.Header().Get("Cache-Control"), "no-store")
+		var created struct {
+			Success bool
+			Data    struct {
+				ID        int
+				Name, Key string
+			}
+		}
+		require.NoError(t, common.Unmarshal(w.Body.Bytes(), &created))
+		require.True(t, created.Success)
+		createdAudit := assertAudit(w, "created", "none", created.Data.ID)
+		auditBytes, e := common.Marshal(createdAudit)
+		require.NoError(t, e)
+		assert.False(t, strings.Contains(string(auditBytes), created.Data.Key), "usable created key is never audited")
+		require.True(t, len(created.Data.Key) > 20, "created key must be usable")
+		var token model.Token
+		require.NoError(t, f.db.First(&token, created.Data.ID).Error)
+		assert.True(t, token.Key == created.Data.Key, "response matches persisted key")
+		assert.Equal(t, grant.UserID, token.UserId)
+		assert.Equal(t, "ordinary", token.Name)
+		assert.True(t, token.UnlimitedQuota)
+		assert.EqualValues(t, -1, token.ExpiredTime)
+		assert.Empty(t, token.Group)
+		assert.Zero(t, token.RemainQuota)
+		kind, e := model.ClassifyOAuthDerivedToken(t.Context(), token.Id)
+		require.NoError(t, e)
+		assert.Equal(t, model.OAuthDerivedTokenManualProven, kind)
+		var sources int64
+		require.NoError(t, f.db.Model(&model.OAuthDerivedTokenSource{}).Count(&sources).Error)
+		assert.Zero(t, sources)
+		var afterUser model.User
+		require.NoError(t, f.db.First(&afterUser, grant.UserID).Error)
+		assert.Equal(t, userBefore.Quota, afterUser.Quota)
+		assert.Equal(t, userBefore.UsedQuota, afterUser.UsedQuota)
+		var auditCountBefore int64
+		require.NoError(t, auditDB.Model(&model.AuditLog{}).Count(&auditCountBefore).Error)
+		metadata := request()
+		var auditCountAfter int64
+		require.NoError(t, auditDB.Model(&model.AuditLog{}).Count(&auditCountAfter).Error)
+		assert.Equal(t, auditCountBefore, auditCountAfter, "metadata GET never emits a key creation event")
+		require.Equal(t, 200, metadata.Code)
+		assert.False(t, strings.Contains(metadata.Body.String(), created.Data.Key), "GET must not disclose the new ordinary key")
+		var response struct{ Data []any }
+		require.NoError(t, common.Unmarshal(metadata.Body.Bytes(), &response))
+		assert.Empty(t, response.Data)
+		models := gin.New()
+		SetRelayRouter(models)
+		modelsRequest := httptest.NewRequest("GET", "/v1/models", nil)
+		modelsRequest.Header.Set("Authorization", "Bearer "+created.Data.Key)
+		modelsResponse := httptest.NewRecorder()
+		models.ServeHTTP(modelsResponse, modelsRequest)
+		assert.Equal(t, 200, modelsResponse.Code, "normal token authentication reaches the production model-list route")
+		oldLimit := operation_setting.GetTokenSetting().MaxUserTokens
+		ownedCount, e := model.CountUserTokens(grant.UserID)
+		require.NoError(t, e)
+		operation_setting.GetTokenSetting().MaxUserTokens = int(ownedCount)
+		defer func() { operation_setting.GetTokenSetting().MaxUserTokens = oldLimit }()
+		overLimit := post(`{"name":"over-limit"}`, "synthetic-metadata")
+		assert.Equal(t, 503, overLimit.Code)
+		assertAudit(overLimit, "rejected", "creation_unavailable", 0)
+		assert.Equal(t, initial+1, count())
+		operation_setting.GetTokenSetting().MaxUserTokens = oldLimit
+		t.Run("audit_insert_failure", func(t *testing.T) {
+			var inserts atomic.Int32
+			const callback = "ordinary-oauth:audit-unavailable"
+			require.NoError(t, auditDB.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "audit_logs" {
+					inserts.Add(1)
+					tx.AddError(errors.New("ordinary audit sink unavailable"))
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, auditDB.Callback().Create().Remove(callback)) })
+			before := count()
+			t.Run("success", func(t *testing.T) {
+				response := post(`{"name":"audit-unavailable"}`, "synthetic-metadata")
+				require.Equal(t, http.StatusOK, response.Code)
+				assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+				var body struct {
+					Success bool
+					Data    struct {
+						ID  int
+						Key string
+					}
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+				require.True(t, body.Success)
+				require.Positive(t, body.Data.ID)
+				require.True(t, len(body.Data.Key) > 20)
+				var stored model.Token
+				require.NoError(t, f.db.First(&stored, body.Data.ID).Error)
+				assert.True(t, body.Data.Key == stored.Key, "successful response retains its persisted ordinary key")
+				assert.Equal(t, grant.UserID, stored.UserId)
+				assert.True(t, stored.UnlimitedQuota)
+				assert.EqualValues(t, -1, stored.ExpiredTime)
+				assertNoAudit(response)
+				assert.Equal(t, before+1, count())
+				assert.False(t, strings.Contains(errorOutput.snapshot(), body.Data.Key), "audit error output excludes usable key")
+				assert.Contains(t, errorOutput.snapshot(), response.Header().Get(common.RequestIdKey))
+			})
+			t.Run("authenticated_rejection", func(t *testing.T) {
+				response := post(`{"name":"`+auditCanary+`","password":"`+auditCanary+`"}`, "synthetic-metadata")
+				assert.Equal(t, http.StatusBadRequest, response.Code)
+				assert.Contains(t, response.Body.String(), "invalid_request")
+				assert.NotContains(t, response.Body.String(), "data")
+				assertNoAudit(response)
+				assert.Equal(t, before+1, count(), "authenticated rejection creates no key even when audit is down")
+				assert.Contains(t, errorOutput.snapshot(), response.Header().Get(common.RequestIdKey))
+			})
+			assert.EqualValues(t, 2, inserts.Load(), "both new OAuth route outcomes attempt the real audit insert")
+			output := errorOutput.snapshot()
+			assert.Equal(t, 2, strings.Count(output, "ordinary audit sink unavailable"))
+			for _, secret := range []string{auditCanary, "synthetic-metadata", grant.GrantID, f.sids["owner"], created.Data.Key} {
+				assert.False(t, strings.Contains(output, secret), "audit error output excludes request capabilities")
+			}
+			t.Logf("ordinary audit failure attempts=%d output_sha256=%x credential_exposure=false", inserts.Load(), sha256.Sum256([]byte(output)))
+		})
+	})
+
 }
 
 // tokenMetadata checks the metadata envelope without treating it as a usage feed.

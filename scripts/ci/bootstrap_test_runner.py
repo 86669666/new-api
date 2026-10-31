@@ -25,18 +25,222 @@ import tempfile
 import threading
 import time
 
+# Installed-controller injection point, not a candidate CLI/environment option.
+# The outer controller owns producer isolation and returns a completed named
+# namespace. The constrained PG tier must use a root-authenticated proxy to it;
+# it must never acquire a Docker socket or create nested namespaces.
+OUTER_BIRTH = None
+
+
+class OuterBirthControlClient:
+    """Root-only constrained-controller transport; never exposed to test UID997.
+
+    The outer launcher must mount its control directory read-only at the fixed
+    path below and supply the root-custodied descriptor. This class does not
+    activate a hook, register a runner or create any namespaces/containers.
+    """
+    def __init__(self, attempt):
+        if os.geteuid() != 0 or not re.fullmatch('[a-zA-Z0-9_-]{1,80}', attempt):
+            raise ValueError('root controller required')
+        directory = Path('/run/newapi-formal-control')
+        descriptor = directory / 'control.json'
+        for path in (descriptor, *descriptor.parents):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError('outer control custody mismatch')
+        info = descriptor.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4096 or info.st_mode & 0o077:
+            raise ValueError('invalid outer control descriptor')
+        value = json.loads(descriptor.read_text())
+        if (set(value) != {'attempt', 'socket_device', 'socket_inode', 'nonce'} or value['attempt'] != attempt or
+                not re.fullmatch('[0-9a-f]{64}', value['nonce'])):
+            raise ValueError('outer control descriptor mismatch')
+        endpoint = directory / 'control.sock'
+        info = endpoint.lstat()
+        if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or
+                (info.st_dev, info.st_ino) != (value['socket_device'], value['socket_inode'])):
+            raise ValueError('outer control socket replaced')
+        self.attempt_id, self.nonce = attempt, value['nonce']
+        self.sequence, self.failed = 0, False
+        self.lock = threading.Lock()
+        self.connection = socket.socket(socket.AF_UNIX)
+        self.connection.settimeout(240)
+        try:
+            self.connection.connect(str(endpoint))
+            _, uid, gid = struct.unpack('3i', self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if (uid, gid) != (0, 0):
+                raise ValueError('outer server is not root')
+            self.reader = self.connection.makefile('rb')
+        except BaseException:
+            self.connection.close()
+            raise
+
+    def close(self):
+        self.failed = True
+        self.reader.close()
+        self.connection.close()
+
+    def request(self, operation, engine, purpose):
+        with self.lock:
+            if self.failed:
+                raise ValueError('outer control connection closed; no retry')
+            try:
+                message = dict(attempt=self.attempt_id, nonce=self.nonce, sequence=self.sequence,
+                               operation=operation, engine=engine, purpose=purpose)
+                self.connection.sendall(json.dumps(message, separators=(',', ':')).encode() + b'\n')
+                line = self.reader.readline(65537)
+                if not line.endswith(b'\n') or len(line) > 65536:
+                    raise ValueError('invalid outer control frame')
+                reply = json.loads(line)
+                if (type(reply) is not dict or set(reply) != {'sequence', 'result'} or
+                        type(reply['sequence']) is not int or reply['sequence'] != self.sequence):
+                    raise ValueError('outer control sequence or result mismatch')
+                self.sequence += 1
+                return reply['result']
+            except BaseException:
+                # An interrupted birth is ambiguous. Never reconnect/retry or
+                # fall back to executing a candidate producer as root.
+                self.close()
+                raise
+
+    def __call__(self, engine, purpose):
+        return self.request('birth', engine, purpose)
+
+    def producer_regression(self, expected_hash):
+        result = self.request('producer-regression', 'sqlite', '')
+        if (type(result) is not dict or set(result) != {'test_sha256', 'output_sha256', 'observed_exit', 'regression_complete'} or
+                result['test_sha256'] != expected_hash or type(result['observed_exit']) is not int or
+                result['observed_exit'] != 0 or result['regression_complete'] is not True or
+                not re.fullmatch('[0-9a-f]{64}', result['output_sha256'])):
+            self.close()
+            raise ValueError('outer producer regression incomplete or mismatched')
+        return result
+
+    def verify_daemon(self, engine, daemon):
+        if daemon is None:
+            raise ValueError('same owned daemon required')
+        observed = daemon.verify()
+        binding = hashlib.sha256(json.dumps(observed, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        remote = self.request('verify-daemon', engine, '')
+        if remote != {'binding': binding}:
+            self.close()
+            raise ValueError('outer and service daemon observations differ')
+
+
+class OuterDaemonBinding:
+    """Read-only root descriptor plus a locally observed SAME Unix endpoint.
+
+    The host process PID is not visible in the controller PID namespace. The
+    root control peer revalidates it; inode/device and UID bind the local mount
+    to that process, rather than pretending that PID zero is a local child.
+    Administrator credentials remain in this root-only descriptor and are used
+    only by existing trusted SQL methods, never by candidate service processes.
+    """
+    def __init__(self, engine):
+        if OUTER_BIRTH is None or os.geteuid() != 0 or engine not in ('postgres', 'mysql'):
+            raise ValueError('selected outer daemon required')
+        path = Path('/run/newapi-formal-control/daemon.json')
+        for item in (path, *path.parents):
+            info = item.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError('outer daemon descriptor custody mismatch')
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 8192:
+            raise ValueError('invalid private daemon descriptor')
+        value = json.loads(path.read_text())
+        if (set(value) != {'attempt', 'engine', 'socket_dir', 'socket_path', 'daemon_uid', 'password', 'version', 'identity'} or
+                value['attempt'] != OUTER_BIRTH.attempt_id or value['engine'] != engine or
+                not re.fullmatch('[0-9a-f]{64}', value['password']) or
+                type(value['daemon_uid']) is not int or value['daemon_uid'] in (0, 997)):
+            raise ValueError('outer daemon descriptor binding mismatch')
+        directory = Path('/opt/newapi-box-formal/captures') / value['attempt'] / 'resources' / ('pg-socket' if engine == 'postgres' else 'mysql-socket')
+        endpoint = directory / ('.s.PGSQL.5432' if engine == 'postgres' else 'mysql.sock')
+        if value['socket_dir'] != str(directory) or value['socket_path'] != str(endpoint):
+            raise ValueError('outer daemon endpoint path mismatch')
+        self.engine, self.value = engine, value
+        self.socket_dir, self.socket_path = directory, endpoint
+        self.identity = value['identity']
+        self.verify()
+
+    def verify(self):
+        directory, endpoint = self.socket_dir.lstat(), self.socket_path.lstat()
+        uid = self.value['daemon_uid']
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_mode & 0o022 or directory.st_uid != uid or
+                not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != uid or
+                (directory.st_dev, directory.st_ino, endpoint.st_dev, endpoint.st_ino) !=
+                (self.identity['directory_device'], self.identity['directory_inode'],
+                 self.identity['socket_device'], self.identity['socket_file_inode'])):
+            raise ValueError('outer daemon mounted endpoint replaced')
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(2)
+            connection.connect(str(self.socket_path))
+            pid, peer_uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if pid != 0 or peer_uid != uid:
+                raise ValueError('outer daemon peer not in separate owned PID namespace')
+        expected = hashlib.sha256(json.dumps(self.identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if OUTER_BIRTH.request('verify-daemon', self.engine, '') != {'binding': expected}:
+            raise ValueError('outer daemon host identity changed')
+        return dict(self.identity)
+
+    def bind(self, daemon):
+        daemon.socket_dir, daemon.socket_path = self.socket_dir, self.socket_path
+        daemon.daemon_uid = self.value['daemon_uid']
+        daemon.password, daemon.version = self.value['password'], self.value['version']
+        daemon.identity = dict(self.identity)
+
+
+def outer_birth(engine, purpose, daemon=None):
+    if OUTER_BIRTH is None:
+        return None
+    allowed = {'installer': ('sqlite',), 'postgres': ('postgres',),
+               'admission': ('sqlite',), 'wallet': ('sqlite', 'postgres', 'mysql')}
+    if os.geteuid() != 0 or engine not in allowed.get(purpose, ()):
+        raise ValueError('unadmitted outer birth operation')
+    # Only names cross the operation boundary: never commands, credentials,
+    # target paths or producer-supplied database observations.
+    if engine != 'sqlite':
+        OUTER_BIRTH.verify_daemon(engine, daemon)
+    result = OUTER_BIRTH(engine, purpose)
+    if (type(result) is not dict or set(result) != {'id', 'engine', 'target', 'journal', 'output_sha256'} or
+            result['engine'] != engine or not re.fullmatch('[0-9a-f]{32}', result['id']) or
+            not re.fullmatch('[0-9a-f]{64}', result['output_sha256'])):
+        raise ValueError('invalid completed outer birth')
+    attempt = OUTER_BIRTH.attempt_id
+    if not re.fullmatch('[a-zA-Z0-9_-]{1,80}', attempt):
+        raise ValueError('invalid outer attempt')
+    publication = Path('/opt/newapi-box-formal/work') / attempt
+    target, journal = Path(result['target']), Path(result['journal'])
+    if journal != publication / 'journals' / (result['id'] + '.json'):
+        raise ValueError('invalid outer journal path')
+    if engine == 'sqlite':
+        if target != publication / ('birth-' + result['id']) / 'new.db':
+            raise ValueError('invalid outer SQLite path')
+    elif result['target'] != 'birth_' + result['id']:
+        raise ValueError('outer SQL namespace mismatch')
+    # Root publication is checked independently of the transport response. The
+    # broker must mount this exact sealed journal read-only before returning.
+    for path in (journal, *journal.parents):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('outer journal custody mismatch')
+    state = json.loads(journal.read_text())
+    if state['phase'] != 'READY' or state['engine'] != engine or state['target'] != result['target']:
+        raise ValueError('outer birth not published READY')
+    return result
+
+
 DIALECT_TESTS = {
     'service': ('TestOAuthDerivedTextRawUsageRejection', 'TestOAuthDerivedTransportDatabaseCASWire'),
     'controller': ('TestOAuthDerivedSelectedHTTP',),
 }
 PRODUCER_TEST = 'TestOAuthBootstrapProducer'
-PG_IMAGE = 'sha256:ba9938eb70de48e82a511ea812eef26cc1399b0b072d6f2f7dc22a977e783401'
+PG_IMAGE = 'sha256:85b1ab67e7c7410b11da3f5b42913fc51b5b46f9cf5f07cc28a98e5f62083c5e'
 PG_SELECTOR = '^TestSessionRevocationS1Namespace$'
-JOINT_IMAGE = 'sha256:894680346c8e75455a0a6c969b7b8241aeb9b6e9c0d0d95689669153d4627c4d'
+JOINT_IMAGE = 'sha256:85b1ab67e7c7410b11da3f5b42913fc51b5b46f9cf5f07cc28a98e5f62083c5e'
 JOINT_SELECTOR = '^TestSessionRevocationS1RealRedis$'
-MYSQL_IMAGE = 'sha256:6ec0af605b45e088e789150f865fc1ad92434f6aab0e3f3ab27688312be19000'
+MYSQL_IMAGE = 'sha256:d78bbb8f2cfdeb362aff7fcbea6b7954bef6429bef26b308f0e65ca5d9410482'
 # Same MySQL base plus signed, pinned Redis runtime closure; lifecycle alone requires both.
-LIFECYCLE_MYSQL_IMAGE = 'sha256:029f948eedb0182550fa11bc4249927cc17970788230d999a8eb35909e48b131'
+LIFECYCLE_MYSQL_IMAGE = 'sha256:d78bbb8f2cfdeb362aff7fcbea6b7954bef6429bef26b308f0e65ca5d9410482'
 WALLET_TESTS = ('TestBillingSessionSQLAdmission', 'TestBillingLegacySQLRegressions')
 WALLET_ENGINES = ('sqlite', 'mysql', 'postgres')
 WALLET_SCENARIOS = ('arrears_retry', 'arrears_retry_held', 'arrears_retry_claimed', 'arrears_settle', 'held_refund', 'image_available', 'search_available', 'zero_held', 'trusted_held', 'task_zero_held', 'task_trusted_held')
@@ -49,6 +253,7 @@ def wallet_selector(engine):
 METADATA_SELECTOR = '^TestOAuthTokensConsumerHTTP$'
 METADATA_CASES = ('bridge_only_rejected', 'empty_current_grant_no_writes', 'wrong_client', 'wrong_actor', 'wrong_audience', 'wrong_issuer', 'refresh_bearer', 'expired', 'future', 'write_scope_not_supported', 'old_grant_missing_read_scope', 'post_encoding_revocation_discards_empty_success', 'missing_store_is_not_empty')
 METADATA_TIERS = tuple('metadata-'+e for e in WALLET_ENGINES)
+ORDINARY_AUDIT_SELECTOR = '^TestOAuthTokensConsumerHTTP$/^ordinary_key_creation$'
 LIFECYCLE_SELECTOR = '^TestOAuthDerivedTokenOwnerLifecycle$'
 LIFECYCLE_CASES = ('owner_reveal_and_mutation', 'revoke_and_rollback', 'disable_delete_rollback',
                    'unknown_is_not_manual', 'same_user_creation_limit', 'registration_default_token',
@@ -78,6 +283,10 @@ def prepare(args):
         raise ValueError('trusted provenance test runner requires Linux')
     if args.tier == 'all' and (args.package or args.run != '.'):
         raise ValueError('bounded selectors require an explicit resource --tier')
+    if args.tier == 'ordinary-audit' or args.tier in ORDINARY_AUDIT_SHARED:
+        if args.package not in (None, ['./router']) or args.run not in ('.', ORDINARY_AUDIT_SELECTOR):
+            raise ValueError('ordinary audit tier requires its exact OAuth route inventory')
+        args.package, args.run = ['./router'], ORDINARY_AUDIT_SELECTOR
     if args.tier in LIFECYCLE_TIERS:
         if args.package not in (None, ['./controller']) or args.run not in ('.', LIFECYCLE_SELECTOR):
             raise ValueError('lifecycle tier requires the exact controller lifecycle inventory')
@@ -235,7 +444,29 @@ def verified_manifest(bundle):
     return metadata
 
 
+def broker_inventory(bundle):
+    """Unprivileged inventory only; never evidence of completed formal tiers."""
+    if os.geteuid() != 997 or os.getegid() != 990 or os.getgroups():
+        raise ValueError('broker inventory requires isolated executor 997:990 without groups')
+    status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+    if status['NoNewPrivs'].strip() != '1' or int(status['CapEff'].strip(), 16) != 0:
+        raise ValueError('broker inventory forbids elevation and effective capabilities')
+    bundle = Path(bundle).absolute()
+    metadata = verified_manifest(bundle)
+    if metadata['tier'] != 'all':
+        raise ValueError('broker inventory requires full prepared manifest')
+    inventory = compiled_inventory(bundle, metadata['entries'])
+    partitions = resource_partitions(metadata['entries'], inventory)
+    if inventory != metadata.get('inventory') or partitions != metadata.get('partitions'):
+        raise ValueError('broker inventory differs from admitted full plan')
+    return {'scope': 'inventory-only', 'manifest_sha256': digest(bundle / 'manifest.json'),
+            'inventory': inventory, 'partitions': partitions}
+
+
 def required_leaves(tier):
+    if tier == 'ordinary-audit' or tier in ORDINARY_AUDIT_SHARED:
+        return ['TestOAuthTokensConsumerHTTP/ordinary_key_creation/audit_insert_failure/'+case
+                for case in ('success', 'authenticated_rejection')]
     if tier in LIFECYCLE_TIERS:
         return ['TestOAuthDerivedTokenOwnerLifecycle/'+case for case in LIFECYCLE_CASES]
     if tier in METADATA_TIERS:
@@ -279,8 +510,11 @@ def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
 
 def dispatch_tier(bundle, tier):
     metadata = verified_manifest(bundle)
-    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
+    if tier not in ('sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
         raise ValueError('dispatch tier mismatch')
+    if tier in ORDINARY_AUDIT_SHARED:
+        ordinary_audit_shared_dispatch(bundle,tier)
+        return
     if tier == 'admission':
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
         if available < 4*1024**3:raise RuntimeError('admission needs 1GiB tmpfs plus 3GiB process margin')
@@ -298,13 +532,13 @@ def dispatch_tier(bundle, tier):
                  'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && '+('ip link set lo up && ' if tier == 'metadata-sqlite' else '')+'exec "$@"',
                  'wallet-tests', sys.executable, str(bundle/'runner.py'), '_wallet_run', str(bundle), tier])
         return
-    if tier != 'sqlite':
+    if tier not in ('sqlite', 'ordinary-audit'):
         postgres_container(bundle, tier)
         return
     # Docker remains in the host controller, never this private net namespace.
     command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork',
              'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && ip link set lo up && exec "$@"',
-             'bootstrap-tests', sys.executable, str(bundle / 'runner.py'), '_run', str(bundle)])
+             'bootstrap-tests', sys.executable, str(bundle / 'runner.py'), '_run', str(bundle), tier])
 
 
 def execute_prepared(bundle, tier):
@@ -659,22 +893,31 @@ class Installer:
                             outcome = 'success'
                             continue
                         phase = 'data_create'
-                        ident = secrets.token_hex(16)
-                        data = self.root / ('data-' + ident)
-                        data.mkdir(mode=0o755)
-                        target = data / 'new.db'
-                        journal = self.root / 'journals' / (ident + '.json')
-                        argv = [str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(target), '--journal', str(journal)]
-                        phase = 'cli_begin'
-                        bootstrap_observation('installer', phase, started, pid, label=label)
-                        proc = subprocess.run(argv, env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
-                        cli_exit = proc.returncode
-                        phase = 'cli_return'
-                        bootstrap_observation('installer', phase, started, pid, label=label, cli_exit=cli_exit)
-                        self.receipts.append({'argv': argv, 'exit': proc.returncode, 'output_sha256': hashlib.sha256(proc.stdout).hexdigest(), 'peer_uid': peer_uid})
-                        if proc.returncode:
-                            outcome = 'cli_nonzero'
-                            continue
+                        completed_birth = outer_birth('sqlite', 'installer')
+                        if completed_birth is not None:
+                            ident = completed_birth['id']
+                            target = Path(completed_birth['target'])
+                            data = target.parent
+                            journal = Path(completed_birth['journal'])
+                            self.receipts.append({'operation': 'outer-birth', 'id': ident, 'exit': 0,
+                                'output_sha256': completed_birth['output_sha256'], 'peer_uid': peer_uid})
+                        else:
+                            ident = secrets.token_hex(16)
+                            data = self.root / ('data-' + ident)
+                            data.mkdir(mode=0o755)
+                            target = data / 'new.db'
+                            journal = self.root / 'journals' / (ident + '.json')
+                            argv = [str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(target), '--journal', str(journal)]
+                            phase = 'cli_begin'
+                            bootstrap_observation('installer', phase, started, pid, label=label)
+                            proc = subprocess.run(argv, env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+                            cli_exit = proc.returncode
+                            phase = 'cli_return'
+                            bootstrap_observation('installer', phase, started, pid, label=label, cli_exit=cli_exit)
+                            self.receipts.append({'argv': argv, 'exit': proc.returncode, 'output_sha256': hashlib.sha256(proc.stdout).hexdigest(), 'peer_uid': peer_uid})
+                            if proc.returncode:
+                                outcome = 'cli_nonzero'
+                                continue
                         phase = 'file_owner'
                         os.chown(target, self.uid, self.uid)
                         phase = 'file_mode'
@@ -910,6 +1153,7 @@ class OwnedPostgres:
         self.password = secrets.token_hex(32)
         self.births = {}
         self.commands = []
+        self.outer = None
 
     def sql(self, database, statement):
         if not re.fullmatch(r'[a-z][a-z0-9_]{0,47}', database):
@@ -925,6 +1169,8 @@ class OwnedPostgres:
         return q.stdout.decode().strip()
 
     def verify(self):
+        if self.outer is not None:
+            return self.outer.verify()
         if self.process is None or self.process.poll() is not None:
             raise RuntimeError('owned PG exited')
         # Container /proc is mounted in this PID namespace. Bind via peer PID,
@@ -971,6 +1217,11 @@ class OwnedPostgres:
         return identity
 
     def start(self):
+        if OUTER_BIRTH is not None:
+            self.outer = OuterDaemonBinding('postgres')
+            self.outer.bind(self)
+            return {'NEWAPI_BOOTSTRAP_ENGINE': 'postgres', 'NEWAPI_S2_MAIN': 'postgres',
+                    'NEWAPI_W01_MAIN_KIND': 'postgres', 'NEWAPI_BOOTSTRAP_TIER': 'postgres'}
         for name in ('postgres', 'initdb', 'psql'):
             p = self.bin / name
             st = p.stat()
@@ -1018,27 +1269,36 @@ class OwnedPostgres:
 
     def birth(self):
         self.verify()
-        ident = secrets.token_hex(16)
-        database, role, restricted = 'birth_'+ident, 'svc_'+ident, 'limited_'+ident
-        journal = self.root / 'journals' / (ident+'.json')
-        # URL syntax is the permanent product CLI contract. Password only in env.
-        admin = 'postgresql://bootstrap:'+self.password+'@/postgres?host='+str(self.socket_dir)+'&sslmode=disable'
-        q = subprocess.run([str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'postgres',
-                            '--target', database, '--journal', str(journal)],
-                           env={'PATH': '/usr/bin:/bin', 'GOMAXPROCS': '2', 'BOOTSTRAP_ADMIN_DSN': admin},
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-        self.commands.append({'operation': 'permanent CLI fresh', 'database': database, 'exit': q.returncode,
-                              'output_sha256': hashlib.sha256(q.stdout+q.stderr).hexdigest(), 'journal_phase': json.loads(journal.read_text()).get('phase') if journal.exists() else None, 'error': (q.stdout+q.stderr).decode(errors='replace').replace(self.password, '[redacted]') if q.returncode else None})
-        if q.returncode:
-            self.commands.append({'operation': 'birth failure boundary',
-                                  'lock_exists': Path(str(journal)+'.lock').exists(),
-                                  'protected_ancestors': [{'path': str(p), 'uid': p.stat().st_uid, 'mode': oct(p.stat().st_mode & 0o777)} for p in (journal.parent, self.root, Path('/run'), Path('/'))],
-                                  'admin_superuser': self.sql('postgres', 'SELECT rolsuper FROM pg_roles WHERE rolname=current_user;'),
-                                  'pg_error_categories': [category for category in ('password authentication failed', 'role does not exist', 'database does not exist', 'no pg_hba.conf entry', 'unsupported frontend protocol', 'invalid startup packet') if category in (self.root/'postgres.log').read_text()]})
-            raise RuntimeError('permanent PG birth failed')
-        j = json.loads(journal.read_text())
-        if j['phase'] != 'READY' or j['target'] != database or j['engine'] != 'postgres':
-            raise RuntimeError('PG birth journal mismatch')
+        completed_birth = outer_birth('postgres', 'postgres', self)
+        if completed_birth is not None:
+            ident = completed_birth['id']
+            database = completed_birth['target']
+            journal = Path(completed_birth['journal'])
+            role, restricted = 'svc_' + ident, 'limited_' + ident
+            self.commands.append({'operation': 'outer-birth', 'database': database, 'exit': 0,
+                                  'output_sha256': completed_birth['output_sha256']})
+        else:
+            ident = secrets.token_hex(16)
+            database, role, restricted = 'birth_'+ident, 'svc_'+ident, 'limited_'+ident
+            journal = self.root / 'journals' / (ident+'.json')
+            # URL syntax is the permanent product CLI contract. Password only in env.
+            admin = 'postgresql://bootstrap:'+self.password+'@/postgres?host='+str(self.socket_dir)+'&sslmode=disable'
+            q = subprocess.run([str(self.root / 'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', 'postgres',
+                                '--target', database, '--journal', str(journal)],
+                               env={'PATH': '/usr/bin:/bin', 'GOMAXPROCS': '2', 'BOOTSTRAP_ADMIN_DSN': admin},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            self.commands.append({'operation': 'permanent CLI fresh', 'database': database, 'exit': q.returncode,
+                                  'output_sha256': hashlib.sha256(q.stdout+q.stderr).hexdigest(), 'journal_phase': json.loads(journal.read_text()).get('phase') if journal.exists() else None, 'error': (q.stdout+q.stderr).decode(errors='replace').replace(self.password, '[redacted]') if q.returncode else None})
+            if q.returncode:
+                self.commands.append({'operation': 'birth failure boundary',
+                                      'lock_exists': Path(str(journal)+'.lock').exists(),
+                                      'protected_ancestors': [{'path': str(p), 'uid': p.stat().st_uid, 'mode': oct(p.stat().st_mode & 0o777)} for p in (journal.parent, self.root, Path('/run'), Path('/'))],
+                                      'admin_superuser': self.sql('postgres', 'SELECT rolsuper FROM pg_roles WHERE rolname=current_user;'),
+                                      'pg_error_categories': [category for category in ('password authentication failed', 'role does not exist', 'database does not exist', 'no pg_hba.conf entry', 'unsupported frontend protocol', 'invalid startup packet') if category in (self.root/'postgres.log').read_text()]})
+                raise RuntimeError('permanent PG birth failed')
+            j = json.loads(journal.read_text())
+            if j['phase'] != 'READY' or j['target'] != database or j['engine'] != 'postgres':
+                raise RuntimeError('PG birth journal mismatch')
         password = secrets.token_hex(32)
         self.sql(database, f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}'; CREATE ROLE {restricted} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; GRANT {restricted} TO {role}; REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE,CREATE ON SCHEMA public TO {role}; CREATE SCHEMA app; GRANT USAGE,CREATE ON SCHEMA app TO {role}; GRANT USAGE ON SCHEMA app TO {restricted};")
         # Exactly the existing organization fixture's mutable tables. History and
@@ -1073,6 +1333,9 @@ class OwnedPostgres:
         return receipt
 
     def close(self):
+        if self.outer is not None:
+            self.outer.verify()
+            return  # only the outer owner may stop the daemon
         if self.process is not None:
             if self.process.poll() is None:
                 self.process.send_signal(2)  # PostgreSQL fast shutdown, owns only this child.
@@ -1266,6 +1529,8 @@ class CombinedPostgres(OwnedPostgres):
         return result
 
     def verify(self):
+        if self.outer is not None:
+            return self.outer.verify()
         daemon_process_identity(self.process, self.daemon_uid)
         st = self.socket_dir.lstat()
         socket_stat = self.socket_path.lstat()
@@ -1372,8 +1637,12 @@ def trusted_run(bundle, tier="sqlite"):
     for required in ('new-api', 'runner.py'):
         if required not in metadata['files']:
             raise ValueError('missing producer input')
-    if tier not in ('sqlite', 'postgres', 'postgres-redis') or metadata.get('tier', 'sqlite') != tier:
+    if tier not in ('sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis') or metadata.get('tier', 'sqlite') != tier:
         raise ValueError('resource tier mismatch')
+    if tier == 'ordinary-audit' and (len(metadata['entries']) != 1 or
+            metadata['entries'][0]['cwd'] != 'router' or
+            metadata['entries'][0]['run'] != ORDINARY_AUDIT_SELECTOR):
+        raise ValueError('ordinary audit mandatory inventory mismatch')
     if tier in ('postgres', 'postgres-redis') and (len(metadata['entries']) != 1 or metadata['entries'][0]['cwd'] != 'router' or metadata['entries'][0]['run'] != (PG_SELECTOR if tier == 'postgres' else JOINT_SELECTOR)):
         raise ValueError('PG mandatory inventory mismatch')
     if tier in ('postgres', 'postgres-redis'):
@@ -1455,7 +1724,14 @@ def trusted_run(bundle, tier="sqlite"):
         for entry in metadata['entries']:
             if entry['cwd'] == 'model':
                 print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='producer')), flush=True)
-                command([str(root / 'bundle' / entry['binary']), '-test.run=^' + PRODUCER_TEST + '$', '-test.v'], cwd=root / 'bundle/source/model', env=dict(env, NEWAPI_BOOTSTRAP_ROOT_TEST_DIR=str(root / 'producer-tests')))
+                if OUTER_BIRTH is not None:
+                    # The host observes the isolated uid997 test process. Never
+                    # launch a candidate producer/test as this controller's root.
+                    if tier != 'sqlite':
+                        raise ValueError('outer producer regression requires sqlite tier')
+                    OUTER_BIRTH.producer_regression(metadata['files'][entry['binary']])
+                else:
+                    command([str(root / 'bundle' / entry['binary']), '-test.run=^' + PRODUCER_TEST + '$', '-test.v'], cwd=root / 'bundle/source/model', env=dict(env, NEWAPI_BOOTSTRAP_ROOT_TEST_DIR=str(root / 'producer-tests')))
                 print('BOOTSTRAP_TEST_END '+json.dumps(dict(entry, phase='producer', exit=0)), flush=True)
         installer = Installer(root, uid, redis_resource, pg_resource, metadata)
         thread = threading.Thread(target=installer.serve)
@@ -1471,8 +1747,9 @@ def trusted_run(bundle, tier="sqlite"):
             print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='ordinary')), flush=True)
             if redis_resource:
                 redis_resource.verify()
-            if pg_resource:
-                pg_resource.verify()
+            if pg_resource or tier == 'ordinary-audit':
+                if pg_resource:
+                    pg_resource.verify()
                 installer.process_ready.clear()
                 with subprocess.Popen(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid), stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
                     installer.process = process
@@ -1487,7 +1764,8 @@ def trusted_run(bundle, tier="sqlite"):
                 output = result.stdout.decode(errors='replace')
                 print(output, end='', flush=True)
                 validate_required_output(tier, output, result.returncode)
-                pg_resource.verify()
+                if pg_resource:
+                    pg_resource.verify()
             else:
                 command(argv, cwd=root / 'bundle/source' / cwd, env=env, preexec_fn=lambda: demote(uid))
             if redis_resource:
@@ -1654,13 +1932,21 @@ class AdmissionFixture:
         self.identity = root.stat()
         for name, gid, mode in [('data', broker_uid, 0o750), ('socket', broker_uid, 0o771), ('control', 0, 0o755)]:
             p = root/name; p.mkdir(); os.chown(p, 0, gid); p.chmod(mode)
-        self.db, self.journal = root/'data/main.db', root/'control/birth.json'
-        producer = root.parent/'bundle/new-api'
-        birth = subprocess.run([str(producer), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(self.db), '--journal', str(self.journal)],
-                               env={'PATH':'/usr/bin:/bin'}, capture_output=True, timeout=90)
-        print(json.dumps({'admission_birth': case, 'exit': birth.returncode, 'output_sha256': hashlib.sha256(birth.stdout+birth.stderr).hexdigest()}), flush=True)
-        if birth.returncode or json.loads(self.journal.read_text())['phase'] != 'READY':
-            raise ValueError('permanent birth failed')
+        completed_birth = outer_birth('sqlite', 'admission')
+        if completed_birth is not None:
+            self.db, self.journal = Path(completed_birth['target']), Path(completed_birth['journal'])
+            print(json.dumps({'admission_birth': case, 'exit': 0,
+                              'output_sha256': completed_birth['output_sha256']}), flush=True)
+        else:
+            self.db, self.journal = root/'data/main.db', root/'control/birth.json'
+            producer = root.parent/'bundle/new-api'
+            birth = subprocess.run([str(producer), 'db-bootstrap', 'fresh', '--engine', 'sqlite', '--target', str(self.db), '--journal', str(self.journal)],
+                                   env={'PATH':'/usr/bin:/bin'}, capture_output=True, timeout=90)
+            print(json.dumps({'admission_birth': case, 'exit': birth.returncode, 'output_sha256': hashlib.sha256(birth.stdout+birth.stderr).hexdigest()}), flush=True)
+            if birth.returncode or json.loads(self.journal.read_text())['phase'] != 'READY':
+                raise ValueError('permanent birth failed')
+        if completed_birth is not None:
+            os.chown(self.db.parent, 0, broker_uid); self.db.parent.chmod(0o770)
         os.chown(self.db, 0, broker_uid); self.db.chmod(0o660); (root/'data').chmod(0o770)
         os.chown(self.journal,0,broker_uid);self.journal.chmod(0o640)
         conn = sqlite3.connect(self.db)
@@ -1764,7 +2050,7 @@ class AdmissionFixture:
                 try:
                     os.setsid()
                     libc=ctypes.CDLL(None,use_errno=True)
-                    if libc.prctl(4,0,0,0,0):os._exit(1)
+                    if libc.prctl(4,0,0,0,0) or Path('/proc/sys/fs/suid_dumpable').read_text().strip()!='0':os._exit(1)
                     # No installer listener, journal, database, barrier or log
                     # descriptor may survive into a service-UID probe.
                     for fd in inherited:
@@ -2193,6 +2479,7 @@ class OwnedWalletMySQL:
         self.process = self.log = self.identity = None
         self.password = secrets.token_hex(32)
         self.commands = []
+        self.outer = None
 
     def sql(self, database, statement, initial=False):
         if not re.fullmatch(r'[a-z][a-z0-9_]{0,47}', database):
@@ -2208,6 +2495,8 @@ class OwnedWalletMySQL:
         return q.stdout.decode().strip()
 
     def verify(self):
+        if self.outer is not None:
+            return self.outer.verify()
         with WalletObservation('wallet_mysql_verify'):
             daemon_process_identity(self.process, self.daemon_uid)
             st, endpoint = self.socket_dir.lstat(), self.socket_path.lstat()
@@ -2234,6 +2523,10 @@ class OwnedWalletMySQL:
             return identity
 
     def start(self):
+        if OUTER_BIRTH is not None:
+            self.outer = OuterDaemonBinding('mysql')
+            self.outer.bind(self)
+            return
         for executable in (self.executable, Path('/usr/bin/mysql')):
             st = executable.stat()
             if st.st_uid != 0 or st.st_mode & 0o022 or not stat.S_ISREG(st.st_mode):
@@ -2264,6 +2557,9 @@ class OwnedWalletMySQL:
         self.version = self.sql('mysql', 'SELECT VERSION();')
 
     def close(self):
+        if self.outer is not None:
+            self.outer.verify()
+            return  # only the outer owner may stop the daemon
         if self.process and self.process.poll() is None:
             self.process.terminate()
             try:self.process.wait(timeout=20)
@@ -2369,28 +2665,38 @@ class WalletInstaller:
 
     def birth(self):
         if self.resource:self.resource.verify()
-        ident = secrets.token_hex(16)
-        journal = self.root/'journals'/(ident+'.json')
-        env = {'PATH':'/usr/bin:/bin', 'GOMAXPROCS':'2'}
-        role, password = 'owner_'+ident[:20], secrets.token_hex(32)
-        if self.engine == 'sqlite':
-            data = self.root/('data-'+ident);data.mkdir(mode=0o700)
-            database = str(data/'main.db')
+        completed_birth = outer_birth(self.engine, 'wallet', self.resource)
+        if completed_birth is not None:
+            ident, database = completed_birth['id'], completed_birth['target']
+            journal = Path(completed_birth['journal'])
+            role, password = 'owner_' + ident[:20], secrets.token_hex(32)
+            if self.engine == 'sqlite':
+                data = Path(database).parent
+            print(json.dumps({'wallet_birth': ident, 'engine': self.engine, 'exit': 0,
+                              'output_sha256': completed_birth['output_sha256']}), flush=True)
         else:
-            database = 'birth_'+ident
-            if self.engine == 'postgres':
-                env['BOOTSTRAP_ADMIN_DSN'] = 'postgresql://bootstrap:'+self.resource.password+'@/postgres?host='+str(self.resource.socket_dir)+'&sslmode=disable'
+            ident = secrets.token_hex(16)
+            journal = self.root/'journals'/(ident+'.json')
+            env = {'PATH':'/usr/bin:/bin', 'GOMAXPROCS':'2'}
+            role, password = 'owner_'+ident[:20], secrets.token_hex(32)
+            if self.engine == 'sqlite':
+                data = self.root/('data-'+ident);data.mkdir(mode=0o700)
+                database = str(data/'main.db')
             else:
-                env['BOOTSTRAP_ADMIN_DSN'] = 'root:'+self.resource.password+'@unix('+str(self.resource.socket_path)+')/mysql?parseTime=true'
-        result = subprocess.run([str(self.root/'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', self.engine,
-            '--target', database, '--journal', str(journal)], env=env, capture_output=True, timeout=120)
-        print(json.dumps({'wallet_birth':ident, 'engine':self.engine, 'exit':result.returncode,
-            'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest()}),flush=True)
-        if result.returncode:
-            raise RuntimeError('permanent wallet birth failed')
-        j = json.loads(journal.read_text())
-        if j['phase'] != 'READY' or j['engine'] != self.engine or j['target'] != database:
-            raise RuntimeError('wallet birth identity mismatch')
+                database = 'birth_'+ident
+                if self.engine == 'postgres':
+                    env['BOOTSTRAP_ADMIN_DSN'] = 'postgresql://bootstrap:'+self.resource.password+'@/postgres?host='+str(self.resource.socket_dir)+'&sslmode=disable'
+                else:
+                    env['BOOTSTRAP_ADMIN_DSN'] = 'root:'+self.resource.password+'@unix('+str(self.resource.socket_path)+')/mysql?parseTime=true'
+            result = subprocess.run([str(self.root/'bundle/new-api'), 'db-bootstrap', 'fresh', '--engine', self.engine,
+                '--target', database, '--journal', str(journal)], env=env, capture_output=True, timeout=120)
+            print(json.dumps({'wallet_birth':ident, 'engine':self.engine, 'exit':result.returncode,
+                'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest()}),flush=True)
+            if result.returncode:
+                raise RuntimeError('permanent wallet birth failed')
+            j = json.loads(journal.read_text())
+            if j['phase'] != 'READY' or j['engine'] != self.engine or j['target'] != database:
+                raise RuntimeError('wallet birth identity mismatch')
         provenance = self.snapshot(database)
         file_identity = None
         if self.engine == 'sqlite':
@@ -2694,7 +3000,306 @@ assert os.getgroups()==[] and 'NoNewPrivs:\\t1' in open('/proc/self/status').rea
             'required_leaves':required_leaves(tier),'exit':status,'cleanup':True},sort_keys=True),flush=True)
 
 
+# These explicit daily audit jobs reuse shared engines, never the gate databases
+# or wallet owner protocol. The only mutable names have a generated W01/W82 prefix.
+ORDINARY_AUDIT_SHARED = ('ordinary-audit-mysql', 'ordinary-audit-postgres', 'ordinary-audit-clickhouse')
+ORDINARY_AUDIT_IMAGE = 'sha256:85b1ab67e7c7410b11da3f5b42913fc51b5b46f9cf5f07cc28a98e5f62083c5e'
+ORDINARY_AUDIT_RESOURCES = {
+ 'mysql': ('newapi-cherry-20261022-mysql', 'sha256:6cd09145362dfe6831b14545de3d5fd6cc75c37cfd6ef8561429c1fc73518b39', '/usr/sbin/mysqld', 3306),
+ 'postgres': ('newapi-cherry-20261022-postgres', 'sha256:20fd00b87c6f0a89c5defff2312154761c1d84580af196bcaac19dcb0bf51547', '/usr/lib/postgresql/15/bin/postgres', 5432),
+ 'clickhouse': ('newapi-cherry-20261022-clickhouse', 'sha256:21c0b0ead100ba822e65cb5d1e467824be8df4af88e5972ada0ab1556d47b8c3', '/usr/bin/clickhouse', 9000),
+}
+
+
+def ordinary_audit_shared_dispatch(bundle, tier):
+    # Docker control stays in the outer host controller. The test container gets
+    # neither a daemon socket nor host networking, and starts no database daemon.
+    metadata = verified_manifest(bundle)
+    expected = [{'binary': 'test-0', 'cwd': 'router', 'run': ORDINARY_AUDIT_SELECTOR}]
+    if tier not in ORDINARY_AUDIT_SHARED or metadata['tier'] != tier or metadata['entries'] != expected:
+        raise ValueError('ordinary audit shared inventory mismatch')
+    kind = tier.removeprefix('ordinary-audit-')
+    name, image, executable, port = ORDINARY_AUDIT_RESOURCES[kind]
+    info = json.loads(subprocess.check_output(['docker', 'inspect', name]))[0]
+    if info['Image'] != image or not info['State']['Running']:
+        raise ValueError('ordinary audit shared engine identity mismatch')
+    executable_hash=None
+    if kind=='clickhouse':
+        # The exec attach transport returned empty EOF for this large binary.
+        # Stream one fixed executable through Docker's archive API instead;
+        # never copy an image, retain a binary, or accept an external digest.
+        import tarfile
+        archive=subprocess.Popen(['docker','cp',info['Id']+':'+executable,'-'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            with tarfile.open(fileobj=archive.stdout,mode='r|') as stream:
+                member=stream.next()
+                if member is None or not member.isfile() or member.name!='clickhouse' or not 0<member.size<=2*1024**3:
+                    raise ValueError('ordinary audit daemon archive identity mismatch')
+                reader=stream.extractfile(member);hasher=hashlib.sha256();total=0
+                for block in iter(lambda:reader.read(1024**2),b''):
+                    total+=len(block);hasher.update(block)
+                if total!=member.size or stream.next() is not None:raise ValueError('ordinary audit daemon archive incomplete')
+                executable_hash=hasher.hexdigest()
+            archive.stdout.close()
+            if archive.wait(timeout=30):raise RuntimeError('ordinary audit daemon archive failed')
+        finally:
+            archive.stdout.close()
+            if archive.poll() is None:archive.kill();archive.wait(timeout=5)
+            archive.stderr.close()
+    else:
+        observed=subprocess.run(['docker','exec',info['Id'],'sha256sum',executable],capture_output=True)
+        match=re.fullmatch(rb'([0-9a-f]{64})  '+re.escape(executable.encode())+rb'\n',observed.stdout)
+        if observed.returncode==0 and match:executable_hash=match[1].decode()
+    if executable_hash is None:raise RuntimeError('ordinary audit daemon hash receipt unavailable')
+    env = dict(item.split('=', 1) for item in info['Config']['Env'] if '=' in item)
+    if kind == 'mysql':
+        if not env.get('MYSQL_ROOT_PASSWORD') and env.get('MYSQL_ALLOW_EMPTY_PASSWORD') not in ('yes','1','true'):raise ValueError('shared MySQL administrator credential unavailable')
+        admin = 'root:'+env.get('MYSQL_ROOT_PASSWORD','')+'@unix(/audit-sockets/mysql.sock)/mysql?parseTime=true'
+    elif kind == 'postgres':
+        from urllib.parse import quote
+        if not env.get('POSTGRES_PASSWORD') and env.get('POSTGRES_HOST_AUTH_METHOD')!='trust':raise ValueError('shared PostgreSQL administrator credential unavailable')
+        admin = 'postgresql://'+quote(env.get('POSTGRES_USER', 'postgres'), safe='')+':'+quote(env.get('POSTGRES_PASSWORD',''), safe='')+'@/postgres?host=/audit-sockets&sslmode=disable'
+    else:
+        from urllib.parse import urlencode
+        if not env.get('CLICKHOUSE_PASSWORD') and env.get('CLICKHOUSE_SKIP_USER_SETUP')!='1':raise ValueError('shared ClickHouse administrator credential unavailable')
+        admin = 'clickhouse://127.0.0.1:9000/default?'+urlencode({'username':env.get('CLICKHOUSE_USER','default'), 'password':env.get('CLICKHOUSE_PASSWORD','')})
+    size = sum((bundle/n).stat().st_size for n in metadata['files'])
+    available = int(re.search(r'^MemAvailable:\s+(\d+)', Path('/proc/meminfo').read_text(), re.M)[1])*1024
+    if size+1024**3 >= 4*1024**3 or available < size+1024**3+3*1024**3:
+        raise RuntimeError('ordinary audit memory budget unavailable')
+    subprocess.run(['docker','image','inspect',ORDINARY_AUDIT_IMAGE],check=True,stdout=subprocess.DEVNULL)
+    merged=info.get('GraphDriver',{}).get('Data',{}).get('MergedDir','')
+    if kind!='clickhouse' and not re.fullmatch(r'/var/lib/docker/overlay2/[0-9a-f]{64}/merged',merged):raise ValueError('shared engine socket mount substrate unsupported')
+    cid = None
+    try:
+        cid = subprocess.check_output(['docker','create','--pull=never','--network=container:'+info['Id'],
+            '--pid=container:'+info['Id'],'--read-only','--security-opt=no-new-privileges',
+            '--cap-drop=ALL','--cap-add=SETUID','--cap-add=SETGID','--cap-add=CHOWN','--cap-add=FOWNER',
+            '--cap-add=DAC_OVERRIDE','--cap-add=KILL','--memory=3g','--pids-limit=128',
+            '--tmpfs=/run:rw,exec,nosuid,nodev,size=4g,mode=0755',
+            '--tmpfs=/var/lib/postgresql/data:rw,noexec,nosuid,nodev,size=1m,mode=0700',
+            *(['--mount=type=bind,src='+merged+('/run/mysqld/mysqld.sock' if kind=='mysql' else '/run/postgresql/.s.PGSQL.5432')+',dst=/audit-sockets/'+('mysql.sock' if kind=='mysql' else '.s.PGSQL.5432')+',readonly'] if kind!='clickhouse' else []),
+            '--entrypoint=/bin/sleep',ORDINARY_AUDIT_IMAGE,'600'],text=True).strip()
+        command(['docker','start',cid],stdout=subprocess.DEVNULL)
+        command(['docker','exec',cid,'mkdir','/run/input'])
+        archive=subprocess.Popen(['tar','-C',str(bundle),'-cf','-','.'],stdout=subprocess.PIPE)
+        try:command(['docker','exec','-i',cid,'tar','-xf','-','-C','/run/input'],stdin=archive.stdout)
+        finally:
+            archive.stdout.close()
+            if archive.wait()!=0:raise RuntimeError('ordinary audit bundle stream failed')
+        control=json.dumps({'admin':admin,'exe_sha256':executable_hash,'port':port,'engine_image':image}).encode()
+        subprocess.run(['docker','exec','-i',cid,'sh','-c','umask 077; cat > /run/audit-control.json'],input=control,check=True)
+        command(['docker','exec','-d',cid,'sh','-c',
+            'umask 077; python3 /run/input/runner.py _ordinary_audit_shared /run/input '+tier+' < /run/audit-control.json > /run/audit-result.log 2>&1; printf "%s\\n" "$?" > /run/audit-result.exit'])
+        deadline=time.monotonic()+480
+        receipt=None
+        while receipt is None:
+            probe=subprocess.run(['docker','exec',cid,'sh','-c',
+                'if test -f /run/audit-result.exit; then printf "AUDIT_DONE:"; cat /run/audit-result.exit; sha256sum /run/audit-result.log; fi'],capture_output=True)
+            match=re.fullmatch(rb'AUDIT_DONE:([0-9]{1,3})\n([0-9a-f]{64})  /run/audit-result.log\n',probe.stdout)
+            if probe.returncode==0 and match:receipt=(int(match[1]),match[2].decode());break
+            if time.monotonic()>=deadline:raise RuntimeError('ordinary audit completion receipt unavailable')
+            time.sleep(0.2)
+        output=b''
+        while hashlib.sha256(output).hexdigest()!=receipt[1]:
+            read=subprocess.run(['docker','exec',cid,'cat','/run/audit-result.log'],capture_output=True)
+            if read.returncode==0:output=read.stdout
+            if hashlib.sha256(output).hexdigest()==receipt[1]:break
+            if time.monotonic()>=deadline:raise RuntimeError('ordinary audit retained output hash unavailable')
+            time.sleep(0.2)
+        exit_code=receipt[0]
+        print('ORDINARY_AUDIT_EXEC '+json.dumps({'exit':exit_code,'output_bytes':len(output),'output_sha256':hashlib.sha256(output).hexdigest()}),flush=True)
+        sys.stdout.buffer.write(output);sys.stdout.flush()
+        after = json.loads(subprocess.check_output(['docker','inspect',name]))[0]
+        if (after['Id'],after['Image'],after['State']['Pid'],after['State']['StartedAt']) != (info['Id'],info['Image'],info['State']['Pid'],info['State']['StartedAt']):
+            raise RuntimeError('ordinary audit shared engine changed')
+        validate_required_output(tier,output.decode(errors='replace'),exit_code)
+        print('ORDINARY_AUDIT_SHARED_RESOURCE '+json.dumps({'engine':kind,'container_id':info['Id'],'engine_image':image,
+            'tool_image':ORDINARY_AUDIT_IMAGE,'exe_sha256':executable_hash,'engine_unchanged':True}),flush=True)
+    finally:
+        if cid:
+            command(['docker','rm','-f',cid],stdout=subprocess.DEVNULL)
+            print('ORDINARY_AUDIT_TOOL_CLEANUP '+json.dumps({'container_id':cid,'removed':True,'shared_engine_touched':False}),flush=True)
+
+
+def ordinary_audit_shared_kernel(kind, expected):
+    # Shared engines are deliberately not claimed as owned Popen children.
+    # Observe their current executable and listener from their same PID/net NS.
+    # A fixed fork-only, nondumpable same-UID observer reads kernel metadata;
+    # only its root-held socketpair can carry a complete successful result.
+    comm = {'mysql':'mysqld','postgres':'postgres','clickhouse':'clickhouse-serv'}[kind]
+    listeners = set()
+    for name in ('tcp','tcp6'):
+        for line in Path('/proc/net/'+name).read_text().splitlines()[1:]:
+            row=line.split()
+            if row[3]=='0A' and int(row[1].split(':')[1],16)==expected['port']:listeners.add(row[9])
+    if kind!='clickhouse':
+        path='/var/run/mysqld/mysqld.sock' if kind=='mysql' else '/var/run/postgresql/.s.PGSQL.5432'
+        rows=[r.split() for r in Path('/proc/net/unix').read_text().splitlines()[1:]]
+        unix=[r[6] for r in rows if len(r)==8 and r[7]==path and r[3]=='00010000']
+        if len(unix)!=1:raise RuntimeError('ordinary audit Unix listener missing')
+        listeners.update(unix)
+    if not listeners:raise RuntimeError('ordinary audit listener missing')
+    candidates=[]
+    for p in Path('/proc').glob('[0-9]*'):
+        try:
+            if not (p/'comm').read_text().strip().startswith(comm):continue
+            status=dict(l.split(':',1) for l in (p/'status').read_text().splitlines() if ':' in l)
+            candidates.append((int(p.name),int(status['Uid'].split()[0]),(p/'stat').read_text().rsplit(')',1)[1].split()[19]))
+        except (FileNotFoundError,ProcessLookupError):continue
+    # PG backends may share the executable but only the postmaster owns every
+    # fixed-port listening socket. Require exactly one matching kernel result.
+    results=[]
+    for pid,uid,start in candidates:
+        if uid==0:raise RuntimeError('shared database daemon must be nonroot')
+        parent,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET);parent.settimeout(3)
+        inherited=[int(p.name) for p in Path('/proc/self/fd').iterdir()]
+        observer=os.fork()
+        if observer==0:
+            try:
+                parent.close();os.setsid();libc=ctypes.CDLL(None,use_errno=True)
+                if libc.prctl(4,0,0,0,0) or Path('/proc/sys/fs/suid_dumpable').read_text().strip()!='0':os._exit(1)
+                demote(uid)
+                if libc.prctl(4,0,0,0,0) or libc.prctl(3,0,0,0,0)!=0:os._exit(1)
+                for fd in inherited:
+                    if fd!=child.fileno():
+                        try:os.close(fd)
+                        except OSError:pass
+                p=Path('/proc')/str(pid)
+                before=(p/'stat').read_text().rsplit(')',1)[1].split()[19]
+                exe=p/'exe';st=exe.stat();exe_hash=digest(exe)
+                fds=set()
+                for fd in (p/'fd').iterdir():
+                    try:fds.add(os.readlink(fd))
+                    except FileNotFoundError:pass
+                after=(p/'stat').read_text().rsplit(')',1)[1].split()[19]
+                ns={n:os.readlink(p/'ns'/n) for n in ('pid','net')}
+                if before!=start or after!=start or exe_hash!=expected['exe_sha256'] or not all('socket:['+n+']' in fds for n in listeners) or ns!={n:os.readlink('/proc/self/ns/'+n) for n in ns}:os._exit(2)
+                child.sendall(json.dumps({'pid':pid,'uid':uid,'start':start,'exe_sha256':exe_hash,'device':st.st_dev,'inode':st.st_ino,'listeners':sorted(listeners),'namespaces':ns}).encode());os._exit(0)
+            except BaseException:os._exit(1)
+        child.close();packet=b'';normal=False
+        try:
+            # Child may not have demoted yet; packet is accepted only after exit,
+            # not from filesystem JSON, INFO, or a service-supplied claim.
+            packet,_,flags,_=parent.recvmsg(4096)
+            if flags&socket.MSG_TRUNC or parent.recv(1):raise RuntimeError('ordinary audit observer framing')
+        except (TimeoutError,ConnectionResetError):
+            os.kill(observer,9)
+        finally:
+            parent.close();_,status=os.waitpid(observer,0);normal=os.WIFEXITED(status) and os.WEXITSTATUS(status)==0
+        if normal and packet:results.append(json.loads(packet))
+    if len(results)!=1:raise RuntimeError('ordinary audit daemon/listener observation unavailable or ambiguous')
+    return results[0]
+
+
+def ordinary_audit_shared_run(bundle,tier):
+    if os.geteuid()!=0 or tier not in ORDINARY_AUDIT_SHARED:raise ValueError('ordinary audit installer denied')
+    metadata=verified_manifest(bundle)
+    if metadata['tier']!=tier or metadata['entries']!=[{'binary':'test-0','cwd':'router','run':ORDINARY_AUDIT_SELECTOR}]:raise ValueError('ordinary audit inventory changed')
+    mounts=[r.split() for r in Path('/proc/mounts').read_text().splitlines() if len(r.split())>3]
+    run=[r for r in mounts if r[1]=='/run']
+    status=dict(l.split(':',1) for l in Path('/proc/self/status').read_text().splitlines() if ':' in l)
+    if (not os.statvfs('/').f_flag&os.ST_RDONLY or len(run)!=1 or run[0][2]!='tmpfs' or 'noexec' in run[0][3].split(',') or
+        not {'nosuid','nodev'}.issubset(run[0][3].split(',')) or os.statvfs('/run').f_blocks*os.statvfs('/run').f_frsize>4*1024**3 or
+        status['NoNewPrivs'].strip()!='1' or int(status['CapBnd'],16)&((1<<19)|(1<<21))):raise ValueError('ordinary audit isolation missing')
+    expected=json.loads(sys.stdin.buffer.read(8193))
+    if set(expected)!={'admin','exe_sha256','port','engine_image'}:raise ValueError('ordinary audit control input mismatch')
+    kind=tier.removeprefix('ordinary-audit-');kernel=ordinary_audit_shared_kernel(kind,expected)
+    root=Path(tempfile.mkdtemp(prefix='ordinary-audit-',dir='/run'));root.chmod(0o755)
+    (root/'bundle').mkdir(mode=0o755);(root/'bundle').chmod(0o755)
+    shutil.copyfile(bundle/'manifest.json',root/'bundle/manifest.json');(root/'bundle/manifest.json').chmod(0o644)
+    uid=200000+secrets.randbelow(100000000)
+    try:pwd.getpwuid(uid);raise ValueError('ordinary audit UID occupied')
+    except KeyError:pass
+    for p in Path('/proc').glob('[0-9]*/status'):
+        try:
+            if re.search(r'^Uid:\s+'+str(uid)+r'\s',p.read_text(),re.M):raise ValueError('ordinary audit UID active')
+        except (FileNotFoundError,PermissionError):pass
+    ident=secrets.token_hex(12);password=secrets.token_hex(32)
+    main_kind=kind if kind!='clickhouse' else 'sqlite'
+    main_name='newapi_w01_w82_'+ident+'_main';log_name='newapi_w01_w82_'+ident+'_log'
+    main_role='w82_'+ident[:20]+'_main';log_role='w82_'+ident[:20]+'_log'
+    (root/'journals').mkdir(mode=0o755);(root/'journals').chmod(0o755);(root/'data').mkdir(mode=0o700)
+    (root/'tmp').mkdir(mode=0o700);os.chown(root/'tmp',uid,uid)
+    journal=root/'journals/birth.json'
+    env={'PATH':'/usr/bin:/bin','GOMAXPROCS':'2'}
+    if main_kind!='sqlite':env['BOOTSTRAP_ADMIN_DSN']=expected['admin']
+    target=str(root/'data/main.db') if main_kind=='sqlite' else main_name
+    cfg={'MainKind':main_kind,'LogKind':kind,'MainDatabase':main_name,'LogDatabase':log_name,'MainRole':main_role,'LogRole':log_role,'Password':password,
+         'MainDSN':'','LogDSN':'','MainAdminDSN':expected['admin'] if main_kind!='sqlite' else '', 'LogAdminDSN':expected['admin'],
+         'UID':uid,'Journal':str(journal),'BinarySHA256':metadata['files']['test-0'],'ManifestSHA256':digest(bundle/'manifest.json')}
+    if kind=='mysql':
+        cfg['MainDSN']=main_role+':'+password+'@unix(/audit-sockets/mysql.sock)/'+main_name+'?parseTime=true'
+        cfg['LogDSN']=log_role+':'+password+'@unix(/audit-sockets/mysql.sock)/'+log_name+'?parseTime=true'
+    elif kind=='postgres':
+        cfg['MainDSN']='postgresql://'+main_role+':'+password+'@/'+main_name+'?host=/audit-sockets&sslmode=disable'
+        cfg['LogDSN']='postgresql://'+log_role+':'+password+'@/'+log_name+'?host=/audit-sockets&sslmode=disable'
+    else:
+        cfg['MainDSN']=target;cfg['LogDSN']='clickhouse://127.0.0.1:9000/'+log_name+'?username='+log_role+'&password='+password
+    print('ORDINARY_AUDIT_IDENTITY '+json.dumps({'tier':tier,'main_database':main_name,'log_database':log_name,'main_role':main_role,'log_role':log_role,'uid':uid}),flush=True)
+    private=root/'admin.json';public=root/'service.json'
+    private.write_text(json.dumps(cfg));private.chmod(0o600)
+    def fixture(mode):
+        result=subprocess.run([str(bundle/'test-0'),'-test.v','-test.run=^TestOAuthTokensConsumerHTTP$'],
+            cwd=bundle/'source/router',env=dict(env,NEWAPI_ORDINARY_AUDIT_CONFIG=str(private),NEWAPI_ORDINARY_AUDIT_SETUP=mode),capture_output=True,timeout=90)
+        # Installer errors are never echoed: a server may quote SQL/credentials.
+        print('ORDINARY_AUDIT_PROVISION '+json.dumps({'phase':mode,'exit':result.returncode,'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest(),
+            'source_lines':sorted(set(re.findall(r'oauth_public_test.go:[0-9]+',(result.stdout+result.stderr).decode(errors='replace'))))[-8:],
+            'metadata_controls':re.findall(r'^\s*--- (PASS|FAIL|SKIP): (TestOAuthTokensConsumerHTTP/(?:cleanup|grant|include)_metadata/[a-z0-9_]+) \(', result.stdout.decode(errors='replace'), re.M),
+            'compatibility_controls':re.findall(r'PG96_ROW_SHAPE_CONTROL actual_server=([0-9]+) modified_queries=([0-9]+) actual_96_runtime=false',result.stdout.decode(errors='replace'))}),flush=True)
+        if result.returncode:raise RuntimeError('ordinary audit fixture '+mode+' failed')
+    try:
+        result=subprocess.run([str(bundle/'new-api'),'db-bootstrap','fresh','--engine',main_kind,'--target',target,'--journal',str(journal)],env=env,capture_output=True,timeout=120)
+        print('ORDINARY_AUDIT_BIRTH '+json.dumps({'engine':main_kind,'exit':result.returncode,'output_sha256':hashlib.sha256(result.stdout+result.stderr).hexdigest()}),flush=True)
+        if result.returncode:raise RuntimeError('ordinary audit permanent birth failed')
+        birth=json.loads(journal.read_text())
+        if birth['phase']!='READY' or birth['target']!=target or birth['engine']!=main_kind:raise RuntimeError('ordinary audit birth mismatch')
+        fixture('provision')
+        if main_kind=='sqlite':os.chown(root/'data',uid,uid);os.chown(target,uid,uid)
+        public_cfg=dict(cfg,MainAdminDSN='',LogAdminDSN='')
+        public.write_text(json.dumps(public_cfg));os.chown(public,0,uid);public.chmod(0o640)
+        before=digest(journal)
+        service_env={'PATH':'/usr/bin:/bin','HOME':str(root/'tmp'),'TMPDIR':str(root/'tmp'),'GOMAXPROCS':'2','NEWAPI_ORDINARY_AUDIT_CONFIG':str(public)}
+        result=subprocess.run([str(bundle/'test-0'),'-test.v','-test.count=1','-test.run='+ORDINARY_AUDIT_SELECTOR],cwd=bundle/'source/router',
+            env=service_env,preexec_fn=lambda:demote(uid),capture_output=True,timeout=180)
+        sys.stdout.buffer.write(result.stdout+result.stderr);sys.stdout.flush()
+        validate_required_output(tier,result.stdout.decode(errors='replace'),result.returncode)
+        if digest(journal)!=before or ordinary_audit_shared_kernel(kind,expected)!=kernel:raise RuntimeError('ordinary audit birth/kernel changed')
+        print('ORDINARY_AUDIT_RESULT '+json.dumps({'tier':tier,'main_database':main_name,'log_database':log_name,'uid':uid,'kernel':kernel,
+            'manifest_sha256':digest(bundle/'manifest.json'),'binary_sha256':metadata['files']['test-0'],'runner_sha256':metadata['files']['runner.py'],
+            'journal_sha256':before,'exit':0,'required_leaves':required_leaves(tier),'source':'permanent CLI fresh; synthetic actors only'}),flush=True)
+    finally:
+        try:fixture('cleanup')
+        finally:shutil.rmtree(root)
+        print('ORDINARY_AUDIT_DATABASE_CLEANUP '+json.dumps({'main':main_name,'log':log_name,'cleanup':True}),flush=True)
+
+
+def run_outer_controller(bundle, tier):
+    """Future admitted entry; not selected by legacy local/hosted commands."""
+    global OUTER_BIRTH
+    if os.geteuid() != 0 or OUTER_BIRTH is not None:
+        raise ValueError('fresh trusted outer controller required')
+    value = json.loads(Path('/run/newapi-formal-control/control.json').read_text())
+    control = OuterBirthControlClient(value['attempt'])
+    OUTER_BIRTH = control
+    try:
+        if tier.startswith('wallet-') or tier in METADATA_TIERS or tier in LIFECYCLE_TIERS:
+            with WalletObservationCollector():
+                trusted_wallet_run(Path(bundle), tier)
+        elif tier in ('sqlite', 'ordinary-audit', 'postgres', 'postgres-redis'):
+            trusted_run(Path(bundle), tier)
+        else:
+            raise ValueError('unsupported outer controller tier')
+    finally:
+        OUTER_BIRTH = None
+        control.close()
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '_outer_run':
+        run_outer_controller(sys.argv[2], sys.argv[3]);return
+    if len(sys.argv)==4 and sys.argv[1]=="_ordinary_audit_shared":
+        ordinary_audit_shared_run(Path(sys.argv[2]),sys.argv[3]);return
     if len(sys.argv) == 4 and sys.argv[1] == '_wallet_run':
         with WalletObservationCollector():
             trusted_wallet_run(Path(sys.argv[2]), sys.argv[3])
@@ -2715,15 +3320,20 @@ def main():
         dispatch_tier(Path(sys.argv[2]), sys.argv[3])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; ordinary-audit uses SQLite and does not qualify external log stores')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
+    parser.add_argument('--broker-inventory', action='store_true', help='uid997 isolated inventory only; not formal execution')
     parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')
     parser.add_argument('--prepare-only', action='store_true', help='prepare for an isolated root container instead of local sudo')
     parser.add_argument('--package', action='append', help='bounded root-package check; default retains all three Go modules')
     parser.add_argument('--run', default='.', help='Go test selector; defaults to every test')
     args = parser.parse_args()
-    if args.execute_prepared:
+    if args.broker_inventory:
+        if args.execute_prepared or args.prepare_only or args.package or args.run != '.' or args.tier != 'all':
+            parser.error('--broker-inventory cannot change full-plan selectors or execute tiers')
+        print(json.dumps(broker_inventory(args.bundle), sort_keys=True))
+    elif args.execute_prepared:
         if args.prepare_only or args.package or args.run != '.':
             parser.error('--execute-prepared cannot change compiled selectors')
         execute_prepared(args.bundle, args.tier)

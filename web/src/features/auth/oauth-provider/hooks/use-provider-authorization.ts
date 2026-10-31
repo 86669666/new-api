@@ -50,6 +50,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
   const [balance, setBalance] = useState(false)
   const [usage, setUsage] = useState(false)
   const [tokens, setTokens] = useState(false)
+  const [tokensWrite, setTokensWrite] = useState(false)
   const mounted = useRef(false)
   const invalidated = useRef(false)
   const submitted = useRef(false)
@@ -70,6 +71,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
       entry.discard(ceremony)
     }
     if (mounted.current) {
+      setTokensWrite(false)
       setState({ kind: 'terminal' })
     }
   }, [ceremony, entry])
@@ -116,6 +118,7 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
       }
       setUsage(false)
       setTokens(false)
+      setTokensWrite(false)
       setState({ kind: 'ready', preview })
       clearTimeout(expiry.current)
       const expires = waiting.current
@@ -272,6 +275,10 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
             tokens &&
             preview.requested_scopes.includes('tokens:read') &&
             preview.allowed_scopes.includes('tokens:read'),
+          tokensWrite:
+            tokensWrite &&
+            preview.requested_scopes.includes('tokens:write') &&
+            preview.allowed_scopes.includes('tokens:write'),
           usage:
             usage &&
             preview.requested_scopes.includes('usage:read') &&
@@ -306,6 +313,8 @@ export function useProviderAuthorization(entry: AuthorizationEntry) {
     setUsage,
     tokens,
     setTokens,
+    tokensWrite,
+    setTokensWrite,
     decide,
     resume,
     cancel: stop,

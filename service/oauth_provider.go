@@ -134,7 +134,7 @@ func InitOAuthProviderBridge() error {
 	if public != "" && public != "false" && public != "true" {
 		return ErrOAuthProviderConfiguration
 	}
-	if _, err := NewOAuthPublic(OAuthPublicConfig{Enabled: public == "true", BaseURL: os.Getenv("OAUTH_PROVIDER_PUBLIC_BASE_URL")}, bridge); err != nil {
+	if _, err := NewOAuthPublic(OAuthPublicConfig{Enabled: public == "true", BaseURL: os.Getenv("OAUTH_PROVIDER_PUBLIC_BASE_URL"), DesktopClientID: os.Getenv("OAUTH_PROVIDER_DESKTOP_CLIENT_ID")}, bridge); err != nil {
 		return err
 	}
 	currentOAuthProvider.Store(bridge)
