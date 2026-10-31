@@ -129,6 +129,17 @@ func DeleteCustomOAuthProvider(id int) error {
 	return DB.Delete(&CustomOAuthProvider{}, id).Error
 }
 
+// reservedCustomOAuthSlugs cannot be used as a login-provider slug. The OAuth
+// provider routes and the built-in Telegram provider already own these names.
+var reservedCustomOAuthSlugs = map[string]struct{}{
+	"admin": {}, "consent": {}, "login": {}, "logout": {}, "provider": {}, "telegram": {},
+}
+
+func IsReservedCustomOAuthSlug(slug string) bool {
+	_, reserved := reservedCustomOAuthSlugs[strings.ToLower(strings.TrimSpace(slug))]
+	return reserved
+}
+
 // IsSlugTaken checks if a slug is already taken by another provider
 // Returns true on DB errors (fail-closed) to prevent slug conflicts
 func IsSlugTaken(slug string, excludeId int) bool {
@@ -161,8 +172,8 @@ func validateCustomOAuthProvider(provider *CustomOAuthProvider) error {
 		}
 	}
 	provider.Slug = slug
-	if slug == "telegram" {
-		return errors.New("the telegram slug is reserved for built-in Telegram OAuth; rename this custom provider")
+	if IsReservedCustomOAuthSlug(slug) {
+		return errors.New("This slug is reserved")
 	}
 
 	switch slug {

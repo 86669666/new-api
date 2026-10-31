@@ -220,6 +220,11 @@ func CreateCustomOAuthProvider(c *gin.Context) {
 		return
 	}
 
+	if model.IsReservedCustomOAuthSlug(req.Slug) {
+		common.ApiErrorT(c, "This slug is reserved")
+		return
+	}
+
 	// Check if slug is already taken
 	if model.IsSlugTaken(req.Slug, 0) {
 		common.ApiErrorT(c, "This slug is already in use")
@@ -312,6 +317,10 @@ func UpdateCustomOAuthProvider(c *gin.Context) {
 
 	// Check if new slug is taken by another provider
 	if req.Slug != "" && req.Slug != provider.Slug {
+		if model.IsReservedCustomOAuthSlug(req.Slug) {
+			common.ApiErrorT(c, "This slug is reserved")
+			return
+		}
 		if model.IsSlugTaken(req.Slug, id) {
 			common.ApiErrorT(c, "This slug is already in use")
 			return
