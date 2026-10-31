@@ -216,7 +216,11 @@ Proof 同时绑定用户、登录会话、用户鉴权版本、会话版本和 s
 
 ### 公开客户端注册与回调核对
 
-公开客户端应在私有 issuer 管理边界登记：`token_endpoint_auth_method=none`、`subject_type=public`，`grant_types` 恰为 `authorization_code` 与 `refresh_token`，`response_types` 恰为 `code`，`skip_consent=false`，audience 包含 gateway 配置的 audience。公开客户端不使用 client secret。登记 scopes 只能来自支持列表且包含 `profile`；登记后还须纳入 gateway 的客户端允许列表。此处是 operator 登记契约，不表示 gateway 已提供公开客户端 CRUD UI/API、管理二次验证或客户端变更审计；外部身份提供商配置也不是这类客户端注册入口。
+公开客户端在 Hydra Admin 上的登记形态是：`token_endpoint_auth_method=none`、`subject_type=public`，`grant_types` 恰为 `authorization_code` 与 `refresh_token`，`response_types` 恰为 `code`，`skip_consent=false`，audience 恰为 gateway 配置的 audience。公开客户端不使用 client secret。登记 scopes 只能来自支持列表且包含 `profile`。授权与换票路径仍要求 S256 PKCE。Hydra 的 `OAUTH2_PKCE_ENFORCED_FOR_PUBLIC_CLIENTS` 仍是部署要求；Admin 客户端文档没有单独的 PKCE 字段，同步请求也不会写入 client secret。
+
+控制台 `oauth_public_clients` 的创建、更新和删除由 [`CommitOAuthPublicClient`](../service/oauth_public_client.go) 写入。仅当进程内 provider bridge 与 public 服务同时生效（`OAuthProviderBridge.Public()` 非空，因此 revocation 也已启用）时，同一次本地事务才会在提交前调用 Hydra Admin：启用的客户端 `PUT /admin/clients/{id}`，若不存在则 `POST /admin/clients`；删除或 `enabled=false` 时 `DELETE /admin/clients/{id}`，404 视为已经删除。Hydra 回显必须与本次 client_id、名称、redirect、scope、grant、response type、audience 和 `skip_consent=false` 一致，事务才提交。Hydra 4xx 时 API 返回 HTTP 409 与 `OAUTH_PUBLIC_CLIENT_SYNC_REJECTED`；超时、连接失败或 5xx 返回 HTTP 503 与 `OAUTH_PUBLIC_CLIENT_SYNC_UNAVAILABLE`。这两种失败都回滚本地行，响应的 `success` 为 false，且不会出现 `hydra_synced: true`。任一开关未生效时不访问 Hydra，只提交本地行，成功响应里 `hydra_synced` 为 false。进程在 Hydra 已接受之后、本地提交之前退出时，Hydra 可能超前于本地行；接口不会报告成功，下一次成功的管理写入会再次对齐。同步不修改 `OAUTH_USERINFO_CLIENT_IDS`，公开代理仍只接受该允许列表中的客户端。外部身份提供商配置不是这类客户端注册入口。
+
+预设 Boxnai Desktop 与 Cherry Studio 的 scopes 为 `openid`、`profile`、`offline_access`、`tokens:write`。`balance:read`、`usage:read`、`tokens:read` 仍可选。`NormalizePublicOAuthClient` 仍强制包含 `profile`。
 
 下表对应 [`validOAuthProviderRedirect`](../service/oauth_provider.go) 与 [`OAuthPublic.client`](../service/oauth_public.go)。后者会用每个登记 URI 自身调用校验，因此登记值也必须满足规则。示例域名及回环端口仅说明协议，不指向真实部署。
 

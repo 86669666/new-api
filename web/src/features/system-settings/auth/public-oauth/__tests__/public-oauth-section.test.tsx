@@ -92,7 +92,7 @@ describe('PublicOAuthSection', () => {
             'http://127.0.0.1/oauth/callback',
             'boxnai://oauth/callback',
           ],
-          scopes: ['openid', 'profile', 'offline_access'],
+          scopes: ['openid', 'profile', 'offline_access', 'tokens:write'],
           grant_types: ['authorization_code', 'refresh_token'],
         },
       ],
@@ -109,6 +109,11 @@ describe('PublicOAuthSection', () => {
     render(<Fixture />)
 
     expect(await screen.findByText('existing-client')).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'Saving a client here records it in this console. When the public OAuth provider is enabled, the same client is registered with the authorization server. If that registration fails, the save fails and the console record stays unchanged.'
+      )
+    ).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Add client' }))
     await user.click(screen.getByRole('button', { name: 'Boxnai Desktop' }))
 
@@ -117,6 +122,7 @@ describe('PublicOAuthSection', () => {
     expect(screen.getByLabelText(/Redirect URIs/)).toHaveValue(
       'http://127.0.0.1/oauth/callback\nboxnai://oauth/callback'
     )
+    expect(screen.getByText('Write tokens')).toBeInTheDocument()
 
     await user.type(screen.getByLabelText(/Client ID/), 'boxnai-desktop-test')
     await user.click(screen.getByRole('button', { name: 'Create' }))
@@ -142,7 +148,12 @@ describe('PublicOAuthSection', () => {
       ],
     })
     expect(body.scopes).toEqual(
-      expect.arrayContaining(['openid', 'profile', 'offline_access'])
+      expect.arrayContaining([
+        'openid',
+        'profile',
+        'offline_access',
+        'tokens:write',
+      ])
     )
   })
 })

@@ -143,6 +143,12 @@ func InitOAuthProviderBridge() error {
 
 func CurrentOAuthProviderBridge() *OAuthProviderBridge { return currentOAuthProvider.Load() }
 
+// SetCurrentOAuthProviderBridge replaces the process-wide bridge and returns
+// the previous value. Tests install a local Admin stub and must restore it.
+func SetCurrentOAuthProviderBridge(bridge *OAuthProviderBridge) *OAuthProviderBridge {
+	return currentOAuthProvider.Swap(bridge)
+}
+
 func NewOAuthProviderBridge(config OAuthProviderConfig, resource *OAuthUserInfoResource) (*OAuthProviderBridge, error) {
 	if config.RevocationEnabled && (!config.Enabled || resource == nil) {
 		return nil, ErrOAuthProviderConfiguration

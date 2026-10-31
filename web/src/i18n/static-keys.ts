@@ -913,6 +913,8 @@ export const STATIC_I18N_KEYS = [
   'Authorized application not found',
   'Authorized application revoked',
   'OAuth revocation is unavailable',
+  'OAuth client registration was rejected',
+  'OAuth client registration is unavailable',
   'This slug is reserved',
   'Boxnai Desktop',
   'Cherry Studio',

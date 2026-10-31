@@ -27,8 +27,9 @@ import (
 )
 
 // OAuthPublicClient is the console registry for a public OAuth client.
-// It stores no client secret. Live issuer registration stays with the
-// configured authorization server.
+// It stores no client secret. A row here is not itself a Hydra registration:
+// when the public provider is active, the service commits the row only after
+// Hydra Admin accepts the same client_id.
 type OAuthPublicClient struct {
 	ID           int       `json:"id" gorm:"primaryKey"`
 	ClientID     string    `json:"client_id" gorm:"column:client_id;type:varchar(64);uniqueIndex;not null"`
