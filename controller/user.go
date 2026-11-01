@@ -893,7 +893,7 @@ func UpdateSelf(c *gin.Context) {
 			return
 		}
 		succeeded = true
-		notificationFailed = service.NotifyAccountSecurityChange(current.Email, "Password updated") != nil
+		notificationFailed = service.NotifyAccountSecurityChange(service.AccountMailLanguage(c, current.Id), current.Email, i18n.MsgSecurityEventPasswordUpdated) != nil
 		if err := model.PublishUserAuthCache(cleanUser.Id); err != nil {
 			writeSecurityOperationError(c, err)
 			return

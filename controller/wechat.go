@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
@@ -165,7 +166,7 @@ func WeChatBind(c *gin.Context) {
 		writeSecurityOperationError(c, err)
 		return
 	}
-	notificationFailed = service.NotifyAccountSecurityChange(user.Email, "WeChat account linked") != nil
+	notificationFailed = service.NotifyAccountSecurityChange(service.AccountMailLanguage(c, user.Id), user.Email, i18n.MsgSecurityEventWeChatLinked) != nil
 	data := authRotationData(bundle)
 	data["notification_warning"] = notificationFailed
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": data})
