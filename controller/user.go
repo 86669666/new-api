@@ -1423,20 +1423,21 @@ func UpdateUserSetting(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	existingSettings := user.GetSetting()
-	upstreamModelUpdateNotifyEnabled := existingSettings.UpstreamModelUpdateNotifyEnabled
+	// 保留不由此表单管理的语言、侧边栏和扣费策略等设置。
+	settings := user.GetSetting()
+	settings.NotifyType = req.QuotaWarningType
+	settings.QuotaWarningThreshold = req.QuotaWarningThreshold
+	settings.AcceptUnsetRatioModel = req.AcceptUnsetModelRatioModel
+	settings.RecordIpLog = req.RecordIpLog
 	if user.Role >= common.RoleAdminUser && req.UpstreamModelUpdateNotifyEnabled != nil {
-		upstreamModelUpdateNotifyEnabled = *req.UpstreamModelUpdateNotifyEnabled
+		settings.UpstreamModelUpdateNotifyEnabled = *req.UpstreamModelUpdateNotifyEnabled
 	}
 
-	// 构建设置
-	settings := dto.UserSetting{
-		NotifyType:                       req.QuotaWarningType,
-		QuotaWarningThreshold:            req.QuotaWarningThreshold,
-		UpstreamModelUpdateNotifyEnabled: upstreamModelUpdateNotifyEnabled,
-		AcceptUnsetRatioModel:            req.AcceptUnsetModelRatioModel,
-		RecordIpLog:                      req.RecordIpLog,
-	}
+	// 保持原有行为：清空非当前通知方式的配置。
+	settings.WebhookUrl, settings.WebhookSecret = "", ""
+	settings.NotificationEmail = ""
+	settings.BarkUrl = ""
+	settings.GotifyUrl, settings.GotifyToken, settings.GotifyPriority = "", "", 0
 
 	// 如果是webhook类型,添加webhook相关设置
 	if req.QuotaWarningType == dto.NotifyTypeWebhook {
