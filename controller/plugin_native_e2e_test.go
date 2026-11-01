@@ -250,3 +250,5 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 	assert.NotContains(t, queryRecorder.Body.String(), "kling-private-1")
 	assert.NotContains(t, queryRecorder.Body.String(), upstream.URL)
 }
+
+func (s *nativeRouteBilling) ReserveBeforeSubmit(quota int) error { return s.Reserve(quota) }

@@ -314,3 +314,10 @@ func TestImageHelperKeepsAdaptorClassifiedConvertError(t *testing.T) {
 	assert.True(t, types.IsSkipRetryError(apiErr), "other channels must not be asked to serve the same name")
 	assert.Contains(t, apiErr.Error(), "not served by the alibaba task plugin")
 }
+
+func (s *imageReservation) ReserveBeforeSubmit(quota int) error {
+	if err := s.Reserve(quota); err != nil {
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry())
+	}
+	return nil
+}

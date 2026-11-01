@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -432,7 +433,7 @@ func TestUpdateWithStatus_PersistsPluginStateAndPollFailures(t *testing.T) {
 func TestWalletTaskDurableObligation(t *testing.T) {
 	for _, database := range []common.DatabaseType{common.DatabaseTypeSQLite, common.DatabaseTypeMySQL, common.DatabaseTypePostgreSQL} {
 		t.Run(string(database), func(t *testing.T) {
-			for _, scenario := range []string{"insert_failure", "adjustment_failure_recovery", "cancel_unclaimed", "claimed_no_refund", "concurrent_recovery", "revoked_before_claim", "expired_before_claim", "deleted_before_claim", "historical_revoked", "unlimited"} {
+			for _, scenario := range []string{"retry_topup", "retry_channel_settle", "retry_wallet_insufficient", "retry_token_insufficient", "retry_update_failure", "insert_failure", "adjustment_failure_recovery", "cancel_unclaimed", "claimed_no_refund", "concurrent_recovery", "revoked_before_claim", "expired_before_claim", "deleted_before_claim", "historical_revoked", "unlimited"} {
 				t.Run(scenario, func(t *testing.T) {
 					db, facts := newSQLWalletFixture(t, database)
 					if scenario == "concurrent_recovery" && database != common.DatabaseTypeSQLite {
@@ -440,7 +441,7 @@ func TestWalletTaskDurableObligation(t *testing.T) {
 						require.NoError(t, err)
 						pool.SetMaxOpenConns(2)
 					}
-					task := &Task{TaskID: "task_obligation", UserId: facts.UserID, Platform: "fixture", Status: TaskStatusNotStart, Progress: "0%"}
+					task := &Task{TaskID: "task_obligation", UserId: facts.UserID, ChannelId: 1, Platform: "fixture", Status: TaskStatusNotStart, Progress: "0%"}
 					if scenario == "insert_failure" {
 						require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:task-insert-failure", func(tx *gorm.DB) {
 							if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "tasks" {
@@ -460,6 +461,74 @@ func TestWalletTaskDurableObligation(t *testing.T) {
 					}
 					require.NoError(t, CreateWalletTaskObligation(context.Background(), task, facts.TokenID, 80))
 					assert.Equal(t, 20, getUserQuotaFromDB(t, facts.UserID))
+					if strings.HasPrefix(scenario, "retry_") {
+						ctx := context.Background()
+						if scenario == "retry_token_insufficient" {
+							require.NoError(t, db.Model(&Token{}).Where("id = ?", facts.TokenID).UpdateColumn("remain_quota", 5).Error)
+						}
+						if scenario == "retry_update_failure" {
+							require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:task-topup-failure", func(tx *gorm.DB) {
+								if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "tasks" {
+									tx.AddError(errors.New("injected task reservation update failure"))
+								}
+							}))
+						}
+						target := 90
+						if scenario == "retry_wallet_insufficient" {
+							target = 110
+						}
+						err := ReserveWalletTaskBeforeSubmit(ctx, task.ID, target, 2)
+						wantReserved, wantToken, wantChannel := 80, 20, 1
+						switch scenario {
+						case "retry_topup", "retry_channel_settle":
+							require.NoError(t, err)
+							wantReserved, wantToken, wantChannel = 90, 10, 3
+							for _, amount := range []int{90, 70} {
+								require.NoError(t, ReserveWalletTaskBeforeSubmit(ctx, task.ID, amount, 3))
+							}
+						case "retry_wallet_insufficient", "retry_token_insufficient":
+							require.ErrorIs(t, err, ErrInsufficientTaskQuota)
+							if scenario == "retry_token_insufficient" {
+								wantToken = 5
+							}
+						case "retry_update_failure":
+							require.Error(t, err)
+							require.NoError(t, db.Callback().Update().Remove("test:task-topup-failure"))
+						}
+						require.NoError(t, db.First(task, task.ID).Error)
+						p, err := decodeTaskBilling(task)
+						require.NoError(t, err)
+						assert.Equal(t, wantReserved, p.Applied)
+						assert.Equal(t, wantReserved, task.Quota)
+						assert.Equal(t, TaskBillingIntent, task.BillingState)
+						assert.Equal(t, wantChannel, task.ChannelId)
+						assert.False(t, p.TargetKnown)
+						assert.Equal(t, 100-wantReserved, getUserQuotaFromDB(t, facts.UserID))
+						assert.Equal(t, wantToken, getTokenFromDB(t, facts.TokenID).RemainQuota)
+						assert.Equal(t, wantReserved, getTokenFromDB(t, facts.TokenID).UsedQuota)
+						if scenario == "retry_channel_settle" {
+							require.NoError(t, ClaimWalletTaskSend(ctx, task.ID))
+							require.ErrorIs(t, ReserveWalletTaskBeforeSubmit(ctx, task.ID, 95, 4), ErrTaskObligationConflict)
+							require.NoError(t, db.First(task, task.ID).Error)
+							assert.Equal(t, 3, task.ChannelId)
+							task.Status, task.Progress = TaskStatusSuccess, "100%"
+							task.PrivateData.UpstreamTaskID = "retry-accepted"
+							require.NoError(t, StageWalletTaskOutcome(ctx, task, 95))
+							require.NoError(t, ReconcileWalletTask(ctx, task.ID))
+							require.NoError(t, db.First(task, task.ID).Error)
+							assert.Equal(t, TaskBillingSettled, task.BillingState)
+							assert.Equal(t, 95, task.Quota)
+							assert.Equal(t, 5, getUserQuotaFromDB(t, facts.UserID))
+							assert.Equal(t, 5, getTokenFromDB(t, facts.TokenID).RemainQuota)
+							return
+						}
+						require.NoError(t, CancelUnclaimedWalletTask(ctx, task.ID))
+						require.NoError(t, CancelUnclaimedWalletTask(ctx, task.ID))
+						assert.Equal(t, 100, getUserQuotaFromDB(t, facts.UserID))
+						assert.Equal(t, wantToken+wantReserved, getTokenFromDB(t, facts.TokenID).RemainQuota)
+						assert.Zero(t, getTokenFromDB(t, facts.TokenID).UsedQuota)
+						return
+					}
 					if scenario == "cancel_unclaimed" {
 						require.NoError(t, CancelUnclaimedWalletTask(context.Background(), task.ID))
 						require.NoError(t, CancelUnclaimedWalletTask(context.Background(), task.ID))
@@ -475,12 +544,14 @@ func TestWalletTaskDurableObligation(t *testing.T) {
 						} else {
 							require.NoError(t, db.Model(&Token{}).Where("id = ?", facts.TokenID).UpdateColumn("expired_time", int64(1)).Error)
 						}
+						require.ErrorIs(t, ReserveWalletTaskBeforeSubmit(context.Background(), task.ID, 90, 2), ErrTaskObligationConflict)
 						require.Error(t, ClaimWalletTaskSend(context.Background(), task.ID))
 						require.NoError(t, CancelUnclaimedWalletTask(context.Background(), task.ID))
 						assert.Equal(t, 100, getUserQuotaFromDB(t, facts.UserID))
 						return
 					}
 					require.NoError(t, ClaimWalletTaskSend(context.Background(), task.ID))
+					require.ErrorIs(t, ReserveWalletTaskBeforeSubmit(context.Background(), task.ID, 90, 2), ErrTaskObligationConflict)
 					if scenario == "historical_revoked" {
 						require.NoError(t, db.Model(&Token{}).Where("id = ?", facts.TokenID).Updates(map[string]any{"status": common.TokenStatusDisabled, "expired_time": int64(1)}).Error)
 					}

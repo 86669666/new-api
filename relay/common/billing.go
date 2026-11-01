@@ -21,4 +21,7 @@ type BillingSettler interface {
 
 	// Reserve 将预扣额度补到目标值；若目标值不高于当前预扣额度则不做任何事。
 	Reserve(targetQuota int) error
+
+	// ReserveBeforeSubmit 补足提交前预扣，余额必须覆盖差额。
+	ReserveBeforeSubmit(targetQuota int) error
 }

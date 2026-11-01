@@ -47,8 +47,12 @@ func newOAuthTextDatabaseFixture(t *testing.T, database common.DatabaseType, dri
 		oauthCleanupDB.Store(cleanup)
 		require.NoError(t, sql.Close())
 	})
-	tables := []any{&User{}, &Token{}, &UserSession{}, &SessionRevocationEvent{}, &OAuthGrant{}, &OAuthOperation{}, &OAuthArtifact{}, &OAuthCleanupJob{}, &OAuthDerivedTokenSource{}, &OAuthDerivedTokenHistory{}, &OAuthDerivedTextCharge{}}
+	tables := []any{&User{}, &Token{}, &UserSession{}, &SessionRevocationEvent{}, &OAuthGrant{}, &OAuthOperation{}, &OAuthArtifact{}, &OAuthCleanupJob{}, &OAuthDerivedTokenSource{}, &OAuthDerivedTextCharge{}}
 	require.NoError(t, db.AutoMigrate(tables...))
+	// Trusted wallet birth keeps oauth_derived_token_history installer-owned and
+	// immutable. AutoMigrate would require OWNER and must not run against it;
+	// the producer must have created the sealed history table already.
+	require.True(t, db.Migrator().HasTable(&OAuthDerivedTokenHistory{}), "trusted birth must pre-create oauth_derived_token_history")
 	require.NoError(t, InitOAuthCleanupStore(true))
 	now := time.Now().Unix()
 	h := strings.Repeat("a", 64)

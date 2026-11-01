@@ -193,7 +193,7 @@ func ApplyOriginTaskAffinity(c *gin.Context, info *relaycommon.RelayInfo) *dto.T
 
 // RelayTaskSubmit 完成 task 提交的全部流程（每次尝试调用一次）：
 // 刷新渠道元数据 → 确定 platform/adaptor → 验证请求 →
-// 估算计费(EstimateBilling) → 计算价格 → 预扣费（仅首次）→
+// 估算计费(EstimateBilling) → 计算价格 → 预扣费（重试时补足差额）→
 // 构建/发送/解析上游请求 → 提交后计费调整(AdjustBillingOnSubmit)。
 // 共享控制器编排负责未落库退款、最终额度预留、落库和结算。
 func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitResult, *dto.TaskError) {
@@ -246,7 +246,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 
-	// 4. 价格计算：基础模型价格
+	// 4. 每次尝试按当前插件/渠道重新计算价格。
+	info.TieredBillingSnapshot = nil
 	info.OriginModelName = modelName
 	var priceData types.PriceData
 	var err error
@@ -331,15 +332,17 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	c.Set("platform", string(platform))
-	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
+	// 7. 预扣费（重试时在同一会话补足差额）
 	if info.Billing == nil && info.PriceData.FreeModel {
 		// A free task has no funding reservation. Admit without inventing a
 		// personal-wallet payer or overriding a subscription preference.
 		if err := model.CheckUserBillingAdmission(c.Request.Context(), info.UserId); err != nil {
 			return nil, service.TaskErrorWrapper(err, "billing_admission_failed", http.StatusForbidden)
 		}
-	} else if info.Billing == nil {
-		info.ForcePreConsume = true
+	} else {
+		if info.Billing == nil {
+			info.ForcePreConsume = true
+		}
 		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
 		}
