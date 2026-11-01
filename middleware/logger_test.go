@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -69,4 +72,60 @@ func TestSetUpLoggerMasksQueryCredentials(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAccessAndPanicLogsFollowLogRotation(t *testing.T) {
+	previousMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	firstPath := filepath.Join(t.TempDir(), "first.log")
+	secondPath := filepath.Join(t.TempDir(), "second.log")
+	first, err := os.Create(firstPath)
+	require.NoError(t, err)
+	defer first.Close()
+	second, err := os.Create(secondPath)
+	require.NoError(t, err)
+	defer second.Close()
+	common.LogWriterMu.Lock()
+	previousOut, previousErr := gin.DefaultWriter, gin.DefaultErrorWriter
+	gin.DefaultWriter, gin.DefaultErrorWriter = first, first
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter, gin.DefaultErrorWriter = previousOut, previousErr
+		common.LogWriterMu.Unlock()
+		gin.SetMode(previousMode)
+	})
+	router := gin.New()
+	SetUpLogger(router)
+	router.Use(HTTPPanicRecover())
+	router.GET("/before", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	router.GET("/after", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	router.GET("/panic", func(c *gin.Context) { panic("rotation-panic-marker") })
+	before := httptest.NewRecorder()
+	router.ServeHTTP(before, httptest.NewRequest(http.MethodGet, "/before", nil))
+	require.Equal(t, http.StatusNoContent, before.Code)
+	common.LogWriterMu.Lock()
+	gin.DefaultWriter, gin.DefaultErrorWriter = second, second
+	closeErr := first.Close()
+	common.LogWriterMu.Unlock()
+	require.NoError(t, closeErr)
+	after := httptest.NewRecorder()
+	router.ServeHTTP(after, httptest.NewRequest(http.MethodGet, "/after", nil))
+	assert.Equal(t, http.StatusNoContent, after.Code)
+	recovered := httptest.NewRecorder()
+	router.ServeHTTP(recovered, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	assert.Equal(t, http.StatusInternalServerError, recovered.Code)
+	firstLog, err := os.ReadFile(firstPath)
+	require.NoError(t, err)
+	secondLog, err := os.ReadFile(secondPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(firstLog), "GET /before")
+	assert.NotContains(t, string(firstLog), "GET /after")
+	assert.NotContains(t, string(firstLog), "rotation-panic-marker")
+	assert.Contains(t, string(secondLog), "[GIN]")
+	assert.Contains(t, string(secondLog), "GET /after")
+	assert.Contains(t, string(secondLog), "GET /panic")
+	assert.NotContains(t, string(secondLog), "GET /before")
+	assert.Contains(t, string(secondLog), "[SYS]")
+	assert.Contains(t, string(secondLog), "rotation-panic-marker")
 }

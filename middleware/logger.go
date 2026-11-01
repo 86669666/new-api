@@ -45,51 +45,54 @@ func RouteTag(tag string) gin.HandlerFunc {
 
 func SetUpLogger(server *gin.Engine) {
 	server.Use(redactTaskArtifactAccessQuery())
-	server.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
-		var requestID string
-		if param.Keys != nil {
-			requestID, _ = param.Keys[common.RequestIdKey].(string)
-		}
-		tag, _ := param.Keys[RouteTagKey].(string)
-		if tag == "" {
-			tag = "web"
-		}
-		path := param.Path
-		if safeRoute, ok := param.Keys[organizationSafeLogKey].(string); ok {
-			path = safeRoute
-		}
-		// OAuth callbacks carry one-time codes and state in the query string.
-		// Redact the log value only; the handler still needs the original query.
-		resourcePath, _, _ := strings.Cut(path, "?")
-		if OAuthTokensPath(param.Request.URL.EscapedPath()) {
-			path = "/api/v1/oauth/tokens/[resource]"
-		}
-		if OAuthUsagePath(param.Request.URL.EscapedPath()) {
-			path = "/api/v1/oauth/usage/[resource]"
-		}
-		if OAuthPublicPath(param.Request.URL.Path) {
-			path = "/oauth2/[protocol]"
-		}
-		if OAuthProviderPagePath(param.Request.URL.Path) {
-			path = "/oauth/provider/[authorization]"
-		}
-		if OAuthBalancePath(resourcePath) || strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || OAuthRevocationPath(resourcePath) || strings.TrimSuffix(resourcePath, "/") == "/api/v1/oauth/userinfo" || strings.TrimRight(resourcePath, "/") == "/api/events" {
-			path, _, _ = strings.Cut(path, "?")
-		}
-		// Sanitize only the remaining log query, preserving all route redactions above.
-		if logPath, rawQuery, found := strings.Cut(path, "?"); found {
-			query, _ := url.ParseQuery(rawQuery)
-			path = logPath + relaycommon.SanitizeURLForLog("?"+query.Encode())
-		}
-		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
-			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
-			tag,
-			requestID,
-			param.StatusCode,
-			param.Latency,
-			param.ClientIP,
-			param.Method,
-			path,
-		)
+	server.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		Output: common.LogWriter,
+		Formatter: func(param gin.LogFormatterParams) string {
+			var requestID string
+			if param.Keys != nil {
+				requestID, _ = param.Keys[common.RequestIdKey].(string)
+			}
+			tag, _ := param.Keys[RouteTagKey].(string)
+			if tag == "" {
+				tag = "web"
+			}
+			path := param.Path
+			if safeRoute, ok := param.Keys[organizationSafeLogKey].(string); ok {
+				path = safeRoute
+			}
+			// OAuth callbacks carry one-time codes and state in the query string.
+			// Redact the log value only; the handler still needs the original query.
+			resourcePath, _, _ := strings.Cut(path, "?")
+			if OAuthTokensPath(param.Request.URL.EscapedPath()) {
+				path = "/api/v1/oauth/tokens/[resource]"
+			}
+			if OAuthUsagePath(param.Request.URL.EscapedPath()) {
+				path = "/api/v1/oauth/usage/[resource]"
+			}
+			if OAuthPublicPath(param.Request.URL.Path) {
+				path = "/oauth2/[protocol]"
+			}
+			if OAuthProviderPagePath(param.Request.URL.Path) {
+				path = "/oauth/provider/[authorization]"
+			}
+			if OAuthBalancePath(resourcePath) || strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || OAuthRevocationPath(resourcePath) || strings.TrimSuffix(resourcePath, "/") == "/api/v1/oauth/userinfo" || strings.TrimRight(resourcePath, "/") == "/api/events" {
+				path, _, _ = strings.Cut(path, "?")
+			}
+			// Sanitize only the remaining log query, preserving all route redactions above.
+			if logPath, rawQuery, found := strings.Cut(path, "?"); found {
+				query, _ := url.ParseQuery(rawQuery)
+				path = logPath + relaycommon.SanitizeURLForLog("?"+query.Encode())
+			}
+			return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
+				param.TimeStamp.Format("2006/01/02 - 15:04:05"),
+				tag,
+				requestID,
+				param.StatusCode,
+				param.Latency,
+				param.ClientIP,
+				param.Method,
+				path,
+			)
+		},
 	}))
 }
