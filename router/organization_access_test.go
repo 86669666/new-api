@@ -428,6 +428,7 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 	oldRedis, oldMemory, oldRDB := common.RedisEnabled, common.MemoryCacheEnabled, common.RDB
 	oldMaster, oldSecret, oldRate := common.IsMasterNode, common.SessionSecret, common.GlobalApiRateLimitEnable
 	oldRegistry := jsplugin.DefaultRegistry
+	oldDispatcherRegistry := defaultPluginDispatcher.registry
 	oldWriter, oldErrWriter := gin.DefaultWriter, gin.DefaultErrorWriter
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = oldDB, oldLog
@@ -435,6 +436,7 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 		common.RedisEnabled, common.MemoryCacheEnabled, common.RDB = oldRedis, oldMemory, oldRDB
 		common.IsMasterNode, common.SessionSecret, common.GlobalApiRateLimitEnable = oldMaster, oldSecret, oldRate
 		jsplugin.DefaultRegistry = oldRegistry
+		defaultPluginDispatcher.registry = oldDispatcherRegistry
 		gin.DefaultWriter, gin.DefaultErrorWriter = oldWriter, oldErrWriter
 	})
 	t.Setenv("FRONTEND_BASE_URL", "")
@@ -576,6 +578,7 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 	}
 	require.NoError(t, db.Create(&model.OrganizationEvent{ID: 9007199254740993, OrganizationID: f.orgA, OrganizationRevision: 9007199254740993, ActorUserID: 0, Action: "organization.rename", CreatedAt: time.Now().Unix()}).Error)
 	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	defaultPluginDispatcher.registry = jsplugin.DefaultRegistry
 	// A real loaded query alias enters the production NoRoute dispatcher. No provider hook is used.
 	_, err = jsplugin.DefaultRegistry.Register(routerPluginSource("s2alias", "1.0.0", `[{method:"GET",path:"/s2alias/jobs/:task_id",type:"query",render:"native"}]`), jsplugin.Options{Key: "s2alias", Version: "1.0.0"})
 	require.NoError(t, err)
