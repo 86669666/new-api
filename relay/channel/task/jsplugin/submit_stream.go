@@ -214,7 +214,6 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 // the client of a native route. The first event commits a 200 event-stream
 // response; a client that has left only misses the rest.
 func relaySubmitEvent(c *gin.Context, frame string) {
-	helper.ExtendWriteDeadline(c)
 	helper.SetEventStreamHeaders(c)
 	_, _ = c.Writer.WriteString(frame)
 	c.Writer.Flush()
