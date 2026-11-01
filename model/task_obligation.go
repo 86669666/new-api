@@ -20,6 +20,8 @@ const (
 
 var ErrTaskObligationConflict = errors.New("task obligation state conflict")
 
+var ErrInsufficientTaskQuota = errors.New("insufficient quota for task reservation")
+
 // TaskBillingProgress contains accounting facts only. Request bodies, credentials,
 // provider responses and current account preferences are never recovery authority.
 type TaskBillingProgress struct {
@@ -234,6 +236,46 @@ func invalidateWalletTaskProjection(userID, tokenID int) {
 			_ = invalidateTokenCacheForMutation(token.Key)
 		}
 	}
+}
+
+// ReserveWalletTaskBeforeSubmit raises the existing intent's reservation before
+// send permission is claimed. Money, the applied marker and the server-selected
+// channel move together; a claimed obligation cannot be rebound.
+func ReserveWalletTaskBeforeSubmit(ctx context.Context, id int64, target, channelID int) error {
+	if target < 0 || target > common.MaxWalletQuota {
+		return ErrWalletQuotaLimitExceeded
+	}
+	var userID, tokenID int
+	err := walletTaskTransaction(ctx, id, func(tx *gorm.DB, user *User, token *Token, t *Task, p *TaskBillingProgress) error {
+		if t.BillingState != TaskBillingIntent || user.Status != common.UserStatusEnabled || p.TokenID != 0 && (token.DeletedAt.Valid || token.Status != common.TokenStatusEnabled || token.UnlimitedQuota != p.Unlimited || token.ExpiredTime != -1 && token.ExpiredTime <= common.GetTimestamp()) {
+			return ErrTaskObligationConflict
+		}
+		if err := oauthTextUnresolved(tx, p.UserID, ""); err != nil {
+			return err
+		}
+		if err := taskWalletUnresolved(tx, p.UserID, id); err != nil {
+			return err
+		}
+		if target <= p.Applied {
+			t.ChannelId = channelID
+			return nil
+		}
+		delta := target - p.Applied
+		if user.Quota < delta || p.TokenID != 0 && !p.Unlimited && token.RemainQuota < delta {
+			return ErrInsufficientTaskQuota
+		}
+		if err := applyWalletTaskDelta(tx, user, token, p, target); err != nil {
+			return err
+		}
+		t.Quota = p.Applied
+		t.ChannelId = channelID
+		userID, tokenID = p.UserID, p.TokenID
+		return nil
+	})
+	if err == nil && userID != 0 {
+		invalidateWalletTaskProjection(userID, tokenID)
+	}
+	return err
 }
 
 func ClaimWalletTaskSend(ctx context.Context, id int64, selectedURL ...string) error {

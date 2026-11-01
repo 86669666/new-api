@@ -1629,3 +1629,5 @@ func newAdmissionResponsesFixture(t *testing.T, handle func(*websocket.Conn, *ht
 	t.Cleanup(func() { fixture.closeAndWait(t) })
 	return fixture
 }
+
+func (s *taskSubmissionTestBilling) ReserveBeforeSubmit(quota int) error { return s.Reserve(quota) }

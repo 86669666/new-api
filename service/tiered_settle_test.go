@@ -1276,3 +1276,5 @@ func TestBillingLegacySQLRegressions(t *testing.T) {
 		})
 	}
 }
+
+func (s *recordingBillingSettler) ReserveBeforeSubmit(quota int) error { return s.Reserve(quota) }

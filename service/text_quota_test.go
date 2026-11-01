@@ -129,6 +129,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 		audio, stream, refund, insufficient, tool bool
 		realtime, reserveInsufficient             bool
 		wallet, outboundImages                    int
+		retryQuota                                int
 		groupRatio                                float64
 		want                                      int
 		unit                                      billingexpr.BillingUnit
@@ -146,6 +147,8 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 		{name: "explicit zero remains free", expression: `tier("free", fixed(0))`, usage: &dto.Usage{PromptTokens: 100, TotalTokens: 100}, unit: billingexpr.BillingUnitRequest},
 		{name: "multipliers and separate tool surcharge", expression: flat + ` * (param("fast") == true ? 2 : 1)`, groupRatio: 1.5, tool: true, want: 18000, unit: billingexpr.BillingUnitRequest},
 		{name: "failed request refunds exactly once", expression: flat, refund: true},
+		{name: "retry top up refunds entire reservation", expression: flat, retryQuota: 15000, refund: true},
+		{name: "retry cannot exceed remaining wallet", expression: flat, retryQuota: 15000, wallet: 10000, reserveInsufficient: true, refund: true},
 		{name: "insufficient wallet never reserves tokens", expression: flat, insufficient: true},
 		{name: "image cache stream settles usage and refunds unused reservation", expression: imageExpression, estimate: 10000, usage: imageUsage, stream: true, want: 4113, unit: billingexpr.BillingUnitToken},
 		{name: "audio settlement records image cache billing inputs", expression: imageExpression, estimate: 10000, usage: imageUsage, audio: true, want: 4113, unit: billingexpr.BillingUnitToken},
@@ -210,6 +213,19 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 				held, err := model.GetUserQuota(user.Id, true)
 				require.NoError(t, err)
 				assert.Equal(t, quota-reservation, held)
+				if tc.retryQuota > 0 {
+					session := info.Billing
+					reserveErr := PreConsumeBilling(ctx, tc.retryQuota, info)
+					require.Same(t, session, info.Billing)
+					if tc.reserveInsufficient {
+						require.NotNil(t, reserveErr)
+						assert.Equal(t, types.ErrorCodeInsufficientUserQuota, reserveErr.GetErrorCode())
+						assert.Equal(t, reservation, info.Billing.GetPreConsumedQuota())
+					} else {
+						require.Nil(t, reserveErr)
+						assert.Equal(t, tc.retryQuota, info.Billing.GetPreConsumedQuota())
+					}
+				}
 				if tc.outboundImages > 0 {
 					reserveErr := PrepareImageBillingForRequest(ctx, info, tc.outboundImages)
 					if tc.reserveInsufficient {
@@ -267,6 +283,19 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 						count := tc.actualImages
 						if count == 0 {
 							count = tc.requestedImages
+							if tc.retryQuota > 0 {
+								session := info.Billing
+								reserveErr := PreConsumeBilling(ctx, tc.retryQuota, info)
+								require.Same(t, session, info.Billing)
+								if tc.reserveInsufficient {
+									require.NotNil(t, reserveErr)
+									assert.Equal(t, types.ErrorCodeInsufficientUserQuota, reserveErr.GetErrorCode())
+									assert.Equal(t, reservation, info.Billing.GetPreConsumedQuota())
+								} else {
+									require.Nil(t, reserveErr)
+									assert.Equal(t, tc.retryQuota, info.Billing.GetPreConsumedQuota())
+								}
+							}
 							if tc.outboundImages > 0 {
 								count = tc.outboundImages
 							}

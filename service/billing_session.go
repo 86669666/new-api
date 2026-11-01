@@ -185,6 +185,45 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	return s.reserve(targetQuota, false)
 }
 
+// ReserveBeforeSubmit raises the same reservation before any upstream send.
+// Durable wallet tasks retain their obligation and may only top up before claim.
+func (s *BillingSession) ReserveBeforeSubmit(targetQuota int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.taskObligationID != 0 {
+		if s.taskSendClaimed {
+			return model.ErrTaskObligationConflict
+		}
+		if err := model.ReserveWalletTaskBeforeSubmit(context.Background(), s.taskObligationID, targetQuota, s.relayInfo.ChannelId); err != nil {
+			return err
+		}
+		s.preConsumedQuota = max(s.preConsumedQuota, targetQuota)
+		s.tokenConsumed = s.preConsumedQuota
+		s.syncRelayInfo()
+		return nil
+	}
+	if s.settled || s.refunded || s.taskAccepted {
+		return model.ErrTaskObligationConflict
+	}
+	if err := model.CheckUserBillingAdmission(context.Background(), s.relayInfo.UserId); err != nil {
+		return err
+	}
+	delta := max(0, targetQuota-s.preConsumedQuota)
+	if err := s.reserveFunding(delta, true, false); err != nil {
+		return err
+	}
+	if err := s.reserveToken(delta); err != nil {
+		s.rollbackFundingReserve(delta)
+		return err
+	}
+	s.preConsumedQuota += delta
+	s.tokenConsumed += delta
+	s.extraReserved += delta
+	s.trusted = false
+	s.syncRelayInfo()
+	return nil
+}
+
 // ReserveAcceptedTask is only called after submit returned a successful result.
 // This records an existing obligation, not permission to send another request.
 func (s *BillingSession) ReserveAcceptedTask(targetQuota int) error {
