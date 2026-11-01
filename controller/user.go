@@ -1322,6 +1322,8 @@ func TopUp(c *gin.Context) {
 }
 
 type UpdateUserSettingRequest struct {
+	QuotaWarningEnabled              *bool   `json:"quota_warning_enabled,omitempty"`
+	ChannelNotifyEnabled             *bool   `json:"channel_notify_enabled,omitempty"`
 	QuotaWarningType                 string  `json:"notify_type"`
 	QuotaWarningThreshold            float64 `json:"quota_warning_threshold"`
 	WebhookUrl                       string  `json:"webhook_url,omitempty"`
@@ -1349,9 +1351,9 @@ func UpdateUserSetting(c *gin.Context) {
 		return
 	}
 
-	// 验证预警阈值
-	if req.QuotaWarningThreshold <= 0 {
-		common.ApiErrorT(c, "Warning threshold must be greater than 0")
+	// 0 使用系统默认预警阈值。
+	if req.QuotaWarningThreshold < 0 {
+		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
 
@@ -1429,6 +1431,12 @@ func UpdateUserSetting(c *gin.Context) {
 	settings.QuotaWarningThreshold = req.QuotaWarningThreshold
 	settings.AcceptUnsetRatioModel = req.AcceptUnsetModelRatioModel
 	settings.RecordIpLog = req.RecordIpLog
+	if req.QuotaWarningEnabled != nil {
+		settings.QuotaWarningEnabled = req.QuotaWarningEnabled
+	}
+	if user.Role >= common.RoleAdminUser && req.ChannelNotifyEnabled != nil {
+		settings.ChannelNotifyEnabled = req.ChannelNotifyEnabled
+	}
 	if user.Role >= common.RoleAdminUser && req.UpstreamModelUpdateNotifyEnabled != nil {
 		settings.UpstreamModelUpdateNotifyEnabled = *req.UpstreamModelUpdateNotifyEnabled
 	}
