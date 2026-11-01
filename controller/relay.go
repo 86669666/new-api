@@ -558,7 +558,8 @@ func executeTaskSubmissionWith(
 	accepted := false
 	stage := "start"
 	defer func() {
-		if !durable && !accepted && relayInfo.Billing != nil {
+		// Delivered streams and accepted upstream obligations are never refunded.
+		if !durable && !accepted && relayInfo.Billing != nil && !c.Writer.Written() {
 			diagnostics.refund(stage)
 			relayInfo.Billing.Refund(c)
 		}
@@ -672,7 +673,6 @@ func executeTaskSubmissionWith(
 	// Successful submit is the accepted-upstream boundary. Cancellation or a
 	// later SQL error must not refund that obligation or cause another send.
 	// No fallback to Reserve: it is a future-admission operation.
-	var adjustmentErr error
 	var obligationID int64
 	if owner, ok := relayInfo.Billing.(interface{ WalletTaskObligationID() int64 }); ok {
 		obligationID = owner.WalletTaskObligationID()
@@ -680,13 +680,22 @@ func executeTaskSubmissionWith(
 	if relayInfo.Billing != nil && obligationID == 0 {
 		stage = "reserve"
 		diagnostics.reserve("reserve_start", result.Quota)
+		var adjustmentErr error
 		adjuster, ok := relayInfo.Billing.(interface{ ReserveAcceptedTask(int) error })
 		if !ok {
 			adjustmentErr = errors.New("accepted task billing adjustment unavailable")
 		} else {
 			adjustmentErr = adjuster.ReserveAcceptedTask(result.Quota)
 		}
-		if adjustmentErr == nil {
+		if adjustmentErr != nil {
+			common.SysError(common.LogText("reserve adjusted task billing error: %s", adjustmentErr.Error()))
+			if !c.Writer.Written() {
+				taskErr = service.TaskErrorWrapperLocal(errors.New("insufficient quota for adjusted task cost"), string(types.ErrorCodeInsufficientUserQuota), http.StatusForbidden)
+				diagnostics.failed("reserve", "insufficient_quota", taskErr, false)
+				return nil, taskErr
+			}
+			// Delivered streams settle the full cost even if it exceeds the reservation.
+		} else {
 			diagnostics.reserve("reserve_complete", result.Quota)
 		}
 	}
@@ -709,11 +718,6 @@ func executeTaskSubmissionWith(
 		TieredSnapshot:  relayInfo.TieredBillingSnapshot,
 	}
 	task.Quota = result.Quota
-	if adjustmentErr != nil && relayInfo.Billing != nil {
-		// Persist only the actually tracked reservation; never advertise an
-		// unsuccessful adjustment as paid or make it refundable by the poller.
-		task.Quota = relayInfo.Billing.GetPreConsumedQuota()
-	}
 	task.Data = result.TaskData
 	if len(result.PluginState) > 0 {
 		task.PrivateData.PluginState = result.PluginState
@@ -786,18 +790,20 @@ func executeTaskSubmissionWith(
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
 		taskErr.NoRetry = true
 		diagnostics.failed("insert", "database_error", taskErr, false)
+		// The client of a relayed event stream already holds the vendor's
+		// work, so it is settled and logged without a task row.
+		if c.Writer.Written() {
+			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+				common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
+				return nil, taskErr
+			}
+			service.LogTaskConsumption(c, relayInfo, task)
+		}
 		return nil, taskErr
 	}
 	durable = true
 	stage = "settle"
 	diagnostics.durable(task)
-	if adjustmentErr != nil {
-		common.SysError("accepted task billing adjustment failed; retained task and reservation require reconciliation")
-		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to adjust accepted task billing"), "task_billing_adjustment_failed", http.StatusInternalServerError)
-		taskErr.NoRetry = true
-		diagnostics.failed("reserve", "billing_error", taskErr, true)
-		return nil, taskErr
-	}
 	diagnostics.settleStart(task, result.Quota)
 
 	if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
