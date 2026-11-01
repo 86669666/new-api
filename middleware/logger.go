@@ -78,10 +78,13 @@ func SetUpLogger(server *gin.Engine) {
 			if OAuthBalancePath(resourcePath) || strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || OAuthRevocationPath(resourcePath) || strings.TrimSuffix(resourcePath, "/") == "/api/v1/oauth/userinfo" || strings.TrimRight(resourcePath, "/") == "/api/events" {
 				path, _, _ = strings.Cut(path, "?")
 			}
-			// Sanitize only the remaining log query, preserving all route redactions above.
-			if logPath, rawQuery, found := strings.Cut(path, "?"); found {
-				query, _ := url.ParseQuery(rawQuery)
-				path = logPath + relaycommon.SanitizeURLForLog("?"+query.Encode())
+			// Preserve route redactions and use the remaining query: handlers may
+			// have removed credentials that gin captured in param.Path on arrival.
+			if logPath, _, found := strings.Cut(path, "?"); found {
+				path = logPath
+				if param.Request.URL.RawQuery != "" {
+					path += relaycommon.SanitizeURLForLog("?" + param.Request.URL.Query().Encode())
+				}
 			}
 			return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
 				param.TimeStamp.Format("2006/01/02 - 15:04:05"),

@@ -129,3 +129,35 @@ func TestAccessAndPanicLogsFollowLogRotation(t *testing.T) {
 	assert.Contains(t, string(secondLog), "[SYS]")
 	assert.Contains(t, string(secondLog), "rotation-panic-marker")
 }
+
+func TestSetUpLoggerOmitsQueryCredentialsTakenOutByHandlers(t *testing.T) {
+	previousMode, previousWriter := gin.Mode(), gin.DefaultWriter
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() {
+		gin.SetMode(previousMode)
+		gin.DefaultWriter = previousWriter
+	})
+
+	for _, tc := range []struct{ target, loggedPath string }{
+		{"/v1beta/models/veo:predictLongRunning?key=sk-secret", "/v1beta/models/veo:predictLongRunning"},
+		{"/v1beta/models/veo:predictLongRunning?key=sk-secret&alt=sse", "/v1beta/models/veo:predictLongRunning?alt=sse"},
+	} {
+		t.Run(tc.target, func(t *testing.T) {
+			var output bytes.Buffer
+			gin.DefaultWriter = &output
+			router := gin.New()
+			SetUpLogger(router)
+			router.POST("/v1beta/models/:action", NativeRouteCredential("google"), func(c *gin.Context) {
+				c.Status(http.StatusNoContent)
+			})
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, tc.target, nil))
+
+			require.Equal(t, http.StatusNoContent, response.Code)
+			assert.NotContains(t, output.String(), "sk-secret")
+			_, loggedPath, found := strings.Cut(strings.TrimSuffix(output.String(), "\n"), "POST ")
+			require.True(t, found)
+			assert.Equal(t, tc.loggedPath, loggedPath)
+		})
+	}
+}
