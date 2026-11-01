@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
@@ -561,7 +562,7 @@ func UnbindCustomOAuth(c *gin.Context) {
 		writeSecurityOperationError(c, err)
 		return
 	}
-	notificationFailed = service.NotifyAccountSecurityChange(user.Email, "Login account unlinked") != nil
+	notificationFailed = service.NotifyAccountSecurityChange(service.AccountMailLanguage(c, user.Id), user.Email, i18n.MsgSecurityEventLoginUnlinked) != nil
 
 	data := authRotationData(bundle)
 	data["notification_warning"] = notificationFailed
