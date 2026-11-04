@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,8 @@ import (
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -164,6 +167,92 @@ func TestIncrementFailedAttemptsCountsConcurrentFailures(t *testing.T) {
 	var reloaded TwoFA
 	require.NoError(t, DB.First(&reloaded, twoFA.Id).Error)
 	assert.Equal(t, attempts, reloaded.FailedAttempts)
+}
+
+// TEST_MYSQL_DSN and TEST_POSTGRES_DSN must point to disposable test databases.
+func TestIncrementFailedAttemptsRestartsWindowAfterLockoutExpires(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			if dialect != "sqlite" {
+				env := "TEST_MYSQL_DSN"
+				if dialect == "postgres" {
+					env = "TEST_POSTGRES_DSN"
+				}
+				dsn := os.Getenv(env)
+				if dsn == "" {
+					t.Skip(env + " not configured")
+				}
+				var driver gorm.Dialector = mysql.Open(dsn)
+				if dialect == "postgres" {
+					driver = postgres.Open(dsn)
+				}
+				db, err := gorm.Open(driver, &gorm.Config{})
+				require.NoError(t, err)
+				sqlDB, err := db.DB()
+				require.NoError(t, err)
+				previousDB := DB
+				DB = db
+				t.Cleanup(func() {
+					DB = previousDB
+					require.NoError(t, sqlDB.Close())
+				})
+				require.NoError(t, DB.AutoMigrate(&TwoFA{}))
+			}
+			var version string
+			query := "SELECT version()"
+			if dialect == "sqlite" {
+				query = "SELECT sqlite_version()"
+			}
+			require.NoError(t, DB.Raw(query).Scan(&version).Error)
+			t.Logf("database version: %s", version)
+			testTwoFALockoutExpiry(t)
+		})
+	}
+}
+
+func testTwoFALockoutExpiry(t *testing.T) {
+	t.Helper()
+	for _, tc := range []struct {
+		name            string
+		lockedUntil     time.Duration
+		failures        int
+		wantAttempts    int
+		wantLocked      bool
+		keepLockedUntil bool
+	}{
+		{name: "first failure after expiry", lockedUntil: -time.Minute, failures: 1, wantAttempts: 1, wantLocked: false},
+		{name: "max failures after expiry", lockedUntil: -time.Minute, failures: common.MaxFailAttempts, wantAttempts: common.MaxFailAttempts, wantLocked: true},
+		{name: "failure during active lockout", lockedUntil: time.Minute, failures: 1, wantAttempts: common.MaxFailAttempts, wantLocked: true, keepLockedUntil: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lockedUntil := time.Now().Add(tc.lockedUntil)
+			twoFA := TwoFA{UserId: 133, Secret: "secret", IsEnabled: true, FailedAttempts: common.MaxFailAttempts, LockedUntil: &lockedUntil}
+			require.NoError(t, DB.Create(&twoFA).Error)
+			t.Cleanup(func() { require.NoError(t, DB.Unscoped().Delete(&twoFA).Error) })
+			var stored TwoFA
+			require.NoError(t, DB.First(&stored, twoFA.Id).Error)
+
+			for i := range tc.failures {
+				receiver := &TwoFA{Id: twoFA.Id}
+				require.NoError(t, receiver.IncrementFailedAttempts())
+				if !tc.keepLockedUntil {
+					assert.Equal(t, i+1, receiver.FailedAttempts)
+				}
+			}
+
+			var reloaded TwoFA
+			require.NoError(t, DB.First(&reloaded, twoFA.Id).Error)
+			assert.Equal(t, tc.wantAttempts, reloaded.FailedAttempts)
+			assert.Equal(t, tc.wantLocked, reloaded.IsLocked())
+			if !tc.wantLocked {
+				assert.Nil(t, reloaded.LockedUntil)
+			}
+			if tc.keepLockedUntil {
+				require.NotNil(t, reloaded.LockedUntil)
+				assert.True(t, stored.LockedUntil.Equal(*reloaded.LockedUntil), "lockout must not be extended")
+			}
+		})
+	}
 }
 
 func TestValidateBackupCodeCanOnlySucceedOnce(t *testing.T) {
