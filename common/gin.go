@@ -24,6 +24,7 @@ import (
 const KeyRequestBody = "key_request_body"
 const KeyBodyStorage = "key_body_storage"
 const keyBodyReadError = "key_body_read_error"
+const keyRequestSizedMultipartText = "request_sized_multipart_text"
 
 var ErrRequestBodyTooLarge = errors.New("request body too large")
 
@@ -354,6 +355,15 @@ func init() {
 	}
 }
 
+// AllowRequestSizedMultipartText lets this request's multipart parsers keep text
+// up to the body limit already enforced by GetBodyStorage. ReadForm couples its
+// text and file memory budgets, so files may also stay in memory up to the stored
+// request size. Callers must enforce their own per-file and part-count limits.
+// The allowance follows the request through later reparsing, not other requests.
+func AllowRequestSizedMultipartText(c *gin.Context) {
+	c.Set(keyRequestSizedMultipartText, true)
+}
+
 func ParseMultipartFormReusable(c *gin.Context) (*multipart.Form, error) {
 	storage, err := GetBodyStorage(c)
 	if err != nil {
@@ -379,7 +389,7 @@ func ParseMultipartFormReusable(c *gin.Context) (*multipart.Form, error) {
 	}
 
 	reader := multipart.NewReader(bytes.NewReader(requestBody), boundary)
-	form, err := reader.ReadForm(multipartMemoryLimit())
+	form, err := reader.ReadForm(multipartMemoryLimit(c, len(requestBody)))
 	if err != nil {
 		return nil, err
 	}
@@ -440,7 +450,7 @@ func parseMultipartFormData(c *gin.Context, data []byte, v any) error {
 	}
 
 	reader := multipart.NewReader(bytes.NewReader(data), boundary)
-	form, err := reader.ReadForm(multipartMemoryLimit())
+	form, err := reader.ReadForm(multipartMemoryLimit(c, len(data)))
 	if err != nil {
 		return err
 	}
@@ -477,7 +487,12 @@ func parseBoundary(contentType string) (string, error) {
 }
 
 // multipartMemoryLimit returns the configured multipart memory limit in bytes
-func multipartMemoryLimit() int64 {
+func multipartMemoryLimit(c *gin.Context, bodySize int) int64 {
+	if c.GetBool(keyRequestSizedMultipartText) {
+		// The stored body bounds all payload bytes; ReadForm's extra 10 MiB
+		// remains available for its metadata accounting.
+		return int64(bodySize)
+	}
 	limitMB := constant.MaxFileDownloadMB
 	if limitMB <= 0 {
 		limitMB = 32
