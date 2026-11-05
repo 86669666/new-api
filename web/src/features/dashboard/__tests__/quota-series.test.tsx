@@ -347,6 +347,60 @@ describe('personal hourly series response contract', () => {
 })
 
 describe('hourly usage cards', () => {
+  it('shows cache read and write alongside unchanged totals through the personal API', async () => {
+    const data = [
+      { ...rows[0], cache_read_tokens: 1200, cache_creation_tokens: 300 },
+      { ...rows[0], cache_read_tokens: 800, cache_creation_tokens: 200 },
+    ]
+    vi.spyOn(api, 'get').mockResolvedValue({ data: { ...current, data } })
+    render(<LogStatCards />)
+    await waitFor(() =>
+      expect(screen.getByRole('group', { name: 'Cache Read' })).toHaveAttribute(
+        'aria-busy',
+        'false'
+      )
+    )
+    expect(
+      within(screen.getByRole('group', { name: 'Cache Read' })).getByTitle(
+        '2,000'
+      )
+    ).toBeVisible()
+    expect(
+      within(screen.getByRole('group', { name: 'Cache Write' })).getByTitle(
+        '500'
+      )
+    ).toBeVisible()
+    expect(
+      within(screen.getByRole('group', { name: 'Total Tokens' })).getByTitle(
+        '30'
+      )
+    ).toBeVisible()
+    expect(
+      within(screen.getByRole('group', { name: 'Total Count' })).getByTitle('4')
+    ).toBeVisible()
+    expect(screen.getByText(incompleteText)).toBeVisible()
+    expect(screen.getAllByRole('group')).toHaveLength(7)
+    expect(
+      screen.getByRole('group', { name: 'Cache Read' }).parentElement
+    ).toHaveClass('grid-cols-2', 'sm:grid-cols-3', 'lg:grid-cols-7')
+  })
+
+  it('shows zero cache usage for historical rows without cache fields', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue({ data: current })
+    render(<LogStatCards />)
+    await waitFor(() =>
+      expect(screen.getByRole('group', { name: 'Cache Read' })).toHaveAttribute(
+        'aria-busy',
+        'false'
+      )
+    )
+    for (const name of ['Cache Read', 'Cache Write']) {
+      expect(
+        within(screen.getByRole('group', { name })).getByTitle('0')
+      ).toBeVisible()
+    }
+  })
+
   it.each([
     ['collection on', current, incompleteText],
     [
@@ -367,7 +421,7 @@ describe('hourly usage cards', () => {
     await screen.findByText(notice)
     expect(updated).toHaveBeenLastCalledWith(data.data, false)
     if (data.data.length === 0) {
-      expect(screen.getAllByText('--')).toHaveLength(5)
+      expect(screen.getAllByText('--')).toHaveLength(7)
     }
     expect(screen.queryByText('No recent usage')).not.toBeInTheDocument()
   })

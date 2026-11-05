@@ -1012,6 +1012,7 @@
     "Cache Read": "Чтение кэша",
     "Cache read price": "Цена чтения кэша",
     "Cache repeated prompt prefixes for cheaper, faster reuse": "Кэшировать повторяющиеся префиксы промптов для дешёвого и быстрого повторного использования",
+    "Cache usage is recorded only after the upgrade; historical data is not backfilled.": "Использование кэша учитывается только после обновления; исторические данные не заполняются.",
     "Cache write": "Запись кэша",
     "Cache Write": "Запись в кэш",
     "Cache Write (12h)": "Запись кэша (12h)",
