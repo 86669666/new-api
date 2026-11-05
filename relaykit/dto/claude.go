@@ -494,6 +494,12 @@ func ProcessTools(tools []any) ([]*Tool, []*ClaudeWebSearchTool) {
 	var webSearchTools []*ClaudeWebSearchTool
 
 	for _, tool := range tools {
+		if raw, ok := tool.(json.RawMessage); ok {
+			// AddTool keeps client tools raw; decode a reader copy for accounting.
+			if err := kitutil.Unmarshal(raw, &tool); err != nil {
+				continue
+			}
+		}
 		switch t := tool.(type) {
 		case *Tool:
 			normalTools = append(normalTools, t)

@@ -710,15 +710,11 @@ func attachGeminiRequest(request any, set Set, options *convmeta.Options) (any, 
 			}
 			parametersField, parameters := "parameters", any(nil)
 			if definition.Function.Parameters != nil {
-				var schema any
-				if err := kitutil.Unmarshal(definition.Function.Parameters, &schema); err != nil {
-					return nil, diagnostics, fmt.Errorf("tools[%d].parameters: %w", index, err)
-				}
 				var misfits []string
-				parametersField, parameters, misfits = sharedgemini.FunctionParameters(schema, jsonSchema)
-				if parametersField == "parametersJsonSchema" {
-					// The schema goes unchanged; send the client's bytes and property order.
-					parameters = definition.Function.Parameters
+				var err error
+				parametersField, parameters, misfits, err = sharedgemini.FunctionParametersJSON(definition.Function.Parameters, jsonSchema)
+				if err != nil {
+					return nil, diagnostics, fmt.Errorf("tools[%d].parameters: %w", index, err)
 				}
 				if len(misfits) > 0 {
 					diagnostics = append(diagnostics, presentationLoss(fmt.Sprintf("tools[%d].parameters", index), "gemini_schema_keyword_dropped",
