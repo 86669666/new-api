@@ -824,7 +824,7 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 	if err != nil {
 		return nil, err
 	}
-	return a.doFetchDescriptor(baseURL, proxy, descriptor)
+	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
@@ -834,6 +834,8 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 			return nil, err
 		}
 		fetcher = denyWalletQueryHookFetch
+	} else if task != nil && task.PrivateData.Key != "" {
+		key = task.PrivateData.Key
 	}
 	ctx, err := a.queryContext(task, key, baseURL, proxy)
 	if err != nil {
@@ -858,7 +860,7 @@ func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy str
 		// descriptor cannot add forwarding or alternate-auth headers.
 		return service.FetchWalletTaskReadQuery(context.Background(), task, key, proxy, a.channelSetting())
 	}
-	return a.doFetchDescriptor(baseURL, proxy, descriptor)
+	return a.doFetchDescriptor(baseURL, key, proxy, descriptor)
 }
 
 // walletQueryEligibility runs before auth resolution or a plugin hook. Only the
@@ -920,7 +922,7 @@ func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 	}
 }
 
-func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, descriptor requestDescriptor) (*http.Response, error) {
+func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor requestDescriptor) (*http.Response, error) {
 	if err := pluginruntime.ValidateRequestURL(descriptor.URL, baseURL, a.plugin.Meta.AllowedHosts); err != nil {
 		return nil, err
 	}
@@ -948,6 +950,9 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, descriptor reques
 	}
 	for name, value := range descriptor.Headers {
 		req.Header.Set(name, value)
+	}
+	if err := channel.ApplyHeaderOverride(a.headerOverrideInfo(key), nil, req); err != nil {
+		return nil, err
 	}
 	client, err := service.GetHttpClientWithProxySettings(proxy, a.channelSetting())
 	if err != nil {
@@ -1410,15 +1415,43 @@ func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task,
 	if len(descriptor.MimeType) > 255 || strings.ContainsAny(descriptor.MimeType, "\r\n") {
 		return nil, fmt.Errorf("plugin returned an invalid artifact mimeType")
 	}
+	headers := descriptor.Headers
+	if !descriptor.Credentialless {
+		var overrides map[string]string
+		if overrides, err = channel.ResolveHeaderOverride(a.headerOverrideInfo(a.info.ApiKey), nil); err != nil {
+			return nil, err
+		}
+		if len(overrides) > 0 {
+			headers = make(map[string]string, len(descriptor.Headers)+len(overrides))
+			for name, value := range descriptor.Headers {
+				headers[http.CanonicalHeaderKey(strings.TrimSpace(name))] = value
+			}
+			for name, value := range overrides {
+				// A content request keeps the host of its URL.
+				if name != "host" {
+					headers[http.CanonicalHeaderKey(name)] = value
+				}
+			}
+		}
+	}
 	return &channel.TaskContentRequest{
 		URL:            descriptor.URL,
 		Method:         method,
-		Headers:        descriptor.Headers,
+		Headers:        headers,
 		Body:           body,
 		Credentialless: descriptor.Credentialless,
 		ContentPath:    descriptor.ContentPath,
 		MimeType:       descriptor.MimeType,
 	}, nil
+}
+
+// headerOverrideInfo carries the channel's Request Header Override for a
+// request built outside the client request, with {api_key} set to key.
+func (a *TaskAdaptor) headerOverrideInfo(key string) *relaycommon.RelayInfo {
+	return &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ApiKey:          key,
+		HeadersOverride: relaycommon.GetEffectiveHeaderOverride(a.info),
+	}}
 }
 
 func taskArtifactContext(task *model.Task) (map[string]any, error) {
