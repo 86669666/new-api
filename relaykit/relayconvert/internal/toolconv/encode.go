@@ -12,6 +12,7 @@ import (
 	sharedgemini "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/gemini"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/tidwall/gjson"
 )
 
 func AttachRequest(format types.RelayFormat, request any, set Set, options *convmeta.Options) (any, []types.ConversionDiagnostic, error) {
@@ -236,6 +237,9 @@ func jsonSchemaParameters(index int, function *Function) (json.RawMessage, []typ
 		return nil, nil, fmt.Errorf("tools[%d].parameters: %w", index, err)
 	}
 	converted, dropped := sharedgemini.OpenAPISchemaToJSONSchema(schema)
+	if err := sharedgemini.OrderFunctionSchemaProperties(converted, gjson.ParseBytes(function.Parameters)); err != nil {
+		return nil, nil, fmt.Errorf("tools[%d].parameters: %w", index, err)
+	}
 	parameters, err := kitutil.Marshal(converted)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tools[%d].parameters: %w", index, err)

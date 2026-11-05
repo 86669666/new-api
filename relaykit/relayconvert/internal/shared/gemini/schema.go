@@ -66,16 +66,16 @@ func CleanFunctionParametersJSON(parameters json.RawMessage) (json.RawMessage, e
 	if cleaned == nil {
 		return nil, nil
 	}
-	if err := orderFunctionSchemaProperties(cleaned, gjson.ParseBytes(parameters)); err != nil {
+	if err := OrderFunctionSchemaProperties(cleaned, gjson.ParseBytes(parameters)); err != nil {
 		return nil, err
 	}
 	return kitutil.Marshal(cleaned)
 }
 
-// orderFunctionSchemaProperties restores client property order after the typed
-// Schema cleanup. Only properties are encoded raw; normalized types, keywords,
-// explicit propertyOrdering and the existing depth limit remain unchanged.
-func orderFunctionSchemaProperties(schema any, source gjson.Result) error {
+// OrderFunctionSchemaProperties restores client property order after schema
+// normalization. Only properties are encoded raw; normalized values and
+// keywords remain unchanged.
+func OrderFunctionSchemaProperties(schema any, source gjson.Result) error {
 	object, ok := schema.(map[string]any)
 	if !ok {
 		return nil
@@ -86,7 +86,7 @@ func orderFunctionSchemaProperties(schema any, source gjson.Result) error {
 		var propertyErr error
 		source.Get("properties").ForEach(func(key, value gjson.Result) bool {
 			property := properties[key.String()]
-			if propertyErr = orderFunctionSchemaProperties(property, value); propertyErr != nil {
+			if propertyErr = OrderFunctionSchemaProperties(property, value); propertyErr != nil {
 				return false
 			}
 			var raw []byte
@@ -114,14 +114,15 @@ func orderFunctionSchemaProperties(schema any, source gjson.Result) error {
 			// The legacy cleaner keeps the first tuple item.
 			original = original.Get("0")
 		}
-		if err := orderFunctionSchemaProperties(items, original); err != nil {
+		if err := OrderFunctionSchemaProperties(items, original); err != nil {
 			return err
 		}
 	}
 	if variants, ok := object["anyOf"].([]any); ok {
 		original := source.Get("anyOf").Array()
-		for i, variant := range variants {
-			if err := orderFunctionSchemaProperties(variant, original[i]); err != nil {
+		// JSON Schema normalization may append a null variant for nullable.
+		for i, sourceVariant := range original {
+			if err := OrderFunctionSchemaProperties(variants[i], sourceVariant); err != nil {
 				return err
 			}
 		}
@@ -340,7 +341,7 @@ func FunctionParametersJSON(raw json.RawMessage, jsonSchema bool) (field string,
 	if field == "parametersJsonSchema" {
 		value = raw
 	} else {
-		err = orderFunctionSchemaProperties(value, gjson.ParseBytes(raw))
+		err = OrderFunctionSchemaProperties(value, gjson.ParseBytes(raw))
 	}
 	return
 }

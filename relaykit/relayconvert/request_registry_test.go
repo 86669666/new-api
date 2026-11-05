@@ -14,10 +14,13 @@ import (
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestRequestConversionPreservesSchemaPropertyOrder(t *testing.T) {
 	const schema = `{"type":"object","additionalProperties":false,"properties":{"reasoning":{"type":"string","const":"explain"},"answer":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}}`
+	const typedSchema = `{"type":"OBJECT","propertyOrdering":["reasoning","answer"],"properties":{"reasoning":{"type":"STRING","nullable":true},"answer":{"nullable":true,"anyOf":[{"type":"OBJECT","properties":{"z":{"type":"STRING"},"a":{"type":"STRING"}}}]}}}`
+	const normalizedSchema = `{"type":"object","properties":{"reasoning":{"type":["string","null"]},"answer":{"anyOf":[{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}},{"type":"null"}]}}}`
 	for _, source := range []struct {
 		name       string
 		body       string
@@ -27,6 +30,7 @@ func TestRequestConversionPreservesSchemaPropertyOrder(t *testing.T) {
 		{"responses", `{"model":"test","max_output_tokens":1024,"input":[],"tools":[{"type":"function","name":"answer","parameters":` + schema + `}]}`, func() dto.Request { return &dto.OpenAIResponsesRequest{} }},
 		{"claude", `{"model":"test","max_tokens":1024,"messages":[],"tools":[{"name":"answer","input_schema":` + schema + `}]}`, func() dto.Request { return &dto.ClaudeRequest{} }},
 		{"gemini_json_schema", `{"generationConfig":{"maxOutputTokens":1024},"contents":[],"tools":[{"functionDeclarations":[{"name":"answer","parametersJsonSchema":` + schema + `}]}]}`, func() dto.Request { return &dto.GeminiChatRequest{} }},
+		{"gemini_parameters", `{"generationConfig":{"maxOutputTokens":1024},"contents":[],"tools":[{"functionDeclarations":[{"name":"answer","parameters":` + typedSchema + `}]}]}`, func() dto.Request { return &dto.GeminiChatRequest{} }},
 	} {
 		for _, target := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatClaude, types.RelayFormatGemini} {
 			t.Run(source.name+"/"+string(target), func(t *testing.T) {
@@ -37,7 +41,27 @@ func TestRequestConversionPreservesSchemaPropertyOrder(t *testing.T) {
 				require.NoError(t, err)
 				encoded, err := kitutil.Marshal(result.Value)
 				require.NoError(t, err)
-				assert.Contains(t, string(encoded), schema)
+				if source.name == "gemini_parameters" {
+					path := "tools.0.function.parameters"
+					switch target {
+					case types.RelayFormatOpenAIResponses:
+						path = "tools.0.parameters"
+					case types.RelayFormatClaude:
+						path = "tools.0.input_schema"
+					case types.RelayFormatGemini:
+						assert.Contains(t, string(encoded), typedSchema)
+						return
+					}
+					parameters := gjson.GetBytes(encoded, path).Raw
+					assert.JSONEq(t, normalizedSchema, parameters)
+					assert.Less(t, strings.Index(parameters, `"reasoning":`), strings.Index(parameters, `"answer":`))
+					assert.Contains(t, parameters, `"properties":{"z":{"type":"string"},"a":{"type":"string"}}`)
+					require.Len(t, result.Diagnostics, 1)
+					assert.Equal(t, "gemini_schema_keyword_dropped", result.Diagnostics[0].Code)
+					assert.Contains(t, result.Diagnostics[0].Message, "propertyOrdering")
+				} else {
+					assert.Contains(t, string(encoded), schema)
+				}
 			})
 		}
 	}
