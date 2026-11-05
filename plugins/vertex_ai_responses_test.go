@@ -478,6 +478,39 @@ func TestVertexAIOmniUsageAndVideoDecoder(t *testing.T) {
 	partial, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": omni}, map[string]any{}, map[string]any{"usage": map[string]any{"total_input_tokens": 12}})
 	require.NoError(t, err)
 	assert.Equal(t, map[string]any{"input_tokens": float64(12)}, decodePluginValue(t, partial))
+	for _, tc := range []struct {
+		name  string
+		usage map[string]any
+		want  map[string]any
+	}{
+		{name: "empty usage keeps reservation", usage: map[string]any{}, want: map[string]any{}},
+		{
+			name: "reported zero replaces reservation",
+			usage: map[string]any{"total_input_tokens": 0, "total_thought_tokens": 0,
+				"output_tokens_by_modality": []any{map[string]any{"modality": "video", "tokens": 0}}},
+			want: map[string]any{"input_tokens": float64(0), "output_tokens": float64(0), "video_tokens": float64(0)},
+		},
+		{
+			name: "audio joins video output",
+			usage: map[string]any{"output_tokens_by_modality": []any{
+				map[string]any{"modality": "VIDEO", "tokens": 5792}, map[string]any{"modality": "audio", "tokens": 23},
+			}},
+			want: map[string]any{"video_tokens": float64(5815)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": omni}, map[string]any{}, map[string]any{"usage": tc.usage})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, decodePluginValue(t, value))
+		})
+	}
+	for _, seconds := range []int{-1, 0, 11} {
+		_, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"upstreamModel": omni, "requestBody": map[string]any{"duration": seconds}})
+		assert.ErrorContains(t, err, "3 to 10")
+	}
+	maximum, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"upstreamModel": omni, "requestBody": map[string]any{"duration": 10, "resolution": "4k"}})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"input_tokens": float64(0), "output_tokens": float64(0), "video_tokens": float64(173760)}, decodePluginValue(t, maximum))
 	veo, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": "veo-3.0-generate-001"}, map[string]any{}, map[string]any{"done": true})
 	require.NoError(t, err)
 	assert.Nil(t, veo)
