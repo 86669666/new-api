@@ -84,6 +84,7 @@ func UploadTaskPlugin(c *gin.Context) {
 	if request.Enabled != nil {
 		enabled = *request.Enabled
 	}
+	restoresFactory := false
 	if enabled {
 		if err = jsplugin.PreflightRoutingConflict(jsplugin.DefaultRegistry.Generation(), loaded); err != nil {
 			common.ApiErrorMsg(c, err.Error())
@@ -102,6 +103,7 @@ func UploadTaskPlugin(c *gin.Context) {
 			if rejectTaskPluginRoutingConflict(c, loaded.Meta.Key, nil) {
 				return
 			}
+			restoresFactory = taskPluginHasFactory(loaded.Meta.Key)
 		}
 	}
 	plugin := model.TaskPlugin{
@@ -118,7 +120,7 @@ func UploadTaskPlugin(c *gin.Context) {
 		return
 	}
 	detail := taskPluginDetail{Plugin: &plugin, Meta: loaded.Meta, Source: string(plugin.Source), Layer: "override", HasIcon: plugin.HasIcon(), SkippedRoutes: taskPluginSkippedRoutes(plugin.Key, plugin.Version)}
-	if plugin.Active && plugin.Enabled {
+	if plugin.Active && (plugin.Enabled || restoresFactory) {
 		detail.PricingIssues = taskPluginPricingIssues(plugin.Key)
 	}
 	common.ApiSuccess(c, detail)

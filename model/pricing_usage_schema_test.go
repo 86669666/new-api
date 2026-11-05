@@ -385,3 +385,77 @@ func TestModelPricingIssuesFollowPluginChanges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, issues)
 }
+
+// A single provider keeps billing saved facts after its display profile narrows.
+// Shared models still enforce field compatibility, and invalid prices stay visible.
+func TestModelPricingIssuesPreserveSingleProviderExpressions(t *testing.T) {
+	require.NoError(t, DB.AutoMigrate(&Option{}))
+	saved := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, DB.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Delete(&Option{}).Error)
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+	const key = "issue-legacy"
+	const name = "issue-legacy-model"
+	source := strings.ReplaceAll(pricingUsagePluginSource("1.0.0", `{old_units:{type:"number",unit:"count"}}`), "pricing-usage-probe", key)
+	source = strings.ReplaceAll(source, "pricing-usage-model", name)
+	source = strings.Replace(source, `fetchMode: "per_task"`, `fetchMode: "per_task", usageProfiles:[{models:["issue-legacy-model"],schema:{seconds:{type:"number",unit:"second"}}}]`, 1)
+	source += `export function extractUsage(){return {old_units:2};}`
+	_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(key) })
+	const legacy = `tier("legacy", u("old_units") * 2)`
+	for _, tc := range []struct {
+		name, expression string
+		provider         bool
+		reason           string
+	}{
+		{"inherited narrowed profile", legacy, false, ""},
+		{"provider narrowed profile", legacy, true, ""},
+		{"invalid inherited expression", `tier("broken",`, false, ModelPricingIssueIncompatible},
+		{"invalid provider expression", `tier("broken",`, true, ModelPricingIssueIncompatible},
+		{"missing expression", "", false, ModelPricingIssueUnconfigured},
+		{"ordinary fixed pricing", `tier("image", fixed(0.02)) * image_count`, false, ModelPricingIssueUnconfigured},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := map[string]string{}
+			expression := tc.expression
+			if tc.provider {
+				overrides[key+"::"+name] = expression
+				expression = `tier("current", u("seconds"))`
+			}
+			encodedExpr, err := common.Marshal(map[string]string{name: expression})
+			require.NoError(t, err)
+			encodedOverrides, err := common.Marshal(overrides)
+			require.NoError(t, err)
+			options := map[string]string{
+				"ModelPrice":                            "{}",
+				"billing_setting.billing_mode":          `{"issue-legacy-model":"tiered_expr"}`,
+				"billing_setting.billing_expr":          string(encodedExpr),
+				billing_setting.PluginBillingExprOption: string(encodedOverrides),
+			}
+			for option, value := range options {
+				require.NoError(t, DB.Save(&Option{Key: option, Value: value}).Error)
+			}
+			require.NoError(t, config.GlobalConfig.LoadFromDB(options))
+			issues, err := GetModelPricingIssues(key)
+			require.NoError(t, err)
+			want := []ModelPricingIssue{}
+			if tc.reason != "" {
+				want = append(want, ModelPricingIssue{ModelName: name, PluginKey: key, PluginName: "Pricing Usage Probe", Reason: tc.reason})
+			}
+			assert.Equal(t, want, issues)
+
+			_, err = jsplugin.DefaultRegistry.Register(strings.Replace(source, `key: "issue-legacy"`, `key: "issue-second"`, 1), jsplugin.Options{})
+			require.NoError(t, err)
+			t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("issue-second") })
+			issues, err = GetModelPricingIssues(key)
+			require.NoError(t, err)
+			reason := tc.reason
+			if reason == "" {
+				reason = ModelPricingIssueIncompatible
+			}
+			assert.Equal(t, []ModelPricingIssue{{ModelName: name, PluginKey: key, PluginName: "Pricing Usage Probe", Reason: reason}}, issues, "shared providers still require schema compatibility")
+		})
+	}
+}

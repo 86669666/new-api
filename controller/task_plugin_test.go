@@ -719,6 +719,73 @@ func TestTaskPluginChangesReportPricingIssuesOfServingPlugin(t *testing.T) {
 	assert.Equal(t, "1.0.0", active.Version)
 }
 
+// Re-uploading the serving override disabled hands the key back to its factory.
+// Notices describe that factory, while uploads of inactive versions stay silent.
+func TestTaskPluginUploadReportsFactoryFallbackPricingIssues(t *testing.T) {
+	setupTaskPluginFactoryDisableTest(t)
+	previousLogDB := model.LOG_DB
+	t.Cleanup(func() { model.LOG_DB = previousLogDB })
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB())
+	savedConfig := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() { require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig)) })
+	cleanupTaskPluginControllerRuntime(t, "kling")
+	source := taskPluginControllerTestSource("kling", "9.9.9-pricing")
+	require.Contains(t, postTaskPluginUpload(t, map[string]any{"source": source}).Body.String(), `"success":true`)
+	var factory jsplugin.Meta
+	for _, meta := range jsplugin.DefaultRegistry.Snapshot().Factory {
+		if meta.Key == "kling" {
+			factory = meta
+		}
+	}
+	require.NotEmpty(t, factory.Models)
+	prices := map[string]float64{}
+	for _, name := range factory.Models {
+		prices[name] = 0
+	}
+	encodedPrices, err := common.Marshal(prices)
+	require.NoError(t, err)
+	encodedModes, err := common.Marshal(map[string]string{factory.Models[0]: "tiered_expr"})
+	require.NoError(t, err)
+	encodedExpr, err := common.Marshal(map[string]string{factory.Models[0]: ""})
+	require.NoError(t, err)
+	options := map[string]string{
+		"ModelPrice":                            string(encodedPrices),
+		"billing_setting.billing_mode":          string(encodedModes),
+		"billing_setting.billing_expr":          string(encodedExpr),
+		billing_setting.PluginBillingExprOption: "{}",
+	}
+	for key, value := range options {
+		require.NoError(t, model.DB.Save(&model.Option{Key: key, Value: value}).Error)
+	}
+	require.NoError(t, config.GlobalConfig.LoadFromDB(options))
+	want := []model.ModelPricingIssue{{ModelName: factory.Models[0], PluginKey: "kling", PluginName: factory.Name, Reason: model.ModelPricingIssueUnconfigured}}
+	for _, step := range []struct {
+		name, source, servingVersion string
+		want                         []model.ModelPricingIssue
+	}{
+		{"inactive disabled upload", taskPluginControllerTestSource("kling", "9.9.8-pricing"), "9.9.9-pricing", nil},
+		{"disable serving override", source, factory.Version, want},
+		{"already disabled upload", source, factory.Version, nil},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			recorder := postTaskPluginUpload(t, map[string]any{"source": step.source, "enabled": false})
+			var response struct {
+				Success bool             `json:"success"`
+				Data    taskPluginDetail `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success, recorder.Body.String())
+			assert.Equal(t, step.want, response.Data.PricingIssues)
+			require.NotNil(t, response.Data.Plugin)
+			assert.False(t, response.Data.Plugin.Enabled)
+			serving, ok := jsplugin.DefaultRegistry.Get("kling")
+			require.True(t, ok)
+			assert.Equal(t, step.servingVersion, serving.Meta.Version)
+		})
+	}
+}
+
 // A plugin switched off keeps its saved prices for when it is switched back
 // on, whether its override row is stored disabled or its built-in sits in the
 // disabled set: prices for models its installed version declares are not

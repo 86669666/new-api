@@ -367,8 +367,8 @@ type ModelPricingIssue struct {
 // GetModelPricingIssues reads the provider variants of the pricing snapshot for
 // every model a live plugin declares or a saved provider price names. A
 // provider with neither an expression nor a per-call price is unconfigured, one
-// whose expression reads usage its schema lacks is incompatible, and a saved
-// provider price whose plugin is not installed or whose installed version no
+// whose shared-model expression reads usage its schema lacks is incompatible.
+// A saved provider price whose plugin is not installed or whose installed version no
 // longer declares the model is stale. A plugin switched off keeps its prices
 // for when it is switched back on. An empty pluginKey covers every plugin.
 func GetModelPricingIssues(pluginKey string) ([]ModelPricingIssue, error) {
@@ -428,6 +428,13 @@ func GetModelPricingIssues(pluginKey string) ([]ModelPricingIssue, error) {
 				continue
 			// fixed() marks ordinary channel pricing: the provider has no task price.
 			case variant.Effective != "" && !billingexpr.UsesFixedPricing(variant.Effective):
+				// Submission checks usage keys only for shared models. A single
+				// provider may still return facts removed from its display profile.
+				if !generation.SharedModel(entry.ModelName) {
+					if _, err := billingexpr.CompileFromCache(variant.Effective); err == nil {
+						continue
+					}
+				}
 				reason = ModelPricingIssueIncompatible
 			case perCall:
 				continue
