@@ -25,7 +25,10 @@ func TestSetUpLoggerMasksQueryCredentials(t *testing.T) {
 		task                                bool
 	}{
 		{name: "encoded and repeated credentials", target: "/v1/models?%6bey=first&key=second&API-Key=third&session_token=fourth&alt=sse", loggedPath: "/v1/models?API-Key=%2A%2A%2Amasked%2A%2A%2A&alt=sse&key=%2A%2A%2Amasked%2A%2A%2A&session_token=%2A%2A%2Amasked%2A%2A%2A"},
-		{name: "literal hashes", target: "/v1/models%23test%25?key=#secret&alt=#sse", loggedPath: "/v1/models#test%?alt=%23sse&key=%2A%2A%2Amasked%2A%2A%2A"},
+		{name: "literal hashes", target: "/v1/models%23test%25?key=#secret&alt=#sse", loggedPath: "/v1/models%23test%25?alt=%23sse&key=%2A%2A%2Amasked%2A%2A%2A"},
+		{name: "encoded slash", target: "//v1%2Fmodels?key=secret", loggedPath: "//v1%2Fmodels?key=%2A%2A%2Amasked%2A%2A%2A"},
+		{name: "encoded question mark", target: "/v1/models%3Ftest?key=secret", loggedPath: "/v1/models%3Ftest?key=%2A%2A%2Amasked%2A%2A%2A"},
+		{name: "encoded question mark without query", target: "/v1/models%3Ftest", loggedPath: "/v1/models?test"},
 		{name: "malformed query", target: "/v1/models?key=bad%ZZ&%ZZ=bad&token=bad;other=true&alt=sse", loggedPath: "/v1/models?alt=sse"},
 		{name: "only malformed credential", target: "/v1/models?key=bad%ZZ", loggedPath: "/v1/models?"},
 		{name: "ordinary query", target: "/v1/models?alt=sse&api-version=2024-02-01", loggedPath: "/v1/models?alt=sse&api-version=2024-02-01"},
@@ -35,6 +38,10 @@ func TestSetUpLoggerMasksQueryCredentials(t *testing.T) {
 		{name: "encoded usage resource", target: "/api/v1/oauth/%2575sage/private-resource?key=secret", loggedPath: "/api/v1/oauth/usage/[resource]"},
 		{name: "public protocol", target: "/oauth2/authorize/private-resource?code=secret", loggedPath: "/oauth2/[protocol]"},
 		{name: "provider challenge", target: "/oauth/provider/login/private-challenge?code=secret", loggedPath: "/oauth/provider/[authorization]"},
+		{name: "balance", target: "/api/v1/oauth/balance?code=secret&alt=sse", loggedPath: "/api/v1/oauth/balance"},
+		{name: "revocation", target: "/oauth2/revoke?code=secret&alt=sse", loggedPath: "/oauth2/[protocol]"},
+		{name: "userinfo", target: "/api/v1/oauth/userinfo?code=secret&alt=sse", loggedPath: "/api/v1/oauth/userinfo"},
+		{name: "events", target: "/api/events?code=secret&alt=sse", loggedPath: "/api/events"},
 		{name: "organization route", target: "/organizations/private-resource?key=secret", safeRoute: "/organizations/:id", loggedPath: "/organizations/:id"},
 		{name: "task capability", target: "/v1/tasks/task-1/artifacts/video/content?access=private-capability&key=secret&keep=ok", loggedPath: "/v1/tasks/task-1/artifacts/video/content?keep=ok&key=%2A%2A%2Amasked%2A%2A%2A", task: true},
 		{name: "legacy video capability", target: "/v1/videos/video-1/content?access=private-capability&key=secret", loggedPath: "/v1/videos/video-1/content?key=%2A%2A%2Amasked%2A%2A%2A", task: true},
@@ -141,6 +148,8 @@ func TestSetUpLoggerOmitsQueryCredentialsTakenOutByHandlers(t *testing.T) {
 	for _, tc := range []struct{ target, loggedPath string }{
 		{"/v1beta/models/veo:predictLongRunning?key=sk-secret", "/v1beta/models/veo:predictLongRunning"},
 		{"/v1beta/models/veo:predictLongRunning?key=sk-secret&alt=sse", "/v1beta/models/veo:predictLongRunning?alt=sse"},
+		{"/v1beta/models/veo%23test?key=sk-secret", "/v1beta/models/veo%23test"},
+		{"/v1beta/models/veo%23test?key=sk-secret&alt=sse", "/v1beta/models/veo%23test?alt=sse"},
 	} {
 		t.Run(tc.target, func(t *testing.T) {
 			var output bytes.Buffer
