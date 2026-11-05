@@ -13,6 +13,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,6 +35,13 @@ func TestConvertImageEditRequestMultipart(t *testing.T) {
 		require.NoError(t, err)
 		_, err = part.Write([]byte("fake image"))
 		require.NoError(t, err)
+		require.NoError(t, writer.WriteField("complexity", "low"))
+		for _, name := range []string{"mask", "markup"} {
+			part, err := writer.CreateFormFile(name, name+".png")
+			require.NoError(t, err)
+			_, err = part.Write([]byte("fake " + name))
+			require.NoError(t, err)
+		}
 		require.NoError(t, writer.Close())
 
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -66,6 +74,20 @@ func TestConvertImageEditRequestMultipart(t *testing.T) {
 		require.Equal(t, "true", replayedRequest.PostForm.Get("stream"))
 		require.Equal(t, "3", replayedRequest.PostForm.Get("partial_images"))
 		require.Len(t, replayedRequest.MultipartForm.File["image"], 1)
+		require.Equal(t, "low", replayedRequest.PostForm.Get("complexity"))
+		require.Len(t, replayedRequest.MultipartForm.File["mask"], 1)
+		require.Len(t, replayedRequest.MultipartForm.File["markup"], 1)
+		for _, name := range []string{"mask", "markup"} {
+			header := replayedRequest.MultipartForm.File[name][0]
+			assert.Equal(t, name+".png", header.Filename)
+			assert.Equal(t, "image/png", header.Header.Get("Content-Type"))
+			file, err := header.Open()
+			require.NoError(t, err)
+			content, err := io.ReadAll(file)
+			require.NoError(t, err)
+			require.NoError(t, file.Close())
+			assert.Equal(t, "fake "+name, string(content))
+		}
 
 		file, err := replayedRequest.MultipartForm.File["image"][0].Open()
 		require.NoError(t, err)
