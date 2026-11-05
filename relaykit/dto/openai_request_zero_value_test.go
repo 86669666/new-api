@@ -327,3 +327,20 @@ func TestSGLangRequestExtensionsRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// GPT image extension fields must survive serialization, including explicit zero.
+func TestImageRequestPreserveGPTImage26Fields(t *testing.T) {
+	for _, raw := range []string{
+		`{"model":"gpt-image-2.6-flare","prompt":"p"}`,
+		`{"model":"gpt-image-2.6-flare","prompt":"p","complexity":"low","markup":{"image_url":"https://x/o.png"},"svg":{"model":"m"},"frame_count":2,"frame_duration_ms":0}`,
+		`{"model":"gpt-image-2.6-flare","prompt":"p","complexity":"high","markup":false,"svg":false,"frame_count":0,"frame_duration_ms":0,"n":0,"stream":false,"watermark":false}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			var req ImageRequest
+			require.NoError(t, kitutil.Unmarshal([]byte(raw), &req))
+			encoded, err := kitutil.Marshal(req)
+			require.NoError(t, err)
+			assert.JSONEq(t, raw, string(encoded))
+		})
+	}
+}
