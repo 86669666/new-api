@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/convdiag"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/tidwall/gjson"
 )
 
 var geminiOpenAPISchemaAllowedFields = map[string]struct{}{
@@ -43,6 +45,89 @@ const geminiFunctionSchemaMaxDepth = 64
 
 func CleanFunctionParameters(params interface{}) interface{} {
 	return cleanGeminiFunctionParametersWithDepth(params, 0)
+}
+
+// CleanFunctionParametersJSON is CleanFunctionParameters for raw function
+// parameters. Parameters with an empty properties object are left out.
+func CleanFunctionParametersJSON(parameters json.RawMessage) (json.RawMessage, error) {
+	if len(parameters) == 0 {
+		return nil, nil
+	}
+	var schema any
+	if err := kitutil.Unmarshal(parameters, &schema); err != nil {
+		return nil, err
+	}
+	if object, ok := schema.(map[string]any); ok {
+		if properties, ok := object["properties"].(map[string]any); ok && len(properties) == 0 {
+			return nil, nil
+		}
+	}
+	cleaned := CleanFunctionParameters(schema)
+	if cleaned == nil {
+		return nil, nil
+	}
+	if err := OrderFunctionSchemaProperties(cleaned, gjson.ParseBytes(parameters)); err != nil {
+		return nil, err
+	}
+	return kitutil.Marshal(cleaned)
+}
+
+// OrderFunctionSchemaProperties restores client property order after schema
+// normalization. Only properties are encoded raw; normalized values and
+// keywords remain unchanged.
+func OrderFunctionSchemaProperties(schema any, source gjson.Result) error {
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return nil
+	}
+	if properties, ok := object["properties"].(map[string]any); ok {
+		var encoded bytes.Buffer
+		encoded.WriteByte('{')
+		var propertyErr error
+		source.Get("properties").ForEach(func(key, value gjson.Result) bool {
+			property := properties[key.String()]
+			if propertyErr = OrderFunctionSchemaProperties(property, value); propertyErr != nil {
+				return false
+			}
+			var raw []byte
+			raw, propertyErr = kitutil.Marshal(property)
+			if propertyErr != nil {
+				return false
+			}
+			if encoded.Len() > 1 {
+				encoded.WriteByte(',')
+			}
+			encoded.WriteString(key.Raw)
+			encoded.WriteByte(':')
+			encoded.Write(raw)
+			return true
+		})
+		if propertyErr != nil {
+			return propertyErr
+		}
+		encoded.WriteByte('}')
+		object["properties"] = json.RawMessage(encoded.Bytes())
+	}
+	if items, ok := object["items"].(map[string]any); ok {
+		original := source.Get("items")
+		if original.IsArray() {
+			// The legacy cleaner keeps the first tuple item.
+			original = original.Get("0")
+		}
+		if err := OrderFunctionSchemaProperties(items, original); err != nil {
+			return err
+		}
+	}
+	if variants, ok := object["anyOf"].([]any); ok {
+		original := source.Get("anyOf").Array()
+		// JSON Schema normalization may append a null variant for nullable.
+		for i, sourceVariant := range original {
+			if err := OrderFunctionSchemaProperties(variants[i], sourceVariant); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) interface{} {
@@ -243,6 +328,22 @@ func FunctionParameters(schema any, jsonSchema bool) (field string, value any, m
 		return "parameters", nil, misfits
 	}
 	return "parameters", CleanFunctionParameters(schema), misfits
+}
+
+// FunctionParametersJSON selects and normalizes a raw client schema while
+// retaining property order in both Gemini schema representations.
+func FunctionParametersJSON(raw json.RawMessage, jsonSchema bool) (field string, value any, misfits []string, err error) {
+	var schema any
+	if err = kitutil.Unmarshal(raw, &schema); err != nil {
+		return
+	}
+	field, value, misfits = FunctionParameters(schema, jsonSchema)
+	if field == "parametersJsonSchema" {
+		value = raw
+	} else {
+		err = OrderFunctionSchemaProperties(value, gjson.ParseBytes(raw))
+	}
+	return
 }
 
 // ApplyResponseSchema sets the structured output schema from the json_schema

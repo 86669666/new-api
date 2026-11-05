@@ -3,6 +3,7 @@ package relayconvert
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -13,7 +14,159 @@ import (
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
+
+func TestRequestConversionPreservesSchemaPropertyOrder(t *testing.T) {
+	const schema = `{"type":"object","additionalProperties":false,"properties":{"reasoning":{"type":"string","const":"explain"},"answer":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}}`
+	const typedSchema = `{"type":"OBJECT","propertyOrdering":["reasoning","answer"],"properties":{"reasoning":{"type":"STRING","nullable":true},"answer":{"nullable":true,"anyOf":[{"type":"OBJECT","properties":{"z":{"type":"STRING"},"a":{"type":"STRING"}}}]}}}`
+	const normalizedSchema = `{"type":"object","properties":{"reasoning":{"type":["string","null"]},"answer":{"anyOf":[{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}},{"type":"null"}]}}}`
+	for _, source := range []struct {
+		name       string
+		body       string
+		newRequest func() dto.Request
+	}{
+		{"chat", `{"model":"test","max_tokens":1024,"messages":[],"tools":[{"type":"function","function":{"name":"answer","parameters":` + schema + `}}]}`, func() dto.Request { return &dto.GeneralOpenAIRequest{} }},
+		{"responses", `{"model":"test","max_output_tokens":1024,"input":[],"tools":[{"type":"function","name":"answer","parameters":` + schema + `}]}`, func() dto.Request { return &dto.OpenAIResponsesRequest{} }},
+		{"claude", `{"model":"test","max_tokens":1024,"messages":[],"tools":[{"name":"answer","input_schema":` + schema + `}]}`, func() dto.Request { return &dto.ClaudeRequest{} }},
+		{"gemini_json_schema", `{"generationConfig":{"maxOutputTokens":1024},"contents":[],"tools":[{"functionDeclarations":[{"name":"answer","parametersJsonSchema":` + schema + `}]}]}`, func() dto.Request { return &dto.GeminiChatRequest{} }},
+		{"gemini_parameters", `{"generationConfig":{"maxOutputTokens":1024},"contents":[],"tools":[{"functionDeclarations":[{"name":"answer","parameters":` + typedSchema + `}]}]}`, func() dto.Request { return &dto.GeminiChatRequest{} }},
+	} {
+		for _, target := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatClaude, types.RelayFormatGemini} {
+			t.Run(source.name+"/"+string(target), func(t *testing.T) {
+				request := source.newRequest()
+				require.NoError(t, kitutil.Unmarshal([]byte(source.body), request))
+				request.SetModelName("test")
+				result, err := ConvertRequest(context.Background(), &convmeta.Values{UpstreamModelName: "test", ChannelMetaAttached: true, Options: &convmeta.Options{Gemini: convmeta.GeminiOptions{SupportsJSONSchema: func(string) bool { return true }}}}, target, request)
+				require.NoError(t, err)
+				encoded, err := kitutil.Marshal(result.Value)
+				require.NoError(t, err)
+				if source.name == "gemini_parameters" {
+					path := "tools.0.function.parameters"
+					switch target {
+					case types.RelayFormatOpenAIResponses:
+						path = "tools.0.parameters"
+					case types.RelayFormatClaude:
+						path = "tools.0.input_schema"
+					case types.RelayFormatGemini:
+						assert.Contains(t, string(encoded), typedSchema)
+						return
+					}
+					parameters := gjson.GetBytes(encoded, path).Raw
+					assert.JSONEq(t, normalizedSchema, parameters)
+					assert.Less(t, strings.Index(parameters, `"reasoning":`), strings.Index(parameters, `"answer":`))
+					assert.Contains(t, parameters, `"properties":{"z":{"type":"string"},"a":{"type":"string"}}`)
+					require.Len(t, result.Diagnostics, 1)
+					assert.Equal(t, "gemini_schema_keyword_dropped", result.Diagnostics[0].Code)
+					assert.Contains(t, result.Diagnostics[0].Message, "propertyOrdering")
+				} else {
+					assert.Contains(t, string(encoded), schema)
+				}
+			})
+		}
+	}
+	for _, target := range []types.RelayFormat{types.RelayFormatOpenAIResponses, types.RelayFormatOpenAI} {
+		t.Run("response_format/"+string(target), func(t *testing.T) {
+			var request dto.Request = &dto.GeneralOpenAIRequest{}
+			body := `{"model":"test","messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":` + schema + `}}}`
+			if target == types.RelayFormatOpenAI {
+				request = &dto.OpenAIResponsesRequest{}
+				body = `{"model":"test","input":[],"text":{"format":{"type":"json_schema","name":"answer","schema":` + schema + `}}}`
+			}
+			require.NoError(t, kitutil.Unmarshal([]byte(body), request))
+			result, err := ConvertRequest(context.Background(), &convmeta.Values{UpstreamModelName: "test", ChannelMetaAttached: true, Options: &convmeta.Options{Gemini: convmeta.GeminiOptions{SupportsJSONSchema: func(string) bool { return true }}}}, target, request)
+			require.NoError(t, err)
+			encoded, err := kitutil.Marshal(result.Value)
+			require.NoError(t, err)
+			assert.Contains(t, string(encoded), schema)
+		})
+	}
+	// Appending host tools and reading tools must not decode the client's schema in place.
+	var request dto.ClaudeRequest
+	require.NoError(t, kitutil.Unmarshal([]byte(`{"tools":[{"name":"answer","description":"Explain the answer","input_schema":`+schema+`}]}`), &request))
+	require.Len(t, request.GetTools(), 1)
+	before := request.GetTokenCountMeta()
+	request.AddTool(map[string]any{"type": "web_search_20250305", "name": "web_search"})
+	assert.Equal(t, before.ToolsCount+1, request.GetTokenCountMeta().ToolsCount)
+	assert.Equal(t, before.CombineText+"\nweb_search", request.GetTokenCountMeta().CombineText)
+	normal, search := dto.ProcessTools(request.GetTools())
+	require.Len(t, normal, 1)
+	require.Len(t, search, 1)
+	assert.Equal(t, "answer", normal[0].Name)
+	assert.Equal(t, "Explain the answer", normal[0].Description)
+	assert.JSONEq(t, schema, string(normal[0].InputSchema))
+	assert.Equal(t, "web_search", search[0].Name)
+	encoded, err := kitutil.Marshal(request)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), schema)
+	assert.Contains(t, string(encoded), "web_search_20250305")
+}
+
+func TestGeminiTypedSchemaPreservesPropertyOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		schema     string
+		expected   string
+		jsonSchema bool
+	}{
+		{
+			name:     "ordinary",
+			schema:   `{"type":"object","additionalProperties":false,"properties":{"reasoning":{"type":"string"},"answer":{"type":"object","properties":{"z.key":{"type":"string"},"a":{"type":"string"}}}}}`,
+			expected: `{"type":"OBJECT","properties":{"reasoning":{"type":"STRING"},"answer":{"type":"OBJECT","properties":{"z.key":{"type":"STRING"},"a":{"type":"STRING"}}}}}`,
+		},
+		{
+			name:       "ordinary_json_schema_capable",
+			schema:     `{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"object","propertyOrdering":["a","z.key"],"properties":{"z.key":{"type":"string"},"a":{"type":"string"}}}}}`,
+			expected:   `{"type":"OBJECT","properties":{"reasoning":{"type":"STRING"},"answer":{"type":"OBJECT","propertyOrdering":["a","z.key"],"properties":{"z.key":{"type":"STRING"},"a":{"type":"STRING"}}}}}`,
+			jsonSchema: true,
+		},
+		{
+			name:     "legacy_normalization",
+			schema:   `{"type":"object","properties":{"reasoning":{"type":["string","null"],"enum":[1,2]},"answer":{"type":"array","items":[{"type":"object","properties":{"z.key":{"type":"string"},"a":{"type":"string"}}}]},"variant":{"anyOf":[{"type":"object","properties":{"z.key":{"type":"string"},"a":{"type":"string"}}}]}}}`,
+			expected: `{"type":"OBJECT","properties":{"reasoning":{"type":"STRING","nullable":true},"answer":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"z.key":{"type":"STRING"},"a":{"type":"STRING"}}}},"variant":{"anyOf":[{"type":"OBJECT","properties":{"z.key":{"type":"STRING"},"a":{"type":"STRING"}}}]}}}`,
+		},
+	} {
+		for _, source := range []struct {
+			name    string
+			body    string
+			request dto.Request
+		}{
+			{"chat", `{"model":"test","max_tokens":1024,"messages":[],"tools":[{"type":"function","function":{"name":"answer","parameters":` + tc.schema + `}}]}`, &dto.GeneralOpenAIRequest{}},
+			{"responses", `{"model":"test","max_output_tokens":1024,"input":[],"tools":[{"type":"function","name":"answer","parameters":` + tc.schema + `}]}`, &dto.OpenAIResponsesRequest{}},
+			{"claude", `{"model":"test","max_tokens":1024,"messages":[],"tools":[{"name":"answer","input_schema":` + tc.schema + `}]}`, &dto.ClaudeRequest{}},
+		} {
+			t.Run(tc.name+"/"+source.name, func(t *testing.T) {
+				require.NoError(t, kitutil.Unmarshal([]byte(source.body), source.request))
+				result, err := ConvertRequest(context.Background(), &convmeta.Values{UpstreamModelName: "test", ChannelMetaAttached: true, Options: &convmeta.Options{Gemini: convmeta.GeminiOptions{SupportsJSONSchema: func(string) bool { return tc.jsonSchema }}}}, types.RelayFormatGemini, source.request)
+				require.NoError(t, err)
+				encoded, err := kitutil.Marshal(result.Value)
+				require.NoError(t, err)
+				var output struct {
+					Tools []struct {
+						Functions []struct {
+							Parameters json.RawMessage `json:"parameters"`
+							JSONSchema json.RawMessage `json:"parametersJsonSchema"`
+						} `json:"functionDeclarations"`
+					} `json:"tools"`
+				}
+				require.NoError(t, kitutil.Unmarshal(encoded, &output))
+				require.Len(t, output.Tools, 1)
+				require.Len(t, output.Tools[0].Functions, 1)
+				function := output.Tools[0].Functions[0]
+				assert.Empty(t, function.JSONSchema)
+				assert.JSONEq(t, tc.expected, string(function.Parameters))
+				assert.Less(t, strings.Index(string(function.Parameters), `"reasoning"`), strings.Index(string(function.Parameters), `"answer"`))
+				nested := `"properties":{"z.key":{"type":"STRING"},"a":{"type":"STRING"}}`
+				assert.Equal(t, strings.Count(tc.expected, nested), strings.Count(string(function.Parameters), nested))
+				if tc.name == "legacy_normalization" {
+					assert.Len(t, result.Diagnostics, 1)
+				} else {
+					assert.Empty(t, result.Diagnostics)
+				}
+			})
+		}
+	}
+}
 
 func TestClaudeMessagesToOpenAIChatPreservesAssistantTextWithToolCalls(t *testing.T) {
 	text := "I will look that up."
@@ -301,7 +454,7 @@ func TestConvertRequestClaudeToResponsesPreservesMixedBlockOrder(t *testing.T) {
 		Tools: []dto.Tool{{
 			Name:        "lookup",
 			Description: "Look up a value",
-			InputSchema: map[string]any{"type": "object", "properties": map[string]any{"q": map[string]any{"type": "string"}}},
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}}}`),
 			Strict:      &strict,
 		}},
 		ToolChoice: dto.ClaudeToolChoice{Type: "tool", Name: "lookup", DisableParallelToolUse: true},
@@ -753,8 +906,8 @@ func TestConvertRequestResponsesToGeminiUsesDirectConverter(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, functions, 1)
 	assert.Equal(t, "lookup", functions[0].Name)
-	params, ok := functions[0].Parameters.(map[string]any)
-	require.True(t, ok)
+	var params map[string]any
+	require.NoError(t, kitutil.Unmarshal(functions[0].Parameters, &params))
 	assert.Equal(t, "OBJECT", params["type"])
 	assert.NotContains(t, params, "additionalProperties")
 	assert.NotContains(t, params, "propertyNames")
@@ -922,7 +1075,7 @@ func TestConvertRequestOpenAIChatToGeminiAddsThoughtSignatureForAdvancedCustom(t
 				Type: "function",
 				Function: dto.FunctionRequest{
 					Name:       "lookup",
-					Parameters: map[string]any{"type": "object"},
+					Parameters: json.RawMessage(`{"type":"object"}`),
 				},
 			},
 		},

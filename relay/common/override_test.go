@@ -1042,6 +1042,35 @@ func TestApplyParamOverrideCopy(t *testing.T) {
 	assertJSONEqual(t, `{"model":"gpt-4","original_model":"gpt-4","temperature":0.7}`, string(out))
 }
 
+func TestApplyParamOverridePreservesSchemaPropertyOrder(t *testing.T) {
+	const schema = `{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}}}`
+	for _, mode := range []string{"copy", "move", "append", "prepend"} {
+		t.Run(mode, func(t *testing.T) {
+			input := []byte(`{"schema":` + schema + `,"tools":[{"input_schema":` + schema + `}]}`)
+			operation := map[string]any{"mode": mode, "from": "schema", "to": "output", "path": "tools", "value": map[string]any{"name": "added"}}
+			out, err := ApplyParamOverride(input, map[string]any{"operations": []any{operation}}, nil)
+			require.NoError(t, err)
+			var result struct {
+				Output json.RawMessage `json:"output"`
+				Tools  []struct {
+					InputSchema json.RawMessage `json:"input_schema"`
+				} `json:"tools"`
+			}
+			require.NoError(t, common2.Unmarshal(out, &result))
+			if mode == "copy" || mode == "move" {
+				assert.Equal(t, schema, string(result.Output))
+			} else {
+				require.Len(t, result.Tools, 2)
+				index := 0
+				if mode == "prepend" {
+					index = 1
+				}
+				assert.Equal(t, schema, string(result.Tools[index].InputSchema))
+			}
+		})
+	}
+}
+
 func TestApplyParamOverrideCopyMissingSource(t *testing.T) {
 	// copy missing source example:
 	// {"operations":[{"mode":"copy","from":"model","to":"original_model"}]}
@@ -2328,6 +2357,17 @@ func TestRemoveDisabledFieldsDefaultFiltering(t *testing.T) {
 		t.Fatalf("RemoveDisabledFields returned error: %v", err)
 	}
 	assertJSONEqual(t, `{"cache_control":{"type":"ephemeral"},"store":true}`, string(out))
+}
+
+// Upstreams fill a schema's properties in their order, so removing a field
+// must leave the client's nested key order as it was.
+func TestRemoveDisabledFieldsKeepsNestedKeyOrder(t *testing.T) {
+	input := `{"service_tier":"flex","response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}}}}},"stream_options":{"include_usage":true,"include_obfuscation":false}}`
+
+	out, err := RemoveDisabledFields([]byte(input), dto.ChannelOtherSettings{}, false)
+
+	require.NoError(t, err)
+	assert.Equal(t, `{"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}}}}},"stream_options":{"include_usage":true}}`, string(out))
 }
 
 func TestRemoveDisabledFieldsNoControlledFieldsKeepsBody(t *testing.T) {
