@@ -118,6 +118,9 @@ func UploadTaskPlugin(c *gin.Context) {
 		return
 	}
 	detail := taskPluginDetail{Plugin: &plugin, Meta: loaded.Meta, Source: string(plugin.Source), Layer: "override", HasIcon: plugin.HasIcon(), SkippedRoutes: taskPluginSkippedRoutes(plugin.Key, plugin.Version)}
+	if plugin.Active && plugin.Enabled {
+		detail.PricingIssues = taskPluginPricingIssues(plugin.Key)
+	}
 	common.ApiSuccess(c, detail)
 }
 
@@ -321,6 +324,8 @@ type taskPluginDetail struct {
 	Layer         string            `json:"layer"`
 	HasIcon       bool              `json:"has_icon"`
 	SkippedRoutes []string          `json:"skipped_routes"`
+	// PricingIssues is set by an upload that puts the version into service.
+	PricingIssues []model.ModelPricingIssue `json:"pricing_issues,omitempty"`
 }
 
 // taskPluginSkippedRoutes lists, as "METHOD /path", the declared top-level
@@ -516,7 +521,12 @@ func DeleteTaskPluginVersion(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, nil)
+	var data any
+	if plugin.Active {
+		// Deleting the active version changes which plugin, if any, serves key.
+		data = gin.H{"pricing_issues": taskPluginPricingIssues(key)}
+	}
+	common.ApiSuccess(c, data)
 }
 
 type taskPluginActivateRequest struct {
@@ -563,7 +573,7 @@ func ActivateTaskPlugin(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, nil)
+	common.ApiSuccess(c, gin.H{"pricing_issues": taskPluginPricingIssues(target.Key)})
 }
 
 type taskPluginStatusRequest struct {
@@ -626,6 +636,7 @@ func SetTaskPluginStatus(c *gin.Context) {
 	if *request.Enabled && rejectTaskPluginRoutingConflict(c, key, active) {
 		return
 	}
+	response := gin.H{"plugin_enabled": *request.Enabled, "disabled_channels": disabledChannels, "unbound_channels": unboundChannels}
 	// Switching a key off must silence every layer that can serve it. The
 	// factory built-in goes into the disabled set even when an override row
 	// exists; otherwise the built-in would keep routing the same models (and
@@ -658,7 +669,10 @@ func SetTaskPluginStatus(c *gin.Context) {
 			return
 		}
 		if !hasActiveOverride {
-			common.ApiSuccess(c, gin.H{"plugin_enabled": *request.Enabled, "disabled_channels": disabledChannels, "unbound_channels": unboundChannels})
+			if *request.Enabled {
+				response["pricing_issues"] = taskPluginPricingIssues(key)
+			}
+			common.ApiSuccess(c, response)
 			return
 		}
 	}
@@ -670,7 +684,10 @@ func SetTaskPluginStatus(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"plugin_enabled": *request.Enabled, "disabled_channels": disabledChannels, "unbound_channels": unboundChannels})
+	if *request.Enabled {
+		response["pricing_issues"] = taskPluginPricingIssues(key)
+	}
+	common.ApiSuccess(c, response)
 }
 
 func taskPluginHasFactory(key string) bool {
@@ -711,6 +728,18 @@ func rejectTaskPluginRoutingConflict(c *gin.Context, key string, row *model.Task
 		return true
 	}
 	return false
+}
+
+// taskPluginPricingIssues lists, after the registry sync, the task model prices
+// the plugin serving key cannot charge. The plugin change is already saved, so
+// a failed read only drops the notice; the model pricing page still shows them.
+func taskPluginPricingIssues(key string) []model.ModelPricingIssue {
+	issues, err := model.GetModelPricingIssues(key)
+	if err != nil {
+		common.SysError(common.LogText("read pricing issues of task plugin %s: %v", key, err))
+		return nil
+	}
+	return issues
 }
 
 func GetTaskPluginMarketplaceSources(c *gin.Context) {
