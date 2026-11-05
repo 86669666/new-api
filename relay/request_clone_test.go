@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -17,6 +18,27 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRequestSchemaOrderThroughCloneAndProviderControls(t *testing.T) {
+	const schema = `{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}}}`
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	claude := &dto.ClaudeRequest{Model: "claude-test@thinking:off", OutputConfig: json.RawMessage(`{"effort":"high","format":{"type":"json_schema","schema":` + schema + `}}`)}
+	clone, err := common.DeepCopy(claude)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{OriginModelName: claude.Model, Request: claude, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: claude.Model}}
+	require.NoError(t, helper.ApplyReasoningModelSuffix(c, info, clone))
+	assert.Contains(t, string(clone.OutputConfig), schema)
+	assert.NotContains(t, string(clone.OutputConfig), `"effort"`)
+	assert.Contains(t, string(claude.OutputConfig), `"effort":"high"`)
+
+	request := &dto.GeneralOpenAIRequest{Model: "ollama-test", ResponseFormat: &dto.ResponseFormat{Type: "json_schema", JsonSchema: json.RawMessage(`{"name":"answer","schema":` + schema + `}`)}}
+	adaptor := &ollama.Adaptor{}
+	out, err := adaptor.ConvertOpenAIRequest(c, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}, request)
+	require.NoError(t, err)
+	encoded, err := common.Marshal(out)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"format":`+schema)
+}
 
 func TestRequestDeepCopyResponses(t *testing.T) {
 	t.Run("nil source", func(t *testing.T) {
@@ -194,7 +216,7 @@ func TestRequestDeepCopyOtherProtocols(t *testing.T) {
 			"metadata":{"user_id":"test"},"messages":[{"role":"user","content":"hello"}]
 		}`, func(clone *dto.ClaudeRequest) {
 			clone.Metadata[0] = '!'
-			clone.Tools.([]any)[0].(map[string]any)["input_schema"].(map[string]any)["type"] = "array"
+			clone.Tools.(json.RawMessage)[0] = '!'
 			clone.Messages[0].Content = "changed"
 			*clone.Temperature = 1
 		})

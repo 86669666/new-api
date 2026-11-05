@@ -15,6 +15,58 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRequestConversionPreservesSchemaPropertyOrder(t *testing.T) {
+	const schema = `{"type":"object","additionalProperties":false,"properties":{"reasoning":{"type":"string","const":"explain"},"answer":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}}`
+	for _, source := range []struct {
+		name       string
+		body       string
+		newRequest func() dto.Request
+	}{
+		{"chat", `{"model":"test","max_tokens":1024,"messages":[],"tools":[{"type":"function","function":{"name":"answer","parameters":` + schema + `}}]}`, func() dto.Request { return &dto.GeneralOpenAIRequest{} }},
+		{"responses", `{"model":"test","max_output_tokens":1024,"input":[],"tools":[{"type":"function","name":"answer","parameters":` + schema + `}]}`, func() dto.Request { return &dto.OpenAIResponsesRequest{} }},
+		{"claude", `{"model":"test","max_tokens":1024,"messages":[],"tools":[{"name":"answer","input_schema":` + schema + `}]}`, func() dto.Request { return &dto.ClaudeRequest{} }},
+		{"gemini_json_schema", `{"generationConfig":{"maxOutputTokens":1024},"contents":[],"tools":[{"functionDeclarations":[{"name":"answer","parametersJsonSchema":` + schema + `}]}]}`, func() dto.Request { return &dto.GeminiChatRequest{} }},
+	} {
+		for _, target := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatClaude, types.RelayFormatGemini} {
+			t.Run(source.name+"/"+string(target), func(t *testing.T) {
+				request := source.newRequest()
+				require.NoError(t, kitutil.Unmarshal([]byte(source.body), request))
+				request.SetModelName("test")
+				result, err := ConvertRequest(context.Background(), &convmeta.Values{UpstreamModelName: "test", ChannelMetaAttached: true, Options: &convmeta.Options{Gemini: convmeta.GeminiOptions{SupportsJSONSchema: func(string) bool { return true }}}}, target, request)
+				require.NoError(t, err)
+				encoded, err := kitutil.Marshal(result.Value)
+				require.NoError(t, err)
+				assert.Contains(t, string(encoded), schema)
+			})
+		}
+	}
+	for _, target := range []types.RelayFormat{types.RelayFormatOpenAIResponses, types.RelayFormatOpenAI} {
+		t.Run("response_format/"+string(target), func(t *testing.T) {
+			var request dto.Request = &dto.GeneralOpenAIRequest{}
+			body := `{"model":"test","messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":` + schema + `}}}`
+			if target == types.RelayFormatOpenAI {
+				request = &dto.OpenAIResponsesRequest{}
+				body = `{"model":"test","input":[],"text":{"format":{"type":"json_schema","name":"answer","schema":` + schema + `}}}`
+			}
+			require.NoError(t, kitutil.Unmarshal([]byte(body), request))
+			result, err := ConvertRequest(context.Background(), &convmeta.Values{UpstreamModelName: "test", ChannelMetaAttached: true, Options: &convmeta.Options{Gemini: convmeta.GeminiOptions{SupportsJSONSchema: func(string) bool { return true }}}}, target, request)
+			require.NoError(t, err)
+			encoded, err := kitutil.Marshal(result.Value)
+			require.NoError(t, err)
+			assert.Contains(t, string(encoded), schema)
+		})
+	}
+	// Appending host tools and reading tools must not decode the client's schema in place.
+	var request dto.ClaudeRequest
+	require.NoError(t, kitutil.Unmarshal([]byte(`{"tools":[{"name":"answer","input_schema":`+schema+`}]}`), &request))
+	require.Len(t, request.GetTools(), 1)
+	request.AddTool(map[string]any{"type": "web_search_20250305", "name": "web_search"})
+	encoded, err := kitutil.Marshal(request)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), schema)
+	assert.Contains(t, string(encoded), "web_search_20250305")
+}
+
 func TestClaudeMessagesToOpenAIChatPreservesAssistantTextWithToolCalls(t *testing.T) {
 	text := "I will look that up."
 	request := dto.ClaudeRequest{
@@ -301,7 +353,7 @@ func TestConvertRequestClaudeToResponsesPreservesMixedBlockOrder(t *testing.T) {
 		Tools: []dto.Tool{{
 			Name:        "lookup",
 			Description: "Look up a value",
-			InputSchema: map[string]any{"type": "object", "properties": map[string]any{"q": map[string]any{"type": "string"}}},
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}}}`),
 			Strict:      &strict,
 		}},
 		ToolChoice: dto.ClaudeToolChoice{Type: "tool", Name: "lookup", DisableParallelToolUse: true},
@@ -753,8 +805,8 @@ func TestConvertRequestResponsesToGeminiUsesDirectConverter(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, functions, 1)
 	assert.Equal(t, "lookup", functions[0].Name)
-	params, ok := functions[0].Parameters.(map[string]any)
-	require.True(t, ok)
+	var params map[string]any
+	require.NoError(t, kitutil.Unmarshal(functions[0].Parameters, &params))
 	assert.Equal(t, "OBJECT", params["type"])
 	assert.NotContains(t, params, "additionalProperties")
 	assert.NotContains(t, params, "propertyNames")
@@ -922,7 +974,7 @@ func TestConvertRequestOpenAIChatToGeminiAddsThoughtSignatureForAdvancedCustom(t
 				Type: "function",
 				Function: dto.FunctionRequest{
 					Name:       "lookup",
-					Parameters: map[string]any{"type": "object"},
+					Parameters: json.RawMessage(`{"type":"object"}`),
 				},
 			},
 		},
