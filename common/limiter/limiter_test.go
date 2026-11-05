@@ -3,6 +3,7 @@ package limiter
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
@@ -28,6 +29,46 @@ func newTestRedisLimiter(t *testing.T) (*RedisLimiter, *redis.Client) {
 	sha, err := client.ScriptLoad(ctx, rateLimitScript).Result()
 	require.NoError(t, err)
 	return &RedisLimiter{client: client, limitScriptSHA: sha}, client
+}
+
+func TestAllowFallsBackToEvalAfterScriptFlush(t *testing.T) {
+	ctx := context.Background()
+	_, client := newTestRedisLimiter(t)
+	previousInstance := instance
+	instance = nil
+	once = sync.Once{}
+	t.Cleanup(func() {
+		instance = previousInstance
+		once = sync.Once{}
+		if previousInstance != nil {
+			once.Do(func() {})
+		}
+	})
+	limiter := New(ctx, client)
+	beforeKey := "limiter-test:" + t.Name() + ":before-flush"
+	afterKey := "limiter-test:" + t.Name() + ":after-flush"
+	require.NoError(t, client.Del(ctx, beforeKey, afterKey).Err())
+	t.Cleanup(func() { _ = client.Del(ctx, beforeKey, afterKey).Err() })
+	opts := []Option{WithCapacity(60), WithRate(60), WithRequested(60)}
+
+	allowed, err := limiter.Allow(ctx, beforeKey, opts...)
+	require.NoError(t, err)
+	assert.True(t, allowed)
+	exists, err := client.ScriptExists(ctx, limiter.limitScriptSHA).Result()
+	require.NoError(t, err)
+	require.Equal(t, []bool{true}, exists)
+
+	require.NoError(t, client.ScriptFlush(ctx).Err())
+	exists, err = client.ScriptExists(ctx, limiter.limitScriptSHA).Result()
+	require.NoError(t, err)
+	require.Equal(t, []bool{false}, exists)
+
+	allowed, err = limiter.Allow(ctx, afterKey, opts...)
+	require.NoError(t, err)
+	assert.True(t, allowed)
+	exists, err = client.ScriptExists(ctx, limiter.limitScriptSHA).Result()
+	require.NoError(t, err)
+	assert.Equal(t, []bool{true}, exists)
 }
 
 func TestAllowAfterScriptFlush(t *testing.T) {
