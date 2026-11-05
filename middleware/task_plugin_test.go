@@ -258,6 +258,61 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	assert.Contains(t, recorder.Body.String(), "this route requires a JSON body")
 }
 
+func TestPrepareTaskPluginNativeRouteMultipartTextUsesRequestLimit(t *testing.T) {
+	previousRequestLimit, previousFileLimit := constant.MaxRequestBodyMB, constant.MaxFileDownloadMB
+	constant.MaxRequestBodyMB, constant.MaxFileDownloadMB = 16, 1
+	t.Cleanup(func() {
+		constant.MaxRequestBodyMB, constant.MaxFileDownloadMB = previousRequestLimit, previousFileLimit
+	})
+	plugin := compileTaskRoutePlugin(t, `
+export const meta = {
+  apiVersion: 1, key: "multipart-text-limit", name: "Multipart", version: "1.0.0",
+  author: {name: "Test"}, models: ["multipart-model"], fetchMode: "per_task",
+  routes: [{method: "POST", path: "/vendor/text", type: "submit", decode: "decodeUpload", render: "created"}],
+};
+export const native = {
+  decodeUpload: function(ctx) {
+    return {kind: "submit", model: "multipart-model", requestBody: {length: ctx.body.fields.request[0].length}};
+  },
+  created: function(ctx, task) { return task; },
+};
+export function buildSubmitRequest() { return {url: "https://example.com"}; }
+export function parseSubmitResponse() { return {taskId: "one"}; }
+export function buildQueryRequest() { return {url: "https://example.com"}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+`)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	// Above ReadForm's 1 MiB file budget + 10 MiB text reserve, below 16 MiB total.
+	require.NoError(t, writer.WriteField("request", strings.Repeat("a", 12<<20)))
+	require.NoError(t, writer.Close())
+	require.Less(t, body.Len(), 16<<20)
+	router := gin.New()
+	var storage common.BodyStorage
+	router.POST("/vendor/text", BodyStorageCleanup(), pinTaskPluginRoute(plugin, 0), PrepareTaskPluginRoute(), func(c *gin.Context) {
+		assert.Equal(t, map[string]any{"length": int64(12 << 20)}, c.MustGet("task_request"))
+		// The adaptor reparses the same request when resolving uploaded files.
+		form, err := common.ParseMultipartFormReusable(c)
+		require.NoError(t, err)
+		defer form.RemoveAll()
+		assert.Len(t, form.Value["request"][0], 12<<20)
+		replayed, err := io.ReadAll(c.Request.Body)
+		require.NoError(t, err)
+		assert.True(t, bytes.Equal(body.Bytes(), replayed), "multipart replay must preserve the original bytes")
+		storage, err = common.GetBodyStorage(c)
+		require.NoError(t, err)
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/vendor/text", bytes.NewReader(body.Bytes()))
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+	require.NotNil(t, storage)
+	_, err := storage.NewReader()
+	assert.ErrorIs(t, err, common.ErrStorageClosed)
+}
+
 func TestPrepareTaskPluginSharedMultipartRouteFiltersEachCandidate(t *testing.T) {
 	for _, routeType := range []string{"submit", "dynamic"} {
 		for _, tc := range []struct {

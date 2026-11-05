@@ -132,6 +132,7 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			len(candidates),
 		)
 
+		common.AllowRequestSizedMultipartText(c)
 		requestContext, err := buildTaskPluginRouteRequest(c)
 		requestContext.Params = pluginruntime.RouteParams(c.Params, pinned.Route)
 		c.Set(pluginruntime.ContextKeyRouteRequest, requestContext)
