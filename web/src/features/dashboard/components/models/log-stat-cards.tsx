@@ -49,7 +49,7 @@ interface LogStatCardsProps {
   ) => void
 }
 
-const MAX_INLINE_STAT_CHARS = 9
+const MAX_INLINE_STAT_CHARS = 7
 
 function formatStatNumber(value: number, locale: Intl.LocalesArgument) {
   const fullValue = formatNumber(value, locale)
@@ -160,6 +160,8 @@ export function LogStatCards(props: LogStatCardsProps) {
     rpm: stats?.totalCount ?? 0,
     quota: stats?.totalQuota ?? 0,
     tpm: stats?.totalTokens ?? 0,
+    cacheRead: stats?.totalCacheReadTokens ?? 0,
+    cacheCreation: stats?.totalCacheCreationTokens ?? 0,
   }
 
   const items = statCardsConfig.map((config) => {
@@ -174,6 +176,7 @@ export function LogStatCards(props: LogStatCardsProps) {
         : formatStatNumber(rawValue, locale)
 
     return {
+      key: config.key,
       title: config.title,
       value: formatted.displayValue,
       fullValue: formatted.fullValue,
@@ -207,7 +210,7 @@ export function LogStatCards(props: LogStatCardsProps) {
           </AlertDescription>
         </Alert>
       )}
-      <div className='divide-border/60 grid min-w-0 grid-cols-2 divide-x sm:grid-cols-3 lg:grid-cols-5'>
+      <div className='divide-border/60 grid min-w-0 grid-cols-2 divide-x sm:grid-cols-3 lg:grid-cols-7'>
         {items.map((it, idx) => {
           const Icon = it.icon
           let valueContent
@@ -250,9 +253,12 @@ export function LogStatCards(props: LogStatCardsProps) {
 
           return (
             <div
-              key={it.title}
+              key={it.key}
+              role='group'
+              aria-label={it.title}
+              aria-busy={loading}
               className={cn(
-                'min-w-0 px-2.5 py-1.5 sm:px-5 sm:py-4',
+                'min-w-0 px-2.5 py-1.5 sm:px-3 sm:py-4 xl:px-4',
                 idx === items.length - 1 &&
                   items.length % 2 !== 0 &&
                   'col-span-2 sm:col-span-1'
@@ -266,7 +272,10 @@ export function LogStatCards(props: LogStatCardsProps) {
                 >
                   <Icon />
                 </IconBadge>
-                <div className='text-muted-foreground truncate text-[11px] leading-4 font-medium tracking-wide uppercase sm:text-xs sm:tracking-wider'>
+                <div
+                  title={it.title}
+                  className='text-muted-foreground truncate text-[11px] leading-4 font-medium tracking-wide uppercase sm:text-xs sm:tracking-wider'
+                >
                   {it.title}
                 </div>
               </div>

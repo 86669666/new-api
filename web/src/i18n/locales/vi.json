@@ -1012,6 +1012,7 @@
     "Cache Read": "Đọc bộ nhớ đệm",
     "Cache read price": "Giá đọc cache",
     "Cache repeated prompt prefixes for cheaper, faster reuse": "Lưu cache phần đầu lời nhắc lặp lại để tái sử dụng nhanh và rẻ hơn",
+    "Cache usage is recorded only after the upgrade; historical data is not backfilled.": "Mức sử dụng bộ nhớ đệm chỉ được ghi nhận sau khi nâng cấp; dữ liệu lịch sử không được bổ sung.",
     "Cache write": "Ghi cache",
     "Cache Write": "Ghi bộ nhớ đệm",
     "Cache Write (12h)": "Ghi cache (12h)",

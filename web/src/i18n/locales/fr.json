@@ -1012,6 +1012,7 @@
     "Cache Read": "Lecture du cache",
     "Cache read price": "Prix de lecture du cache",
     "Cache repeated prompt prefixes for cheaper, faster reuse": "Mettre en cache les préfixes répétés pour une réutilisation plus rapide et moins coûteuse",
+    "Cache usage is recorded only after the upgrade; historical data is not backfilled.": "L’utilisation du cache est enregistrée uniquement après la mise à niveau ; les données historiques ne sont pas complétées.",
     "Cache write": "Écriture du cache",
     "Cache Write": "Écriture du cache",
     "Cache Write (12h)": "Écriture cache (12h)",
