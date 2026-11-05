@@ -276,7 +276,7 @@ func TestAuthCacheIntegrityDatabaseMatrix(t *testing.T) {
 				_, err = GetTokenByKey(token.Key, false)
 				assert.ErrorIs(t, err, ErrDatabase)
 				_, err = GetUserSessionCached(session.SID)
-				require.NoError(t, err, "valid session cache must not query the database")
+				require.Error(t, err, "valid session cache must fail closed without SQL freshness")
 				require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "CacheMAC", "invalid").Err())
 				require.NoError(t, common.RDB.HSet(t.Context(), userSessionCacheKey(session.SID), "CacheMAC", "invalid").Err())
 				_, err = GetTokenByKey(token.Key, false)

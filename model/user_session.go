@@ -257,17 +257,15 @@ func GetUserSessionBySIDWithContext(ctx context.Context, sid string) (*UserSessi
 	return &session, nil
 }
 
-// GetUserSessionCached validates cached state first and falls back to the
-// database on a miss or Redis read failure. A deny tombstone never falls back.
+// GetUserSessionCached honors signed deny tombstones, but confirms active
+// sessions and current user security state in SQL. A valid cache MAC proves
+// authenticity, not freshness: Redis can replay an older active snapshot.
 func GetUserSessionCached(sid string) (*UserSession, error) {
 	if sid == "" {
 		return nil, ErrUserSessionInvalid
 	}
 	if common.RedisEnabled {
-		entry, err := getUserSessionCache(sid)
-		if err == nil {
-			return entry.session(), nil
-		}
+		_, err := getUserSessionCache(sid)
 		if errors.Is(err, ErrUserSessionInactive) {
 			return nil, err
 		}
@@ -285,6 +283,13 @@ func GetUserSessionCached(sid string) (*UserSession, error) {
 			entry.Status = UserSessionStatusRevoked
 			_ = writeUserSessionCache(entry, time.Time{})
 		}
+		return nil, ErrUserSessionInactive
+	}
+	user, err := GetUserById(session.UserID, false)
+	if err != nil {
+		return nil, err
+	}
+	if user.Status != common.UserStatusEnabled || user.AuthVersion != session.UserAuthVersion {
 		return nil, ErrUserSessionInactive
 	}
 	if common.RedisEnabled {
