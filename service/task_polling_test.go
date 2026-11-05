@@ -183,6 +183,28 @@ func TestRedactVideoResponseBodyDropsInteractionInlineVideo(t *testing.T) {
 	assert.Equal(t, "done", content[1].(map[string]any)["text"])
 }
 
+func TestRedactVideoResponseBodyKeepsUntouchedBytes(t *testing.T) {
+	body := []byte(`{"name":"op","response":{"videos":[{"uri":"u","bytesBase64Encoded":"x"}],"durationSeconds":8.0,"bytesBase64Encoded":"y"},"done":true}`)
+
+	assert.Equal(t, `{"name":"op","response":{"videos":[{"uri":"u"}],"durationSeconds":8.0},"done":true}`, string(redactVideoResponseBody(body)))
+}
+
+func TestRedactVideoResponseBodyRepeatedMembers(t *testing.T) {
+	tests := []struct {
+		body string
+		want string
+	}{
+		{`{"response":{"bytesBase64Encoded":"secret-first"},"response":{"bytesBase64Encoded":"secret-last","video":"ok"}}`, `{"response":{"video":"ok"}}`},
+		{`{"response":{"bytesBase64Encoded":"secret-first","bytesBase64Encoded":"secret-last","video":"ok"}}`, `{"response":{"video":"ok"}}`},
+		{`{"steps":[{"content":[{"type":"video","data":"secret-first","data":"secret-last","mime_type":"video/mp4"}]}]}`, `{"steps":[{"content":[{"type":"video","mime_type":"video/mp4"}]}]}`},
+	}
+	for _, test := range tests {
+		out := redactVideoResponseBody([]byte(test.body))
+		assert.NotContains(t, string(out), "secret")
+		assert.JSONEq(t, test.want, string(out))
+	}
+}
+
 func seedTaskPollingChannel(t *testing.T, id int, disableSleep bool) {
 	t.Helper()
 	ch := &model.Channel{
