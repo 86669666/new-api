@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -309,4 +310,152 @@ func TestPricingSharedPluginVariantsUseEachSchemaAndExpression(t *testing.T) {
 	encoded, err := common.Marshal(single)
 	require.NoError(t, err)
 	assert.Contains(t, string(encoded), "billing_plugin_variants")
+}
+
+// Prices saved while a plugin fit stop fitting when it changes: a dropped model
+// leaves its provider price stale, and a new provider without the usage the
+// model expression reads cannot charge it. Unpriced models are listed too,
+// including those whose only expression prices ordinary channels.
+func TestModelPricingIssuesFollowPluginChanges(t *testing.T) {
+	require.NoError(t, DB.AutoMigrate(&Option{}))
+	saved := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, DB.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Delete(&Option{}).Error)
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+	pluginSource := func(key, name, version, models, usageSchema string) string {
+		source := strings.ReplaceAll(pricingUsagePluginSource(version, usageSchema), "pricing-usage-probe", key)
+		source = strings.Replace(source, "Pricing Usage Probe", name, 1)
+		return strings.Replace(source, `["pricing-usage-model"]`, models, 1)
+	}
+	savePricing := func(options map[string]string) {
+		for key, value := range options {
+			require.NoError(t, DB.Save(&Option{Key: key, Value: value}).Error)
+		}
+		require.NoError(t, config.GlobalConfig.LoadFromDB(options))
+	}
+	const seconds = `{seconds:{type:"number",unit:"second"}}`
+	_, err := jsplugin.DefaultRegistry.Register(pluginSource("issue-alpha", "Alpha", "1.0.0", `["issue-priced","issue-per-call","issue-unpriced","issue-ordinary","issue-shared","issue-dropped"]`, seconds), jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("issue-alpha") })
+	savePricing(map[string]string{
+		"ModelPrice":                            `{"issue-per-call":0.3}`,
+		"billing_setting.billing_mode":          `{"issue-priced":"tiered_expr","issue-ordinary":"tiered_expr","issue-shared":"tiered_expr"}`,
+		"billing_setting.billing_expr":          `{"issue-priced":"u(\"seconds\") * 0.1","issue-ordinary":"tier(\"image\", fixed(0.02)) * image_count","issue-shared":"u(\"seconds\") * 0.2"}`,
+		billing_setting.PluginBillingExprOption: `{"issue-alpha::issue-dropped":"u(\"seconds\") * 0.5"}`,
+	})
+	unpriced := ModelPricingIssue{ModelName: "issue-unpriced", PluginKey: "issue-alpha", PluginName: "Alpha", Reason: ModelPricingIssueUnconfigured}
+	ordinary := ModelPricingIssue{ModelName: "issue-ordinary", PluginKey: "issue-alpha", PluginName: "Alpha", Reason: ModelPricingIssueUnconfigured}
+	// Other tests leave their plugins in the shared registry.
+	ownIssues := func() []ModelPricingIssue {
+		issues, err := GetModelPricingIssues("")
+		require.NoError(t, err)
+		return slices.DeleteFunc(issues, func(issue ModelPricingIssue) bool { return !strings.HasPrefix(issue.PluginKey, "issue-") })
+	}
+
+	assert.Equal(t, []ModelPricingIssue{ordinary, unpriced}, ownIssues())
+	snapshot, err := GetModelPricingSnapshot([]string{"issue-unpriced"})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Entries, 1)
+	assert.Empty(t, snapshot.Entries[0].PluginVariants, "notices must not change the single-provider pricing snapshot contract")
+
+	_, err = jsplugin.DefaultRegistry.Register(pluginSource("issue-alpha", "Alpha", "1.1.0", `["issue-priced","issue-per-call","issue-unpriced","issue-ordinary","issue-shared"]`, seconds), jsplugin.Options{})
+	require.NoError(t, err)
+	_, err = jsplugin.DefaultRegistry.Register(pluginSource("issue-beta", "Beta", "1.0.0", `["issue-shared"]`, `{credits:{type:"number",unit:"credit"}}`), jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("issue-beta") })
+	incompatible := ModelPricingIssue{ModelName: "issue-shared", PluginKey: "issue-beta", PluginName: "Beta", Reason: ModelPricingIssueIncompatible}
+
+	assert.Equal(t, []ModelPricingIssue{
+		{ModelName: "issue-dropped", PluginKey: "issue-alpha", PluginName: "Alpha", Reason: ModelPricingIssueStale},
+		ordinary,
+		incompatible,
+		unpriced,
+	}, ownIssues())
+	issues, err := GetModelPricingIssues("issue-beta")
+	require.NoError(t, err)
+	assert.Equal(t, []ModelPricingIssue{incompatible}, issues)
+
+	// A provider price that reads the provider's own usage replaces the model
+	// expression for that provider only.
+	savePricing(map[string]string{
+		billing_setting.PluginBillingExprOption: `{"issue-alpha::issue-dropped":"u(\"seconds\") * 0.5","issue-beta::issue-shared":"u(\"credits\") * 2"}`,
+	})
+	issues, err = GetModelPricingIssues("issue-beta")
+	require.NoError(t, err)
+	assert.Empty(t, issues)
+}
+
+// A single provider keeps billing saved facts after its display profile narrows.
+// Shared models still enforce field compatibility, and invalid prices stay visible.
+func TestModelPricingIssuesPreserveSingleProviderExpressions(t *testing.T) {
+	require.NoError(t, DB.AutoMigrate(&Option{}))
+	saved := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, DB.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Delete(&Option{}).Error)
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+	const key = "issue-legacy"
+	const name = "issue-legacy-model"
+	source := strings.ReplaceAll(pricingUsagePluginSource("1.0.0", `{old_units:{type:"number",unit:"count"}}`), "pricing-usage-probe", key)
+	source = strings.ReplaceAll(source, "pricing-usage-model", name)
+	source = strings.Replace(source, `fetchMode: "per_task"`, `fetchMode: "per_task", usageProfiles:[{models:["issue-legacy-model"],schema:{seconds:{type:"number",unit:"second"}}}]`, 1)
+	source += `export function extractUsage(){return {old_units:2};}`
+	_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(key) })
+	const legacy = `tier("legacy", u("old_units") * 2)`
+	for _, tc := range []struct {
+		name, expression string
+		provider         bool
+		reason           string
+	}{
+		{"inherited narrowed profile", legacy, false, ""},
+		{"provider narrowed profile", legacy, true, ""},
+		{"invalid inherited expression", `tier("broken",`, false, ModelPricingIssueIncompatible},
+		{"invalid provider expression", `tier("broken",`, true, ModelPricingIssueIncompatible},
+		{"missing expression", "", false, ModelPricingIssueUnconfigured},
+		{"ordinary fixed pricing", `tier("image", fixed(0.02)) * image_count`, false, ModelPricingIssueUnconfigured},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := map[string]string{}
+			expression := tc.expression
+			if tc.provider {
+				overrides[key+"::"+name] = expression
+				expression = `tier("current", u("seconds"))`
+			}
+			encodedExpr, err := common.Marshal(map[string]string{name: expression})
+			require.NoError(t, err)
+			encodedOverrides, err := common.Marshal(overrides)
+			require.NoError(t, err)
+			options := map[string]string{
+				"ModelPrice":                            "{}",
+				"billing_setting.billing_mode":          `{"issue-legacy-model":"tiered_expr"}`,
+				"billing_setting.billing_expr":          string(encodedExpr),
+				billing_setting.PluginBillingExprOption: string(encodedOverrides),
+			}
+			for option, value := range options {
+				require.NoError(t, DB.Save(&Option{Key: option, Value: value}).Error)
+			}
+			require.NoError(t, config.GlobalConfig.LoadFromDB(options))
+			issues, err := GetModelPricingIssues(key)
+			require.NoError(t, err)
+			want := []ModelPricingIssue{}
+			if tc.reason != "" {
+				want = append(want, ModelPricingIssue{ModelName: name, PluginKey: key, PluginName: "Pricing Usage Probe", Reason: tc.reason})
+			}
+			assert.Equal(t, want, issues)
+
+			_, err = jsplugin.DefaultRegistry.Register(strings.Replace(source, `key: "issue-legacy"`, `key: "issue-second"`, 1), jsplugin.Options{})
+			require.NoError(t, err)
+			t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("issue-second") })
+			issues, err = GetModelPricingIssues(key)
+			require.NoError(t, err)
+			reason := tc.reason
+			if reason == "" {
+				reason = ModelPricingIssueIncompatible
+			}
+			assert.Equal(t, []ModelPricingIssue{{ModelName: name, PluginKey: key, PluginName: "Pricing Usage Probe", Reason: reason}}, issues, "shared providers still require schema compatibility")
+		})
+	}
 }
