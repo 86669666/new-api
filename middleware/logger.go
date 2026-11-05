@@ -80,7 +80,10 @@ func SetUpLogger(server *gin.Engine) {
 			}
 			// Preserve route redactions and use the remaining query: handlers may
 			// have removed credentials that gin captured in param.Path on arrival.
-			if logPath, _, found := strings.Cut(path, "?"); found {
+			if path == param.Path && strings.HasPrefix(path, param.Request.URL.Path+"?") {
+				path = param.Request.URL.EscapedPath() + "?"
+			}
+			if logPath, _, found := strings.Cut(path, "?"); found && path != param.Request.URL.Path {
 				path = logPath
 				if param.Request.URL.RawQuery != "" {
 					path += relaycommon.SanitizeURLForLog("?" + param.Request.URL.Query().Encode())
