@@ -861,6 +861,7 @@ func executeTaskSubmissionWith(
 			task.Data = transientData
 		}
 	}
+	perfmetrics.RecordImmediateTaskResult(relayInfo, result.Immediate)
 	if task.Status != model.TaskStatusFailure {
 		service.MarkRequestPolicySuccess(c, nil)
 	} else {

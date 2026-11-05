@@ -91,8 +91,7 @@ func TestKlingResponsesProtocol(t *testing.T) {
 		}{
 			{"native duration above an hour", native, "kling-v3", map[string]any{"model_name": "kling-v3", "prompt": "a cat", "duration": 1e12}, "duration must be a positive integer of at most 3600"},
 			{"native fractional duration", native, "kling-v3", map[string]any{"model_name": "kling-v3", "prompt": "a cat", "duration": "5.5"}, "duration must be a positive integer of at most 3600"},
-			// The host's recursive usage guard rejects metadata before the build hook runs.
-			{"metadata duration behind valid seconds", openaiVideo, "kling-v3", map[string]any{"model": "kling-v3", "prompt": "a cat", "seconds": "5", "metadata": map[string]any{"duration": 3601}}, "plugin usage value exceeds the host limit"},
+			{"metadata duration behind valid seconds", openaiVideo, "kling-v3", map[string]any{"model": "kling-v3", "prompt": "a cat", "seconds": "5", "metadata": map[string]any{"duration": 3601}}, "duration must be a positive integer of at most 3600"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				_, err := plugin.Engine.CallPath(t.Context(), tc.decoder[0], tc.decoder[1:], map[string]any{"model": tc.model, "body": map[string]any{"kind": "json", "value": tc.body}})
