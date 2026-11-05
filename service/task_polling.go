@@ -708,7 +708,6 @@ func finalizeTerminalTask(ctx context.Context, adaptor TaskPollingAdaptor, task 
 }
 
 func redactVideoResponseBody(body []byte) []byte {
-	// Only the redacted members change; the rest keeps the upstream bytes.
 	if !ojson.ValidBytes(body) || !ojson.GetBytesNoCopy(body, "@this").IsObject() {
 		return body
 	}

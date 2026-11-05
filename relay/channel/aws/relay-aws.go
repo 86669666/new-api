@@ -187,8 +187,6 @@ func buildAwsRequestBody(c *gin.Context, info *relaycommon.RelayInfo, awsClaudeR
 		if err != nil {
 			return nil, errors.Wrap(err, "get request body bytes fail")
 		}
-		// Only model and stream are removed: the rest keeps the client's bytes
-		// and key order. The Doc reads body in place and never changes it.
 		if !ojson.ValidBytes(body) || !ojson.GetBytesNoCopy(body, "@this").IsObject() {
 			return nil, errors.New("pass-through unmarshal request body fail: request body must be a JSON object")
 		}

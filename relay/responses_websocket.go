@@ -822,7 +822,6 @@ func newResponsesWSInvalidRequestError(err error) *types.NewAPIError {
 // once as the typed request; the envelope is not parsed again.
 func normalizeResponsesWSCreateEvent(message []byte, event responsesWSCreateEvent, streamID string) (responsesWSCreateRequest, error) {
 	create := responsesWSCreateRequest{StreamID: streamID, Generate: event.Generate}
-	// Edit the wrapped request on its own so outer fields cannot enter the HTTP body.
 	source := message
 	if len(event.Request) > 0 {
 		source = event.Request

@@ -1227,8 +1227,6 @@ func RemoveDisabledFields(jsonData []byte, channelOtherSettings dto.ChannelOther
 		return jsonData, nil
 	}
 
-	// Only the removed members change: everything else keeps the client's
-	// bytes and key order, which upstreams follow when they fill a schema.
 	if !ojson.ValidBytes(jsonData) {
 		common.SysError(common.LogText("RemoveDisabledFields Unmarshal error :%s", "invalid JSON"))
 		return jsonData, nil
@@ -1381,8 +1379,6 @@ func RemoveGeminiDisabledFields(jsonData []byte) ([]byte, error) {
 		return encoded, nil
 	}
 
-	// Process contents array; only the removed ids change, so inline data
-	// is never decoded or re-encoded.
 	// Handle both camelCase (functionResponse) and snake_case (function_response)
 	contents := ojson.GetBytesNoCopy(jsonData, "contents")
 	if !contents.IsArray() {

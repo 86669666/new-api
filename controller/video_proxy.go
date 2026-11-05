@@ -374,8 +374,6 @@ func writeTaskMediaContentPath(c *gin.Context, body io.Reader, descriptor *relay
 			message: "Failed to decode artifact content",
 		}
 	}
-	// The root shares memory with raw, which stays unchanged until the
-	// artifact is written, so the base64 payload is not copied.
 	operation := ojson.GetBytesNoCopy(raw, "@this")
 	if failure := operation.Get("error"); failure.Exists() && failure.Type != ojson.Null {
 		return &taskMediaProxyError{

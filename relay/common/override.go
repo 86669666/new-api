@@ -164,7 +164,6 @@ func ApplyParamOverride(jsonData []byte, paramOverride map[string]any, condition
 		return jsonData, nil
 	}
 	auditRecorder := getParamOverrideAuditRecorder(conditionContext)
-	// 新旧两种格式的所有修改都在同一个 Doc 上进行，最后只生成一次输出
 	doc := ojson.NewDoc(jsonData)
 
 	// 尝试断言为操作格式
@@ -1550,8 +1549,6 @@ func readSyncTargetValue(doc *ojson.Doc, context map[string]any, target syncTarg
 		if value.Type == ojson.String && strings.TrimSpace(value.String()) == "" {
 			return nil, false, nil
 		}
-		// A header target keeps the value in the context map, so it must not
-		// point into the request body.
 		value.Raw, value.Str = strings.Clone(value.Raw), strings.Clone(value.Str)
 		return value.Value(), true, nil
 	case "header":
@@ -1945,7 +1942,6 @@ func pruneObjects(doc *ojson.Doc, path, contextJSON string, value any) error {
 	if _, err := collectPrunedObjects(target, path, options, contextJSON, true, &pruned); err != nil {
 		return err
 	}
-	// 从后往前删，前面数组元素的下标不受影响
 	for i := len(pruned) - 1; i >= 0; i-- {
 		if pruned[i].member {
 			err = DeleteJSONMember(doc, pruned[i].path)

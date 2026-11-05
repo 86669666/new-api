@@ -299,11 +299,6 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 		}
 	}
 
-	// ojson.Result.Array returns the element list for an array and a single
-	// element for an object-shaped data. The results share memory with
-	// responseBody, which stays unchanged here, so the fields are forwarded
-	// without copying. Entries without url or b64_json carry no image and are
-	// not forwarded.
 	emitted := 0
 	for _, image := range ojson.GetBytesNoCopy(responseBody, "data").Array() {
 		if !openaiImageDataHasField(image, "url") && !openaiImageDataHasField(image, "b64_json") {
@@ -318,8 +313,6 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 				return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 			}
 		}
-		// The event keeps its field order with b64_json last. The Doc writes
-		// the event once, so the large blob is copied only into the output.
 		for _, field := range []string{"url", "revised_prompt", "b64_json"} {
 			value := image.Get(field)
 			if value.Type != ojson.String || value.Raw == `""` {
