@@ -1,8 +1,10 @@
 package relay
 
 import (
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,6 +25,8 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -31,14 +35,30 @@ func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	previousDB := model.DB
 	previousType := common.MainDatabaseType()
 	previousCache := common.MemoryCacheEnabled
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	// Remote runs must use a disposable database dedicated to this package.
+	dialect := common.DatabaseTypeSQLite
+	var driver gorm.Dialector = sqlite.Open(":memory:")
+	switch os.Getenv("TEST_TASK_RELAY_DIALECT") {
+	case "":
+	case "mysql":
+		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+		require.NotEmpty(t, os.Getenv("TEST_MYSQL_DSN"))
+		dialect, driver = common.DatabaseTypeMySQL, mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+	case "postgres":
+		require.Equal(t, "isolated-ci", os.Getenv("NEWAPI_TEST_PROFILE"))
+		require.NotEmpty(t, os.Getenv("TEST_POSTGRES_DSN"))
+		dialect, driver = common.DatabaseTypePostgreSQL, postgres.Open(os.Getenv("TEST_POSTGRES_DSN"))
+	default:
+		t.Fatal("unsupported task relay test dialect")
+	}
+	database, err := gorm.Open(driver, &gorm.Config{})
 	require.NoError(t, err)
 	sqlDB, err := database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, database.AutoMigrate(&model.Channel{}))
 	model.DB = database
-	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	common.SetMainDatabaseType(dialect)
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() {
 		model.DB = previousDB
@@ -47,6 +67,95 @@ func setupRelayChannelDB(t *testing.T) *gorm.DB {
 		require.NoError(t, sqlDB.Close())
 	})
 	return database
+}
+
+func TestRealtimeFetchAppliesChannelHeaderOverrides(t *testing.T) {
+	database := setupRelayChannelDB(t)
+	service.InitHttpClient()
+	requests := make(chan *http.Request, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Clone(r.Context())
+		_, _ = w.Write([]byte(`{"name":"operations/task-1","done":false}`))
+	}))
+	t.Cleanup(server.Close)
+	headerOverride := `{"X-API-Key":"{api_key}"}`
+	channel := &model.Channel{
+		Name: "realtime-header-override", Type: constant.ChannelTypeGemini,
+		Key: "channel-key", BaseURL: &server.URL, HeaderOverride: &headerOverride,
+	}
+	require.NoError(t, database.Create(channel).Error)
+	task := &model.Task{
+		TaskID: "public-task", ChannelId: channel.Id,
+		Status: model.TaskStatusInProgress, Progress: "50%",
+		PrivateData: model.TaskPrivateData{
+			Key: "saved-key", UpstreamTaskID: base64.RawURLEncoding.EncodeToString([]byte("operations/task-1")),
+		},
+	}
+
+	tryRealtimeFetch(task, true)
+
+	require.Len(t, requests, 1)
+	request := <-requests
+	assert.Equal(t, "/v1beta/operations/task-1", request.URL.Path)
+	assert.Equal(t, "saved-key", request.Header.Get("X-API-Key"))
+	assert.Equal(t, "saved-key", request.Header.Get("X-Goog-Api-Key"))
+}
+
+func TestRealtimeFetchRefundsTaskItFindsFailed(t *testing.T) {
+	database := setupRelayChannelDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.User{}, &model.Log{}))
+	previousLogDB := model.LOG_DB
+	previousLogType := common.LogDatabaseType()
+	common.SetLogDatabaseType(common.MainDatabaseType())
+	previousFactory := service.GetTaskAdaptorFunc
+	previousRedis := common.RedisEnabled
+	model.LOG_DB = database
+	common.RedisEnabled = false
+	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
+		if adaptor := GetTaskAdaptor(platform); adaptor != nil {
+			return adaptor
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		model.LOG_DB = previousLogDB
+		common.SetLogDatabaseType(previousLogType)
+		service.GetTaskAdaptorFunc = previousFactory
+		common.RedisEnabled = previousRedis
+	})
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"operations/task-1","done":true,"error":{"code":3,"message":"blocked by safety"}}`))
+	}))
+	t.Cleanup(server.Close)
+	channel := &model.Channel{Name: "realtime-refund", Type: constant.ChannelTypeGemini, Key: "channel-key", BaseURL: &server.URL}
+	require.NoError(t, database.Create(channel).Error)
+	require.NoError(t, database.Create(&model.User{Id: 7, Username: "realtime-owner", Quota: 100}).Error)
+	task := &model.Task{
+		TaskID: "public-task", Platform: constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeGemini)),
+		UserId: 7, ChannelId: channel.Id, Quota: 1000,
+		Status: model.TaskStatusInProgress, Progress: "50%",
+		PrivateData: model.TaskPrivateData{
+			Key: "channel-key", UpstreamTaskID: base64.RawURLEncoding.EncodeToString([]byte("operations/task-1")),
+		},
+	}
+	require.NoError(t, database.Create(task).Error)
+
+	tryRealtimeFetch(task, true)
+
+	var stored model.Task
+	require.NoError(t, database.First(&stored, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), stored.Status)
+	assert.Equal(t, "blocked by safety", stored.FailReason)
+	assert.Zero(t, stored.Quota, "the failed task is refunded")
+	var user model.User
+	require.NoError(t, database.First(&user, 7).Error)
+	assert.Equal(t, 1100, user.Quota)
+
+	// A later realtime read must not refund the same task twice.
+	tryRealtimeFetch(&stored, true)
+	require.NoError(t, database.First(&user, 7).Error)
+	assert.Equal(t, 1100, user.Quota)
 }
 
 func TestApplyChannelPinPreservesOriginTasksAndRetryMode(t *testing.T) {
