@@ -14,6 +14,7 @@ Transitive dependencies should be audited before a final external release.
 | backend  | production  | Go        | `github.com/Calcium-Ion/go-epay`                        | `v0.0.5`                             | MIT                     |
 | backend  | production  | Go        | `github.com/Calcium-Ion/moejs`                          | `v0.1.0-alpha.7`                     | Apache-2.0              |
 | backend  | production  | Go        | `github.com/ClickHouse/clickhouse-go/v2`                | `v2.46.0`                            | Apache-2.0              |
+| backend  | production  | Go        | `github.com/MoeForge/moego`                             | `v0.1.0-alpha.1`                     | MIT                     |
 | backend  | production  | Go        | `github.com/abema/go-mp4`                               | `v1.4.1`                             | MIT                     |
 | backend  | test        | Go        | `github.com/alicebob/miniredis/v2`                      | `v2.38.0`                            | MIT                     |
 | backend  | production  | Go        | `github.com/andybalholm/brotli`                         | `v1.2.0`                             | MIT                     |

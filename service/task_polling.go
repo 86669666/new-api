@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
 )
@@ -707,40 +708,75 @@ func finalizeTerminalTask(ctx context.Context, adaptor TaskPollingAdaptor, task 
 }
 
 func redactVideoResponseBody(body []byte) []byte {
-	var m map[string]any
-	if err := common.Unmarshal(body, &m); err != nil {
+	if !ojson.ValidBytes(body) || !ojson.GetBytesNoCopy(body, "@this").IsObject() {
 		return body
 	}
-	resp, _ := m["response"].(map[string]any)
-	if resp != nil {
-		delete(resp, "bytesBase64Encoded")
-		if v, ok := resp["video"].(string); ok {
-			resp["video"] = truncateBase64(v)
+	root := ojson.GetBytesNoCopy(body, "@this")
+	if relaycommon.HasDuplicateJSONMembers(root, false) ||
+		relaycommon.HasDuplicateJSONMembers(root.Get("response"), true) ||
+		relaycommon.HasDuplicateJSONMembers(root.Get("steps"), true) {
+		var data map[string]any
+		if err := common.Unmarshal(body, &data); err != nil {
+			return body
 		}
-		if vs, ok := resp["videos"].([]any); ok {
-			for i := range vs {
-				if vm, ok := vs[i].(map[string]any); ok {
-					delete(vm, "bytesBase64Encoded")
+		if response, ok := data["response"].(map[string]any); ok {
+			delete(response, "bytesBase64Encoded")
+			if video, ok := response["video"].(string); ok {
+				response["video"] = truncateBase64(video)
+			}
+			if videos, ok := response["videos"].([]any); ok {
+				for _, video := range videos {
+					if videoMap, ok := video.(map[string]any); ok {
+						delete(videoMap, "bytesBase64Encoded")
+					}
+				}
+			}
+		}
+		if steps, ok := data["steps"].([]any); ok {
+			for _, step := range steps {
+				stepMap, _ := step.(map[string]any)
+				parts, _ := stepMap["content"].([]any)
+				for _, part := range parts {
+					if partMap, ok := part.(map[string]any); ok && partMap["type"] == "video" {
+						delete(partMap, "data")
+					}
+				}
+			}
+		}
+		encoded, err := common.Marshal(data)
+		if err != nil {
+			return body
+		}
+		return encoded
+	}
+	doc := ojson.NewDoc(body)
+	if resp := ojson.GetBytesNoCopy(body, "response"); resp.IsObject() {
+		_ = doc.Delete("response.bytesBase64Encoded")
+		if video := resp.Get("video"); video.Type == ojson.String {
+			_ = doc.Set("response.video", truncateBase64(video.Str))
+		}
+		if videos := resp.Get("videos"); videos.IsArray() {
+			for i, video := range videos.Array() {
+				if video.IsObject() {
+					_ = doc.Delete(fmt.Sprintf("response.videos.%d.bytesBase64Encoded", i))
 				}
 			}
 		}
 	}
-	if steps, ok := m["steps"].([]any); ok {
-		for _, step := range steps {
-			sm, _ := step.(map[string]any)
-			parts, _ := sm["content"].([]any)
-			for _, part := range parts {
-				if pm, ok := part.(map[string]any); ok && pm["type"] == "video" {
-					delete(pm, "data")
+	if steps := ojson.GetBytesNoCopy(body, "steps"); steps.IsArray() {
+		for i, step := range steps.Array() {
+			parts := step.Get("content")
+			if !parts.IsArray() {
+				continue
+			}
+			for j, part := range parts.Array() {
+				if part.Get("type").String() == "video" {
+					_ = doc.Delete(fmt.Sprintf("steps.%d.content.%d.data", i, j))
 				}
 			}
 		}
 	}
-	b, err := common.Marshal(m)
-	if err != nil {
-		return body
-	}
-	return b
+	return doc.Bytes()
 }
 
 func truncateBase64(s string) string {
