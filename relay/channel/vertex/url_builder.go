@@ -32,6 +32,11 @@ func appendVertexAPIVersion(baseURL, version string) string {
 	if strings.HasSuffix(baseURL, "/"+version) {
 		return baseURL
 	}
+	if prefix, ok := strings.CutSuffix(baseURL, "/"+DefaultAPIVersion); ok {
+		baseURL = prefix
+	} else if prefix, ok := strings.CutSuffix(baseURL, "/"+OpenSourceAPIVersion); ok {
+		baseURL = prefix
+	}
 	return baseURL + "/" + version
 }
 
