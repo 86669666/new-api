@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -442,6 +443,262 @@ func TestDoubaoRelayedImageStreamSettlement(t *testing.T) {
 			require.NoError(t, database.Where("type = ?", model.LogTypeConsume).Find(&consumeLogs).Error)
 			require.Len(t, consumeLogs, 1)
 			assert.Equal(t, tc.wantQuota, consumeLogs[0].Quota)
+		})
+	}
+}
+
+// Local httptest upstream only. It simulates a vendor SSE body; it is not a
+// live provider and it does not move production money.
+//
+// The relayed-image test above settles through a protocol-0 double. This one
+// drives the same submission barrier with a real wallet obligation:
+// reserve (intent debit) → claim send → stage → reconcile. A native route
+// passes vendor frames through. A direct SSE read does not. A finished stream
+// settles reported usage, including explicit zero. Missing usage and a stream
+// that stops early keep the reservation. A claimed send is not refunded and
+// is not sent again.
+const sseWalletPlugin = `
+export const meta={apiVersion:1,key:"sse-wallet",name:"SSE wallet",version:"1.0.0",author:{name:"Test"},models:["sse-wallet"],fetchMode:"per_task",submitResponseTypes:["json","sse"],usageSchema:{units:{type:"number",unit:"count"}}};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/compile",responseType:"sse",body:ctx.requestBody};}
+export function parseSubmitEvent(ctx,event,previous){
+  const chunk=JSON.parse(event.data);
+  if(chunk.error) throw new Error("provider stream failure");
+  const state=Object.assign({}, previous||{saw:false,omit:false,fail:false});
+  if(chunk.units!==undefined) state.units=chunk.units;
+  if(chunk.omit===true) state.omit=true;
+  if(chunk.fail===true) state.fail=true;
+  state.saw=true;
+  return {state:state,done:chunk.complete===true};
+}
+export function parseSubmitResponse(ctx,response){
+  const body=response.body||{};
+  if(body.fail===true) return {taskId:"vendor-sse",immediate:{status:"FAILURE",reason:"vendor failed"}};
+  return {taskId:"vendor-sse",taskData:body,immediate:{status:"SUCCESS"}};
+}
+export function extractUsage(){return {units:4};}
+export function extractUsageOnComplete(ctx,result,body){
+  if(!body||body.omit===true) return null;
+  if(body.units===undefined) return {};
+  return {units:body.units};
+}
+export function parseTaskResult(){throw new Error("completed submissions must not poll");}
+export function buildQueryRequest(){throw new Error("completed submissions must not poll");}
+`
+
+func TestNativeAndDirectSSEWalletObligation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}, &model.OAuthDerivedTextCharge{})
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+	oldRedis, oldMemory, oldBatch, oldConsume, oldExport := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(dialect, dialect)
+	common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, false, false, true, false
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLogDB
+		common.SetDatabaseTypes(oldMain, oldLog)
+		common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = oldRedis, oldMemory, oldBatch, oldConsume, oldExport
+	})
+	previousGroups := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousGroups)) })
+	withTieredBillingConfig(t, map[string]string{"sse-wallet": "tiered_expr"}, map[string]string{"sse-wallet": `tier("meter", u("units") * 0.01)`})
+
+	plugin, err := pluginruntime.CompilePlugin(sseWalletPlugin, pluginruntime.Options{})
+	require.NoError(t, err)
+	const initial = 100_000
+	reserved := common.QuotaRound(4 * 0.01 * common.QuotaPerUnit)
+	actual := common.QuotaRound(2 * 0.01 * common.QuotaPerUnit)
+	require.Positive(t, reserved)
+	require.Less(t, actual, reserved)
+
+	var calls atomic.Int32
+	var lastBody atomic.Value
+	lastBody.Store("")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			http.Error(w, "read", http.StatusBadRequest)
+			return
+		}
+		lastBody.Store(string(body))
+		var request struct {
+			Scenario string `json:"scenario"`
+		}
+		_ = common.Unmarshal(body, &request)
+		w.Header().Set("Content-Type", "text/event-stream")
+		frame := map[string]string{
+			"done":   "data: {\"units\":2,\"complete\":true}\n\n",
+			"break":  "data: {\"units\":1}\n\n",
+			"omit":   "data: {\"omit\":true,\"complete\":true}\n\n",
+			"absent": "data: {\"complete\":true}\n\n",
+			"zero":   "data: {\"units\":0,\"complete\":true}\n\n",
+			"fail":   "data: {\"fail\":true,\"complete\":true}\n\n",
+			"hook":   "data: {\"error\":true}\n\n",
+		}[request.Scenario]
+		if frame == "" {
+			http.Error(w, "unknown scenario", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(w, frame)
+		w.(http.Flusher).Flush()
+		if request.Scenario == "break" {
+			panic(http.ErrAbortHandler)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	channel := model.Channel{Name: "sse-wallet-local", Type: constant.ChannelTypeTaskPlugin, Key: "local-fixture-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "sse-wallet", Group: "default"}
+	require.NoError(t, db.Create(&channel).Error)
+
+	cases := []struct {
+		name    string
+		native  bool
+		want    int
+		status  model.TaskStatus
+		failed  bool
+		frame   string
+		replay  bool
+		retries int
+	}{
+		{name: "done", native: true, want: actual, status: model.TaskStatusSuccess, frame: "data: {\"units\":2,\"complete\":true}\n\n", replay: true},
+		{name: "break", native: true, want: reserved, status: model.TaskStatusSuccess, frame: "data: {\"units\":1}\n\n"},
+		{name: "omit", native: true, want: reserved, status: model.TaskStatusSuccess, frame: "data: {\"omit\":true,\"complete\":true}\n\n"},
+		{name: "absent", native: true, want: reserved, status: model.TaskStatusSuccess, frame: "data: {\"complete\":true}\n\n"},
+		{name: "zero", native: true, want: 0, status: model.TaskStatusSuccess, frame: "data: {\"units\":0,\"complete\":true}\n\n"},
+		{name: "fail", native: true, want: 0, status: model.TaskStatusFailure, frame: "data: {\"fail\":true,\"complete\":true}\n\n"},
+		{name: "done", native: false, want: actual, status: model.TaskStatusSuccess},
+		{name: "break", native: false, failed: true},
+		{name: "hook", native: false, failed: true, replay: true, retries: 2},
+	}
+	for index, tc := range cases {
+		label := "direct/" + tc.name
+		if tc.native {
+			label = "native/" + tc.name
+		}
+		t.Run(label, func(t *testing.T) {
+			calls.Store(0)
+			if tc.retries > 0 {
+				previous := common.RetryTimes
+				common.RetryTimes = tc.retries
+				t.Cleanup(func() { common.RetryTimes = previous })
+			}
+			user := model.User{Username: fmt.Sprintf("sse%02d", index), AffCode: "sse-" + label, Quota: initial, Status: common.UserStatusEnabled, Group: "default"}
+			require.NoError(t, db.Create(&user).Error)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/compile", strings.NewReader(`{}`))
+			c.Set("group", "default")
+			c.Set("username", user.Username)
+			c.Set("task_request", map[string]any{"scenario": tc.name})
+			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
+			if tc.native {
+				c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{
+					Plugin: plugin,
+					Route:  pluginruntime.Route{Method: http.MethodPost, Path: "/compile", Type: pluginruntime.RouteTypeSubmit},
+				})
+			}
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, "sse-wallet")
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
+			common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)
+			info := &relaycommon.RelayInfo{
+				UserId: user.Id, UserGroup: "default", UsingGroup: "default", OriginModelName: "sse-wallet", IsPlayground: true,
+				TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_" + strings.ReplaceAll(label, "/", "_"), LockedChannel: &channel},
+			}
+			info.UserSetting.BillingPreference = "wallet_only"
+			info.UserSetting.QuotaWarningThreshold = -1000
+			outcome, taskErr := executeTaskSubmission(c, info)
+			assert.Equal(t, int32(1), calls.Load(), "upstream body %s", lastBody.Load())
+			require.NotNil(t, info.Billing)
+			assert.False(t, info.Billing.NeedsRefund())
+
+			var stored model.Task
+			require.NoError(t, db.Where("user_id = ?", user.Id).First(&stored).Error)
+			var rows int64
+			require.NoError(t, db.Model(&model.Task{}).Where("user_id = ?", user.Id).Count(&rows).Error)
+			assert.Equal(t, int64(1), rows)
+			assert.Equal(t, 1, stored.BillingProtocol)
+			require.NotNil(t, stored.BillingRef)
+			assert.Equal(t, info.PublicTaskID, *stored.BillingRef)
+
+			relayed := recorder.Body.String()
+			if tc.failed {
+				require.NotNil(t, taskErr, "upstream body %s", lastBody.Load())
+				assert.True(t, taskErr.NoRetry)
+				assert.Empty(t, relayed)
+				assert.Equal(t, model.TaskBillingClaimed, stored.BillingState)
+				assert.Equal(t, reserved, stored.Quota)
+				respondTaskSubmissionError(c, taskErr)
+			} else {
+				require.Nil(t, taskErr, "task error %#v upstream %s", taskErr, lastBody.Load())
+				require.NotNil(t, outcome)
+				assert.Equal(t, tc.want, outcome.Task.Quota)
+				assert.Equal(t, tc.status, outcome.Task.Status)
+				assert.Equal(t, model.TaskBillingSettled, outcome.Task.BillingState)
+				assert.Equal(t, tc.want, stored.Quota)
+				if tc.native {
+					assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+					assert.Equal(t, tc.frame, relayed)
+					presentTaskSubmission(c, outcome)
+					assert.Equal(t, relayed, recorder.Body.String())
+				} else {
+					assert.Empty(t, relayed)
+					assert.False(t, c.Writer.Written())
+					presentTaskSubmission(c, outcome)
+					assert.NotContains(t, recorder.Body.String(), "data:")
+					assert.Contains(t, recorder.Body.String(), info.PublicTaskID)
+				}
+			}
+
+			var updated model.User
+			require.NoError(t, db.First(&updated, user.Id).Error)
+			if tc.failed {
+				assert.Equal(t, initial-reserved, updated.Quota)
+				assert.Zero(t, updated.UsedQuota)
+				assert.Zero(t, updated.RequestCount)
+			} else {
+				assert.Equal(t, initial-tc.want, updated.Quota)
+				assert.Equal(t, tc.want, updated.UsedQuota)
+				assert.Equal(t, 1, updated.RequestCount)
+			}
+			var logs []model.Log
+			require.NoError(t, db.Where("user_id = ? AND type = ?", user.Id, model.LogTypeConsume).Find(&logs).Error)
+			if tc.failed {
+				assert.Empty(t, logs)
+			} else {
+				require.Len(t, logs, 1)
+				assert.Equal(t, tc.want, logs[0].Quota)
+			}
+
+			if tc.replay {
+				require.NotNil(t, info.Billing)
+				if !tc.failed {
+					require.NoError(t, info.Billing.Settle(tc.want))
+				}
+				info.Billing.Refund(c)
+				session, ok := info.Billing.(*service.BillingSession)
+				require.True(t, ok)
+				again, reqErr := http.NewRequest(http.MethodPost, upstream.URL+"/compile", strings.NewReader(`{}`))
+				require.NoError(t, reqErr)
+				_, sendErr := session.SendWalletTask(again)
+				require.Error(t, sendErr)
+				assert.Equal(t, int32(1), calls.Load())
+				require.NoError(t, db.First(&updated, user.Id).Error)
+				if tc.failed {
+					assert.Equal(t, initial-reserved, updated.Quota)
+				} else {
+					assert.Equal(t, initial-tc.want, updated.Quota)
+				}
+				require.NoError(t, db.Where("user_id = ? AND type = ?", user.Id, model.LogTypeConsume).Find(&logs).Error)
+				if tc.failed {
+					assert.Empty(t, logs)
+				} else {
+					require.Len(t, logs, 1)
+				}
+			}
 		})
 	}
 }
