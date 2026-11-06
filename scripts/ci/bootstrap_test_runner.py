@@ -254,6 +254,10 @@ METADATA_SELECTOR = '^TestOAuthTokensConsumerHTTP$'
 METADATA_CASES = ('bridge_only_rejected', 'empty_current_grant_no_writes', 'wrong_client', 'wrong_actor', 'wrong_audience', 'wrong_issuer', 'refresh_bearer', 'expired', 'future', 'write_scope_not_supported', 'old_grant_missing_read_scope', 'post_encoding_revocation_discards_empty_success', 'missing_store_is_not_empty')
 METADATA_TIERS = tuple('metadata-'+e for e in WALLET_ENGINES)
 ORDINARY_AUDIT_SELECTOR = '^TestOAuthTokensConsumerHTTP$/^ordinary_key_creation$'
+# Same birth client and database custody as ordinary-audit. This tier does not
+# create a second network namespace, so an isolated Hydra already listening on
+# this namespace's loopback stays reachable. It does not copy a journal.
+HYDRA_BIRTH_SELECTOR = '^TestOAuthPublicHydraHTTP$/^(ordinary_tokens_write|explicit_tokens_read_empty_and_refresh|approval_binding_and_unknown_accept|durable_cleanup_(grant|client|sid|others|user))$'
 LIFECYCLE_SELECTOR = '^TestOAuthDerivedTokenOwnerLifecycle$'
 LIFECYCLE_CASES = ('owner_reveal_and_mutation', 'revoke_and_rollback', 'disable_delete_rollback',
                    'unknown_is_not_manual', 'same_user_creation_limit', 'registration_default_token',
@@ -287,6 +291,12 @@ def prepare(args):
         if args.package not in (None, ['./router']) or args.run not in ('.', ORDINARY_AUDIT_SELECTOR):
             raise ValueError('ordinary audit tier requires its exact OAuth route inventory')
         args.package, args.run = ['./router'], ORDINARY_AUDIT_SELECTOR
+    if args.tier == 'hydra-birth':
+        if args.package not in (None, ['./router']) or args.run not in ('.', HYDRA_BIRTH_SELECTOR):
+            raise ValueError('hydra-birth tier requires its exact Hydra birth inventory')
+        if not args.hydra_input or not os.path.isabs(args.hydra_input) or not os.path.isfile(args.hydra_input):
+            raise ValueError('hydra-birth requires --hydra-input as an absolute file in this network namespace')
+        args.package, args.run = ['./router'], HYDRA_BIRTH_SELECTOR
     if args.tier in LIFECYCLE_TIERS:
         if args.package not in (None, ['./controller']) or args.run not in ('.', LIFECYCLE_SELECTOR):
             raise ValueError('lifecycle tier requires the exact controller lifecycle inventory')
@@ -344,6 +354,9 @@ def prepare(args):
             if (bundle / binary).exists():
                 entries.append({'binary': binary, 'cwd': str(Path(module) / rel), 'run': args.run})
     shutil.copyfile(__file__, bundle / 'runner.py')
+    if args.tier == 'hydra-birth':
+        (bundle / 'hydra-input.path').write_text(args.hydra_input + '\n')
+        (bundle / 'hydra-input.path').chmod(0o644)
     metadata = {'tier': args.tier, 'entries': entries, 'files': {str(p.relative_to(bundle)): digest(p) for p in sorted(bundle.rglob('*')) if p.is_file()}}
     if args.tier == 'all':
         metadata['inventory'] = compiled_inventory(bundle, entries)
@@ -467,6 +480,13 @@ def required_leaves(tier):
     if tier == 'ordinary-audit' or tier in ORDINARY_AUDIT_SHARED:
         return ['TestOAuthTokensConsumerHTTP/ordinary_key_creation/audit_insert_failure/'+case
                 for case in ('success', 'authenticated_rejection')]
+    if tier == 'hydra-birth':
+        return ['TestOAuthPublicHydraHTTP/'+name for name in (
+            'ordinary_tokens_write', 'explicit_tokens_read_empty_and_refresh',
+            'approval_binding_and_unknown_accept/accepted_response_lost',
+            'approval_binding_and_unknown_accept/logout_during_accept',
+            'durable_cleanup_grant', 'durable_cleanup_client', 'durable_cleanup_sid',
+            'durable_cleanup_others', 'durable_cleanup_user')]
     if tier in LIFECYCLE_TIERS:
         return ['TestOAuthDerivedTokenOwnerLifecycle/'+case for case in LIFECYCLE_CASES]
     if tier in METADATA_TIERS:
@@ -510,7 +530,7 @@ def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
 
 def dispatch_tier(bundle, tier):
     metadata = verified_manifest(bundle)
-    if tier not in ('sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
+    if tier not in ('sqlite', 'ordinary-audit', 'hydra-birth', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
         raise ValueError('dispatch tier mismatch')
     if tier in ORDINARY_AUDIT_SHARED:
         ordinary_audit_shared_dispatch(bundle,tier)
@@ -531,6 +551,14 @@ def dispatch_tier(bundle, tier):
         command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork', 'sh', '-c',
                  'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && '+('ip link set lo up && ' if tier == 'metadata-sqlite' else '')+'exec "$@"',
                  'wallet-tests', sys.executable, str(bundle/'runner.py'), '_wallet_run', str(bundle), tier])
+        return
+    if tier == 'hydra-birth':
+        # Share the caller's network so the isolated Hydra on this loopback is
+        # the same one named by --hydra-input. ordinary-audit keeps --net.
+        hydra_input = (bundle / 'hydra-input.path').read_text().strip()
+        command(['sudo', '-n', 'unshare', '--mount', '--pid', '--fork',
+                 'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=4G,mode=0755,nosuid,nodev tmpfs /run && exec "$@"',
+                 'hydra-birth', sys.executable, str(bundle / 'runner.py'), '_run', str(bundle), tier, hydra_input])
         return
     if tier not in ('sqlite', 'ordinary-audit'):
         postgres_container(bundle, tier)
@@ -1621,7 +1649,7 @@ def postgres_container(bundle, tier='postgres'):
         print(json.dumps({'image': image_id, 'cid': cid, 'cleanup': 'owned PG container removed; no volumes'}), flush=True)
 
 
-def trusted_run(bundle, tier="sqlite"):
+def trusted_run(bundle, tier="sqlite", hydra_input=""):
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise ValueError('installer requires Linux root; use the normal prepare entry')
     bundle = Path(bundle).resolve(strict=True)
@@ -1637,12 +1665,16 @@ def trusted_run(bundle, tier="sqlite"):
     for required in ('new-api', 'runner.py'):
         if required not in metadata['files']:
             raise ValueError('missing producer input')
-    if tier not in ('sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis') or metadata.get('tier', 'sqlite') != tier:
+    if tier not in ('sqlite', 'ordinary-audit', 'hydra-birth', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis') or metadata.get('tier', 'sqlite') != tier:
         raise ValueError('resource tier mismatch')
     if tier == 'ordinary-audit' and (len(metadata['entries']) != 1 or
             metadata['entries'][0]['cwd'] != 'router' or
             metadata['entries'][0]['run'] != ORDINARY_AUDIT_SELECTOR):
         raise ValueError('ordinary audit mandatory inventory mismatch')
+    if tier == 'hydra-birth' and (len(metadata['entries']) != 1 or
+            metadata['entries'][0]['cwd'] != 'router' or
+            metadata['entries'][0]['run'] != HYDRA_BIRTH_SELECTOR or hydra_input == ''):
+        raise ValueError('hydra-birth mandatory inventory mismatch')
     if tier in ('postgres', 'postgres-redis') and (len(metadata['entries']) != 1 or metadata['entries'][0]['cwd'] != 'router' or metadata['entries'][0]['run'] != (PG_SELECTOR if tier == 'postgres' else JOINT_SELECTOR)):
         raise ValueError('PG mandatory inventory mismatch')
     if tier in ('postgres', 'postgres-redis'):
@@ -1709,6 +1741,11 @@ def trusted_run(bundle, tier="sqlite"):
         launcher.write_text('#!/bin/sh\nexec /usr/bin/python3 ' + str(root / 'bundle/runner.py') + ' client ' + str(root / 'installer.sock') + ' "$@"\n')
         launcher.chmod(0o755)
         env = {'PATH': '/usr/bin:/bin', 'HOME': str(root / 'tmp'), 'TMPDIR': str(root / 'tmp'), 'NEWAPI_TEST_PROFILE': 'isolated-ci', 'NEWAPI_BOOTSTRAP_CLIENT': str(launcher), 'NEWAPI_BOOTSTRAP_ENGINE': 'sqlite'}
+        if tier == 'hydra-birth':
+            if not hydra_input.startswith('/') or not os.path.isfile(hydra_input):
+                raise ValueError('hydra-birth input must stay an absolute file in this network namespace')
+            env['NEWAPI_W01_HYDRA_INPUT'] = hydra_input
+            env['GOMAXPROCS'] = '2'
         if tier in ('postgres', 'postgres-redis'):
             pg_resource = OwnedPostgres(root, uid) if tier == 'postgres' else CombinedPostgres(root, uid)
             env.update(pg_resource.start())
@@ -1747,7 +1784,7 @@ def trusted_run(bundle, tier="sqlite"):
             print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry, phase='ordinary')), flush=True)
             if redis_resource:
                 redis_resource.verify()
-            if pg_resource or tier == 'ordinary-audit':
+            if pg_resource or tier in ('ordinary-audit', 'hydra-birth'):
                 if pg_resource:
                     pg_resource.verify()
                 installer.process_ready.clear()
@@ -1755,7 +1792,7 @@ def trusted_run(bundle, tier="sqlite"):
                     installer.process = process
                     installer.process_ready.set()
                     try:
-                        stdout, _ = process.communicate(timeout=180)
+                        stdout, _ = process.communicate(timeout=600 if tier == 'hydra-birth' else 180)
                     except BaseException:
                         process.kill()
                         process.communicate()
@@ -3313,14 +3350,15 @@ def main():
     if len(sys.argv) in (3, 4) and sys.argv[1] == 'client':
         client(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'fresh')
         return
-    if len(sys.argv) in (3, 4) and sys.argv[1] == '_run':
-        trusted_run(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else 'sqlite')
+    if len(sys.argv) in (3, 4, 5) and sys.argv[1] == '_run':
+        trusted_run(sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else 'sqlite', sys.argv[4] if len(sys.argv) == 5 else '')
         return
     if len(sys.argv) == 4 and sys.argv[1] == '_dispatch':
         dispatch_tier(Path(sys.argv[2]), sys.argv[3])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('all', 'sqlite', 'ordinary-audit', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; ordinary-audit uses SQLite and does not qualify external log stores')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'ordinary-audit', 'hydra-birth', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; ordinary-audit uses SQLite and does not qualify external log stores')
+    parser.add_argument('--hydra-input', help='absolute isolated Hydra input JSON; hydra-birth only, same network namespace, no secret on the command beyond this path')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--broker-inventory', action='store_true', help='uid997 isolated inventory only; not formal execution')

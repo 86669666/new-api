@@ -356,6 +356,12 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 	require.NoError(t, service.InitOAuthProviderBridge())
 	f := newOrganizationHTTPFixture(t)
 	oauthPublicDatabase(t, f)
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") != "" {
+		// The organization fixture already opened the installer-born database.
+		// Refuse a second database or a missing journal instead of copying one.
+		require.NotEmpty(t, os.Getenv("OAUTH_BOOTSTRAP_JOURNAL"))
+		require.NoError(t, model.ValidateOAuthDerivedTokenStore(t.Context()))
+	}
 	require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}))
 	oldAddress, oldCritical := system_setting.ServerAddress, common.CriticalRateLimitEnable
 	system_setting.ServerAddress = input.Issuer
