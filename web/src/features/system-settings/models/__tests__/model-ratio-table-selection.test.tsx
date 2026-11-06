@@ -331,9 +331,17 @@ it('preserves the choice to show all models when issues refresh', async () => {
   expect(screen.getByRole('row', { name: /kling-v3/ })).toBeVisible()
 })
 
-it('returns to all models when the last pricing issue is resolved', async () => {
+it('returns to all models when Review prices resolves the last pricing issue', async () => {
+  const user = userEvent.setup()
   const fixture = { ...pricingIssueFixture }
   const { queryClient } = await renderEditor(fixture)
+  await user.click(screen.getByRole('button', { name: 'Review prices' }))
+  await user.click(screen.getByRole('button', { name: 'Show all models' }))
+  expect(screen.getByRole('row', { name: /gpt-4\.1-mini/ })).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Review prices' }))
+  expect(
+    screen.queryByRole('row', { name: /gpt-4\.1-mini/ })
+  ).not.toBeInTheDocument()
   fixture.issues = []
 
   await queryClient.invalidateQueries({

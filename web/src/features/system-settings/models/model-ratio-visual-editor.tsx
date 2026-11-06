@@ -718,9 +718,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
             if (!model) return
             setToolbarVersion((version) => version + 1)
             setGlobalFilter('')
-            table.setColumnFilters([
-              { id: 'name', value: [PRICE_ATTENTION_FILTER] },
-            ])
+            setColumnFiltersOverride(null)
             table.setPageIndex(0)
             handleEdit(model)
           }}
