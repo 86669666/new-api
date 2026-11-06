@@ -3,7 +3,33 @@
 // (cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing).
 const OMNI_VIDEO_TOKENS_PER_SECOND = { "360p": 1931, "720p": 5792, "1080p": 8688, "4k": 17376 };
 const RESOLUTIONS = Object.keys(OMNI_VIDEO_TOKENS_PER_SECOND);
+const VEO_USAGE_SCHEMA = {
+  // Requested video duration in seconds. Allowed values: 4, 6, 8.
+  seconds: {
+    type: "number",
+    unit: "second",
+    description: { en: "Video generation unit price", zh: "视频生成单价" },
+  },
+  // Requested video output resolution.
+  resolution: {
+    enum: ["720p", "1080p", "4k"],
+    enumLabels: { "720p": { en: "720p", zh: "720p" }, "1080p": { en: "1080p", zh: "1080p" }, "4k": { en: "4k", zh: "4k" } },
+    description: { en: "Output video resolution", zh: "输出视频分辨率" },
+  },
+  // Whether audio is generated. Default true. Audio and muted tiers have different prices.
+  generate_audio: {
+    type: "boolean",
+    description: { en: "Whether audio is generated", zh: "是否生成音频" },
+  },
+};
 const OMNI_USAGE_SCHEMA = {
+  // Keep saved duration-based prices valid alongside token-based prices.
+  seconds: VEO_USAGE_SCHEMA.seconds,
+  resolution: Object.assign({}, VEO_USAGE_SCHEMA.resolution, {
+    enum: RESOLUTIONS,
+    enumLabels: Object.assign({}, VEO_USAGE_SCHEMA.resolution.enumLabels, { "360p": { en: "360p", zh: "360p" } }),
+  }),
+  generate_audio: VEO_USAGE_SCHEMA.generate_audio,
   // Input tokens (reported on completion).
   input_tokens: {
     type: "number",
@@ -25,7 +51,10 @@ const OMNI_USAGE_SCHEMA = {
 };
 // Input and text output are only known on completion, which reports them.
 function omniUsageFacts(seconds, resolution) {
-  return { input_tokens: 0, output_tokens: 0, video_tokens: seconds * OMNI_VIDEO_TOKENS_PER_SECOND[resolution] };
+  return {
+    seconds: seconds, resolution: resolution, generate_audio: true,
+    input_tokens: 0, output_tokens: 0, video_tokens: seconds * OMNI_VIDEO_TOKENS_PER_SECOND[resolution],
+  };
 }
 
 export const meta = {
@@ -51,25 +80,7 @@ export const meta = {
   fetchMode: "per_task",
   auth: { type: "oauth2_jwt" },
   upstreams: ["vendor", "new_api"],
-  usageSchema: {
-    // Requested video duration in seconds. Allowed values: 4, 6, 8.
-    seconds: {
-      type: "number",
-      unit: "second",
-      description: { en: "Video generation unit price", zh: "视频生成单价" },
-    },
-    // Requested video output resolution.
-    resolution: {
-      enum: ["720p", "1080p", "4k"],
-      enumLabels: { "720p": { en: "720p", zh: "720p" }, "1080p": { en: "1080p", zh: "1080p" }, "4k": { en: "4k", zh: "4k" } },
-      description: { en: "Output video resolution", zh: "输出视频分辨率" },
-    },
-    // Whether audio is generated. Default true. Audio and muted tiers have different prices.
-    generate_audio: {
-      type: "boolean",
-      description: { en: "Whether audio is generated", zh: "是否生成音频" },
-    },
-  },
+  usageSchema: VEO_USAGE_SCHEMA,
   usageExamples: [
     { label: "8s 720p audio", facts: { seconds: 8, resolution: "720p", generate_audio: true } },
     { label: "8s 720p muted", facts: { seconds: 8, resolution: "720p", generate_audio: false } },
@@ -469,19 +480,25 @@ export function extractUsageOnComplete(ctx, _result, body) {
   const usage = plainObject(body && body.usage);
   if (!usage) return null;
   const facts = {};
-  const inputTokens = Number(usage.total_input_tokens);
-  if (Number.isFinite(inputTokens)) facts.input_tokens = inputTokens;
-  let textTokens = Number(usage.total_thought_tokens);
-  let videoTokens = NaN;
-  for (const item of Array.isArray(usage.output_tokens_by_modality) ? usage.output_tokens_by_modality : []) {
-    const entry = plainObject(item) || {};
-    const tokens = Number(entry.tokens) || 0;
-    const modality = trimmed(entry.modality).toLowerCase();
-    if (modality === "video" || modality === "audio") videoTokens = (videoTokens || 0) + tokens;
-    else textTokens = (textTokens || 0) + tokens;
+  // Reject the whole completion overlay on malformed counts. Skipping a bad
+  // contribution could turn a partial sum into an authoritative lower charge.
+  for (const [source, target] of [["total_input_tokens", "input_tokens"], ["total_thought_tokens", "output_tokens"]]) {
+    const tokens = usage[source];
+    if (tokens === undefined) continue;
+    if (!Number.isInteger(tokens) || tokens < 0) return null;
+    facts[target] = tokens;
   }
-  if (Number.isFinite(textTokens)) facts.output_tokens = textTokens;
-  if (Number.isFinite(videoTokens)) facts.video_tokens = videoTokens;
+  const modalities = usage.output_tokens_by_modality;
+  if (modalities !== undefined && !Array.isArray(modalities)) return null;
+  for (const item of modalities || []) {
+    const entry = plainObject(item);
+    if (!entry || !Number.isInteger(entry.tokens) || entry.tokens < 0 || !trimmed(entry.modality)) return null;
+    const modality = trimmed(entry.modality).toLowerCase();
+    const key = modality === "video" || modality === "audio" ? "video_tokens" : "output_tokens";
+    const total = (facts[key] || 0) + entry.tokens;
+    if (!Number.isFinite(total)) return null;
+    facts[key] = total;
+  }
   return facts;
 }
 export function buildQueryRequest(ctx) {
