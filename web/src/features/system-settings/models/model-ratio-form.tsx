@@ -36,6 +36,10 @@ import {
 } from '@/components/ui/form'
 import { Switch } from '@/components/ui/switch'
 import { getEnabledModels } from '@/features/channels/api'
+import {
+  buildPriceChangeRows,
+  pricingOptions,
+} from '@/features/model-pricing/pricing'
 import { handleServerError } from '@/lib/handle-server-error'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
@@ -45,10 +49,12 @@ import {
   SettingsSwitchItem,
 } from '../components/settings-form-layout'
 import { SettingsPageActionsPortal } from '../components/settings-page-context'
+import type { ModelRow } from './model-pricing-snapshots'
 import {
   ModelRatioVisualEditor,
   type ModelRatioVisualEditorHandle,
 } from './model-ratio-visual-editor'
+import { PriceChangesDialog } from './price-change-diff'
 
 type ModelFormValues = {
   ModelPrice: string
@@ -180,6 +186,8 @@ export const ModelRatioForm = memo(function ModelRatioForm({
   const { t } = useTranslation()
   const isUnsetVariant = variant === 'unset'
   const [editMode, setEditMode] = useState<'visual' | 'json'>('visual')
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [changeRows, setChangeRows] = useState<ModelRow[]>([])
   const visualEditorRef = useRef<ModelRatioVisualEditorHandle>(null)
 
   const enabledModelsQuery = useQuery({
@@ -223,14 +231,31 @@ export const ModelRatioForm = memo(function ModelRatioForm({
     setEditMode((prev) => (prev === 'visual' ? 'json' : 'visual'))
   }, [])
 
+  // Commit an open editor before comparing, so a reverted edit cannot hide
+  // other price changes or skip this review.
   const handleSave = useCallback(async () => {
     if (editMode === 'visual') {
       const committed = await visualEditorRef.current?.commitOpenEditor()
       if (committed === false) return
     }
+    if (!(await form.trigger())) return
 
+    const changes = buildPriceChangeRows(
+      pricingOptions(savedValues),
+      pricingOptions(form.getValues())
+    )
+    if (changes.length === 0) {
+      await form.handleSubmit(onSave)()
+      return
+    }
+    setChangeRows(changes)
+    setConfirmOpen(true)
+  }, [editMode, form, onSave, savedValues])
+
+  const handleConfirmSave = useCallback(async () => {
     await form.handleSubmit(onSave)()
-  }, [editMode, form, onSave])
+    setConfirmOpen(false)
+  }, [form, onSave])
 
   return (
     <Form {...form}>
@@ -351,7 +376,12 @@ export const ModelRatioForm = memo(function ModelRatioForm({
             />
           </div>
         ) : (
-          <SettingsForm onSubmit={form.handleSubmit(onSave)}>
+          <SettingsForm
+            onSubmit={(event) => {
+              event.preventDefault()
+              void handleSave()
+            }}
+          >
             <div className='grid min-w-0 gap-x-5 gap-y-8 lg:grid-cols-2 2xl:grid-cols-3'>
               {modelJsonFields.map((config) => (
                 <ModelJsonTextareaField
@@ -366,6 +396,13 @@ export const ModelRatioForm = memo(function ModelRatioForm({
           </SettingsForm>
         )}
       </div>
+      <PriceChangesDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        rows={changeRows}
+        onConfirm={handleConfirmSave}
+        isLoading={isSaving}
+      />
     </Form>
   )
 })
