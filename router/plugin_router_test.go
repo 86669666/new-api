@@ -407,11 +407,11 @@ func TestPluginStaticRouteConflictsAreExcluded(t *testing.T) {
 	}
 }
 
-// The host's namespaces (api and the first segment of every static route)
-// carry the top-level routes of built-in plugins only. Every plugin keeps its
-// /{key} address, so a key may not name a host segment or a built-in plugin's
-// own prefix.
-func TestHostNamespacesCarryOnlyBuiltInTopLevelRoutes(t *testing.T) {
+// Built-in and uploaded plugins alike serve their top-level paths, /v1 ones
+// included, unless a host route answers first or the first segment is another
+// plugin's key. Every plugin keeps its /{key} address, so a key may not name a
+// host segment or a built-in plugin's own prefix.
+func TestTopLevelRoutesSkipOnlyHostRoutesAndOtherKeys(t *testing.T) {
 	outer := newOuterPluginTestEngine()
 	outer.GET("/v1/models", func(c *gin.Context) { c.String(http.StatusOK, "host models") })
 	outer.GET("/v1beta/models", func(c *gin.Context) { c.String(http.StatusOK, "host gemini") })
@@ -428,9 +428,10 @@ func TestHostNamespacesCarryOnlyBuiltInTopLevelRoutes(t *testing.T) {
 		require.NoError(t, err)
 	}
 	third := compileRouterPlugin(t, "third-probe", "1.0.0", `[
-		{method: "POST", path: "/v1/videos/foo", type: "submit"},
+		{method: "POST", path: "/v1/systemone", type: "submit"},
 		{method: "POST", path: "/ent/v2/text2video", type: "submit"},
-		{method: "POST", path: "/beta/jobs", type: "submit"}
+		{method: "POST", path: "/beta/jobs", type: "submit"},
+		{method: "GET", path: "/v1/models", type: "query"}
 	]`)
 	overrides := []*jsplugin.LoadedPlugin{third, compileRouterPlugin(t, "beta", "1.0.0", `[{method: "POST", path: "/own/jobs", type: "submit"}]`)}
 	for _, key := range []string{"pg", "v1beta", "ali", "suno"} {
@@ -449,9 +450,11 @@ func TestHostNamespacesCarryOnlyBuiltInTopLevelRoutes(t *testing.T) {
 	for _, request := range []struct{ method, path, answer string }{
 		{http.MethodPost, "/v1/videos/foo", "builtin-probe"},
 		{http.MethodPost, "/builtin-probe/v1/videos/foo", "builtin-probe"},
-		{http.MethodPost, "/third-probe/v1/videos/foo", "third-probe"},
+		{http.MethodPost, "/v1/systemone", "third-probe"},
+		{http.MethodPost, "/third-probe/v1/systemone", "third-probe"},
 		{http.MethodGet, "/v1/models", "host models"},
 		{http.MethodGet, "/builtin-probe/v1/models", "builtin-probe"},
+		{http.MethodGet, "/third-probe/v1/models", "third-probe"},
 		{http.MethodPost, "/ent/v2/text2video", "third-probe"},
 		{http.MethodPost, "/beta/jobs", "fallback"},
 		{http.MethodPost, "/third-probe/beta/jobs", "third-probe"},
@@ -461,8 +464,8 @@ func TestHostNamespacesCarryOnlyBuiltInTopLevelRoutes(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []jsplugin.SkippedRoute{
 		{PluginKey: "builtin-probe", Route: builtIn.Meta.Routes[1], Reason: "host_route"},
-		{PluginKey: "third-probe", Route: third.Meta.Routes[0], Reason: "host_namespace"},
 		{PluginKey: "third-probe", Route: third.Meta.Routes[2], Reason: "key_namespace"},
+		{PluginKey: "third-probe", Route: third.Meta.Routes[3], Reason: "host_route"},
 	}, registry.Generation().SkippedRoutes())
 	routingErrors := registry.RoutingErrors()
 	assert.Len(t, routingErrors, 4)
@@ -470,6 +473,104 @@ func TestHostNamespacesCarryOnlyBuiltInTopLevelRoutes(t *testing.T) {
 	assert.Contains(t, routingErrors["v1beta"], `plugin key "v1beta" is a host path segment`)
 	assert.Contains(t, routingErrors["ali"], `plugin key "ali" is a prefix owned by built-in plugin alibaba`)
 	assert.Contains(t, routingErrors["suno"], `plugin key "suno" is a prefix owned by built-in plugin sunoapi`)
+}
+
+// Uploaded top-level /v1 routes keep the host route and the same TokenAuth as
+// the /{key} copy. The marker handler is mounted after TokenAuth and stops
+// before RelayTask, so this registration does not enter a protocol1 wallet
+// obligation. A token row without the installer provenance store is refused
+// by TokenAuth; this test does not configure that store. Native plugin
+// response and protocol0 quota settlement stay on
+// controller.TestKlingNativeRouteSubmitPollSettleAndQuery.
+func TestUploadedPluginTopLevelV1KeepsHostRouteAndTokenAuth(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	previousDB := model.DB
+	previousRedis := common.RedisEnabled
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}))
+	model.DB = database
+	common.RedisEnabled = false
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.RedisEnabled = previousRedis
+	})
+	const tokenKey = "toplevelv1key"
+	require.NoError(t, database.Create(&model.Token{
+		UserId:         7,
+		Key:            tokenKey,
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		UnlimitedQuota: true,
+	}).Error)
+
+	outer := gin.New()
+	outer.GET("/v1/models", middleware.TokenAuth(), func(c *gin.Context) {
+		c.String(http.StatusOK, "host models user %d", c.GetInt("id"))
+	})
+	third := compileRouterPlugin(t, "third-probe", "1.0.0", `[
+		{method: "POST", path: "/v1/systemone", type: "submit"},
+		{method: "GET", path: "/v1/models", type: "query"},
+		{method: "POST", path: "/beta/jobs", type: "submit"}
+	]`)
+	beta := compileRouterPlugin(t, "beta", "1.0.0", `[{method: "POST", path: "/own/jobs", type: "submit"}]`)
+	registry := jsplugin.NewRegistry()
+	require.NoError(t, registry.ReplaceOverrides([]*jsplugin.LoadedPlugin{third, beta}))
+	handlers := func(generation *jsplugin.RoutingGeneration, group jsplugin.RouteGroup) []gin.HandlerFunc {
+		production := productionPluginRouteHandlers(generation, group)
+		return []gin.HandlerFunc{production[0], production[1], production[2], func(c *gin.Context) {
+			c.String(http.StatusOK, "plugin %s user %d %s", group.Bindings[0].Plugin.Meta.Key, c.GetInt("id"), c.Request.URL.Path)
+		}}
+	}
+	require.NoError(t, registry.SetGenerationPreparer(newPluginGenerationBuilder(outer.Routes(), nil, handlers).prepare))
+	require.Empty(t, registry.RoutingErrors())
+	outer.NoRoute(
+		(&pluginRouteDispatcher{registry: registry}).dispatch,
+		func(c *gin.Context) { c.String(http.StatusOK, "fallback") },
+	)
+	assert.ElementsMatch(t, []jsplugin.SkippedRoute{
+		{PluginKey: "third-probe", Route: third.Meta.Routes[1], Reason: "host_route"},
+		{PluginKey: "third-probe", Route: third.Meta.Routes[2], Reason: "key_namespace"},
+	}, registry.Generation().SkippedRoutes())
+
+	for _, testCase := range []struct {
+		name          string
+		method, path  string
+		authorization string
+		status        int
+		body          string
+	}{
+		{name: "unauthenticated top-level plugin", method: http.MethodPost, path: "/v1/systemone", status: http.StatusUnauthorized},
+		{name: "invalid token on top-level plugin", method: http.MethodPost, path: "/v1/systemone", authorization: "Bearer not-the-token", status: http.StatusUnauthorized},
+		{name: "vendor Token form is not accepted", method: http.MethodPost, path: "/v1/systemone", authorization: "Token " + tokenKey, status: http.StatusUnauthorized},
+		{name: "token row without provenance is refused", method: http.MethodPost, path: "/v1/systemone", authorization: "Bearer " + tokenKey, status: http.StatusServiceUnavailable},
+		{name: "unauthenticated key copy", method: http.MethodPost, path: "/third-probe/v1/systemone", status: http.StatusUnauthorized},
+		{name: "key copy token row is refused", method: http.MethodPost, path: "/third-probe/v1/systemone", authorization: "Bearer " + tokenKey, status: http.StatusServiceUnavailable},
+		{name: "host route unauthenticated", method: http.MethodGet, path: "/v1/models", status: http.StatusUnauthorized},
+		{name: "host route token row is refused by host auth", method: http.MethodGet, path: "/v1/models", authorization: "Bearer " + tokenKey, status: http.StatusServiceUnavailable},
+		{name: "skipped host route under the key is refused", method: http.MethodGet, path: "/third-probe/v1/models", authorization: "Bearer " + tokenKey, status: http.StatusServiceUnavailable},
+		{name: "other plugin key is not served at top level", method: http.MethodPost, path: "/beta/jobs", authorization: "Bearer " + tokenKey, status: http.StatusOK, body: "fallback"},
+		{name: "other plugin key copy still requires auth", method: http.MethodPost, path: "/third-probe/beta/jobs", status: http.StatusUnauthorized},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(testCase.method, testCase.path, strings.NewReader(`{}`))
+			if testCase.authorization != "" {
+				request.Header.Set("Authorization", testCase.authorization)
+			}
+			recorder := httptest.NewRecorder()
+			outer.ServeHTTP(recorder, request)
+
+			assert.Equal(t, testCase.status, recorder.Code, recorder.Body.String())
+			if testCase.body != "" {
+				assert.Equal(t, testCase.body, recorder.Body.String())
+			} else {
+				assert.NotContains(t, recorder.Body.String(), "plugin third-probe")
+				assert.NotContains(t, recorder.Body.String(), "host models")
+			}
+			assert.NotContains(t, recorder.Body.String(), tokenKey)
+			assert.NotContains(t, recorder.Body.String(), "not-the-token")
+		})
+	}
 }
 
 // Plugins declaring the same path shape share one registration whose
