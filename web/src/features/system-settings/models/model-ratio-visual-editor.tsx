@@ -50,6 +50,7 @@ import { Button } from '@/components/ui/button'
 import { useModelPricing } from '@/features/model-pricing/api'
 import {
   applyPricingDraft,
+  editorPriceSignature,
   pricingOptions,
 } from '@/features/model-pricing/pricing'
 import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
@@ -675,12 +676,17 @@ const ModelRatioVisualEditorComponent = forwardRef<
         if (!editorOpen || !editorPanelRef.current) return true
         const data = await editorPanelRef.current.commitDraft()
         if (!data) return false
+        // The open editor is committed before the save review. A display-only
+        // task default must not become a draft the review then has to confirm.
+        if (editorPriceSignature(editData) === editorPriceSignature(data)) {
+          return true
+        }
         persistPricingData(data)
         setEditData(data)
         return true
       },
     }),
-    [editorOpen, persistPricingData]
+    [editData, editorOpen, persistPricingData]
   )
 
   const hasRows = table.getRowModel().rows.length > 0

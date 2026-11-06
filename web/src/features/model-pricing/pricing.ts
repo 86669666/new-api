@@ -25,6 +25,8 @@ import type { ModelRatioData } from '@/features/system-settings/models/model-pri
 import {
   buildModelRow,
   buildModelSnapshots,
+  getSnapshotSignature,
+  hasPricingValue,
   type ModelPricingSnapshot,
   type ModelRow,
 } from '@/features/system-settings/models/model-pricing-snapshots'
@@ -165,6 +167,69 @@ export function pricingRows(options: PricingOptions): ModelPricingSnapshot[] {
     billingExpr: options['billing_setting.billing_expr'],
     pluginBillingExpr: options['billing_setting.plugin_billing_expr'],
   })
+}
+
+function snapshotHasPrice(row: ModelPricingSnapshot) {
+  return (
+    hasPricingValue(row.price) ||
+    hasPricingValue(row.ratio) ||
+    hasPricingValue(row.cacheRatio) ||
+    hasPricingValue(row.createCacheRatio) ||
+    hasPricingValue(row.completionRatio) ||
+    hasPricingValue(row.imageRatio) ||
+    hasPricingValue(row.audioRatio) ||
+    hasPricingValue(row.audioCompletionRatio) ||
+    Boolean(row.billingExpr) ||
+    Boolean(row.requestRuleExpr) ||
+    Object.keys(row.pluginBillingExpr ?? {}).length > 0
+  )
+}
+
+/**
+ * Signature of one editor draft. An unpriced model matches a missing row, so
+ * opening the task editor does not count as a price change.
+ */
+export function editorPriceSignature(
+  data?: {
+    name?: string
+    billingMode?: ModelRatioData['billingMode']
+    price?: string
+    ratio?: string
+    cacheRatio?: string
+    createCacheRatio?: string
+    completionRatio?: string
+    imageRatio?: string
+    audioRatio?: string
+    audioCompletionRatio?: string
+    billingExpr?: string
+    requestRuleExpr?: string
+    pluginBillingExpr?: Record<string, string>
+  } | null
+): string {
+  if (!data?.name) return ''
+  let billingMode: ModelRatioData['billingMode'] = 'per-token'
+  if (data.billingMode === 'tiered_expr') billingMode = 'tiered_expr'
+  else if (data.price) billingMode = 'per-request'
+  const draft: ModelRatioData = {
+    name: data.name,
+    billingMode,
+    price: data.price || '',
+    ratio: data.ratio || '',
+    cacheRatio: data.cacheRatio || '',
+    createCacheRatio: data.createCacheRatio || '',
+    completionRatio: data.completionRatio || '',
+    imageRatio: data.imageRatio || '',
+    audioRatio: data.audioRatio || '',
+    audioCompletionRatio: data.audioCompletionRatio || '',
+    billingExpr: data.billingExpr,
+    requestRuleExpr: data.requestRuleExpr,
+    pluginBillingExpr: data.pluginBillingExpr,
+  }
+  const row = pricingRows(applyPricingDraft(pricingOptions({}), draft)).find(
+    (entry) => entry.name === data.name
+  )
+  if (!row || !snapshotHasPrice(row)) return ''
+  return getSnapshotSignature(row)
 }
 
 /** Models whose draft price differs from the saved one. */

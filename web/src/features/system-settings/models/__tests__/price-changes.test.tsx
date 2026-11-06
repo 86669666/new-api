@@ -24,6 +24,8 @@ import { useForm } from 'react-hook-form'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { SettingsPageProvider } from '../../components/settings-page-context'
 import { ModelRatioForm } from '../model-ratio-form'
@@ -49,6 +51,7 @@ afterEach(() => {
   client?.clear()
   localStorage.clear()
   vi.restoreAllMocks()
+  useAuthStore.getState().auth.reset()
 })
 
 function PriceFormFixture(props: {
@@ -238,5 +241,138 @@ it('reviews an expression edit even when loaded option keys are unchanged', asyn
   const row = within(dialog).getByRole('row', { name: /example/ })
   expect(within(row).getByText('Added')).toBeVisible()
   expect(within(row).getByText('tier("base", p * 3)')).toBeVisible()
+  expect(onSave).not.toHaveBeenCalled()
+})
+
+const seedance = 'doubao-seedance-1-0-lite-i2v'
+const zeroSeedanceExpr = 'tier("base", u("tokens") * 0 / 1000000)'
+
+async function renderCatalog(saved: typeof emptyMaps, draft: typeof emptyMaps) {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'root', role: ROLE.SUPER_ADMIN })
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/pricing') {
+      return {
+        data: {
+          success: true,
+          data: [
+            {
+              model_name: seedance,
+              billing_usage_schema: {
+                tokens: {
+                  type: 'number',
+                  unit: 'token',
+                  description: 'Token unit price',
+                },
+              },
+            },
+            { model_name: 'bge-large-en' },
+          ],
+          vendors: [],
+          group_ratio: {},
+        },
+      }
+    }
+    if (url === '/api/option/model_pricing/issues') {
+      return {
+        data: {
+          success: true,
+          data: [
+            {
+              model_name: seedance,
+              plugin_key: 'doubao',
+              plugin_name: 'Doubao',
+              reason: 'unconfigured',
+            },
+          ],
+        },
+      }
+    }
+    if (url === '/api/status') {
+      return { data: { success: true, data: {} } }
+    }
+    return {
+      data: {
+        success: true,
+        data: { entries: [], options: {}, empty_version: '' },
+        vendors: [],
+      },
+    }
+  })
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: { effective: {} } },
+  })
+  const onSave = vi.fn(async (_values: typeof emptyMaps) => undefined)
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const queryClient = client
+  render(
+    <QueryClientProvider client={queryClient}>
+      <PriceFormFixture saved={saved} draft={draft} onSave={onSave} />
+    </QueryClientProvider>
+  )
+  await waitFor(() => expect(queryClient.isFetching()).toBe(0))
+  return { onSave }
+}
+
+it('does not confirm the task editor default when no price was edited', async () => {
+  const user = userEvent.setup()
+  const saved = {
+    ...emptyMaps,
+    ModelRatio: '{"bge-large-en":0.13698630137}',
+  }
+  const { onSave } = await renderCatalog(saved, saved)
+
+  const issueRow = await screen.findByRole('row', {
+    name: new RegExp(seedance),
+  })
+  await user.click(within(issueRow).getByRole('button', { name: 'Edit' }))
+  expect(await screen.findByRole('textbox', { name: 'tokens' })).toHaveValue(
+    '0'
+  )
+  await user.click(screen.getByRole('button', { name: 'Save model prices' }))
+
+  expect(
+    screen.queryByRole('alertdialog', { name: 'Confirm price changes' })
+  ).not.toBeInTheDocument()
+  await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  expect(onSave.mock.calls[0][0].BillingExpr).not.toContain(seedance)
+  expect(onSave.mock.calls[0][0].BillingExpr).not.toContain(zeroSeedanceExpr)
+
+  await user.click(screen.getByRole('button', { name: 'Show all models' }))
+  const bgeRow = await screen.findByRole('row', { name: /bge-large-en/ })
+  await user.click(within(bgeRow).getByRole('button', { name: 'Edit' }))
+  await user.click(screen.getByRole('button', { name: 'Save model prices' }))
+
+  expect(
+    screen.queryByRole('alertdialog', { name: 'Confirm price changes' })
+  ).not.toBeInTheDocument()
+  expect(onSave.mock.calls.at(-1)?.[0].BillingExpr).not.toContain(
+    zeroSeedanceExpr
+  )
+})
+
+it('still confirms a token price typed into an unpriced task model', async () => {
+  const user = userEvent.setup()
+  const { onSave } = await renderCatalog(emptyMaps, emptyMaps)
+
+  const issueRow = await screen.findByRole('row', {
+    name: new RegExp(seedance),
+  })
+  await user.click(within(issueRow).getByRole('button', { name: 'Edit' }))
+  const tokens = await screen.findByRole('textbox', { name: 'tokens' })
+  await user.clear(tokens)
+  await user.type(tokens, '1.5')
+  await user.click(screen.getByRole('button', { name: 'Save model prices' }))
+
+  const dialog = await screen.findByRole('alertdialog', {
+    name: 'Confirm price changes',
+  })
+  const row = within(dialog).getByRole('row', { name: new RegExp(seedance) })
+  expect(within(row).getByText('Added')).toBeVisible()
+  expect(within(row).getByText('Unset price')).toBeVisible()
+  expect(
+    within(row).getByText('tier("base", u("tokens") * 1.5 / 1000000)')
+  ).toBeVisible()
   expect(onSave).not.toHaveBeenCalled()
 })
