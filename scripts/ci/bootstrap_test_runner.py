@@ -19,11 +19,15 @@ import shutil
 import socket
 import stat
 import struct
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import time
 
 # Installed-controller injection point, not a candidate CLI/environment option.
@@ -259,8 +263,10 @@ ORDINARY_AUDIT_SELECTOR = '^TestOAuthTokensConsumerHTTP$/^ordinary_key_creation$
 # ordinary-audit. Hydra is reached only at sealed loopback URLs inside that
 # namespace. The journal is never copied onto another database.
 HYDRA_BIRTH_SELECTOR = '^TestOAuthPublicHydraHTTP$/^(ordinary_tokens_write|explicit_tokens_read_empty_and_refresh|approval_binding_and_unknown_accept|durable_cleanup_(grant|client|sid|others|user))$'
-HYDRA_INPUT_NAME = 'hydra-input.json'
-HYDRA_MATERIAL_NAMES = (HYDRA_INPUT_NAME, 'hydra-ca.pem', 'hydra-cert.pem', 'hydra-key.pem')
+HYDRA_FIXED_VERSION = 'v26.2.0'
+HYDRA_PUBLIC_URL = 'https://127.0.0.1:4444'
+HYDRA_ADMIN_URL = 'https://127.0.0.1:4445'
+HYDRA_ISSUER_URL = 'https://127.0.0.1:4446/'
 LIFECYCLE_SELECTOR = '^TestOAuthDerivedTokenOwnerLifecycle$'
 LIFECYCLE_CASES = ('owner_reveal_and_mutation', 'revoke_and_rollback', 'disable_delete_rollback',
                    'unknown_is_not_manual', 'same_user_creation_limit', 'registration_default_token',
@@ -391,13 +397,191 @@ def require_loopback_hydra_document(document):
     return document
 
 
-def seal_hydra_materials(input_path, owner_uid=0):
-    raw = read_custodied_file(input_path, owner_uid)
-    document = require_loopback_hydra_document(json.loads(raw))
-    materials = {HYDRA_INPUT_NAME: raw}
-    for field, name in (('CA', 'hydra-ca.pem'), ('Certificate', 'hydra-cert.pem'), ('Key', 'hydra-key.pem')):
-        materials[name] = read_custodied_file(document[field], owner_uid)
-    return materials
+def hydra_version_error(output):
+    if re.search(r'(?<![0-9A-Za-z.])' + re.escape(HYDRA_FIXED_VERSION) + r'(?![0-9A-Za-z.])', output) is None:
+        return ValueError('hydra binary is not fixed ' + HYDRA_FIXED_VERSION)
+    return None
+
+
+def seal_hydra_binary(path, expected_sha, owner_uid=0):
+    """Hash the custodied bytes before any execution. A mismatch never runs."""
+    if not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+        raise ValueError('hydra sha256 must be 64 hex characters')
+    data = read_custodied_file(path, owner_uid, max_bytes=256 << 20)
+    if digest_bytes(data) != expected_sha:
+        raise ValueError('hydra binary digest mismatch')
+    return data
+
+
+def render_hydra_config(database, cert, key, secret):
+    for value in (database, cert, key):
+        if not str(value).startswith('/') or any(ch in str(value) for ch in '\n"&?'):
+            raise ValueError('hydra config path is not a plain absolute path')
+    if not re.fullmatch(r'[0-9a-f]{64}', secret):
+        raise ValueError('hydra system secret is not runner-generated')
+    require_loopback_hydra_url(HYDRA_ISSUER_URL, 'issuer')
+    require_loopback_hydra_url(HYDRA_PUBLIC_URL, 'public')
+    require_loopback_hydra_url(HYDRA_ADMIN_URL, 'admin')
+    text = '\n'.join([
+        'dsn: "sqlite://' + database + '?_fk=true&mode=rwc"',
+        'serve:',
+        '  public:',
+        '    host: 127.0.0.1',
+        '    port: 4444',
+        '  admin:',
+        '    host: 127.0.0.1',
+        '    port: 4445',
+        '  tls:',
+        '    cert:',
+        '      path: "' + cert + '"',
+        '    key:',
+        '      path: "' + key + '"',
+        'urls:',
+        '  self:',
+        '    issuer: "' + HYDRA_ISSUER_URL + '"',
+        '  login: "https://127.0.0.1:4446/oauth/provider/login"',
+        '  consent: "https://127.0.0.1:4446/oauth/provider/consent"',
+        '  logout: "https://127.0.0.1:4446/oauth/provider/logout"',
+        'secrets:',
+        '  system:',
+        '    - "' + secret + '"',
+        'strategies:',
+        '  access_token: opaque',
+        'ttl:',
+        '  access_token: 15m',
+        '  id_token: 15m',
+        '  auth_code: 10m',
+        '  login_consent_request: 10m',
+        'oauth2:',
+        '  pkce:',
+        '    enforced_for_public_clients: true',
+        '',
+    ])
+    if hydra_config_url_error(text):
+        raise ValueError('hydra config is not loopback-only')
+    return text
+
+
+def hydra_config_url_error(text):
+    urls = re.findall(r'https://[^\s"]+', text)
+    if len(urls) < 4:
+        return ValueError('hydra config has no loopback urls')
+    for value in urls:
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme != 'https' or parsed.hostname not in ('127.0.0.1', '::1') or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            return ValueError('hydra config url is not loopback')
+    if '0.0.0.0' in text or 'curl ' in text or 'wget ' in text:
+        return ValueError('hydra config is not loopback-only')
+    return None
+
+
+def hydra_birth_inventory_error(metadata):
+    entries = metadata.get('entries') or []
+    files = metadata.get('files') or {}
+    if (len(entries) != 1 or entries[0].get('cwd') != 'router' or
+            entries[0].get('run') != HYDRA_BIRTH_SELECTOR or
+            not re.fullmatch(r'[0-9a-f]{64}', str(metadata.get('hydra_bin_sha256', ''))) or
+            metadata.get('hydra_bin_sha256') != files.get('hydra')):
+        return ValueError('hydra-birth mandatory inventory mismatch')
+    return None
+
+
+def hydra_migrate_argv(binary, config):
+    return [str(binary), 'migrate', 'sql', 'up', '-e', '--yes', '--config', str(config)]
+
+
+def hydra_serve_argv(binary, config):
+    return [str(binary), 'serve', 'all', '--config', str(config)]
+
+
+class OwnedHydra:
+    """One Hydra v26.2.0 in the already-private loopback namespace."""
+    def __init__(self, root, uid, binary, expected_sha):
+        self.root, self.uid, self.binary = Path(root), uid, Path(binary)
+        self.expected_sha = expected_sha
+        self.process = None
+        self.directory = self.root / 'hydra-runtime'
+        self.input_path = self.root / 'hydra-runtime-input.json'
+
+    def close(self):
+        process = self.process
+        self.process = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    def wait_ready(self):
+        if self.process is None or self.process.poll() is not None:
+            raise RuntimeError('hydra exited before ready')
+        context = ssl.create_default_context(cafile=str(self.directory / 'ca.pem'))
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError('hydra exited before ready')
+            try:
+                with urllib.request.urlopen(HYDRA_ADMIN_URL + '/health/ready', context=context, timeout=1) as response:
+                    if response.status == 200:
+                        return
+            except (OSError, urllib.error.URLError):
+                time.sleep(0.2)
+        raise RuntimeError('hydra did not become ready')
+
+    def start(self):
+        require_private_loopback()
+        if not re.fullmatch(r'[0-9a-f]{64}', self.expected_sha) or digest(self.binary) != self.expected_sha:
+            raise ValueError('sealed hydra binary digest mismatch')
+        version = subprocess.run([str(self.binary), 'version'], check=False, capture_output=True, timeout=5,
+                                 cwd=self.root / 'tmp', env={'PATH': '/usr/bin:/bin'}, preexec_fn=lambda: demote(self.uid))
+        version_error = hydra_version_error((version.stdout + version.stderr).decode(errors='replace'))
+        if version.returncode or version_error:
+            raise version_error or ValueError('hydra version command failed')
+        self.directory.mkdir(mode=0o700)
+        openssl = Path('/usr/bin/openssl')
+        info = openssl.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode):
+            raise ValueError('untrusted openssl')
+        key, cert, ca = self.directory / 'key.pem', self.directory / 'cert.pem', self.directory / 'ca.pem'
+        command([str(openssl), 'req', '-x509', '-newkey', 'rsa:2048', '-keyout', str(key), '-out', str(cert),
+                 '-days', '2', '-nodes', '-subj', '/CN=127.0.0.1',
+                 '-addext', 'subjectAltName=IP:127.0.0.1,IP:::1'],
+                env={'PATH': '/usr/bin:/bin'}, timeout=30)
+        shutil.copyfile(cert, ca)
+        os.chmod(key, 0o600)
+        os.chmod(cert, 0o644)
+        os.chmod(ca, 0o644)
+        database = self.directory / 'hydra.sqlite'
+        config = self.directory / 'hydra.yaml'
+        secret = secrets.token_hex(32)
+        config.write_text(render_hydra_config(str(database), str(cert), str(key), secret))
+        for path in (self.directory, key, cert, ca, config):
+            os.chown(path, self.uid, self.uid)
+        self.directory.chmod(0o700)
+        key.chmod(0o600)
+        config.chmod(0o600)
+        document = {
+            'Admin': HYDRA_ADMIN_URL, 'Public': HYDRA_PUBLIC_URL, 'Issuer': HYDRA_ISSUER_URL,
+            'CA': str(ca), 'Certificate': str(cert), 'Key': str(key), 'Runtime': str(self.directory), 'Port': 4446,
+        }
+        require_loopback_hydra_document(document)
+        self.input_path.write_text(json.dumps(document))
+        self.input_path.chmod(0o444)
+        migrate = hydra_migrate_argv(self.binary, config)
+        argv = hydra_serve_argv(self.binary, config)
+        if any(token in migrate + argv for token in ('curl', 'wget', 'sh', '-c')):
+            raise ValueError('hydra launch argv is not the fixed serve command')
+        command(migrate, cwd=self.directory, env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root / 'tmp')},
+                preexec_fn=lambda: demote(self.uid), timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.process = subprocess.Popen(argv, cwd=self.directory, env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root / 'tmp')},
+                                        preexec_fn=lambda: demote(self.uid), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.wait_ready()
+        except BaseException:
+            self.close()
+            raise
 
 
 def rewritten_hydra_document(document, materials):
@@ -407,32 +591,6 @@ def rewritten_hydra_document(document, materials):
             raise ValueError('sealed hydra material missing')
         document[field] = materials[name]
     return document
-
-
-def bind_sealed_hydra_input(root, metadata):
-    """Use only the snapshot whose digest is already in the verified manifest."""
-    expected = metadata.get('hydra_input_sha256')
-    files = metadata.get('files', {})
-    snapshot = root / 'bundle'
-    raw_path = snapshot / HYDRA_INPUT_NAME
-    raw = raw_path.read_bytes()
-    mismatch = manifest_binding_error(raw, files.get(HYDRA_INPUT_NAME, ''), expected or '')
-    if mismatch:
-        raise mismatch
-    document = json.loads(raw)
-    materials = {}
-    for field, name in (('CA', 'hydra-ca.pem'), ('Certificate', 'hydra-cert.pem'), ('Key', 'hydra-key.pem')):
-        material = snapshot / name
-        body = material.read_bytes()
-        if manifest_binding_error(body, files.get(name, ''), files.get(name, '')):
-            raise ValueError('sealed hydra material digest mismatch')
-        materials[field] = str(material)
-    document = rewritten_hydra_document(document, materials)
-    sealed = root / 'hydra-runtime-input.json'
-    sealed.write_bytes(json.dumps(document).encode())
-    os.chown(sealed, 0, 0)
-    sealed.chmod(0o444)
-    return str(sealed)
 
 
 def isolated_namespace_argv(tier, bundle):
@@ -458,9 +616,10 @@ def prepare(args):
     if args.tier == 'hydra-birth':
         if args.package not in (None, ['./router']) or args.run not in ('.', HYDRA_BIRTH_SELECTOR):
             raise ValueError('hydra-birth tier requires its exact Hydra birth inventory')
-        if not args.hydra_input:
-            raise ValueError('hydra-birth requires --hydra-input')
-        args.hydra_materials = seal_hydra_materials(args.hydra_input)
+        if not args.hydra_bin or not args.hydra_sha256:
+            raise ValueError('hydra-birth requires --hydra-bin and --hydra-sha256')
+        # Hash only. The binary is executed later, inside the private netns.
+        args.hydra_binary = seal_hydra_binary(args.hydra_bin, args.hydra_sha256)
         args.package, args.run = ['./router'], HYDRA_BIRTH_SELECTOR
     if args.tier in LIFECYCLE_TIERS:
         if args.package not in (None, ['./controller']) or args.run not in ('.', LIFECYCLE_SELECTOR):
@@ -520,13 +679,14 @@ def prepare(args):
                 entries.append({'binary': binary, 'cwd': str(Path(module) / rel), 'run': args.run})
     shutil.copyfile(__file__, bundle / 'runner.py')
     if args.tier == 'hydra-birth':
-        for name, data in args.hydra_materials.items():
-            dest = bundle / name
-            dest.write_bytes(data)
-            dest.chmod(0o644)
+        dest = bundle / 'hydra'
+        dest.write_bytes(args.hydra_binary)
+        dest.chmod(0o755)
     metadata = {'tier': args.tier, 'entries': entries, 'files': {str(p.relative_to(bundle)): digest(p) for p in sorted(bundle.rglob('*')) if p.is_file()}}
     if args.tier == 'hydra-birth':
-        metadata['hydra_input_sha256'] = metadata['files'][HYDRA_INPUT_NAME]
+        metadata['hydra_bin_sha256'] = metadata['files']['hydra']
+        if metadata['hydra_bin_sha256'] != args.hydra_sha256:
+            raise ValueError('sealed hydra digest was not preserved')
     if args.tier == 'all':
         metadata['inventory'] = compiled_inventory(bundle, entries)
         metadata['partitions'] = resource_partitions(entries, metadata['inventory'])
@@ -1832,10 +1992,7 @@ def trusted_run(bundle, tier="sqlite"):
             metadata['entries'][0]['cwd'] != 'router' or
             metadata['entries'][0]['run'] != ORDINARY_AUDIT_SELECTOR):
         raise ValueError('ordinary audit mandatory inventory mismatch')
-    if tier == 'hydra-birth' and (len(metadata['entries']) != 1 or
-            metadata['entries'][0]['cwd'] != 'router' or
-            metadata['entries'][0]['run'] != HYDRA_BIRTH_SELECTOR or
-            metadata.get('hydra_input_sha256') != metadata['files'].get(HYDRA_INPUT_NAME)):
+    if tier == 'hydra-birth' and hydra_birth_inventory_error(metadata):
         raise ValueError('hydra-birth mandatory inventory mismatch')
     if tier == 'hydra-birth':
         require_private_loopback()
@@ -1863,6 +2020,7 @@ def trusted_run(bundle, tier="sqlite"):
     installer = None
     redis_resource = None
     pg_resource = None
+    hydra_resource = None
     thread = None
     status = 1
     completed = []
@@ -1907,7 +2065,9 @@ def trusted_run(bundle, tier="sqlite"):
         env = {'PATH': '/usr/bin:/bin', 'HOME': str(root / 'tmp'), 'TMPDIR': str(root / 'tmp'), 'NEWAPI_TEST_PROFILE': 'isolated-ci', 'NEWAPI_BOOTSTRAP_CLIENT': str(launcher), 'NEWAPI_BOOTSTRAP_ENGINE': 'sqlite'}
         if tier == 'hydra-birth':
             require_private_loopback()
-            env['NEWAPI_W01_HYDRA_INPUT'] = bind_sealed_hydra_input(root, metadata)
+            hydra_resource = OwnedHydra(root, uid, root / 'bundle' / 'hydra', metadata['hydra_bin_sha256'])
+            hydra_resource.start()
+            env['NEWAPI_W01_HYDRA_INPUT'] = str(hydra_resource.input_path)
             env['GOMAXPROCS'] = '2'
         if tier in ('postgres', 'postgres-redis'):
             pg_resource = OwnedPostgres(root, uid) if tier == 'postgres' else CombinedPostgres(root, uid)
@@ -1998,6 +2158,8 @@ def trusted_run(bundle, tier="sqlite"):
             redis_resource.close()
         if pg_resource:
             pg_resource.close()
+        if hydra_resource:
+            hydra_resource.close()
         # Exact inode/device and root ownership: never clean an adopted directory.
         current = root.lstat()
         if (current.st_dev, current.st_ino, current.st_uid) != (root_stat.st_dev, root_stat.st_ino, 0) or not stat.S_ISDIR(current.st_mode):
@@ -3521,7 +3683,8 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tier', choices=('all', 'sqlite', 'ordinary-audit', 'hydra-birth', *ORDINARY_AUDIT_SHARED, 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; ordinary-audit uses SQLite and does not qualify external log stores')
-    parser.add_argument('--hydra-input', help='absolute isolated Hydra input JSON; hydra-birth only, same network namespace, no secret on the command beyond this path')
+    parser.add_argument('--hydra-bin', help='root-owned fixed Hydra v26.2.0 binary; hydra-birth only, never downloaded here')
+    parser.add_argument('--hydra-sha256', help='sha256 of that exact Hydra binary; hydra-birth only')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--broker-inventory', action='store_true', help='uid997 isolated inventory only; not formal execution')

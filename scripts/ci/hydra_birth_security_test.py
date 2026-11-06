@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Negative checks for the hydra-birth custody boundary. No root tier is started."""
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,6 +85,156 @@ class HydraBirthSecurityTest(unittest.TestCase):
         self.assertEqual(audit[9], hydra[9])
         self.assertNotIn('hydra-input.path', audit)
         self.assertNotIn('hydra-input.path', hydra)
+        self.assertNotIn('--hydra-bin', hydra)
+
+    def test_digest_mismatch_does_not_execute(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            binary = Path(temporary) / 'hydra'
+            binary.write_bytes(b'not-hydra')
+            binary.chmod(0o755)
+            calls = []
+            original = subprocess.run
+
+            def trap(*args, **kwargs):
+                calls.append(args)
+                raise AssertionError('digest mismatch must not execute')
+
+            subprocess.run = trap
+            try:
+                with self.assertRaises(ValueError):
+                    runner.seal_hydra_binary(binary, '00' * 32, os.geteuid())
+            finally:
+                subprocess.run = original
+            self.assertEqual(calls, [])
+
+    def test_version_token_is_exact(self):
+        self.assertIsNone(runner.hydra_version_error('Version: v26.2.0\n'))
+        self.assertIsNotNone(runner.hydra_version_error('Version: v26.2.0.1\n'))
+        self.assertIsNotNone(runner.hydra_version_error('Version: v26.2.1\n'))
+        self.assertIsNotNone(runner.hydra_version_error(''))
+
+    def test_rendered_config_is_loopback_only(self):
+        secret = 'ab' * 32
+        text = runner.render_hydra_config('/owned/hydra.sqlite', '/owned/cert.pem', '/owned/key.pem', secret)
+        self.assertIsNone(runner.hydra_config_url_error(text))
+        self.assertIn('host: 127.0.0.1', text)
+        self.assertIn('sqlite:///owned/hydra.sqlite?_fk=true&mode=rwc', text)
+        self.assertIn('access_token: 15m', text)
+        self.assertNotIn('0.0.0.0', text)
+        self.assertIsNotNone(runner.hydra_config_url_error(text.replace('127.0.0.1', '192.0.2.10')))
+        self.assertIsNotNone(runner.hydra_config_url_error(text + '\nhost: 0.0.0.0\n'))
+        with self.assertRaises(ValueError):
+            runner.render_hydra_config('/owned/hydra.sqlite', '/owned/cert.pem', '/owned/bad"key.pem', secret)
+        with self.assertRaises(ValueError):
+            runner.render_hydra_config('/owned/hydra.sqlite', '/owned/cert.pem', '/owned/key.pem', 'short')
+
+    def test_launch_argv_is_fixed(self):
+        binary, config = Path('/owned/bundle/hydra'), Path('/owned/hydra.yaml')
+        self.assertEqual(runner.hydra_migrate_argv(binary, config),
+                         ['/owned/bundle/hydra', 'migrate', 'sql', 'up', '-e', '--yes', '--config', '/owned/hydra.yaml'])
+        self.assertEqual(runner.hydra_serve_argv(binary, config),
+                         ['/owned/bundle/hydra', 'serve', 'all', '--config', '/owned/hydra.yaml'])
+
+    def test_inventory_requires_the_sealed_binary_digest(self):
+        good = {'entries': [{'cwd': 'router', 'run': runner.HYDRA_BIRTH_SELECTOR}],
+                'files': {'hydra': 'ab' * 32}, 'hydra_bin_sha256': 'ab' * 32}
+        self.assertIsNone(runner.hydra_birth_inventory_error(good))
+        broken = dict(good, hydra_bin_sha256='cd' * 32)
+        self.assertIsNotNone(runner.hydra_birth_inventory_error(broken))
+
+    def test_start_digest_mismatch_does_not_exec(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            binary = root / 'hydra'
+            binary.write_bytes(b'not-the-binary')
+            owned = runner.OwnedHydra(root, os.getuid(), binary, 'ab' * 32)
+            calls = []
+            original_net = runner.require_private_loopback
+            original_popen = subprocess.Popen
+            runner.require_private_loopback = lambda: None
+
+            def trap(*args, **kwargs):
+                calls.append(args)
+                raise AssertionError('digest mismatch must not exec')
+
+            subprocess.Popen = trap
+            try:
+                with self.assertRaises(ValueError):
+                    owned.start()
+            finally:
+                runner.require_private_loopback = original_net
+                subprocess.Popen = original_popen
+            self.assertEqual(calls, [])
+            self.assertIsNone(owned.process)
+        finally:
+            shutil.rmtree(root)
+
+    def test_wrong_version_does_not_serve(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            binary = root / 'bundle-hydra'
+            body = b'not-hydra'
+            binary.write_bytes(body)
+            owned = runner.OwnedHydra(root, os.getuid(), binary, runner.digest_bytes(body))
+            original_net = runner.require_private_loopback
+            original_run = subprocess.run
+            original_popen = subprocess.Popen
+            runner.require_private_loopback = lambda: None
+            popen_calls = []
+
+            def fake_run(argv, **kwargs):
+                class Result:
+                    returncode = 0
+                    stdout = b'Version: v26.2.1\n'
+                    stderr = b''
+                return Result()
+
+            def trap(*args, **kwargs):
+                popen_calls.append(args)
+                raise AssertionError('wrong version must not serve')
+
+            subprocess.run = fake_run
+            subprocess.Popen = trap
+            try:
+                with self.assertRaisesRegex(ValueError, 'not fixed'):
+                    owned.start()
+            finally:
+                runner.require_private_loopback = original_net
+                subprocess.run = original_run
+                subprocess.Popen = original_popen
+            self.assertEqual(popen_calls, [])
+            self.assertFalse(owned.directory.exists())
+            self.assertIsNone(owned.process)
+        finally:
+            shutil.rmtree(root)
+
+    def test_exited_process_is_not_ready_and_close_is_idempotent(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            owned = runner.OwnedHydra(root, os.getuid(), root / 'hydra', 'cd' * 32)
+            proc = subprocess.Popen(['/bin/false'])
+            proc.wait(timeout=5)
+            owned.process = proc
+            with self.assertRaises(RuntimeError):
+                owned.wait_ready()
+            owned.close()
+            owned.close()
+            self.assertIsNone(owned.process)
+        finally:
+            shutil.rmtree(root)
+
+    def test_close_stops_a_running_process(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            owned = runner.OwnedHydra(root, os.getuid(), root / 'hydra', 'ef' * 32)
+            proc = subprocess.Popen(['/bin/sleep', '30'])
+            owned.process = proc
+            owned.close()
+            proc.wait(timeout=5)
+            self.assertIsNotNone(proc.poll())
+            self.assertIsNone(owned.process)
+        finally:
+            shutil.rmtree(root)
 
 
 if __name__ == '__main__':
