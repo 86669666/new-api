@@ -348,6 +348,17 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 	data, err := os.ReadFile(inputPath)
 	require.NoError(t, err)
 	require.NoError(t, common.Unmarshal(data, &input))
+	for _, endpoint := range []struct{ name, raw string }{{"admin", input.Admin}, {"public", input.Public}, {"issuer", input.Issuer}} {
+		parsed, err := url.Parse(endpoint.raw)
+		require.NoError(t, err)
+		require.Equal(t, "https", parsed.Scheme, endpoint.name)
+		require.Contains(t, []string{"127.0.0.1", "::1"}, parsed.Hostname(), endpoint.name)
+		require.NotEmpty(t, parsed.Port(), endpoint.name)
+		require.Nil(t, parsed.User, endpoint.name)
+		require.Empty(t, parsed.RawQuery, endpoint.name)
+		require.Empty(t, parsed.Fragment, endpoint.name)
+		require.True(t, parsed.Path == "" || parsed.Path == "/", endpoint.name)
+	}
 	t.Setenv("OAUTH_USERINFO_ENABLED", "false")
 	t.Setenv("OAUTH_PROVIDER_BRIDGE_ENABLED", "false")
 	t.Setenv("OAUTH_PROVIDER_PUBLIC_ENABLED", "false")
