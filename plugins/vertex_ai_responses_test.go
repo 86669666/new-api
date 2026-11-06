@@ -2,12 +2,24 @@ package plugins_test
 
 import (
 	"encoding/base64"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
+	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -51,7 +63,7 @@ func TestVertexAIResponsesProtocol(t *testing.T) {
 			require.True(t, exists, key)
 			assert.NotEmpty(t, schema.Description, key)
 		}
-		assert.Equal(t, []string{"360p", "720p", "1080p", "4k"}, plugin.Meta.UsageSchema["resolution"].Enum)
+		assert.Equal(t, []string{"720p", "1080p", "4k"}, plugin.Meta.UsageSchema["resolution"].Enum)
 		assert.Equal(t, "boolean", plugin.Meta.UsageSchema["generate_audio"].Type)
 	})
 
@@ -459,7 +471,59 @@ func TestVertexAIOmniUsageAndVideoDecoder(t *testing.T) {
 	const omni = "gemini-omni-1.1-flash-preview"
 	usage, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"upstreamModel": omni, "requestBody": map[string]any{"prompt": "x", "size": "1920x1080"}})
 	require.NoError(t, err)
-	assert.Equal(t, map[string]any{"seconds": float64(8), "resolution": "1080p", "generate_audio": true}, decodePluginValue(t, usage))
+	assert.Equal(t, map[string]any{"seconds": float64(8), "resolution": "1080p", "generate_audio": true, "input_tokens": float64(0), "output_tokens": float64(0), "video_tokens": float64(8 * 8688)}, decodePluginValue(t, usage))
+	schema, _ := plugin.Meta.UsageForModel(omni)
+	assert.ElementsMatch(t, []string{"seconds", "resolution", "generate_audio", "input_tokens", "output_tokens", "video_tokens"}, slices.Collect(maps.Keys(schema)))
+
+	// Thinking is billed as text output.
+	completed, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": omni}, map[string]any{}, map[string]any{
+		"usage": map[string]any{
+			"total_input_tokens": 12, "total_thought_tokens": 40,
+			"output_tokens_by_modality": []any{map[string]any{"modality": "VIDEO", "tokens": 5793}, map[string]any{"modality": "text", "tokens": 7}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"input_tokens": float64(12), "output_tokens": float64(47), "video_tokens": float64(5793)}, decodePluginValue(t, completed))
+	// Unreported facts are omitted so the host keeps the submit estimate.
+	partial, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": omni}, map[string]any{}, map[string]any{"usage": map[string]any{"total_input_tokens": 12}})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"input_tokens": float64(12)}, decodePluginValue(t, partial))
+	for _, tc := range []struct {
+		name  string
+		usage map[string]any
+		want  map[string]any
+	}{
+		{name: "empty usage keeps reservation", usage: map[string]any{}, want: map[string]any{}},
+		{
+			name: "reported zero replaces reservation",
+			usage: map[string]any{"total_input_tokens": 0, "total_thought_tokens": 0,
+				"output_tokens_by_modality": []any{map[string]any{"modality": "video", "tokens": 0}}},
+			want: map[string]any{"input_tokens": float64(0), "output_tokens": float64(0), "video_tokens": float64(0)},
+		},
+		{
+			name: "audio joins video output",
+			usage: map[string]any{"output_tokens_by_modality": []any{
+				map[string]any{"modality": "VIDEO", "tokens": 5792}, map[string]any{"modality": "audio", "tokens": 23},
+			}},
+			want: map[string]any{"video_tokens": float64(5815)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": omni}, map[string]any{}, map[string]any{"usage": tc.usage})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, decodePluginValue(t, value))
+		})
+	}
+	for _, seconds := range []int{-1, 0, 11} {
+		_, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"upstreamModel": omni, "requestBody": map[string]any{"duration": seconds}})
+		assert.ErrorContains(t, err, "3 to 10")
+	}
+	maximum, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"upstreamModel": omni, "requestBody": map[string]any{"duration": 10, "resolution": "4k"}})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"seconds": float64(10), "resolution": "4k", "generate_audio": true, "input_tokens": float64(0), "output_tokens": float64(0), "video_tokens": float64(173760)}, decodePluginValue(t, maximum))
+	veo, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": "veo-3.0-generate-001"}, map[string]any{}, map[string]any{"done": true})
+	require.NoError(t, err)
+	assert.Nil(t, veo)
 
 	decoded, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
 		"model": "omni-alias", "upstreamModel": omni,
@@ -479,4 +543,132 @@ func loadVertexAIPlugin(t *testing.T) *jsplugin.LoadedPlugin {
 	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "vertex-ai"})
 	require.NoError(t, err)
 	return plugin
+}
+
+// Use the built-in plugin through the host's usage validation and frozen-expression
+// evaluator. The fixture only parses responses; it never submits or authenticates
+// to Vertex. A gateway channel supplies local credentials without an OAuth exchange.
+func vertexOmniBillingFixture(t *testing.T, plugin *jsplugin.LoadedPlugin, upstream string) (*taskplugin.TaskAdaptor, map[string]any) {
+	t.Helper()
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "omni-alias",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, UpstreamModelName: upstream, ChannelBaseUrl: "https://gateway.example"},
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+	}
+	adaptor := taskplugin.New(plugin)
+	adaptor.Init(info)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Set("task_request", map[string]any{"prompt": "a cat", "duration": 8, "resolution": "360p"})
+	facts, err := adaptor.ExtractUsageFactsValidated(c, info)
+	require.NoError(t, err)
+	return adaptor, facts
+}
+
+func TestVertexAIOmniLegacyBillingRatios(t *testing.T) {
+	plugin := loadVertexAIPlugin(t)
+	for _, upstream := range []string{"gemini-omni-1.1-flash-preview", "gemini-omni-flash-preview"} {
+		t.Run(upstream, func(t *testing.T) {
+			// Only invoke the usage boundaries; no submission or OAuth exchange.
+			info := &relaycommon.RelayInfo{
+				OriginModelName: "omni-alias",
+				ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, UpstreamModelName: upstream},
+				TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+			}
+			adaptor := taskplugin.New(plugin)
+			adaptor.Init(info)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			c.Set("task_request", map[string]any{"prompt": "a cat", "duration": 8, "resolution": "360p"})
+
+			ratios, err := adaptor.EstimateBillingValidated(c, info)
+			require.NoError(t, err)
+			assert.Equal(t, map[string]float64{"seconds": 8}, ratios, "legacy prices keep the baseline duration multiplier")
+			facts, err := adaptor.ExtractUsageFactsValidated(c, info)
+			require.NoError(t, err)
+			assert.Equal(t, float64(15448), facts["video_tokens"], "expression facts retain the token estimate")
+		})
+	}
+}
+
+func TestVertexAIOmniSavedPrices(t *testing.T) {
+	plugin := loadVertexAIPlugin(t)
+	for _, upstream := range []string{"gemini-omni-1.1-flash-preview", "gemini-omni-flash-preview"} {
+		t.Run(upstream, func(t *testing.T) {
+			_, facts := vertexOmniBillingFixture(t, plugin, upstream)
+			schema, _ := plugin.Meta.UsageForModel(upstream)
+			for _, tc := range []struct {
+				name, expression    string
+				reserved, completed int
+			}{
+				{"saved duration price", `tier("base", u("seconds") * 0.4)`, 3200000, 3200000},
+				{"saved resolution and audio price", `u("resolution") == "360p" && u("generate_audio") ? tier("audio", u("seconds") * 0.2) : tier("other", u("seconds") * 0.4)`, 1600000, 1600000},
+				{"new token price", `tier("tokens", (u("input_tokens") * 2 + u("output_tokens") * 3 + u("video_tokens") * 4) / 1000000)`, 61792, 40080},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					require.NoError(t, billing_setting.SmokeTestTaskExpr(tc.expression, schema))
+					snap := &billingexpr.BillingSnapshot{ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression), ExprVersion: 1, TaskUsageBilling: true, QuotaPerUnit: 1000000, GroupRatio: 1, UsageFacts: facts}
+					reserved, _, err := service.EvaluateTaskCompletionUsage(snap, nil)
+					require.NoError(t, err)
+					assert.Equal(t, tc.reserved, reserved.ActualQuotaAfterGroup)
+					value, err := plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"upstreamModel": upstream}, map[string]any{}, map[string]any{"usage": map[string]any{
+						"total_input_tokens": 10, "total_thought_tokens": 15,
+						"output_tokens_by_modality": []any{map[string]any{"modality": "text", "tokens": 5}, map[string]any{"modality": "video", "tokens": 10000}},
+					}})
+					require.NoError(t, err)
+					settled, _, err := service.EvaluateTaskCompletionUsage(snap, decodePluginValue(t, value))
+					require.NoError(t, err)
+					assert.Equal(t, tc.completed, settled.ActualQuotaAfterGroup)
+					assert.Equal(t, tc.expression, snap.ExprString)
+				})
+			}
+		})
+	}
+}
+
+func TestVertexAIOmniCompletionUsageFallback(t *testing.T) {
+	plugin := loadVertexAIPlugin(t)
+	const omni = "gemini-omni-1.1-flash-preview"
+	adaptor, facts := vertexOmniBillingFixture(t, plugin, omni)
+	const expression = `tier("tokens", (u("input_tokens") + u("output_tokens") + u("video_tokens")) / 1000000)`
+	snap := &billingexpr.BillingSnapshot{ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), ExprVersion: 1, TaskUsageBilling: true, QuotaPerUnit: 1000000, GroupRatio: 1, UsageFacts: facts}
+	for _, tc := range []struct {
+		name, usage string
+		wantFacts   map[string]any
+		wantQuota   int
+	}{
+		{name: "missing usage", usage: `null`, wantQuota: 15448},
+		{name: "empty usage", usage: `{}`, wantQuota: 15448},
+		{name: "partial input only", usage: `{"total_input_tokens":12}`, wantFacts: map[string]any{"input_tokens": float64(12)}, wantQuota: 15460},
+		{name: "missing modality count", usage: `{"output_tokens_by_modality":[{"modality":"video"}]}`, wantQuota: 15448},
+		{name: "null modality count", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":null}]}`, wantQuota: 15448},
+		{name: "nonnumeric count", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":"invalid"}]}`, wantQuota: 15448},
+		{name: "numeric string", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":"0"}]}`, wantQuota: 15448},
+		{name: "boolean count", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":false}]}`, wantQuota: 15448},
+		{name: "fractional count", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":0.5}]}`, wantQuota: 15448},
+		{name: "negative cancellation", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":20},{"modality":"audio","tokens":-20}]}`, wantQuota: 15448},
+		{name: "valid plus missing", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":20},{"modality":"audio"}]}`, wantQuota: 15448},
+		{name: "null input", usage: `{"total_input_tokens":null}`, wantQuota: 15448},
+		{name: "negative thinking cancellation", usage: `{"total_thought_tokens":-20,"output_tokens_by_modality":[{"modality":"text","tokens":20}]}`, wantQuota: 15448},
+		{name: "invalid thinking", usage: `{"total_thought_tokens":"invalid","output_tokens_by_modality":[{"modality":"text","tokens":20}]}`, wantQuota: 15448},
+		{name: "malformed modality entry", usage: `{"output_tokens_by_modality":[null]}`, wantQuota: 15448},
+		{name: "malformed modality list", usage: `{"output_tokens_by_modality":{}}`, wantQuota: 15448},
+		{name: "explicit numeric zero", usage: `{"total_input_tokens":0,"total_thought_tokens":0,"output_tokens_by_modality":[{"modality":"video","tokens":0}]}`, wantFacts: map[string]any{"input_tokens": float64(0), "output_tokens": float64(0), "video_tokens": float64(0)}, wantQuota: 0},
+		{name: "video and audio sum", usage: `{"output_tokens_by_modality":[{"modality":"VIDEO","tokens":20},{"modality":"audio","tokens":5}]}`, wantFacts: map[string]any{"video_tokens": float64(25)}, wantQuota: 25},
+		{name: "host saturates tokens", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":2147483647},{"modality":"audio","tokens":1}]}`, wantFacts: map[string]any{"video_tokens": float64(2147483647)}, wantQuota: 2147483647},
+		{name: "aggregate overflow keeps reservation", usage: `{"output_tokens_by_modality":[{"modality":"video","tokens":1e308},{"modality":"audio","tokens":1e308}]}`, wantQuota: 15448},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"object":"interaction","status":"completed","steps":[{"type":"model_output","content":[{"type":"video","uri":"gs://fixture/video.mp4"}]}],"usage":` + tc.usage + `}`)
+			task := &model.Task{TaskID: "task_local", Properties: model.Properties{OriginModelName: "omni-alias", UpstreamModelName: omni}}
+			result, err := adaptor.ParseTaskResult(task, &http.Response{StatusCode: http.StatusOK}, body)
+			require.NoError(t, err)
+			assert.Equal(t, "SUCCESS", result.Status)
+			assert.Equal(t, tc.wantFacts, result.UsageFacts)
+			settled, _, err := service.EvaluateTaskCompletionUsage(snap, result.UsageFacts)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantQuota, settled.ActualQuotaAfterGroup)
+		})
+	}
+	assert.Equal(t, float64(15448), facts["video_tokens"], "completion must not mutate the reservation")
 }
