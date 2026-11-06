@@ -565,6 +565,32 @@ func vertexOmniBillingFixture(t *testing.T, plugin *jsplugin.LoadedPlugin, upstr
 	return adaptor, facts
 }
 
+func TestVertexAIOmniLegacyBillingRatios(t *testing.T) {
+	plugin := loadVertexAIPlugin(t)
+	for _, upstream := range []string{"gemini-omni-1.1-flash-preview", "gemini-omni-flash-preview"} {
+		t.Run(upstream, func(t *testing.T) {
+			// Only invoke the usage boundaries; no submission or OAuth exchange.
+			info := &relaycommon.RelayInfo{
+				OriginModelName: "omni-alias",
+				ChannelMeta:     &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeNewAPI, UpstreamModelName: upstream},
+				TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+			}
+			adaptor := taskplugin.New(plugin)
+			adaptor.Init(info)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			c.Set("task_request", map[string]any{"prompt": "a cat", "duration": 8, "resolution": "360p"})
+
+			ratios, err := adaptor.EstimateBillingValidated(c, info)
+			require.NoError(t, err)
+			assert.Equal(t, map[string]float64{"seconds": 8}, ratios, "legacy prices keep the baseline duration multiplier")
+			facts, err := adaptor.ExtractUsageFactsValidated(c, info)
+			require.NoError(t, err)
+			assert.Equal(t, float64(15448), facts["video_tokens"], "expression facts retain the token estimate")
+		})
+	}
+}
+
 func TestVertexAIOmniSavedPrices(t *testing.T) {
 	plugin := loadVertexAIPlugin(t)
 	for _, upstream := range []string{"gemini-omni-1.1-flash-preview", "gemini-omni-flash-preview"} {

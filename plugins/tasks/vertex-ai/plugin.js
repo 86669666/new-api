@@ -467,7 +467,11 @@ export function parseSubmitResponse(ctx, resp) {
 export function extractUsage(ctx) {
   const req = ctx.requestBody || {};
   const metadata = req.metadata || {};
-  if (omniModel(ctx)) return omniUsageFacts(omniDuration(req), omniResolution(req));
+  if (omniModel(ctx)) {
+    // Legacy prices multiply numeric facts; token estimates belong only to expressions.
+    if (ctx.usagePurpose === "billing_ratios") return { seconds: omniDuration(req), resolution: omniResolution(req), generate_audio: true };
+    return omniUsageFacts(omniDuration(req), omniResolution(req));
+  }
   return {
     seconds: duration(req),
     resolution: String(metadata.resolution || resolution(req.size) || "720p").toLowerCase(),
