@@ -697,7 +697,25 @@ export const ModelPricingEditorPanel = forwardRef<
         audioCompletionRatio: values.audioCompletionRatio || '',
       }
 
-      if (pricingMode === 'tiered_expr') {
+      // An unpriced task model opens on the expression editor, which displays
+      // tier("base", u("tokens") * 0 / 1000000) before anyone types a price.
+      // That placeholder is not a draft. Keep the loaded price unless this
+      // model’s expression or request rules were actually edited.
+      const expressionUntouched =
+        billingExpr === initialBillingExpr &&
+        (!billingExpr || billingExpr === DEFAULT_TOKEN_BILLING_EXPR) &&
+        requestRuleExpr === (editData?.requestRuleExpr || '')
+      if (pricingMode === 'tiered_expr' && expressionUntouched) {
+        if (editData?.billingExpr || editData?.billingMode === 'tiered_expr') {
+          data.billingMode = 'tiered_expr'
+          data.billingExpr = editData.billingExpr || ''
+          data.requestRuleExpr = editData.requestRuleExpr || ''
+        } else if (hasValue(editData?.price)) {
+          data.billingMode = 'per-request'
+        } else {
+          data.billingMode = 'per-token'
+        }
+      } else if (pricingMode === 'tiered_expr') {
         data.billingExpr = resolvedBillingExpr
         data.requestRuleExpr = requestRuleExpr
       }
@@ -706,6 +724,8 @@ export const ModelPricingEditorPanel = forwardRef<
     },
     [
       pricingMode,
+      billingExpr,
+      initialBillingExpr,
       requestRuleExpr,
       resolvedBillingExpr,
       pluginExpressions,
