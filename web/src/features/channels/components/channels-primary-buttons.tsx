@@ -29,6 +29,7 @@ import {
   SortAsc,
   RefreshCw,
   ArrowUpFromLine,
+  CircleHelp,
 } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -65,6 +66,7 @@ import {
   handleUpdateAllBalances,
 } from '../lib'
 import { useChannels } from './channels-provider'
+import { ChannelPriorityGuideDialog } from './dialogs/channel-priority-guide-dialog'
 
 export function ChannelsPrimaryButtons() {
   const { t } = useTranslation()
@@ -82,6 +84,7 @@ export function ChannelsPrimaryButtons() {
   const queryClient = useQueryClient()
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showConsistencyDialog, setShowConsistencyDialog] = useState(false)
+  const [priorityGuideOpen, setPriorityGuideOpen] = useState(false)
   const [isRepairingConsistency, setIsRepairingConsistency] = useState(false)
   const currentUser = useAuthStore((s) => s.auth.user)
   const canEditSensitive = hasPermission(
@@ -209,6 +212,19 @@ export function ChannelsPrimaryButtons() {
 
             <DropdownMenuItem
               onClick={() => {
+                setPriorityGuideOpen(true)
+              }}
+            >
+              {t('How to set channel priority')}
+              <DropdownMenuShortcut>
+                <CircleHelp className='h-4 w-4' />
+              </DropdownMenuShortcut>
+            </DropdownMenuItem>
+
+            <DropdownMenuSeparator />
+
+            <DropdownMenuItem
+              onClick={() => {
                 handleTestAllChannels(queryClient)
               }}
             >
@@ -284,6 +300,11 @@ export function ChannelsPrimaryButtons() {
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+
+      <ChannelPriorityGuideDialog
+        open={priorityGuideOpen}
+        onOpenChange={setPriorityGuideOpen}
+      />
 
       <ConfirmDialog
         open={showDeleteDialog}
