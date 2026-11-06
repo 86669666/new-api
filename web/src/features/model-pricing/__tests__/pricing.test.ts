@@ -22,6 +22,7 @@ import { buildPricingChanges, type ModelPricingConfig } from '../api'
 import {
   applyPriceSyncSelections,
   applyPricingDraft,
+  buildPriceChangeRows,
   pricingFromDraft,
   pricingOptions,
   pricingRow,
@@ -133,6 +134,66 @@ describe('shared model pricing', () => {
     expect(JSON.parse(after['billing_setting.billing_mode'])).toEqual({
       example: 'ratio',
     })
+  })
+
+  it('reads expression drafts from the form fields over loaded option keys', () => {
+    const options = pricingOptions({
+      'billing_setting.billing_mode': '{}',
+      'billing_setting.billing_expr': '{}',
+      'billing_setting.plugin_billing_expr': '{}',
+      BillingMode: '{"example":"tiered_expr"}',
+      BillingExpr: '{"example":"tier(\\"base\\", p * 2)"}',
+      PluginBillingExpr: '{"alpha::example":"u(\\"seconds\\") * 0.4"}',
+    })
+    expect(JSON.parse(options['billing_setting.billing_expr'])).toEqual({
+      example: 'tier("base", p * 2)',
+    })
+    expect(JSON.parse(options['billing_setting.billing_mode'])).toEqual({
+      example: 'tiered_expr',
+    })
+    expect(JSON.parse(options['billing_setting.plugin_billing_expr'])).toEqual({
+      'alpha::example': 'u("seconds") * 0.4',
+    })
+  })
+
+  it('lists added, deleted, and modified prices and omits unchanged models', () => {
+    const saved = pricingOptions({
+      ModelPrice: '{"image-model":0.04,"stable-model":1}',
+      ModelRatio: '{"token-model":0.135}',
+      BillingMode: '{}',
+      BillingExpr: '{}',
+      PluginBillingExpr: '{}',
+    })
+    const draft = pricingOptions({
+      'billing_setting.billing_mode': '{}',
+      'billing_setting.billing_expr': '{}',
+      'billing_setting.plugin_billing_expr': '{}',
+      ModelPrice: '{"stable-model":1}',
+      ModelRatio: '{"token-model":0.15}',
+      BillingMode: '{"fresh-model":"tiered_expr"}',
+      BillingExpr: '{"fresh-model":"tier(\\"base\\", p * 2)"}',
+      PluginBillingExpr: '{}',
+    })
+
+    const rows = buildPriceChangeRows(saved, draft)
+
+    expect(rows.map((row) => row.name)).toEqual([
+      'fresh-model',
+      'image-model',
+      'token-model',
+    ])
+    expect(rows.find((row) => row.name === 'fresh-model')?.isDraftNew).toBe(
+      true
+    )
+    expect(rows.find((row) => row.name === 'image-model')?.isDraftDeleted).toBe(
+      true
+    )
+    expect(rows.find((row) => row.name === 'token-model')?.isDraftChanged).toBe(
+      true
+    )
+    expect(rows.find((row) => row.name === 'token-model')?.isDraftNew).toBe(
+      false
+    )
   })
 
   it('rejects invalid prices instead of silently coercing them', () => {

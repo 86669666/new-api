@@ -401,6 +401,13 @@ it.each(['default', 'unset'] as const)(
     expect(region).not.toContainElement(button)
     expect(button.parentElement?.parentElement).toHaveClass('shrink-0')
     await user.click(button)
+    const dialog = await screen.findByRole('alertdialog', {
+      name: 'Confirm price changes',
+    })
+    expect(save).not.toHaveBeenCalled()
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Confirm Changes' })
+    )
     await waitFor(() => expect(save).toHaveBeenCalledOnce())
     expect(save).toHaveBeenCalledWith(
       expect.objectContaining({ ExposeRatioEnabled: variant === 'default' }),
