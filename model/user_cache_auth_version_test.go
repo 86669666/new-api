@@ -1,7 +1,10 @@
 package model
 
 import (
+	"context"
 	"errors"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +16,28 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+// Sharded Redis hashes only the text inside the first brace pair, so fence
+// and version keys tagged with the untagged cache key share its slot.
+// Miniredis does not enforce slots, so check the tags explicitly.
+func TestAuthCacheKeysShareClusterHashTag(t *testing.T) {
+	for _, tc := range []struct {
+		cacheKey string
+		related  []string
+	}{
+		{getUserCacheKey(5), []string{getUserAuthFenceKey(5), getUserAuthVersionKey(5)}},
+		{getTokenCacheKey("test-token"), []string{getTokenCacheFenceKey("test-token")}},
+	} {
+		assert.NotContains(t, tc.cacheKey, "{")
+		for _, key := range tc.related {
+			_, suffix, ok := strings.Cut(key, "{")
+			require.True(t, ok)
+			tag, _, ok := strings.Cut(suffix, "}")
+			require.True(t, ok)
+			assert.Equal(t, tc.cacheKey, tag)
+		}
+	}
+}
 
 func useUserCacheMiniRedis(t *testing.T) *miniredis.Miniredis {
 	t.Helper()
@@ -220,4 +245,70 @@ func TestUserAuthVersionFenceAndCommittedFloorAreMonotonic(t *testing.T) {
 	committed, err = common.RDB.Get(t.Context(), getUserAuthVersionKey(userID)).Result()
 	require.NoError(t, err)
 	assert.Equal(t, "5", committed)
+}
+
+// Run only against a disposable, cluster-enabled Redis with all slots assigned.
+func TestAuthCacheRealRedisCluster(t *testing.T) {
+	addr := os.Getenv("TEST_AUTH_REDIS_CLUSTER_ADDR")
+	if addr == "" {
+		t.Skip("TEST_AUTH_REDIS_CLUSTER_ADDR is not configured")
+	}
+	oldEnabled, oldRDB := common.RedisEnabled, common.RDB
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	common.RedisEnabled, common.RDB = true, client
+	t.Cleanup(func() {
+		assert.NoError(t, client.Close())
+		common.RedisEnabled, common.RDB = oldEnabled, oldRDB
+	})
+	ctx := t.Context()
+	// Prove that the real server enforces slots, even when one node owns them all.
+	err := client.Eval(ctx, "return 1", []string{"{a}", "{b}"}).Err()
+	require.ErrorContains(t, err, "CROSSSLOT")
+	user := UserBase{Id: 2190214, AuthVersion: 1, Group: "default", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
+	token := Token{Id: 2190214, UserId: user.Id, Key: "cross-slot-test-fixture", Status: common.TokenStatusEnabled, AutoGroups: `["default"]`}
+	keys := []string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getTokenCacheKey(token.Key), getTokenCacheFenceKey(token.Key)}
+	for _, key := range keys {
+		exists, err := client.Exists(ctx, key).Result()
+		require.NoError(t, err)
+		require.Zero(t, exists, "requires unused fixture keys")
+	}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			assert.NoError(t, client.Del(context.Background(), key).Err())
+		}
+	})
+	require.NoError(t, writeUserCache(&user, true))
+	require.NoError(t, SetUserAuthVersionFence(user.Id, 2))
+	floor, err := getUserAuthVersionFloor(user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, floor)
+	assert.ErrorIs(t, writeUserCache(&user, true), ErrUserAuthCachePending)
+	require.NoError(t, publishCommittedUserAuthVersion(user.Id, 2))
+	require.NoError(t, client.Del(ctx, getUserCacheKey(user.Id)).Err())
+	assert.ErrorIs(t, writeUserCache(&user, true), ErrUserAuthCachePending)
+	user.AuthVersion = 2
+	require.NoError(t, writeUserCache(&user, true))
+	cached, err := cacheGetUserBase(user.Id)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, cached.AuthVersion)
+	require.NoError(t, client.HSet(ctx, getUserCacheKey(user.Id), "Role", common.RoleRootUser).Err())
+	_, err = cacheGetUserBase(user.Id)
+	require.Error(t, err, "tampered permissions must not be accepted")
+	inserted, err := cacheInitToken(token)
+	require.NoError(t, err)
+	assert.Equal(t, 1, inserted)
+	var cachedToken Token
+	require.NoError(t, common.RedisHGetObj(getTokenCacheKey(token.Key), &cachedToken))
+	cachedToken.Key = token.Key
+	mac, err := cachedToken.cacheMAC()
+	require.NoError(t, err)
+	assert.True(t, validAuthCacheMAC(mac, cachedToken.CacheMAC, cachedToken.CacheExpiresAt))
+	assert.Equal(t, token.AutoGroups, cachedToken.AutoGroups)
+	require.NoError(t, invalidateTokenCacheForMutation(token.Key))
+	inserted, err = cacheInitToken(token)
+	require.NoError(t, err)
+	assert.Zero(t, inserted, "pending mutation must reject stale token refill")
+	exists, err := client.Exists(ctx, getTokenCacheKey(token.Key)).Result()
+	require.NoError(t, err)
+	assert.Zero(t, exists)
 }
