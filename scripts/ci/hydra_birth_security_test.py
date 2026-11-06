@@ -86,6 +86,9 @@ class HydraBirthSecurityTest(unittest.TestCase):
         self.assertNotIn('hydra-input.path', audit)
         self.assertNotIn('hydra-input.path', hydra)
         self.assertNotIn('--hydra-bin', hydra)
+        self.assertEqual(audit[12], str(Path('/bundle') / 'runner.py'))
+        self.assertEqual(hydra[12], str(Path(runner.__file__).resolve()))
+        self.assertNotEqual(hydra[12], str(Path('/bundle') / 'runner.py'))
 
     def test_digest_mismatch_does_not_execute(self):
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
@@ -135,19 +138,89 @@ class HydraBirthSecurityTest(unittest.TestCase):
         self.assertEqual(runner.hydra_serve_argv(binary, config),
                          ['/owned/bundle/hydra', 'serve', 'all', '--config', '/owned/hydra.yaml'])
 
-    def test_inventory_requires_the_sealed_binary_digest(self):
-        good = {'entries': [{'cwd': 'router', 'run': runner.HYDRA_BIRTH_SELECTOR}],
-                'files': {'hydra': 'ab' * 32}, 'hydra_bin_sha256': 'ab' * 32}
-        self.assertIsNone(runner.hydra_birth_inventory_error(good))
-        broken = dict(good, hydra_bin_sha256='cd' * 32)
-        self.assertIsNotNone(runner.hydra_birth_inventory_error(broken))
+    def test_inventory_does_not_treat_a_matching_manifest_as_the_anchor(self):
+        swapped = {'entries': [{'cwd': 'router', 'run': runner.HYDRA_BIRTH_SELECTOR}],
+                   'files': {'hydra': 'cd' * 32}, 'hydra_bin_sha256': 'cd' * 32}
+        self.assertIsNone(runner.hydra_birth_inventory_error(swapped))
+        self.assertIsNotNone(runner.hydra_birth_inventory_error(dict(swapped, hydra_bin_sha256='not-a-digest')))
+
+    def custodied(self, directory, name, data):
+        path = Path(directory) / name
+        path.write_bytes(data)
+        path.chmod(0o644)
+        return path
+
+    def test_bundle_and_manifest_swap_is_not_the_release_anchor(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            official, evil = b'official-hydra-bytes', b'evil-hydra-bytes'
+            official_sha = runner.digest_bytes(official)
+            evil_sha = runner.digest_bytes(evil)
+            binary = self.custodied(temporary, 'hydra', official)
+            sha_file = self.custodied(temporary, 'hydra.sha256', (official_sha + '\n').encode())
+            with self.assertRaisesRegex(ValueError, 'not the root release anchor'):
+                runner.load_trusted_hydra(binary, sha_file, evil_sha, os.geteuid())
+            payload, anchor = runner.load_trusted_hydra(binary, sha_file, official_sha, os.geteuid())
+            self.assertEqual(payload, official)
+            self.assertNotEqual(payload, evil)
+            self.assertEqual(anchor, official_sha)
+            binary.write_bytes(evil)
+            binary.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, 'not the release anchor'):
+                runner.load_trusted_hydra(binary, sha_file, official_sha, os.geteuid())
+
+    def test_symlink_and_hardlink_are_rejected(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            body = b'official-hydra-bytes'
+            binary = self.custodied(temporary, 'hydra', body)
+            sha_file = self.custodied(temporary, 'hydra.sha256', (runner.digest_bytes(body) + '\n').encode())
+            link = Path(temporary) / 'hydra.link'
+            link.symlink_to(binary)
+            self.assertEqual(runner.digest(link), runner.digest_bytes(body))
+            with self.assertRaises(ValueError):
+                runner.load_trusted_hydra(link, sha_file, runner.digest_bytes(body), os.geteuid())
+            os.link(binary, Path(temporary) / 'hydra-hard')
+            with self.assertRaises(ValueError):
+                runner.load_trusted_hydra(binary, sha_file, runner.digest_bytes(body), os.geteuid())
+
+    def test_version_migrate_and_serve_share_one_payload(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            payload = b'same-trusted-bytes'
+            anchor = runner.digest_bytes(payload)
+            staged = runner.stage_trusted_executable(Path(temporary) / 'hydra', payload, anchor, os.geteuid())
+            config = Path(temporary) / 'hydra.yaml'
+            commands = [
+                [str(staged), 'version'],
+                runner.hydra_migrate_argv(staged, config),
+                runner.hydra_serve_argv(staged, config),
+            ]
+            executed = []
+            open_fd = None
+            for argv in commands:
+                bound, fd = runner.bound_hydra_argv(staged, payload, anchor, os.geteuid(), argv)
+                try:
+                    self.assertTrue(bound[0].startswith('/proc/self/fd/'))
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    self.assertEqual(os.read(fd, len(payload)), payload)
+                    executed.append(bound[1])
+                    if open_fd is None:
+                        open_fd = os.dup(fd)
+                finally:
+                    os.close(fd)
+            self.assertEqual(executed, ['version', 'migrate', 'serve'])
+            staged.chmod(0o755)
+            staged.unlink()
+            staged.symlink_to(self.custodied(temporary, 'replacement', b'replaced-bytes'))
+            os.lseek(open_fd, 0, os.SEEK_SET)
+            self.assertEqual(os.read(open_fd, len(payload)), payload)
+            os.close(open_fd)
+            with self.assertRaises(ValueError):
+                runner.bound_hydra_argv(staged, payload, anchor, os.geteuid(), commands[1])
+            self.assertEqual(executed, ['version', 'migrate', 'serve'])
 
     def test_start_digest_mismatch_does_not_exec(self):
         root = Path(tempfile.mkdtemp())
         try:
-            binary = root / 'hydra'
-            binary.write_bytes(b'not-the-binary')
-            owned = runner.OwnedHydra(root, os.getuid(), binary, 'ab' * 32)
+            owned = runner.OwnedHydra(root, os.getuid(), b'not-the-binary', 'ab' * 32)
             calls = []
             original_net = runner.require_private_loopback
             original_popen = subprocess.Popen
@@ -170,12 +243,10 @@ class HydraBirthSecurityTest(unittest.TestCase):
             shutil.rmtree(root)
 
     def test_wrong_version_does_not_serve(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp(dir=Path.home()))
         try:
-            binary = root / 'bundle-hydra'
             body = b'not-hydra'
-            binary.write_bytes(body)
-            owned = runner.OwnedHydra(root, os.getuid(), binary, runner.digest_bytes(body))
+            owned = runner.OwnedHydra(root, os.getuid(), body, runner.digest_bytes(body))
             original_net = runner.require_private_loopback
             original_run = subprocess.run
             original_popen = subprocess.Popen
@@ -211,7 +282,7 @@ class HydraBirthSecurityTest(unittest.TestCase):
     def test_exited_process_is_not_ready_and_close_is_idempotent(self):
         root = Path(tempfile.mkdtemp())
         try:
-            owned = runner.OwnedHydra(root, os.getuid(), root / 'hydra', 'cd' * 32)
+            owned = runner.OwnedHydra(root, os.getuid(), b'', 'cd' * 32)
             proc = subprocess.Popen(['/bin/false'])
             proc.wait(timeout=5)
             owned.process = proc
@@ -226,7 +297,7 @@ class HydraBirthSecurityTest(unittest.TestCase):
     def test_close_stops_a_running_process(self):
         root = Path(tempfile.mkdtemp())
         try:
-            owned = runner.OwnedHydra(root, os.getuid(), root / 'hydra', 'ef' * 32)
+            owned = runner.OwnedHydra(root, os.getuid(), b'', 'ef' * 32)
             proc = subprocess.Popen(['/bin/sleep', '30'])
             owned.process = proc
             owned.close()
