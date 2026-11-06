@@ -6435,7 +6435,7 @@
     "The organization wallet has insufficient available quota for this reversal.": "Le quota disponible du portefeuille de l’organisation est insuffisant pour cette annulation.",
     "The organization wallet quota limit would be exceeded.": "Cette opération dépasserait le plafond du quota du portefeuille de l’organisation.",
     "The plugin no longer offers this model": "Le plugin ne propose plus ce modèle",
-    "The plus control raises the priority by 1. The minus control lowers it by 1. You can also type a whole number, down to -999.": "Le plus augmente la priorité de 1. Le moins la diminue de 1. Vous pouvez aussi saisir un nombre entier, jusqu'à -999.",
+    "The plus control raises the priority by 1. The minus control lowers it by 1. You can also type a whole number, down to -999.": "Le plus augmente la priorité de 1. Le moins la diminue de 1. Vous pouvez aussi saisir un nombre entier, avec -999 comme valeur minimale.",
     "The price uses usage the plugin no longer provides": "Le prix utilise un usage que le plugin ne fournit plus",
     "The Priority column uses a number control. A higher number is tried before a lower one.": "La colonne Priorité utilise un contrôle numérique. Un nombre plus élevé est essayé avant un nombre plus faible.",
     "The public URL of your server, used for OAuth callbacks, webhooks, and other external integrations": "L'URL publique de votre serveur, utilisée pour les rappels OAuth, les webhooks et autres intégrations externes",
