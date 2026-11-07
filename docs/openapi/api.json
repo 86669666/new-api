@@ -11030,7 +11030,7 @@
       "get": {
         "summary": "获取个人额度数据",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限） Existing personal hourly quota series, grouped by authenticated user, username, model and stored bucket timestamp. Normal collection writes hour-start Unix seconds; filtering is inclusive on these stored bucket timestamps, with no sorting, zero-fill or day aggregation guarantee. DataExportEnabled gates new collection and periodic cache saving, not historical reads. Successful responses also expose granularity=hour, quota_per_unit, fixed data_complete=false and current enable_data_export. The current collection flag is a separate non-atomic configuration snapshot; it does not establish completeness of any historical range or prove zero usage. Quota remains a raw integer; quota_per_unit and existing display settings are separate from a complete currency presentation. The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. The range helper uses min(now,end) only for limit calculation and returns an adjusted start. The original parsed end, including 0 for missing or syntax-invalid input, is still passed to SQL; missing end does not become now. Existing parsing, data rows and success metadata are unchanged. Database query failure returns HTTP500 USAGE_QUERY_FAILED with a fixed safe message and message_key, without data or partial results. This guarantee is limited to database query failures; authentication and range errors retain their existing contracts.",
+        "description": "🔐 需要登录（User权限） Personal quota series (hour by default, optionally day), grouped by authenticated user, username, model and stored bucket timestamp. Normal collection writes hour-start Unix seconds; filtering is inclusive on these stored bucket timestamps, with no sorting or zero-fill guarantee. With granularity=day, those selected rows are summed by authenticated user, username, model and UTC calendar day; created_at is UTC midnight at the start of that day. Filtering happens before aggregation without expanding the requested bounds, so first/last days may be partial and a returned day timestamp may precede start_timestamp. All stored integer counters, including cache token counters, are summed without price or currency conversion. No missing days or models are synthesized. DataExportEnabled gates new collection and periodic cache saving, not historical reads. Successful responses also expose the selected granularity, quota_per_unit, fixed data_complete=false and current enable_data_export. The current collection flag is a separate non-atomic configuration snapshot; it does not establish completeness of any historical range or prove zero usage. Quota remains a raw integer; quota_per_unit and existing display settings are separate from a complete currency presentation. The existing time-range limit applies to all authenticated roles, including administrators and root. An overwide range returns HTTP400 with LOG_RANGE_TOO_WIDE and the unchanged structured Message. The range helper uses min(now,end) only for limit calculation and returns an adjusted start. The original parsed end, including 0 for missing or syntax-invalid input, is still passed to SQL; missing end does not become now. Existing timestamp parsing, hour rows and response fields are unchanged. Missing or empty granularity selects hour; hour and day are case-sensitive. Other values return HTTP400 INVALID_GRANULARITY (after the existing range check). As with existing scalar queries, the first occurrence is used. Database query failure returns HTTP500 USAGE_QUERY_FAILED with a fixed safe message and message_key, without data or partial results. This guarantee is limited to database query failures; authentication and range errors retain their existing contracts.",
         "tags": [
           "数据统计"
         ],
@@ -11059,6 +11059,21 @@
             "description": "Optional raw Unix-second end, inclusive on stored bucket timestamps. Missing or syntax-invalid input yields0; the original parsed0 is passed to SQL, not replaced with now. The range helper only limits its calculation using min(now,end). Existing int64 overflow and parsing behavior are unchanged.",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "granularity",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Optional aggregation: omitted or empty means hour; day sums selected stored hours into UTC-midnight buckets, retaining username and model dimensions. Inclusive timestamp filtering precedes aggregation, so edge days may be partial. First occurrence wins; other nonempty values return HTTP400 INVALID_GRANULARITY.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "",
+                "hour",
+                "day"
+              ]
             }
           }
         ],
@@ -11110,7 +11125,7 @@
             }
           },
           "400": {
-            "description": "Organization selector errors occur before authentication. LOG_RANGE_TOO_WIDE occurs after authentication in GetUserQuotaDates; all authenticated roles, including administrators and root, remain subject to the same range limit. Complete existing message/message_key/message_params are preserved; only status400 and the stable code are added. The Cache-Control promise remains conditional on organization-selector rejection.",
+            "description": "Organization selector errors occur before authentication. LOG_RANGE_TOO_WIDE occurs after authentication in GetUserQuotaDates; all authenticated roles, including administrators and root, remain subject to the same range limit. Complete existing message/message_key/message_params are preserved; only status400 and the stable code are added. The Cache-Control promise remains conditional on organization-selector rejection. INVALID_GRANULARITY rejects unsupported nonempty granularity after the existing range check.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -11128,6 +11143,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/PersonalLogRangeError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PersonalQuotaGranularityError"
                     }
                   ]
                 },
@@ -11168,6 +11186,14 @@
                       "message_params": {
                         "days": 7
                       }
+                    }
+                  },
+                  "INVALID_GRANULARITY": {
+                    "value": {
+                      "success": false,
+                      "code": "INVALID_GRANULARITY",
+                      "message": "Invalid parameters",
+                      "message_key": "Invalid parameters"
                     }
                   }
                 }
@@ -34570,7 +34596,7 @@
       },
       "PersonalQuotaDataPoint": {
         "type": "object",
-        "description": "Existing aggregate row. user_id/username/model_name/created_at and summed count/quota/token_used are populated; id/use_group/token_id/channel_id/node_name are serialized zero/empty placeholders, not additional populated dimensions. Extra legacy fields remain accepted. Normal writer timestamps are rounded to hour start, without a database-enforced multiple or ordering guarantee.",
+        "description": "Existing aggregate row. user_id/username/model_name/created_at and summed count/quota/token_used are populated; id/use_group/token_id/channel_id/node_name are serialized zero/empty placeholders, not additional populated dimensions. Extra legacy fields remain accepted. Normal writer timestamps are rounded to hour start, without a database-enforced multiple or ordering guarantee. In day mode created_at is UTC midnight; the same dimensions and integer sums are retained. Edge days can contain only the hours selected by the inclusive request bounds.",
         "required": [
           "user_id",
           "username",
@@ -34593,7 +34619,7 @@
           "created_at": {
             "type": "integer",
             "format": "int64",
-            "description": "Stored Unix-second bucket timestamp; normal collection writes the start of an hour."
+            "description": "Unix-second bucket timestamp: stored hour timestamp in hour mode; start of the UTC calendar day in day mode. Filtering is on source hour timestamps, so a partial day may start before the requested start_timestamp."
           },
           "count": {
             "type": "integer"
@@ -34624,6 +34650,16 @@
           "node_name": {
             "type": "string",
             "description": "Existing aggregate placeholder, currently empty."
+          },
+          "cache_read_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Summed recorded cache token counter; no price conversion."
+          },
+          "cache_creation_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Summed recorded cache token counter; no price conversion."
           }
         }
       },
@@ -34662,9 +34698,10 @@
           "granularity": {
             "type": "string",
             "enum": [
-              "hour"
+              "hour",
+              "day"
             ],
-            "description": "Stored hourly aggregation; no new granularity query or day aggregation."
+            "description": "Selected aggregation. Hour is the default; day uses UTC-midnight buckets of the selected stored hours, without filling gaps or establishing completeness."
           },
           "quota_per_unit": {
             "type": "number",
@@ -34684,7 +34721,7 @@
         }
       },
       "PersonalQuotaDataResult": {
-        "description": "Successful personal hourly series only. Database query errors use HTTP500 USAGE_QUERY_FAILED. No DATA_EXPORT_DISABLED read error is introduced.",
+        "description": "Successful personal hour/day series only. Database query errors use HTTP500 USAGE_QUERY_FAILED. No DATA_EXPORT_DISABLED read error is introduced.",
         "allOf": [
           {
             "$ref": "#/components/schemas/PersonalQuotaDataSuccess"
@@ -36924,6 +36961,38 @@
                 "description": "Usable ordinary model key, disclosed only once in this no-store creation response."
               }
             }
+          }
+        }
+      },
+      "PersonalQuotaGranularityError": {
+        "type": "object",
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "INVALID_GRANULARITY"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_key": {
+            "type": "string",
+            "enum": [
+              "Invalid parameters"
+            ]
           }
         }
       }

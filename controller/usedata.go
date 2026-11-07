@@ -69,7 +69,20 @@ func GetUserQuotaDates(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusBadRequest, err, gin.H{"code": "LOG_RANGE_TOO_WIDE"})
 		return
 	}
-	dates, err := model.GetQuotaDataByUserId(userId, startTimestamp, endTimestamp)
+	granularity := c.DefaultQuery("granularity", "hour")
+	if granularity == "" {
+		granularity = "hour"
+	}
+	var dates []*model.QuotaData
+	switch granularity {
+	case "hour":
+		dates, err = model.GetQuotaDataByUserId(userId, startTimestamp, endTimestamp)
+	case "day":
+		dates, err = model.GetDailyQuotaDataByUserId(userId, startTimestamp, endTimestamp)
+	default:
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"), gin.H{"code": "INVALID_GRANULARITY"})
+		return
+	}
 	if err != nil {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Failed to query statistics"), gin.H{"code": "USAGE_QUERY_FAILED"})
 		return
@@ -78,7 +91,7 @@ func GetUserQuotaDates(c *gin.Context) {
 		"success":            true,
 		"message":            "",
 		"data":               dates,
-		"granularity":        "hour",
+		"granularity":        granularity,
 		"quota_per_unit":     common.QuotaPerUnit,
 		"data_complete":      false,
 		"enable_data_export": common.DataExportEnabled,
