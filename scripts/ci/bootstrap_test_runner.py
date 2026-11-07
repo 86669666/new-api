@@ -9,6 +9,7 @@ No database history is authored here: only the same-source gateway CLI seals.
 import argparse
 import ctypes
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -766,6 +767,32 @@ class OwnedHydra:
         finally:
             os.close(fd)
 
+    def register_clients(self):
+        context = ssl.create_default_context(cafile=str(self.directory / 'ca.pem'))
+        for client_id in ('newapi-w01-desktop', 'newapi-w01-independent'):
+            redirects = ['http://127.0.0.1:29873/oauth/callback']
+            if client_id == 'newapi-w01-desktop':
+                redirects.append('boxnai://oauth/callback')
+            registration = {
+                'client_id': client_id, 'token_endpoint_auth_method': 'none', 'subject_type': 'public',
+                'grant_types': ['authorization_code', 'refresh_token'], 'response_types': ['code'],
+                # The write-scope leaf adds/restores tokens:write; later leaves
+                # require that scope to remain unregistered in the baseline.
+                'scope': 'openid profile email offline_access balance:read usage:read tokens:read',
+                'audience': ['newapi-userinfo'], 'redirect_uris': redirects, 'skip_consent': False,
+            }
+            connection = http.client.HTTPSConnection('127.0.0.1', 4445, context=context, timeout=5)
+            try:
+                connection.request('POST', '/admin/clients', body=json.dumps(registration),
+                                   headers={'Content-Type': 'application/json'})
+                status = connection.getresponse().status
+                if status != 201:
+                    raise RuntimeError('hydra client registration failed: status ' + str(status))
+            finally:
+                # Creation responses can contain secrets. Do not log the body,
+                # follow redirects, or adopt/update a pre-existing client.
+                connection.close()
+
     def start(self):
         require_private_loopback()
         if digest_bytes(self.payload) != self.anchor:
@@ -822,6 +849,7 @@ class OwnedHydra:
             raise report_hydra_failure('migrate', 'exited', migrate_exit) from None
         self.run_bound(serve, popen=True)
         self.finish_serve()
+        self.register_clients()
 
 
 def rewritten_hydra_document(document, materials):

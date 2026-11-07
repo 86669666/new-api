@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Negative checks for the hydra-birth custody boundary. No root tier is started."""
 import io
+import json
 import os
 import shutil
 import ssl
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import urllib.request
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -337,6 +339,50 @@ class HydraBirthSecurityTest(unittest.TestCase):
         self.assertIsNone(runner.release_anchor_error(runner.HYDRA_SQLITE_RELEASE_SHA256))
         self.assertEqual(runner.HYDRA_NON_SQLITE_RELEASE_SHA256, 'b1437b7882f1863b2173003d6be86ad7b1f9381808cb5f4a19f9c27659595ddf')
 
+    def test_fresh_clients_registration_contract(self):
+        owned = runner.OwnedHydra(Path('/unused'), os.getuid(), b'', '')
+        context = ssl.create_default_context()
+        with patch.object(runner.ssl, 'create_default_context', return_value=context) as tls_context, \
+                patch('http.client.HTTPSConnection') as connection:
+            connection.return_value.getresponse.return_value.status = 201
+            owned.register_clients()
+            tls_context.assert_called_once_with(cafile=str(owned.directory / 'ca.pem'))
+            self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(context.check_hostname)
+            self.assertEqual(connection.call_count, 2)
+            for call in connection.call_args_list:
+                self.assertEqual(call.args, ('127.0.0.1', 4445))
+                self.assertEqual(call.kwargs, {'context': context, 'timeout': 5})
+            documents = []
+            for call in connection.return_value.request.call_args_list:
+                self.assertEqual(call.args[:2], ('POST', '/admin/clients'))
+                self.assertEqual(call.kwargs['headers'], {'Content-Type': 'application/json'})
+                documents.append(json.loads(call.kwargs['body']))
+            self.assertEqual([doc['client_id'] for doc in documents],
+                             ['newapi-w01-desktop', 'newapi-w01-independent'])
+            for doc in documents:
+                self.assertEqual(doc['token_endpoint_auth_method'], 'none')
+                self.assertEqual(doc['subject_type'], 'public')
+                self.assertEqual(doc['grant_types'], ['authorization_code', 'refresh_token'])
+                self.assertEqual(doc['response_types'], ['code'])
+                self.assertEqual(doc['audience'], ['newapi-userinfo'])
+                self.assertIs(doc['skip_consent'], False)
+                self.assertEqual(doc['scope'].split(),
+                                 ['openid', 'profile', 'email', 'offline_access', 'balance:read', 'usage:read', 'tokens:read'])
+            self.assertEqual(documents[0]['redirect_uris'],
+                             ['http://127.0.0.1:29873/oauth/callback', 'boxnai://oauth/callback'])
+            self.assertEqual(documents[1]['redirect_uris'], ['http://127.0.0.1:29873/oauth/callback'])
+            self.assertEqual(connection.return_value.close.call_count, 2)
+
+            for status in (200, 302, 404, 409, 503):
+                with self.subTest(status=status):
+                    connection.reset_mock()
+                    connection.return_value.getresponse.return_value.status = status
+                    with self.assertRaisesRegex(RuntimeError, '^hydra client registration failed: status ' + str(status) + '$'):
+                        owned.register_clients()
+                    connection.return_value.request.assert_called_once()
+                    connection.return_value.close.assert_called_once()
+
     def test_official_sqlite_binary_migrates_and_serves(self):
         binary = os.environ.get('NEWAPI_HYDRA_SQLITE_BIN', '')
         if not binary:
@@ -370,6 +416,24 @@ class HydraBirthSecurityTest(unittest.TestCase):
                 except OSError:
                     time.sleep(0.2)
             self.assertTrue(ready)
+            owned = runner.OwnedHydra(root, os.getuid(), payload, runner.HYDRA_SQLITE_RELEASE_SHA256)
+            owned.directory = root
+            shutil.copyfile(cert, root / 'ca.pem')
+            for client_id in ('newapi-w01-desktop', 'newapi-w01-independent'):
+                with self.assertRaises(urllib.error.HTTPError) as missing:
+                    urllib.request.urlopen('https://127.0.0.1:4445/admin/clients/' + client_id, context=context, timeout=5)
+                self.assertEqual(missing.exception.code, 404)
+                missing.exception.close()
+            owned.register_clients()
+            for client_id in ('newapi-w01-desktop', 'newapi-w01-independent'):
+                with urllib.request.urlopen('https://127.0.0.1:4445/admin/clients/' + client_id, context=context, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    registration = json.load(response)
+                self.assertEqual(registration['client_id'], client_id)
+                self.assertEqual(registration['token_endpoint_auth_method'], 'none')
+                self.assertIs(registration['skip_consent'], False)
+                self.assertIn('tokens:read', registration['scope'].split())
+                self.assertNotIn('tokens:write', registration['scope'].split())
         finally:
             if proc is not None and proc.poll() is None:
                 proc.terminate()
