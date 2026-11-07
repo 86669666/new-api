@@ -264,6 +264,9 @@ ORDINARY_AUDIT_SELECTOR = '^TestOAuthTokensConsumerHTTP$/^ordinary_key_creation$
 # namespace. The journal is never copied onto another database.
 HYDRA_BIRTH_SELECTOR = '^TestOAuthPublicHydraHTTP$/^(ordinary_tokens_write|explicit_tokens_read_empty_and_refresh|approval_binding_and_unknown_accept|durable_cleanup_(grant|client|sid|others|user))$'
 HYDRA_FIXED_VERSION = 'v26.2.0'
+# Official hydra_26.2.0-linux_sqlite_64bit binary. The linux_64bit build has no sqlite driver.
+HYDRA_SQLITE_RELEASE_SHA256 = '5420126fcc96e23243f578801a68ea58a0bee74b38d431e4f29d92c3ba4bc928'
+HYDRA_NON_SQLITE_RELEASE_SHA256 = 'b1437b7882f1863b2173003d6be86ad7b1f9381808cb5f4a19f9c27659595ddf'
 # Root-owned release tool. Not the user bundle and not its manifest.
 HYDRA_TRUSTED_BINARY = Path('/opt/newapi-test-tools/hydra-v26.2.0/hydra')
 HYDRA_TRUSTED_SHA_FILE = Path('/opt/newapi-test-tools/hydra-v26.2.0/hydra.sha256')
@@ -485,7 +488,16 @@ def load_trusted_hydra(binary_path, sha_path, manifest_sha, owner_uid=0):
     return data, anchor
 
 
+def release_anchor_error(anchor):
+    if anchor != HYDRA_SQLITE_RELEASE_SHA256:
+        return ValueError('hydra release anchor is not the sqlite v26.2.0 binary')
+    return None
+
+
 def load_release_hydra(manifest_sha):
+    anchor = read_release_anchor(HYDRA_TRUSTED_SHA_FILE, 0)
+    if release_anchor_error(anchor):
+        raise ValueError('hydra release anchor is not the sqlite v26.2.0 binary')
     return load_trusted_hydra(HYDRA_TRUSTED_BINARY, HYDRA_TRUSTED_SHA_FILE, manifest_sha, 0)
 
 
@@ -569,6 +581,7 @@ def render_hydra_config(database, cert, key, secret):
         '    host: 127.0.0.1',
         '    port: 4445',
         '  tls:',
+        '    enabled: true',
         '    cert:',
         '      path: "' + cert + '"',
         '    key:',
@@ -850,7 +863,7 @@ def prepare(args):
         if Path(args.hydra_bin).absolute() != HYDRA_TRUSTED_BINARY:
             raise ValueError('hydra-birth binary must be the fixed root-owned release file')
         # Early read. The root entry reads the same files again and does not execute the bundle.
-        args.hydra_anchor = load_trusted_hydra(HYDRA_TRUSTED_BINARY, HYDRA_TRUSTED_SHA_FILE, args.hydra_sha256, 0)[1]
+        args.hydra_anchor = load_release_hydra(args.hydra_sha256)[1]
         args.package, args.run = ['./router'], HYDRA_BIRTH_SELECTOR
     if args.tier in LIFECYCLE_TIERS:
         if args.package not in (None, ['./controller']) or args.run not in ('.', LIFECYCLE_SELECTOR):

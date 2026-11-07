@@ -3,10 +3,13 @@
 import io
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -172,6 +175,7 @@ class HydraBirthSecurityTest(unittest.TestCase):
         self.assertIn('host: 127.0.0.1', text)
         self.assertIn('sqlite:///owned/hydra.sqlite?_fk=true&mode=rwc', text)
         self.assertIn('access_token: 15m', text)
+        self.assertIn('enabled: true', text)
         self.assertNotIn('0.0.0.0', text)
         self.assertIsNotNone(runner.hydra_config_url_error(text.replace('127.0.0.1', '192.0.2.10')))
         self.assertIsNotNone(runner.hydra_config_url_error(text + '\nhost: 0.0.0.0\n'))
@@ -326,6 +330,50 @@ class HydraBirthSecurityTest(unittest.TestCase):
             self.assertFalse(owned.directory.exists())
             self.assertIsNone(owned.process)
         finally:
+            shutil.rmtree(root)
+
+    def test_non_sqlite_release_is_not_the_anchor(self):
+        self.assertIsNotNone(runner.release_anchor_error(runner.HYDRA_NON_SQLITE_RELEASE_SHA256))
+        self.assertIsNone(runner.release_anchor_error(runner.HYDRA_SQLITE_RELEASE_SHA256))
+        self.assertEqual(runner.HYDRA_NON_SQLITE_RELEASE_SHA256, 'b1437b7882f1863b2173003d6be86ad7b1f9381808cb5f4a19f9c27659595ddf')
+
+    def test_official_sqlite_binary_migrates_and_serves(self):
+        binary = os.environ.get('NEWAPI_HYDRA_SQLITE_BIN', '')
+        if not binary:
+            self.skipTest('NEWAPI_HYDRA_SQLITE_BIN is not set')
+        payload = Path(binary).read_bytes()
+        self.assertEqual(runner.digest_bytes(payload), runner.HYDRA_SQLITE_RELEASE_SHA256)
+        root = Path(tempfile.mkdtemp(dir=Path.home()))
+        proc = None
+        try:
+            key, cert = root / 'key.pem', root / 'cert.pem'
+            issued = subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-keyout', str(key), '-out', str(cert),
+                                     '-days', '2', '-nodes', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'],
+                                    check=False, capture_output=True, timeout=30)
+            self.assertEqual(issued.returncode, 0)
+            secret = '12' * 32
+            config = root / 'hydra.yaml'
+            config.write_text(runner.render_hydra_config(str(root / 'hydra.sqlite'), str(cert), str(key), secret))
+            migration = subprocess.run(runner.hydra_migrate_argv(binary, config), check=False, capture_output=True, timeout=60)
+            self.assertEqual(migration.returncode, 0)
+            proc = subprocess.Popen(runner.hydra_serve_argv(binary, config), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            context = ssl.create_default_context(cafile=str(cert))
+            deadline = time.time() + 20
+            ready = False
+            while time.time() < deadline:
+                self.assertIsNone(proc.poll())
+                try:
+                    with urllib.request.urlopen('https://127.0.0.1:4445/health/ready', context=context, timeout=1) as response:
+                        ready = response.status == 200
+                        if ready:
+                            break
+                except OSError:
+                    time.sleep(0.2)
+            self.assertTrue(ready)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
             shutil.rmtree(root)
 
     def test_startup_report_is_a_fixed_category(self):
