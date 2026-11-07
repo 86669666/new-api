@@ -99,8 +99,11 @@ func oauthGrantScopes(raw string) []string {
 }
 
 // RevokeAuthorizedOAuthApp revokes the caller's live grants for one client.
-// When issuer cleanup is enabled, the existing cleanup job is queued. Otherwise
-// only the local grant rows change.
+// When issuer cleanup is enabled, the existing cleanup job is queued and derived
+// sources are disabled with it. When cleanup is off, local grant rows change
+// only if this user has no derived-token source rows. A visible source is not
+// proof of trusted birth, and this path must not report that local change as
+// issuer cleanup or leave the source usable.
 func RevokeAuthorizedOAuthApp(ctx context.Context, userID int, clientID string) error {
 	if userID <= 0 || clientID == "" || DB == nil || !DB.Migrator().HasTable(&OAuthGrant{}) {
 		return ErrOAuthGrantInvalid
@@ -119,6 +122,15 @@ func RevokeAuthorizedOAuthApp(ctx context.Context, userID int, clientID string) 
 		}
 		if OAuthCleanupReady() {
 			return RevokeOAuthWithTx(tx, userID, "client", clientID, "explicit")
+		}
+		if tx.Migrator().HasTable(&OAuthDerivedTokenSource{}) {
+			var sources int64
+			if err := tx.Model(&OAuthDerivedTokenSource{}).Where("user_id = ?", userID).Count(&sources).Error; err != nil {
+				return err
+			}
+			if sources != 0 {
+				return ErrOAuthDerivedTokenUnknown
+			}
 		}
 		result := tx.Model(&OAuthGrant{}).Where("user_id = ? AND client_id = ? AND revoked_at = 0", userID, clientID).
 			Updates(map[string]any{"state": "revoked", "revoked_at": now, "revoked_reason": "explicit", "revision": gorm.Expr("revision + 1")})

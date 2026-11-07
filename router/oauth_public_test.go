@@ -1072,8 +1072,8 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 		var binding map[string]any
 		require.NoError(t, common.UnmarshalJsonStr(flow.Payload, &binding))
 		policy := binding["policy_hash"].(string)
-		require.Contains(t, policy, ":public-v4:")
-		legacyPolicy := strings.Split(policy, ":public-v4:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
+		require.Contains(t, policy, ":public-v5:")
+		legacyPolicy := strings.Split(policy, ":public-v5:")[0] + ":public-v2:openid-profile-email-offline-balance:7d"
 		legacyPolicyHash := fmt.Sprintf("%x", sha256.Sum256([]byte(legacyPolicy)))
 
 		// Reconstructed pre-upgrade local fixture: real Hydra issued this
@@ -1711,6 +1711,62 @@ func oauthPublicDatabase(t *testing.T, f *organizationHTTPFixture) {
 	combinedFixtureDatabase(t, "main", db)
 }
 
+func TestOAuthAuthorizedAppRevokeReadiness(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	oauthPublicDatabase(t, f)
+	common.IsMasterNode = true
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	common.IsMasterNode = false
+	require.NoError(t, f.db.AutoMigrate(&model.OAuthDerivedTokenSource{}))
+	oldReady := model.OAuthCleanupReady()
+	t.Cleanup(func() { require.NoError(t, model.InitOAuthCleanupStore(oldReady)) })
+	userID := f.users["owner"].Id
+	now := time.Now().Unix()
+	makeGrant := func(t *testing.T, clientID string) *model.OAuthGrant {
+		t.Helper()
+		grant := &model.OAuthGrant{GrantID: clientID + "-grant", Issuer: "https://gateway.example/", ClientID: clientID, Subject: strconv.Itoa(userID), UserID: userID,
+			ConsentRequestID: clientID + "-consent", HydraLoginSessionID: clientID + "-login", OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1,
+			Scopes: `["profile"]`, PolicyHash: strings.Repeat("a", 64)}
+		require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+		require.NoError(t, model.ApproveOAuthGrant(t.Context(), grant))
+		return grant
+	}
+	target, other := makeGrant(t, "revoked-client"), makeGrant(t, "kept-client")
+	key, err := common.GenerateKey()
+	require.NoError(t, err)
+	ordinary := &model.Token{UserId: userID, Name: "ordinary-not-derived", Key: key, Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1, CreatedTime: now, AccessedTime: now}
+	require.NoError(t, ordinary.Insert())
+	source := &model.OAuthDerivedTokenSource{GrantRef: target.GrantRef, UserID: userID, SchemaVersion: 1, QuotaLimit: 1000, ExpiresAt: now + 600,
+		PolicyHash: strings.Repeat("b", 64), BindingHash: strings.Repeat("c", 64), VerifiedAt: now - 10, ProofExpiresAt: now + 50, PermitDeadline: now + 40,
+		VerifiedMethod: "password", ProofFlowID: 1}
+	require.NoError(t, f.db.Create(source).Error)
+	require.NoError(t, model.InitOAuthCleanupStore(false))
+	require.ErrorIs(t, model.RevokeAuthorizedOAuthApp(t.Context(), userID, target.ClientID), model.ErrOAuthDerivedTokenUnknown)
+	var storedTarget, storedOther model.OAuthGrant
+	require.NoError(t, f.db.Where("grant_ref = ?", target.GrantRef).First(&storedTarget).Error)
+	assert.Zero(t, storedTarget.RevokedAt)
+	require.NoError(t, f.db.Where("grant_ref = ?", other.GrantRef).First(&storedOther).Error)
+	assert.Zero(t, storedOther.RevokedAt)
+	require.NoError(t, f.db.First(ordinary, ordinary.Id).Error)
+	assert.Equal(t, common.TokenStatusEnabled, ordinary.Status)
+	require.NoError(t, f.db.First(source, "grant_ref = ?", source.GrantRef).Error)
+	assert.Nil(t, source.TerminalAt)
+	var jobs int64
+	require.NoError(t, f.db.Model(&model.OAuthCleanupJob{}).Count(&jobs).Error)
+	assert.Zero(t, jobs)
+	require.NoError(t, f.db.Delete(source).Error)
+	require.NoError(t, model.RevokeAuthorizedOAuthApp(t.Context(), userID, target.ClientID))
+	require.NoError(t, f.db.Where("grant_ref = ?", target.GrantRef).First(&storedTarget).Error)
+	assert.NotZero(t, storedTarget.RevokedAt)
+	require.NoError(t, f.db.Where("grant_ref = ?", other.GrantRef).First(&storedOther).Error)
+	assert.Zero(t, storedOther.RevokedAt)
+	require.NoError(t, f.db.First(ordinary, ordinary.Id).Error)
+	assert.Equal(t, common.TokenStatusEnabled, ordinary.Status)
+	assert.True(t, ordinary.UnlimitedQuota)
+	require.NoError(t, f.db.Model(&model.OAuthCleanupJob{}).Count(&jobs).Error)
+	assert.Zero(t, jobs, "cleanup disabled must not enqueue an issuer job")
+}
+
 func TestOAuthPublicRateLimitHTTP(t *testing.T) {
 	oldEnable, oldNum, oldRedis := common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled
 	common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled = true, 1, false
@@ -1779,6 +1835,10 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 	t.Cleanup(admin.Close)
 	var authCalls atomic.Int64
 	var tokenCalls atomic.Int64
+	var tokenTTL atomic.Int64
+	var tokenReplay atomic.Bool
+	tokenTTL.Store(600)
+	tokenReplay.Store(true)
 	var wrongState atomic.Bool
 	forwarded := make(chan struct {
 		headers http.Header
@@ -1793,14 +1853,17 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 			}
 			tokenForms <- r.PostForm
 			w.Header().Set("Content-Type", "application/json")
-			if tokenCalls.Add(1) > 1 {
+			if tokenReplay.Load() && tokenCalls.Add(1) > 1 {
 				// The stub supplies issuer replay rejection; this verifies its
 				// propagation, not Hydra's single-use enforcement.
 				w.WriteHeader(400)
 				_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
 				return
 			}
-			_, _ = io.WriteString(w, `{"access_token":"synthetic-access-token","token_type":"bearer","expires_in":600,"scope":"profile"}`)
+			if !tokenReplay.Load() {
+				tokenCalls.Add(1)
+			}
+			_, _ = fmt.Fprintf(w, `{"access_token":"synthetic-access-token","token_type":"bearer","expires_in":%d,"scope":"profile"}`, tokenTTL.Load())
 			return
 		}
 		if r.URL.Path == "/.well-known/openid-configuration" {
@@ -2044,6 +2107,76 @@ func TestOAuthPublicAuthorizationBoundary(t *testing.T) {
 					assert.Equal(t, "synthetic-access-token", body["access_token"])
 					assert.Equal(t, "bearer", body["token_type"])
 					assert.Equal(t, "profile", body["scope"])
+				}
+			})
+		}
+	})
+	t.Run("access_token_ttl_bound", func(t *testing.T) {
+		f := newOrganizationHTTPFixture(t)
+		common.IsMasterNode = true
+		require.NoError(t, model.InitOAuthGrantStore(true))
+		common.IsMasterNode = false
+		verifier := strings.Repeat("v", 43)
+		sum := sha256.Sum256([]byte(verifier))
+		challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+		redirect := "http://127.0.0.1:39874/oauth/callback"
+		seed := func(t *testing.T, code string) {
+			t.Helper()
+			sumID := sha256.Sum256([]byte("ttl-grant:" + code))
+			grant := &model.OAuthGrant{GrantID: base64.RawURLEncoding.EncodeToString(sumID[:]), Issuer: issuer, ClientID: "boundary-client", Subject: strconv.Itoa(f.users["owner"].Id), UserID: f.users["owner"].Id,
+				ConsentRequestID: code + "-consent", HydraLoginSessionID: code + "-login", OriginSID: f.sids["owner"], SessionVersion: 1, UserAuthVersion: 1, Scopes: `["profile"]`, PolicyHash: strings.Repeat("a", 64)}
+			require.NoError(t, f.db.Transaction(func(tx *gorm.DB) error { return model.CreateOAuthGrantWithTx(tx, grant) }))
+			require.NoError(t, model.ApproveOAuthGrant(t.Context(), grant))
+			op := &model.OAuthOperation{Issuer: issuer, UserID: grant.UserID, ClientID: grant.ClientID, OriginSID: grant.OriginSID, AuthVersion: 1, SessionVersion: 1, GrantRef: grant.GrantRef, Kind: "authorization_code"}
+			require.NoError(t, model.ReserveOAuthOperation(t.Context(), op))
+			require.NoError(t, model.SendOAuthOperation(t.Context(), op))
+			require.NoError(t, model.ObserveOAuthOperation(t.Context(), op, []model.OAuthArtifact{{
+				ArtifactRef: model.OAuthArtifactRef(issuer, "code", code), Kind: "code", PKCE: challenge,
+				RedirectHash: model.OAuthArtifactRef(issuer, "redirect", redirect), ExpiresAt: time.Now().Add(time.Minute).Unix(),
+			}}))
+			claims := map[string]any{"active": true, "token_use": "access_token", "token_type": "Bearer", "iss": issuer, "aud": []string{"boundary-userinfo"}, "client_id": grant.ClientID, "sub": grant.Subject, "exp": time.Now().Unix() + 800, "scope": "profile",
+				"ext": map[string]any{"newapi_auth_version": "1", "newapi_grant_id": grant.GrantID, "newapi_grant_expires_at": strconv.FormatInt(grant.ExpiresAt, 10)}}
+			introspection.Store(&claims)
+		}
+		exchange := func(t *testing.T, code string) *httptest.ResponseRecorder {
+			t.Helper()
+			form := url.Values{"client_id": {"boundary-client"}, "grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirect}, "code_verifier": {verifier}}
+			request := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			<-tokenForms
+			return response
+		}
+		tokenReplay.Store(false)
+		t.Cleanup(func() { tokenReplay.Store(true) })
+		for _, tc := range []struct {
+			name    string
+			ttl     int64
+			status  int
+			failure string
+		}{
+			{"hydras_default_hour_is_refused", 3599, http.StatusServiceUnavailable, "temporarily_unavailable"},
+			{"inclusive_fifteen_minutes_is_accepted", 900, http.StatusOK, ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tokenTTL.Store(tc.ttl)
+				t.Cleanup(func() { tokenTTL.Store(600) })
+				seed(t, "ttl-"+tc.name)
+				response := exchange(t, "ttl-"+tc.name)
+				require.Equal(t, tc.status, response.Code)
+				assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+				if tc.failure != "" {
+					assert.Equal(t, map[string]any{"error": tc.failure}, body)
+					assert.NotContains(t, response.Body.String(), "synthetic-access-token")
+				} else {
+					assert.Equal(t, "synthetic-access-token", body["access_token"])
+					expires, ok := body["expires_in"].(float64)
+					require.True(t, ok)
+					assert.LessOrEqual(t, expires, float64(900))
+					assert.Greater(t, expires, float64(0))
 				}
 			})
 		}
