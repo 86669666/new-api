@@ -10464,7 +10464,7 @@
       "get": {
         "summary": "获取个人日志",
         "deprecated": false,
-        "description": "🔐 需要登录（User权限）\nPersonal log pagination accepts page only when the parsed URL has no p key. Presence of p (including bare p, p=, malformed or repeated values) always wins; duplicate p/page values use the first. Empty, syntax-invalid or zero page numbers default to 1; legacy negative and platform-int overflow behavior is unchanged. Page size uses page_size, then ps, then size, then configured ItemsPerPage when the selected size is zero or fails its initial parse. Nonzero negative sizes retain legacy behavior; positive sizes are capped at 100. Pagination parsing introduces no new parameter validation errors or response fields. This alias does not apply to administrator logs, export, statistics or other endpoints. Ordinary users below the administrator role are subject to log_setting.max_range_days (default 365). The existing start_timestamp/end_timestamp range calculation uses the earlier of now and a nonzero end; a missing start defaults to that end minus the allowed range. Exactly the allowed span is accepted; a greater span returns HTTP400 LOG_RANGE_TOO_WIDE after personal owner validation and the ordinary-user role check. This failure retains success:false, message, message_key and message_params.days without data. Administrators retain their existing self-log range exemption. Invalid/conflicting organization selectors remain separate HTTP400 failures before authentication; timestamp validation is unchanged. Database query failure returns HTTP500 LOG_QUERY_FAILED with a fixed safe message and message_key, without data or partial results. This guarantee is limited to database query failures; authentication and range errors retain their existing contracts. Pre-query invalid-filter validation retains legacy HTTP200 success:false with its original safe message and message_key, without code or data; clients must inspect success before consuming results.",
+        "description": "🔐 需要登录（User权限）\nPersonal log pagination accepts page only when the parsed URL has no p key. Presence of p (including bare p, p=, malformed or repeated values) always wins; duplicate p/page values use the first. Empty, syntax-invalid or zero page numbers default to 1; legacy negative and platform-int overflow behavior is unchanged. Page size uses page_size, then ps, then size, then configured ItemsPerPage when the selected size is zero or fails its initial parse. Nonzero negative sizes retain legacy behavior; positive sizes are capped at 100. Pagination parsing introduces no new parameter validation errors or response fields. This alias does not apply to administrator logs, export, statistics or other endpoints. Ordinary users below the administrator role are subject to log_setting.max_range_days (default 365). The existing start_timestamp/end_timestamp range calculation uses the earlier of now and a nonzero end; a missing start defaults to that end minus the allowed range. Exactly the allowed span is accepted; a greater span returns HTTP400 LOG_RANGE_TOO_WIDE after personal owner validation and the ordinary-user role check. This failure retains success:false, message, message_key and message_params.days without data. Administrators retain their existing self-log range exemption. Invalid/conflicting organization selectors remain separate HTTP400 failures before authentication; Nonempty start_timestamp/end_timestamp values must parse as signed 64-bit base-10 integers. Invalid integer input (including signed 64-bit overflow) returns HTTP400 INVALID_LOG_TIMESTAMP with success:false, message and message_key set to Invalid parameters, without data. Validation follows personal owner validation and applies to every role, including administrators, before range limiting. Omitted, empty and zero values retain their existing defaults. Parsed negative values and reversed intervals retain existing behavior; no additional valid-range policy is introduced. The first parsed query value is used, as before. Database query failure returns HTTP500 LOG_QUERY_FAILED with a fixed safe message and message_key, without data or partial results. This guarantee is limited to database query failures; authentication and range errors retain their existing contracts. Pre-query invalid-filter validation retains legacy HTTP200 success:false with its original safe message and message_key, without code or data; clients must inspect success before consuming results.",
         "tags": [
           "日志"
         ],
@@ -10521,6 +10521,26 @@
             "required": false,
             "allowEmptyValue": true,
             "description": "Legacy final page-size fallback when page_size and ps resolve to zero. First value; zero then uses configured ItemsPerPage. Upper cap 100, negative nonzero unchanged.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start_timestamp",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Unix seconds as a signed 64-bit base-10 integer string. Omitted, empty and zero retain existing defaults; the first value is used. Nonempty invalid integers, including overflow, return HTTP400 INVALID_LOG_TIMESTAMP. No new restriction on parsed negative values or reversed intervals.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "end_timestamp",
+            "in": "query",
+            "required": false,
+            "allowEmptyValue": true,
+            "description": "Unix seconds as a signed 64-bit base-10 integer string. Omitted, empty and zero retain existing defaults; the first value is used. Nonempty invalid integers, including overflow, return HTTP400 INVALID_LOG_TIMESTAMP. No new restriction on parsed negative values or reversed intervals.",
             "schema": {
               "type": "string"
             }
@@ -10656,7 +10676,7 @@
             }
           },
           "400": {
-            "description": "ORG_SELECTOR_INVALID/ORG_SELECTOR_CONFLICT reject an invalid or conflicting organization selector before authentication. Separately, LOG_RANGE_TOO_WIDE rejects an ordinary user's overwide personal-log range after personal owner validation and the role check; administrators retain their self-log exemption. The structured Message fields are preserved.",
+            "description": "ORG_SELECTOR_INVALID/ORG_SELECTOR_CONFLICT reject an invalid or conflicting organization selector before authentication. Separately, LOG_RANGE_TOO_WIDE rejects an ordinary user's overwide personal-log range after personal owner validation and the role check; administrators retain their self-log exemption. The structured Message fields are preserved. INVALID_LOG_TIMESTAMP rejects nonempty invalid timestamp integers (including signed 64-bit overflow) after personal owner validation for all roles, before range limiting.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -10674,6 +10694,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/PersonalLogRangeError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PersonalLogTimestampError"
                     }
                   ]
                 },
@@ -10714,6 +10737,14 @@
                       "message_params": {
                         "days": 7
                       }
+                    }
+                  },
+                  "INVALID_LOG_TIMESTAMP": {
+                    "value": {
+                      "success": false,
+                      "code": "INVALID_LOG_TIMESTAMP",
+                      "message": "Invalid parameters",
+                      "message_key": "Invalid parameters"
                     }
                   }
                 }
@@ -36924,6 +36955,43 @@
                 "description": "Usable ordinary model key, disclosed only once in this no-store creation response."
               }
             }
+          }
+        }
+      },
+      "PersonalLogTimestampError": {
+        "type": "object",
+        "description": "GET /api/log/self only: a nonempty timestamp is not a valid signed 64-bit base-10 integer, including overflow. Applies to all roles.",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message",
+          "message_key"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "INVALID_LOG_TIMESTAMP"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "enum": [
+              "Invalid parameters"
+            ]
+          },
+          "message_key": {
+            "type": "string",
+            "enum": [
+              "Invalid parameters"
+            ]
           }
         }
       }

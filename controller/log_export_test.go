@@ -283,6 +283,81 @@ func TestUserLogPageAlias(t *testing.T) {
 	})
 }
 
+func TestUserLogTimestampValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	setting := operation_setting.GetLogSetting()
+	previous := *setting
+	t.Cleanup(func() { *setting = previous })
+	setting.MaxRangeDays = 7
+	end := time.Now().Unix() - 3600
+	for _, entry := range []model.Log{
+		{UserId: 70016, CreatedAt: end - 600, Type: model.LogTypeError, RequestId: "older"},
+		{UserId: 70016, CreatedAt: end, Type: model.LogTypeError, RequestId: "boundary"},
+		{UserId: 70016, CreatedAt: end + 600, Type: model.LogTypeError, RequestId: "newer"},
+		{UserId: 70017, CreatedAt: end, Type: model.LogTypeError, RequestId: "foreign"},
+	} {
+		require.NoError(t, db.Create(&entry).Error)
+	}
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser} {
+		for _, tc := range []struct {
+			name, start, end string
+			invalid          bool
+			want             []any
+		}{
+			{"valid", fmt.Sprint(end), fmt.Sprint(end), false, []any{"boundary"}},
+			{"missing", "<omit>", "<omit>", false, []any{"newer", "boundary", "older"}},
+			{"empty", "", "", false, []any{"newer", "boundary", "older"}},
+			{"zero", "0", "0", false, []any{"newer", "boundary", "older"}},
+			{"signed", "+" + fmt.Sprint(end), fmt.Sprint(end), false, []any{"boundary"}},
+			{"negative", "-2", "-1", false, []any{}},
+			{"reversed", fmt.Sprint(end + 1), fmt.Sprint(end), false, []any{}},
+			{"malformed_start", "invalid", fmt.Sprint(end), true, nil},
+			{"malformed_end", fmt.Sprint(end), "invalid", true, nil},
+			{"fraction", "1.5", "", true, nil},
+			{"whitespace", "", " 1", true, nil},
+			{"start_overflow", "9223372036854775808", "", true, nil},
+			{"end_overflow", "", "-9223372036854775809", true, nil},
+		} {
+			t.Run(fmt.Sprintf("role_%d/%s", role, tc.name), func(t *testing.T) {
+				query := url.Values{"page_size": {"10"}}
+				if tc.start != "<omit>" {
+					query.Set("start_timestamp", tc.start)
+				}
+				if tc.end != "<omit>" {
+					query.Set("end_timestamp", tc.end)
+				}
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodGet, "/api/log/self?"+query.Encode(), nil)
+				ctx.Set("id", 70016)
+				ctx.Set("auth_identity", service.AuthIdentity{UserID: 70016})
+				ctx.Set("role", role)
+				GetUserLogs(ctx)
+				var body map[string]any
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+				if tc.invalid {
+					assert.Equal(t, http.StatusBadRequest, recorder.Code)
+					assert.Equal(t, map[string]any{"success": false, "code": "INVALID_LOG_TIMESTAMP", "message": "Invalid parameters", "message_key": "Invalid parameters"}, body)
+					return
+				}
+				require.Equal(t, http.StatusOK, recorder.Code)
+				require.Equal(t, true, body["success"])
+				assert.NotContains(t, body, "code")
+				data := body["data"].(map[string]any)
+				ids := []any{}
+				for _, item := range data["items"].([]any) {
+					ids = append(ids, item.(map[string]any)["request_id"])
+				}
+				assert.Equal(t, tc.want, ids)
+				assert.EqualValues(t, len(tc.want), data["total"])
+			})
+		}
+	}
+}
+
 func TestUserLogRangeErrorStatus(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, _ := newAuditTestDatabase(t, "sqlite", "")

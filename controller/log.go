@@ -79,6 +79,14 @@ func GetUserLogs(c *gin.Context) {
 	if !ok {
 		return
 	}
+	for _, key := range []string{"start_timestamp", "end_timestamp"} {
+		if value := c.Query(key); value != "" {
+			if _, err := strconv.ParseInt(value, 10, 64); err != nil {
+				common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"), gin.H{"code": "INVALID_LOG_TIMESTAMP"})
+				return
+			}
+		}
+	}
 	pageInfo := common.GetPageQueryWithPageAlias(c)
 	filter := logFilterFromQuery(c, false)
 	if c.GetInt("role") < common.RoleAdminUser {

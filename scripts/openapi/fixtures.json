@@ -17286,5 +17286,65 @@
       }
     },
     "valid": true
+  },
+  {
+    "name": "personal log invalid timestamp",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "INVALID_LOG_TIMESTAMP",
+      "message": "Invalid parameters",
+      "message_key": "Invalid parameters"
+    },
+    "valid": true
+  },
+  {
+    "name": "personal log invalid timestamp missing code",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "message": "Invalid parameters",
+      "message_key": "Invalid parameters"
+    },
+    "valid": false
+  },
+  {
+    "name": "personal log invalid timestamp wrong code",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "OTHER_LOG_ERROR",
+      "message": "Invalid parameters",
+      "message_key": "Invalid parameters"
+    },
+    "valid": false
+  },
+  {
+    "name": "personal log invalid timestamp partial data",
+    "document": "api",
+    "schema": "#/paths/~1api~1log~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "INVALID_LOG_TIMESTAMP",
+      "message": "Invalid parameters",
+      "message_key": "Invalid parameters",
+      "data": []
+    },
+    "valid": false
+  },
+  {
+    "name": "log timestamp code is not a data self error",
+    "document": "api",
+    "schema": "#/paths/~1api~1data~1self/get/responses/400/content/application~1json/schema",
+    "value": {
+      "success": false,
+      "code": "INVALID_LOG_TIMESTAMP",
+      "message": "Invalid parameters",
+      "message_key": "Invalid parameters"
+    },
+    "valid": false
   }
 ]

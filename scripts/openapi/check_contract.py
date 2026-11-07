@@ -501,11 +501,12 @@ def check_personal_log_range_error(api):
     assert content['schema'] == {'anyOf': [
         {'$ref': '#/components/schemas/OrganizationSelectionBadRequestError'},
         {'$ref': '#/components/schemas/PersonalLogRangeError'},
+        {'$ref': '#/components/schemas/PersonalLogTimestampError'},
     ]}
     for name, example in legacy['content']['application/json']['examples'].items():
         assert content['examples'][name] == example
     assert set(content['examples']) == set(legacy['content']['application/json']['examples']) | {
-        'LOG_RANGE_TOO_WIDE_365', 'LOG_RANGE_TOO_WIDE_7',
+        'LOG_RANGE_TOO_WIDE_365', 'LOG_RANGE_TOO_WIDE_7', 'INVALID_LOG_TIMESTAMP',
     }
     assert 'before authentication' in response['description']
     assert 'after personal owner validation and the role check' in response['description']
@@ -526,7 +527,11 @@ def check_personal_log_range_error(api):
     data_operation = api['paths']['/api/data/self']['get']
     data_response = data_operation['responses']['400']
     assert data_response['headers'] == legacy['headers']
-    assert data_response['content'] == response['content']
+    # The data endpoint retains its original range-only error union/examples.
+    data_content = copy.deepcopy(response['content'])
+    data_content['application/json']['schema']['anyOf'].pop()
+    del data_content['application/json']['examples']['INVALID_LOG_TIMESTAMP']
+    assert data_response['content'] == data_content
     assert 'before authentication' in data_response['description']
     assert 'after authentication in GetUserQuotaDates' in data_response['description']
     assert 'all authenticated roles, including administrators and root' in data_response['description']
@@ -542,6 +547,25 @@ def check_personal_log_range_error(api):
         assert all(node.get('$ref') != '#/components/schemas/PersonalLogRangeError' for node in walk(item))
     return {'scope': '/api/log/self ordinary-user and /api/data/self all-role range errors only', 'status': 400,
             'code': 'LOG_RANGE_TOO_WIDE', 'selector_400_preserved': True, 'structured_message_preserved': True}
+
+
+def check_personal_log_timestamp_error(api):
+    operation = api['paths']['/api/log/self']['get']
+    media = operation['responses']['400']['content']['application/json']
+    example = media['examples']['INVALID_LOG_TIMESTAMP']['value']
+    assert example == {'success': False, 'code': 'INVALID_LOG_TIMESTAMP',
+                       'message': 'Invalid parameters', 'message_key': 'Invalid parameters'}
+    validate_value(api, media['schema'], example)
+    for name in ('start_timestamp', 'end_timestamp'):
+        parameter = next(p for p in operation['parameters'] if p.get('name') == name)
+        assert parameter['schema'] == {'type': 'string'}
+        assert parameter['allowEmptyValue'] is True
+        assert parameter['required'] is False
+    reference = '#/components/schemas/PersonalLogTimestampError'
+    for path, item in api['paths'].items():
+        if path != '/api/log/self':
+            assert all(node.get('$ref') != reference for node in walk(item))
+    return {'scope': 'GET /api/log/self only', 'status': 400, 'code': example['code']}
 
 
 def check_personal_query_errors(api):
@@ -653,7 +677,7 @@ def check_personal_log_pagination(api):
         {'$ref': '#/components/parameters/PersonalOrganizationHeader'},
         {'$ref': '#/components/parameters/PersonalOrganizationQuery'},
     ]
-    assert [parameter['name'] for parameter in parameters[2:]] == ['p', 'page', 'page_size', 'ps', 'size']
+    assert [parameter['name'] for parameter in parameters[2:]] == ['p', 'page', 'page_size', 'ps', 'size', 'start_timestamp', 'end_timestamp']
     for parameter in parameters[2:]:
         assert {key: value for key, value in parameter.items() if key != 'description'} == {
             'name': parameter['name'], 'in': 'query', 'required': False,
@@ -1707,6 +1731,7 @@ def main():
     results['model_capability_metadata'] = check_model_capability_metadata(api, relay)
     results['personal_log_pagination'] = check_personal_log_pagination(api)
     results['personal_log_range_error'] = check_personal_log_range_error(api)
+    results['personal_log_timestamp_error'] = check_personal_log_timestamp_error(api)
     results['personal_quota_series'] = check_personal_quota_series(api)
     results['personal_query_errors'] = check_personal_query_errors(api)
     results['oauth_userinfo'] = check_oauth_userinfo(api, source_root)
