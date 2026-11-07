@@ -339,6 +339,62 @@ func oauthPublicUsageDatabase(t *testing.T, f *organizationHTTPFixture) {
 	combinedFixtureDatabase(t, "log", logDB)
 }
 
+func TestOAuthBridgeClientTrustsIssuerCA(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+	leaf, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}})
+	require.NoError(t, err)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	admin := "https://" + listener.Addr().String()
+	issuer := "https://127.0.0.1:9/"
+	config := service.OAuthUserInfoConfig{Enabled: true, IntrospectionURL: admin + "/admin/oauth2/introspect", Issuer: issuer, Audience: "newapi-userinfo", ClientIDs: []string{"newapi-w01-desktop"}}
+	bridgeConfig := service.OAuthProviderConfig{Enabled: true, RevocationEnabled: true, AdminBaseURL: admin, AuthorizationURL: issuer + "oauth2/auth"}
+	oldAddress := system_setting.ServerAddress
+	system_setting.ServerAddress = issuer
+	t.Cleanup(func() { system_setting.ServerAddress = oldAddress })
+	t.Setenv("FRONTEND_BASE_URL", "")
+	untrusted, err := service.NewOAuthUserInfoResource(config, nil)
+	require.NoError(t, err)
+	t.Cleanup(untrusted.CloseIdleConnections)
+	untrustedBridge, err := service.NewOAuthProviderBridge(bridgeConfig, untrusted)
+	require.NoError(t, err)
+	untrustedPublic, err := service.NewOAuthPublic(service.OAuthPublicConfig{Enabled: true, BaseURL: "https://127.0.0.1:8"}, untrustedBridge)
+	require.NoError(t, err)
+	err = untrustedPublic.ValidateTopology(t.Context())
+	require.Error(t, err)
+	require.ErrorContains(t, err, "client connection")
+	host := listener.Addr().String()
+	_, err = tls.Dial("tcp", host, &tls.Config{MinVersion: tls.VersionTLS12})
+	var unknown x509.UnknownAuthorityError
+	require.ErrorAs(t, err, &unknown)
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	verified, err := tls.Dial("tcp", host, &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots})
+	require.NoError(t, err)
+	require.NoError(t, verified.Close())
+	trusted, err := service.NewOAuthUserInfoResource(config, roots)
+	require.NoError(t, err)
+	t.Cleanup(trusted.CloseIdleConnections)
+	trustedBridge, err := service.NewOAuthProviderBridge(bridgeConfig, trusted)
+	require.NoError(t, err)
+	trustedPublic, err := service.NewOAuthPublic(service.OAuthPublicConfig{Enabled: true, BaseURL: "https://127.0.0.1:8"}, trustedBridge)
+	require.NoError(t, err)
+	err = trustedPublic.ValidateTopology(t.Context())
+	require.Error(t, err)
+	require.ErrorContains(t, err, "client status")
+	require.NotContains(t, err.Error(), "client connection")
+}
+
 func TestOAuthPublicHydraHTTP(t *testing.T) {
 	inputPath := os.Getenv("NEWAPI_W01_HYDRA_INPUT")
 	if inputPath == "" {
@@ -480,7 +536,14 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 	for key, value := range map[string]string{"OAUTH_USERINFO_ENABLED": "true", "OAUTH_USERINFO_ISSUER": input.Issuer, "OAUTH_USERINFO_INTROSPECTION_URL": adminProxy.URL + "/admin/oauth2/introspect", "OAUTH_USERINFO_AUDIENCE": "newapi-userinfo", "OAUTH_USERINFO_CLIENT_IDS": "newapi-w01-desktop,newapi-w01-independent", "OAUTH_PROVIDER_BRIDGE_ENABLED": "true", "OAUTH_PROVIDER_REVOCATION_ENABLED": "true", "OAUTH_PROVIDER_ADMIN_BASE_URL": adminProxy.URL, "OAUTH_PROVIDER_AUTHORIZATION_URL": input.Issuer + "oauth2/auth", "OAUTH_PROVIDER_PUBLIC_ENABLED": "true", "OAUTH_PROVIDER_PUBLIC_BASE_URL": input.Public} {
 		t.Setenv(key, value)
 	}
-	require.NoError(t, service.InitOAuthUserInfoResource())
+	resource, err := service.NewOAuthUserInfoResource(service.OAuthUserInfoConfig{
+		Enabled: true, IntrospectionURL: adminProxy.URL + "/admin/oauth2/introspect", Issuer: input.Issuer,
+		Audience: "newapi-userinfo", ClientIDs: []string{"newapi-w01-desktop", "newapi-w01-independent"},
+	}, roots)
+	require.NoError(t, err)
+	t.Cleanup(resource.CloseIdleConnections)
+	previousResource := service.SetCurrentOAuthUserInfoResource(resource)
+	t.Cleanup(func() { service.SetCurrentOAuthUserInfoResource(previousResource) })
 	require.NoError(t, service.InitOAuthProviderBridge())
 	common.IsMasterNode = true
 	require.NoError(t, service.InitOAuthGrantStore())
