@@ -44,12 +44,13 @@ func SanitizeURLForLog(rawURL string) string {
 
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
-		return rawURL
+		return "[invalid URL]"
 	}
 
-	query := parsedURL.Query()
-	if len(query) == 0 {
-		return rawURL
+	// URL.Query silently drops malformed entries, which may contain credentials.
+	query, err := url.ParseQuery(parsedURL.RawQuery)
+	if err != nil {
+		return "[invalid URL]"
 	}
 
 	changed := false
@@ -59,11 +60,17 @@ func SanitizeURLForLog(rawURL string) string {
 			changed = true
 		}
 	}
+	if changed {
+		parsedURL.RawQuery = query.Encode()
+	}
+	if parsedURL.User != nil {
+		parsedURL.User = nil
+		changed = true
+	}
 	if !changed {
 		return rawURL
 	}
 
-	parsedURL.RawQuery = query.Encode()
 	return parsedURL.String()
 }
 

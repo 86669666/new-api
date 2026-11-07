@@ -49,11 +49,60 @@ func TestSanitizeURLForLogMasksAWSAndSecretLikeQueryKeys(t *testing.T) {
 }
 
 func TestSanitizeURLForLogKeepsURLWithoutSensitiveQuery(t *testing.T) {
-	rawURL := "https://example.test/v1/chat/completions?api-version=2024-02-01&alt=sse"
+	for _, rawURL := range []string{
+		"",
+		"https://example.test/v1/chat/completions",
+		"https://example.test/v1/chat/completions?",
+		"https://example.test/v1/chat/completions?api-version=2024-02-01&alt=sse",
+		"https://example.test/path?model=a%20b&model=c#section",
+	} {
+		assert.Equal(t, rawURL, SanitizeURLForLog(rawURL))
+	}
+}
 
-	got := SanitizeURLForLog(rawURL)
+func TestSanitizeURLForLogRejectsMalformedURL(t *testing.T) {
+	const syntheticCredential = "synthetic-log-test-credential"
+	tests := []struct {
+		name   string
+		rawURL string
+	}{
+		{"invalid path escape", "https://example.test/%zz?key=" + syntheticCredential},
+		{"invalid authority", "https://[example.test/path?token=" + syntheticCredential},
+		{"invalid query value escape", "https://example.test/path?key=" + syntheticCredential + "%zz"},
+		{"invalid query key escape", "https://example.test/path?to%zzken=" + syntheticCredential},
+		{"partial query parse", "https://example.test/path?model=test&token=" + syntheticCredential + "%zz"},
+		{"invalid query separator", "https://example.test/path?token=" + syntheticCredential + ";model=test"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SanitizeURLForLog(tt.rawURL)
+			// Boolean assertions keep even synthetic credentials out of failure logs.
+			assert.False(t, strings.Contains(got, syntheticCredential), "credential survives log projection")
+			assert.True(t, got == "[invalid URL]", "malformed input must use a fixed log placeholder")
+		})
+	}
+}
 
-	assert.Equal(t, rawURL, got)
+func TestSanitizeURLForLogRemovesUserinfo(t *testing.T) {
+	const syntheticCredential = "synthetic-log-test-credential"
+	tests := []struct {
+		name  string
+		user  string
+		query string
+		want  string
+	}{
+		{"username credential", syntheticCredential, "", "https://example.test/path"},
+		{"password credential", "user:" + syntheticCredential, "?model=a%20b", "https://example.test/path?model=a%20b"},
+		{"userinfo and query credential", "user:" + syntheticCredential, "?token=" + syntheticCredential, "https://example.test/path?token=%2A%2A%2Amasked%2A%2A%2A"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rawURL := "https://" + tt.user + "@example.test/path" + tt.query
+			got := SanitizeURLForLog(rawURL)
+			assert.False(t, strings.Contains(got, syntheticCredential), "credential survives log projection")
+			assert.True(t, got == tt.want, "log projection must remove userinfo and preserve harmless URL parts")
+		})
+	}
 }
 
 func TestValidateMultipartDirectNormalizesImageField(t *testing.T) {
