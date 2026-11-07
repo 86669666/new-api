@@ -537,6 +537,166 @@ export async function getMyOrganizationTransfers(
 
 export type OrganizationInvitation = z.infer<typeof invitationSchema>
 
+// Slots include terminal generations and nullable organization metadata. Keep
+// this projection separate from the personal invitation/transfer inboxes.
+const invitationSlotSchema = z.object({
+  organization_id: wireIdSchema,
+  organization_name: z.string().min(1).nullable(),
+  organization_revision: wireIdSchema.nullable(),
+  object_id: wireIdSchema,
+  generation: wireIdSchema,
+  kind: z.literal('invitation'),
+  target_user_id: wireIdSchema,
+  target_username: z.string(),
+  role: z.enum(['member', 'admin']),
+  status: z.enum(['pending', 'expired', 'accepted', 'declined', 'revoked']),
+  expires_at: z.number().int().min(0).max(8640000000000),
+})
+const invitationSlotsSchema = z.object({
+  items: z.array(invitationSlotSchema).max(20),
+  limit: z.literal(20),
+  next_after_id: wireIdSchema.nullable(),
+})
+export type OrganizationInvitationSlot = z.infer<typeof invitationSlotSchema>
+
+export async function getOrganizationInvitationSlots(
+  actorId: number,
+  sid: string,
+  orgId: string,
+  afterId: string,
+  signal: AbortSignal
+) {
+  const identityChanged = new AbortController()
+  const unsubscribe = useAuthStore.subscribe((state) => {
+    if (state.auth.user?.id !== actorId || state.auth.session?.sid !== sid) {
+      identityChanged.abort()
+    }
+  })
+  const boundSignal = AbortSignal.any([signal, identityChanged.signal])
+  try {
+    if (!Number.isSafeInteger(actorId) || actorId <= 0 || !sid) {
+      throw new Error()
+    }
+    wireIdSchema.parse(orgId)
+    z.union([z.literal('0'), wireIdSchema]).parse(afterId)
+    const page = invitationSlotsSchema.parse(
+      await readOrganizationData(
+        actorId,
+        sid,
+        `/api/organizations/${orgId}/invitations`,
+        boundSignal,
+        { after_id: afterId, limit: 20 }
+      )
+    )
+    let previous = BigInt(afterId)
+    for (const slot of page.items) {
+      if (
+        slot.organization_id !== orgId ||
+        BigInt(slot.object_id) <= previous
+      ) {
+        throw new Error()
+      }
+      previous = BigInt(slot.object_id)
+    }
+    const expectedNext =
+      page.items.length === 20 ? page.items.at(-1)?.object_id : null
+    if (page.next_after_id !== expectedNext) throw new Error()
+    // Preserve the server cursor even when a page contains only resolved slots.
+    return {
+      ...page,
+      items: page.items.filter(
+        (slot) => slot.status === 'pending' || slot.status === 'expired'
+      ),
+    }
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, boundSignal)
+  } finally {
+    unsubscribe()
+  }
+}
+
+const revokedInvitationSchema = z.object({
+  organization_id: wireIdSchema,
+  revision: wireIdSchema,
+  action: z.literal('invitation_revoke'),
+  event_id: wireIdSchema,
+  object_kind: z.literal('invitation'),
+  object_id: wireIdSchema,
+  generation: wireIdSchema,
+  status: z.literal('revoked'),
+})
+
+export async function revokeOrganizationInvitation(
+  actorId: number,
+  sid: string,
+  orgId: string,
+  selected: OrganizationInvitationSlot,
+  signal: AbortSignal
+) {
+  const identityChanged = new AbortController()
+  const unsubscribe = useAuthStore.subscribe((state) => {
+    if (state.auth.user?.id !== actorId || state.auth.session?.sid !== sid) {
+      identityChanged.abort()
+    }
+  })
+  const boundSignal = AbortSignal.any([signal, identityChanged.signal])
+  const assertIdentity = () => {
+    const auth = useAuthStore.getState().auth
+    if (
+      boundSignal.aborted ||
+      auth.user?.id !== actorId ||
+      auth.session?.sid !== sid
+    ) {
+      throw new CanceledError('Organization identity changed')
+    }
+  }
+  try {
+    assertIdentity()
+    const intent = invitationSlotSchema
+      .extend({
+        organization_name: z.string().min(1),
+        organization_revision: wireIdSchema,
+        status: z.literal('pending'),
+      })
+      .parse(selected)
+    if (
+      !Number.isSafeInteger(actorId) ||
+      actorId <= 0 ||
+      !sid ||
+      intent.organization_id !== orgId ||
+      intent.expires_at <= Date.now() / 1000
+    ) {
+      throw new Error()
+    }
+    // Role authorization belongs to the model, using the current actor and slot.
+    const response = await api.post(
+      `/api/organizations/${orgId}/invitations/${intent.object_id}/revoke`,
+      { revision: intent.organization_revision, generation: intent.generation },
+      organizationRequestOptions({ userId: actorId, sid }, boundSignal)
+    )
+    assertIdentity()
+    if (response.status !== 200) throw new Error()
+    const receipt = revokedInvitationSchema.parse(
+      z
+        .object({ success: z.literal(true), data: z.unknown() })
+        .parse(requireServerSuccess(response.data)).data
+    )
+    if (
+      receipt.organization_id !== intent.organization_id ||
+      receipt.object_id !== intent.object_id ||
+      receipt.generation !== intent.generation ||
+      BigInt(receipt.revision) <= BigInt(intent.organization_revision)
+    ) {
+      throw new Error()
+    }
+    return receipt
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, boundSignal)
+  } finally {
+    unsubscribe()
+  }
+}
+
 const declinedInvitationSchema = z.object({
   organization_id: wireIdSchema,
   revision: wireIdSchema,

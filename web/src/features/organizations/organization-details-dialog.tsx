@@ -42,6 +42,7 @@ import {
   type OrganizationDetail,
   type OrganizationMember,
 } from './api'
+import { OrganizationInvitationSlotsCard } from './organization-invitation-slots-card'
 import { useRemoveMember } from './use-remove-member'
 
 type OrganizationDetailsProps = {
@@ -357,6 +358,15 @@ function OrganizationDetails(props: OrganizationDetailsProps) {
           {t('Next')}
         </Button>
       </div>
+      {data &&
+        (data.detail.my_role === 'owner' ||
+          data.detail.my_role === 'admin') && (
+          <OrganizationInvitationSlotsCard
+            actorId={props.actorId}
+            sid={props.sid}
+            orgId={props.orgId}
+          />
+        )}
       <ConfirmDialog
         open={selection !== null}
         onOpenChange={(open) => {
