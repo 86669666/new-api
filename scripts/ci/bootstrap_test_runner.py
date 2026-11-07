@@ -630,6 +630,38 @@ def hydra_serve_argv(binary, config):
     return [str(binary), 'serve', 'all', '--config', str(config)]
 
 
+def read_stream_tail(stream, limit=4096):
+    buf = bytearray()
+    while True:
+        block = stream.read(1024)
+        if not block:
+            return bytes(buf)
+        buf.extend(block)
+        if len(buf) > limit:
+            del buf[:-limit]
+
+
+def redact_hydra_diagnostic(text, secret=''):
+    """Keep a short startup note. Drop the system secret and private keys."""
+    redacted = text or ''
+    if secret:
+        redacted = redacted.replace(secret, '[redacted]')
+        redacted = redacted.replace(secret.upper(), '[redacted]')
+    redacted = re.sub(
+        r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----',
+        '[redacted-key]', redacted, flags=re.S)
+    redacted = re.sub(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[redacted-token]', redacted)
+    lines = [line.strip() for line in redacted.splitlines() if line.strip()]
+    return '\n'.join(lines[-8:])[:600]
+
+
+def report_hydra_failure(phase, code, output, secret=''):
+    note = redact_hydra_diagnostic(output, secret)
+    print('HYDRA_START_FAILURE ' + json.dumps({'phase': phase, 'exit': code, 'note': note}, ensure_ascii=True), flush=True)
+    shown = 'none' if code is None else str(code)
+    return RuntimeError('hydra ' + phase + ' exit ' + shown + ': ' + note)
+
+
 class OwnedHydra:
     """One Hydra v26.2.0 in the already-private loopback namespace."""
     def __init__(self, root, uid, payload, anchor):
@@ -641,6 +673,9 @@ class OwnedHydra:
         self.binary_dir = self.root / 'hydra-bin'
         self.directory = self.root / 'hydra-runtime'
         self.input_path = self.root / 'hydra-runtime-input.json'
+        self.secret = ''
+        self._serve_output = bytearray()
+        self._serve_reader = None
 
     def close(self):
         process = self.process
@@ -652,6 +687,11 @@ class OwnedHydra:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        if self._serve_reader is not None:
+            self._serve_reader.join(timeout=2)
+            self._serve_reader = None
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
 
     def wait_ready(self):
         if self.process is None or self.process.poll() is not None:
@@ -677,7 +717,18 @@ class OwnedHydra:
         try:
             if popen:
                 self.process = subprocess.Popen(bound, cwd=self.directory, env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root / 'tmp')},
-                                                pass_fds=(fd,), preexec_fn=lambda: demote(self.uid), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                                pass_fds=(fd,), preexec_fn=lambda: demote(self.uid), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self._serve_output = bytearray()
+                def drain():
+                    while True:
+                        block = self.process.stdout.read(1024)
+                        if not block:
+                            return
+                        self._serve_output.extend(block)
+                        if len(self._serve_output) > 8192:
+                            del self._serve_output[:-8192]
+                self._serve_reader = threading.Thread(target=drain, daemon=True)
+                self._serve_reader.start()
                 return None
             return subprocess.run(bound, check=False, capture_output=True, timeout=timeout,
                                  cwd=self.root / 'tmp', env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root / 'tmp')},
@@ -702,18 +753,20 @@ class OwnedHydra:
         if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode):
             raise ValueError('untrusted openssl')
         key, cert, ca = self.directory / 'key.pem', self.directory / 'cert.pem', self.directory / 'ca.pem'
-        command([str(openssl), 'req', '-x509', '-newkey', 'rsa:2048', '-keyout', str(key), '-out', str(cert),
-                 '-days', '2', '-nodes', '-subj', '/CN=127.0.0.1',
-                 '-addext', 'subjectAltName=IP:127.0.0.1,IP:::1'],
-                env={'PATH': '/usr/bin:/bin'}, timeout=30)
+        issued = subprocess.run([str(openssl), 'req', '-x509', '-newkey', 'rsa:2048', '-keyout', str(key), '-out', str(cert),
+                                 '-days', '2', '-nodes', '-subj', '/CN=127.0.0.1',
+                                 '-addext', 'subjectAltName=IP:127.0.0.1,IP:::1'],
+                                capture_output=True, env={'PATH': '/usr/bin:/bin'}, timeout=30)
+        if issued.returncode:
+            raise report_hydra_failure('openssl', issued.returncode, issued.stderr.decode(errors='replace'))
         shutil.copyfile(cert, ca)
         os.chmod(key, 0o600)
         os.chmod(cert, 0o644)
         os.chmod(ca, 0o644)
         database = self.directory / 'hydra.sqlite'
         config = self.directory / 'hydra.yaml'
-        secret = secrets.token_hex(32)
-        config.write_text(render_hydra_config(str(database), str(cert), str(key), secret))
+        self.secret = secrets.token_hex(32)
+        config.write_text(render_hydra_config(str(database), str(cert), str(key), self.secret))
         for path in (self.directory, key, cert, ca, config):
             os.chown(path, self.uid, self.uid)
         self.directory.chmod(0o700)
@@ -730,13 +783,20 @@ class OwnedHydra:
         serve = hydra_serve_argv(self.binary, config)
         if any(token in migrate + serve for token in ('curl', 'wget', 'sh', '-c')):
             raise ValueError('hydra launch argv is not the fixed serve command')
-        self.run_bound(migrate)
+        migration = self.run_bound(migrate)
+        if migration.returncode:
+            output = ((migration.stdout or b'') + (migration.stderr or b'')).decode(errors='replace')
+            raise report_hydra_failure('migrate', migration.returncode, output, self.secret)
         self.run_bound(serve, popen=True)
         try:
             self.wait_ready()
-        except BaseException:
+        except RuntimeError:
+            process = self.process
+            code = process.poll() if process is not None else None
             self.close()
-            raise
+            if code is None and process is not None:
+                code = process.poll()
+            raise report_hydra_failure('serve', code, self._serve_output.decode(errors='replace'), self.secret) from None
 
 
 def rewritten_hydra_document(document, materials):

@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -324,6 +325,33 @@ class HydraBirthSecurityTest(unittest.TestCase):
             self.assertIsNone(owned.process)
         finally:
             shutil.rmtree(root)
+
+    def test_startup_failure_reports_exit_without_secrets(self):
+        secret = 'ab' * 32
+        raw = 'schema mismatch\n' + secret + '\n-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n'
+        note = runner.redact_hydra_diagnostic(raw, secret)
+        self.assertIn('schema mismatch', note)
+        self.assertNotIn(secret, note)
+        self.assertNotIn('PRIVATE KEY', note)
+        self.assertNotIn('AAAA', note)
+        error = runner.report_hydra_failure('migrate', 2, raw, secret)
+        self.assertEqual(str(error), 'hydra migrate exit 2: ' + note)
+        self.assertNotIn(secret, str(error))
+        config = runner.render_hydra_config('/owned/hydra.sqlite', '/owned/cert.pem', '/owned/key.pem', secret)
+        trimmed = runner.redact_hydra_diagnostic(config + 'startup refused\n', secret)
+        self.assertIn('startup refused', trimmed)
+        self.assertNotIn(secret, trimmed)
+        self.assertNotIn('secrets:', trimmed)
+        proc = subprocess.Popen(
+            [sys.executable, '-c', 'import sys; sys.stderr.write("startup refused\\nsecret %s\\n"); sys.exit(1)' % secret],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        tail = runner.read_stream_tail(proc.stderr).decode()
+        proc.stderr.close()
+        proc.wait(timeout=5)
+        served = runner.report_hydra_failure('serve', proc.returncode, tail, secret)
+        self.assertIn('hydra serve exit 1: ', str(served))
+        self.assertIn('startup refused', str(served))
+        self.assertNotIn(secret, str(served))
 
     def test_exited_process_is_not_ready_and_close_is_idempotent(self):
         root = Path(tempfile.mkdtemp())
