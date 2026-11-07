@@ -303,13 +303,46 @@ def command(argv, **kwargs):
     subprocess.run(argv, check=True, **kwargs)
 
 
-def network_departure_error(route_v4, route_v6, interfaces):
-    """Return an error when a network can leave loopback. Empty means it cannot."""
+# Per-netns devices the kernel creates when a tunnel module is loaded.
+# They have no peer outside the namespace until a route or address is added.
+KERNEL_NETNS_FALLBACKS = frozenset({
+    'sit0', 'ip6tnl0', 'tunl0', 'gre0', 'gretap0', 'erspan0',
+    'ip6gre0', 'ip6gretap0', 'ip6erspan0', 'ip_vti0', 'ip6_vti0',
+})
+RTF_GATEWAY = 0x0002
+RTF_REJECT = 0x0200
+
+
+def proc_net_dev_names(text):
+    """Interface names from /proc/net/dev. That file follows the current netns."""
+    names = []
+    for line in text.splitlines()[2:]:
+        name, sep, _rest = line.partition(':')
+        if sep and name.strip():
+            names.append(name.strip())
+    return names
+
+
+def ipv6_address_names(text):
+    names = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 6:
+            names.append(fields[-1])
+    return names
+
+
+def network_departure_error(route_v4, route_v6, interfaces, ipv6_addrs=''):
+    """Return an error when this netns can leave loopback. Empty means it cannot."""
     names = set(interfaces)
-    if names - {'lo'}:
-        return ValueError('non-loopback interface present')
     if 'lo' not in names:
         return ValueError('loopback interface missing')
+    departed = names - {'lo'} - KERNEL_NETNS_FALLBACKS
+    if departed:
+        return ValueError('non-loopback interface present: ' + ','.join(sorted(departed)))
+    for name in ipv6_address_names(ipv6_addrs):
+        if name != 'lo':
+            return ValueError('non-loopback address present')
     for line in route_v4.splitlines()[1:]:
         fields = line.split()
         if len(fields) >= 2 and fields[1] == '00000000':
@@ -320,26 +353,44 @@ def network_departure_error(route_v4, route_v6, interfaces):
         fields = line.split()
         if len(fields) < 10:
             continue
-        if fields[0] == '00000000000000000000000000000000' and fields[1] == '00':
-            return ValueError('default IPv6 route can leave loopback')
         if fields[9] != 'lo':
             return ValueError('IPv6 route uses a non-loopback interface')
+        if fields[0] == '00000000000000000000000000000000' and fields[1] == '00':
+            try:
+                flags = int(fields[8], 16)
+            except ValueError:
+                return ValueError('default IPv6 route can leave loopback')
+            # The kernel installs ::/0 reject-on-lo in every IPv6 netns. It does not leave.
+            if flags & RTF_GATEWAY or not flags & RTF_REJECT:
+                return ValueError('default IPv6 route can leave loopback')
     return None
+
+
+def private_loopback_error(host_net, self_net, route_v4, route_v6, proc_dev, ipv6_addrs=''):
+    """Prove this process is not in PID 1's netns and that its own proc view cannot leave lo."""
+    if not host_net or not self_net:
+        return ValueError('hydra-birth cannot prove a private network namespace')
+    if self_net == host_net:
+        return ValueError('hydra-birth refuses the host network namespace')
+    return network_departure_error(route_v4, route_v6, proc_net_dev_names(proc_dev), ipv6_addrs)
 
 
 def require_private_loopback():
     try:
         host_net = os.readlink('/proc/1/ns/net')
-    except OSError as error:
-        raise ValueError('hydra-birth cannot prove a private network namespace') from error
-    if os.readlink('/proc/self/ns/net') == host_net:
-        raise ValueError('hydra-birth refuses the host network namespace')
-    interfaces = sorted(p.name for p in Path('/sys/class/net').iterdir())
-    route_v6 = ''
-    ipv6 = Path('/proc/net/ipv6_route')
-    if ipv6.exists():
-        route_v6 = ipv6.read_text()
-    error = network_departure_error(Path('/proc/net/route').read_text(), route_v6, interfaces)
+    except OSError:
+        host_net = None
+    try:
+        self_net = os.readlink('/proc/self/ns/net')
+    except OSError:
+        self_net = None
+    route_v6 = Path('/proc/net/ipv6_route').read_text() if Path('/proc/net/ipv6_route').exists() else ''
+    ipv6_addrs = Path('/proc/net/if_inet6').read_text() if Path('/proc/net/if_inet6').exists() else ''
+    # /sys/class/net follows the sysfs mount and can still list the parent netns.
+    # /proc/net/dev is this process's network namespace.
+    error = private_loopback_error(
+        host_net, self_net, Path('/proc/net/route').read_text(), route_v6,
+        Path('/proc/net/dev').read_text(), ipv6_addrs)
     if error:
         raise error
 

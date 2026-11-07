@@ -10,9 +10,20 @@ from pathlib import Path
 import bootstrap_test_runner as runner
 
 
+DEV_HEADER = (
+    'Inter-|   Receive                                                |  Transmit\n'
+    ' face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n'
+)
+ROUTE_HEADER = 'Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n'
+IPV6_REJECT_ON_LO = (
+    '00000000000000000000000000000000 00 00000000000000000000000000000000 00 '
+    '00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n'
+)
+
+
 class HydraBirthSecurityTest(unittest.TestCase):
     def test_host_network_and_default_route_are_rejected(self):
-        interfaces = sorted(path.name for path in Path('/sys/class/net').iterdir())
+        interfaces = runner.proc_net_dev_names(Path('/proc/net/dev').read_text())
         route_v6 = ''
         ipv6 = Path('/proc/net/ipv6_route')
         if ipv6.exists():
@@ -28,6 +39,41 @@ class HydraBirthSecurityTest(unittest.TestCase):
     def test_loopback_only_network_is_accepted(self):
         self.assertIsNone(runner.network_departure_error(
             'Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n', '', ['lo']))
+
+    def test_parent_sysfs_is_not_this_netns(self):
+        proc = DEV_HEADER + '    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n'
+        self.assertIsNone(runner.private_loopback_error(
+            'net:[parent]', 'net:[private]', ROUTE_HEADER, IPV6_REJECT_ON_LO, proc))
+        self.assertEqual(runner.proc_net_dev_names(proc), ['lo'])
+
+    def test_nic_inside_the_private_netns_is_rejected(self):
+        proc = DEV_HEADER + '    lo: 0\n  eth0: 0\n'
+        error = runner.private_loopback_error('net:[parent]', 'net:[private]', ROUTE_HEADER, '', proc)
+        self.assertIsNotNone(error)
+        self.assertIn('eth0', str(error))
+        same = runner.private_loopback_error('net:[same]', 'net:[same]', ROUTE_HEADER, '', DEV_HEADER + '    lo: 0\n')
+        self.assertIsNotNone(same)
+
+    def test_unconfigured_kernel_fallback_cannot_leave(self):
+        proc = DEV_HEADER + '    lo: 0\n  sit0: 0\n ip6tnl0: 0\n'
+        self.assertIsNone(runner.private_loopback_error(
+            'net:[parent]', 'net:[private]', ROUTE_HEADER, IPV6_REJECT_ON_LO, proc))
+        routed = ROUTE_HEADER + 'sit0 00000000 0100A8C0 0003 0 0 0 00000000 0 0 0\n'
+        self.assertIsNotNone(runner.private_loopback_error(
+            'net:[parent]', 'net:[private]', routed, '', proc))
+        addressed = '20010db8000000000000000000000001 02 40 00 80 sit0\n'
+        self.assertIsNotNone(runner.private_loopback_error(
+            'net:[parent]', 'net:[private]', ROUTE_HEADER, '', proc, addressed))
+        gateway = (
+            '00000000000000000000000000000000 00 00000000000000000000000000000000 00 '
+            '20010db8000000000000000000000001 00000000 00000000 00000000 00000003 eth0\n'
+        )
+        self.assertIsNotNone(runner.network_departure_error(ROUTE_HEADER, gateway, ['lo', 'eth0']))
+        plain_default = (
+            '00000000000000000000000000000000 00 00000000000000000000000000000000 00 '
+            '00000000000000000000000000000000 00000000 00000000 00000000 00000001 lo\n'
+        )
+        self.assertIsNotNone(runner.network_departure_error(ROUTE_HEADER, plain_default, ['lo']))
 
     def test_external_and_rebound_hosts_are_rejected(self):
         for value in ('https://192.0.2.10:4445', 'https://127.0.0.1.example:4445', 'https://localhost:4445',
