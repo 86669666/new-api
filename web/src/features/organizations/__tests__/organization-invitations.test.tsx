@@ -21,7 +21,15 @@ import {
   QueryClient,
   QueryClientProvider,
 } from '@tanstack/react-query'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import {
   AxiosError,
@@ -30,17 +38,19 @@ import {
 } from 'axios'
 import { createInstance, type i18n } from 'i18next'
 import { I18nextProvider } from 'react-i18next'
-import { afterEach, beforeEach, expect, test } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
+  declineOrganizationInvitation,
   getMyOrganizationInvitations,
   OrganizationRequestFailure,
 } from '../api'
 import { OrganizationInvitationsCard } from '../organization-invitations-card'
 
+// HTTP is simulated at the Axios adapter; this is not a live authentication chain.
 const originalAdapter = api.defaults.adapter
 let client: QueryClient
 let language: i18n
@@ -140,7 +150,7 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
-test('projects only own pending invitation data and escapes names without mutation controls', async () => {
+test('projects only own pending invitation data and escapes names with a decline action only', async () => {
   const raw = {
     ...invitation(),
     secret: 'not retained',
@@ -160,7 +170,10 @@ test('projects only own pending invitation data and escapes names without mutati
   expect(screen.getByText('Invited by Inviter')).toBeVisible()
   expect(screen.getByText('Organization member')).toBeVisible()
   expect(
-    screen.queryByRole('button', { name: /accept|decline|join|switch|spend/i })
+    screen.getByRole('button', { name: 'Decline invitation' })
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: /accept|join|switch|spend/i })
   ).not.toBeInTheDocument()
   for (const call of calls) {
     expect(call.url).toBe('/api/organization-invitations')
@@ -382,3 +395,320 @@ test('HTTP failures expose only safe projected errors, with no Axios credentials
   )
   expect(calls).toHaveLength(1)
 })
+
+function declinedReceipt(overrides = {}) {
+  return {
+    success: true,
+    data: {
+      organization_id: invitation().organization_id,
+      revision: '9007199254740996',
+      action: 'invitation_decline',
+      event_id: '9007199254740998',
+      object_kind: 'invitation',
+      object_id: invitation().object_id,
+      generation: '1',
+      status: 'declined',
+      ...overrides,
+    },
+  }
+}
+async function openDecline() {
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Decline invitation' })
+  )
+  return screen.getByRole('alertdialog')
+}
+
+test('cancelled confirmation sends no mutation; confirmed decline uses exact string versions and refreshes', async () => {
+  let declined = false
+  handler = async (config) => {
+    if (config.method === 'post') {
+      declined = true
+      return response(config, declinedReceipt())
+    }
+    return response(config, page(declined ? [] : [invitation()]))
+  }
+  show()
+  const trigger = await screen.findByRole('button', {
+    name: 'Decline invitation',
+  })
+  trigger.focus()
+  await userEvent.keyboard('{Enter}')
+  let dialog = screen.getByRole('alertdialog')
+  expect(within(dialog).getByText(/Invitation A/)).toBeVisible()
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+  expect(calls.filter((c) => c.method === 'post')).toHaveLength(0)
+  dialog = await openDecline()
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Decline invitation' })
+  )
+  expect(
+    await screen.findByText('Organization invitation declined.')
+  ).toBeVisible()
+  expect(
+    await screen.findByText('No pending organization invitations')
+  ).toBeVisible()
+  const posts = calls.filter((c) => c.method === 'post')
+  expect(posts).toHaveLength(1)
+  expect(posts[0].url).toBe(
+    '/api/organizations/9007199254740997/invitations/9007199254740993/decline'
+  )
+  expect(JSON.parse(posts[0].data)).toEqual({
+    revision: '9007199254740995',
+    generation: '1',
+  })
+  expect(posts[0].singleUseAuthorization).toBe(true)
+  expect(posts[0].skipAuthRefresh).toBe(true)
+  expect(posts[0].withCredentials).toBe(true)
+  expect(posts[0].headers.has('Idempotency-Key')).toBe(false)
+  expect(posts[0].headers.get('Content-Type')).toBe('application/json')
+  expect(posts[0].expectedAuthIdentity).toEqual({ userId: 1, sid: 'session-1' })
+  expect(posts[0].headers.has('X-Security-Proof')).toBe(false)
+  expect(posts[0].headers.has('X-Organization-Id')).toBe(false)
+})
+
+test.each([
+  [403, 'ORG_FORBIDDEN'],
+  [401, 'AUTH_SESSION_REVOKED'],
+  [409, 'ORG_STATE_CHANGED'],
+  [409, 'ORG_REQUEST_RESOLVED'],
+  [410, 'ORG_REQUEST_EXPIRED'],
+  [403, 'SECURITY_PROOF_REQUIRED'],
+  [403, 'SECURITY_PROOF_INVALID'],
+  [500, 'ORG_INTERNAL_ERROR'],
+])(
+  'decline failure %s %s never retries or declares success and refreshes server state',
+  async (status, code) => {
+    let sent = false
+    handler = async (config) => {
+      if (config.method === 'post') {
+        sent = true
+        return response(
+          config,
+          { success: false, code, message: 'sensitive backend detail' },
+          status
+        )
+      }
+      return response(config, page(sent ? [] : [invitation()]))
+    }
+    show()
+    const dialog = await openDecline()
+    await userEvent.click(
+      within(dialog).getByRole('button', { name: 'Decline invitation' })
+    )
+    expect(
+      await screen.findByText(
+        'Decline was not confirmed. Review the refreshed invitation status before trying again.'
+      )
+    ).toBeVisible()
+    expect(
+      await screen.findByText('No pending organization invitations')
+    ).toBeVisible()
+    expect(calls.filter((c) => c.method === 'post')).toHaveLength(1)
+    expect(
+      screen.queryByText('Organization invitation declined.')
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText('sensitive backend detail')
+    ).not.toBeInTheDocument()
+  }
+)
+
+test.each(['switch', 'logout', 'A-B-A', 'new SID'])(
+  'confirmation invalidated by %s cannot send',
+  async (change) => {
+    show()
+    const dialog = await openDecline()
+    const confirm = within(dialog).getByRole('button', {
+      name: 'Decline invitation',
+    })
+    act(() => {
+      if (change === 'logout') useAuthStore.getState().auth.reset()
+      else if (change === 'new SID') login(1, 'replacement')
+      else {
+        login(2)
+        if (change === 'A-B-A') login(1)
+      }
+      fireEvent.click(confirm)
+    })
+    expect(calls.filter((c) => c.method === 'post')).toHaveLength(0)
+    await waitFor(() =>
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    )
+  }
+)
+
+test.each(['switch', 'logout', 'A-B-A', 'new SID', 'unmount'])(
+  'duplicate confirmation is one-shot and late response after %s gives no feedback',
+  async (change) => {
+    let finish: (() => void) | undefined
+    handler = async (config) => {
+      if (config.method === 'post') {
+        return new Promise((resolve) => {
+          finish = () => resolve(response(config, declinedReceipt()))
+        })
+      }
+      return response(
+        config,
+        page(useAuthStore.getState().auth.user?.id === 1 ? [invitation()] : [])
+      )
+    }
+    show()
+    const dialog = await openDecline()
+    const button = within(dialog).getByRole('button', {
+      name: 'Decline invitation',
+    })
+    act(() => {
+      fireEvent.click(button)
+      fireEvent.click(button)
+    })
+    await waitFor(() =>
+      expect(calls.filter((c) => c.method === 'post')).toHaveLength(1)
+    )
+    act(() => {
+      if (change === 'unmount') cleanup()
+      else if (change === 'logout') useAuthStore.getState().auth.reset()
+      else if (change === 'new SID') login(1, 'replacement')
+      else {
+        login(2)
+        if (change === 'A-B-A') login(1)
+      }
+    })
+    await act(async () => finish?.())
+    expect(
+      screen.queryByText('Organization invitation declined.')
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/Decline was not confirmed/)
+    ).not.toBeInTheDocument()
+    expect(calls.find((c) => c.method === 'post')?.signal?.aborted).toBe(true)
+  }
+)
+
+test.each([
+  { organization_id: '7' },
+  { object_id: '7' },
+  { generation: '2' },
+  { revision: '9007199254740995' },
+  { status: 'accepted' },
+  { action: 'invitation_accept' },
+  { action: 'invite_decline' },
+  { object_kind: 'transfer' },
+  { event_id: 123 },
+])('decline refuses mismatched receipt %j', async (patch) => {
+  handler = async (config) => response(config, declinedReceipt(patch))
+  await expect(
+    declineOrganizationInvitation(
+      1,
+      'session-1',
+      invitation() as Parameters<typeof declineOrganizationInvitation>[2],
+      new AbortController().signal
+    )
+  ).rejects.toBeInstanceOf(OrganizationRequestFailure)
+  expect(calls).toHaveLength(1)
+})
+
+test.each([
+  { target_user_id: '2' },
+  { expires_at: 1 },
+  { organization_revision: '0' },
+])('invalid decline selection sends nothing %j', async (patch) => {
+  await expect(
+    declineOrganizationInvitation(
+      1,
+      'session-1',
+      { ...invitation(), ...patch } as Parameters<
+        typeof declineOrganizationInvitation
+      >[2],
+      new AbortController().signal
+    )
+  ).rejects.toBeInstanceOf(OrganizationRequestFailure)
+  expect(calls).toHaveLength(0)
+})
+
+test.each(['business failure', 'malformed receipt', 'network loss'])(
+  '%s never declares decline success or replays the command even when refresh is empty',
+  async (failure) => {
+    let sent = false
+    handler = async (config) => {
+      if (config.method === 'post') {
+        sent = true
+        if (failure === 'network loss') {
+          throw new AxiosError('private network detail')
+        }
+        return response(
+          config,
+          failure === 'business failure'
+            ? {
+                success: false,
+                message: 'private business detail',
+                data: declinedReceipt().data,
+              }
+            : { success: true, data: null }
+        )
+      }
+      return response(config, page(sent ? [] : [invitation()]))
+    }
+    show()
+    const dialog = await openDecline()
+    await userEvent.click(
+      within(dialog).getByRole('button', { name: 'Decline invitation' })
+    )
+    expect(await screen.findByText(/Decline was not confirmed/)).toBeVisible()
+    expect(
+      await screen.findByText('No pending organization invitations')
+    ).toBeVisible()
+    expect(
+      screen.queryByText('Organization invitation declined.')
+    ).not.toBeInTheDocument()
+    expect(calls.filter((call) => call.method === 'post')).toHaveLength(1)
+    const error = client.getMutationCache().getAll()[0].state.error
+    expect(error).toBeInstanceOf(OrganizationRequestFailure)
+    expect(JSON.stringify(error)).not.toMatch(
+      /fixture-1|private|Authorization|access_token/
+    )
+  }
+)
+
+test('a stale invitation expires while confirmation is open and sends no command', async () => {
+  const expiresAt = Math.floor(Date.now() / 1000) + 60
+  handler = async (config) =>
+    response(config, page([{ ...invitation(), expires_at: expiresAt }]))
+  show()
+  const dialog = await openDecline()
+  vi.spyOn(Date, 'now').mockReturnValue((expiresAt + 1) * 1000)
+  await userEvent.click(
+    within(dialog).getByRole('button', { name: 'Decline invitation' })
+  )
+  expect(await screen.findByText(/Decline was not confirmed/)).toBeVisible()
+  expect(calls.filter((call) => call.method === 'post')).toHaveLength(0)
+})
+
+test.each(['en', 'zh', 'zh-TW', 'fr', 'ja', 'ru', 'vi'])(
+  '%s translates decline controls and confirmation using the shipped locale',
+  async (locale) => {
+    const resources = await import(`../../../i18n/locales/${locale}.json`)
+    const translations = resources.default.translation
+    language.addResourceBundle(locale, 'translation', translations)
+    show()
+    await screen.findByRole('button', { name: 'Decline invitation' })
+    await act(async () => {
+      await language.changeLanguage(locale)
+    })
+    await userEvent.click(
+      screen.getByRole('button', { name: translations['Decline invitation'] })
+    )
+    const dialog = screen.getByRole('alertdialog', {
+      name: translations['Decline organization invitation?'],
+    })
+    expect(
+      within(dialog).getByRole('button', {
+        name: translations['Decline invitation'],
+      })
+    ).toBeVisible()
+    expect(
+      within(dialog).getByText(/<script>Invitation A<\/script>/)
+    ).toBeVisible()
+    expect(calls.filter((call) => call.method === 'post')).toHaveLength(0)
+  }
+)
