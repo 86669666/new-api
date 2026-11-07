@@ -170,6 +170,39 @@ func GetQuotaDataByUserId(userId int, startTime int64, endTime int64) (quotaData
 	return quotaDatas, err
 }
 
+// GetDailyQuotaDataByUserId folds the existing filtered hourly series into UTC
+// days. Bounds apply before folding, so edge days can be partial. Preserve the
+// username/model dimensions and return only buckets backed by persisted rows.
+func GetDailyQuotaDataByUserId(userId int, startTime int64, endTime int64) ([]*QuotaData, error) {
+	hours, err := GetQuotaDataByUserId(userId, startTime, endTime)
+	if err != nil {
+		return nil, err
+	}
+	type dayKey struct {
+		username  string
+		modelName string
+		day       int64
+	}
+	buckets := make(map[dayKey]*QuotaData)
+	days := make([]*QuotaData, 0)
+	for _, row := range hours {
+		day := time.Unix(row.CreatedAt, 0).UTC().Truncate(24 * time.Hour).Unix()
+		key := dayKey{row.Username, row.ModelName, day}
+		if bucket, ok := buckets[key]; ok {
+			bucket.Count += row.Count
+			bucket.Quota += row.Quota
+			bucket.TokenUsed += row.TokenUsed
+			bucket.CacheReadTokens += row.CacheReadTokens
+			bucket.CacheCreationTokens += row.CacheCreationTokens
+		} else {
+			row.CreatedAt = day
+			buckets[key] = row
+			days = append(days, row)
+		}
+	}
+	return days, nil
+}
+
 func GetQuotaDataGroupByUser(startTime int64, endTime int64) (quotaData []*QuotaData, err error) {
 	var quotaDatas []*QuotaData
 	err = DB.Table("quota_data").

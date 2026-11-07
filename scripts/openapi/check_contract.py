@@ -526,7 +526,11 @@ def check_personal_log_range_error(api):
     data_operation = api['paths']['/api/data/self']['get']
     data_response = data_operation['responses']['400']
     assert data_response['headers'] == legacy['headers']
-    assert data_response['content'] == response['content']
+    data_content = copy.deepcopy(data_response['content'])
+    data_media = data_content['application/json']
+    assert data_media['schema']['anyOf'].pop() == {'$ref': '#/components/schemas/PersonalQuotaGranularityError'}
+    assert data_media['examples'].pop('INVALID_GRANULARITY')['value']['code'] == 'INVALID_GRANULARITY'
+    assert data_content == response['content']
     assert 'before authentication' in data_response['description']
     assert 'after authentication in GetUserQuotaDates' in data_response['description']
     assert 'all authenticated roles, including administrators and root' in data_response['description']
@@ -585,8 +589,11 @@ def check_personal_query_errors(api):
 def check_personal_quota_series(api):
     operation = api['paths']['/api/data/self']['get']
     parameters = operation['parameters'][2:]
-    assert len(parameters) == 2
-    for parameter, name in zip(parameters, ('start_timestamp', 'end_timestamp')):
+    assert len(parameters) == 3
+    assert parameters[2]['name'] == 'granularity'
+    assert parameters[2]['schema'] == {'type': 'string', 'enum': ['', 'hour', 'day']}
+    assert parameters[2]['required'] is False and parameters[2]['allowEmptyValue'] is True
+    for parameter, name in zip(parameters[:2], ('start_timestamp', 'end_timestamp')):
         assert {key: value for key, value in parameter.items() if key != 'description'} == {
             'name': name, 'in': 'query', 'required': False, 'allowEmptyValue': True,
             'schema': {'type': 'string'},
@@ -594,7 +601,7 @@ def check_personal_quota_series(api):
         assert parameter['description']
     assert 'original parsed end' in operation['description']
     assert 'missing end does not become now' in operation['description']
-    assert 'no sorting, zero-fill or day aggregation guarantee' in operation['description']
+    assert 'no sorting or zero-fill guarantee' in operation['description']
     assert operation['responses']['200']['headers'] == {}
     assert operation['responses']['200']['content']['application/json']['schema'] == {
         '$ref': '#/components/schemas/PersonalQuotaDataResult'}
@@ -610,7 +617,7 @@ def check_personal_quota_series(api):
     assert success['properties']['success'] == {'type': 'boolean', 'enum': [True]}
     assert success['properties']['message'] == {'type': 'string', 'enum': ['']}
     for name, expected in {
-        'granularity': {'type': 'string', 'enum': ['hour']},
+        'granularity': {'type': 'string', 'enum': ['hour', 'day']},
         'quota_per_unit': {'type': 'number'},
         'data_complete': {'type': 'boolean', 'enum': [False]},
         'enable_data_export': {'type': 'boolean'},
@@ -624,14 +631,15 @@ def check_personal_quota_series(api):
     assert point['required'] == ['user_id', 'username', 'model_name', 'created_at', 'count', 'quota', 'token_used']
     numeric = {'user_id', 'count', 'quota', 'token_used', 'id', 'token_id', 'channel_id'}
     strings = {'username', 'model_name', 'use_group', 'node_name'}
-    assert set(point['properties']) == numeric | strings | {'created_at'}
+    counters = {'cache_read_tokens', 'cache_creation_tokens'}
+    assert set(point['properties']) == numeric | strings | {'created_at'} | counters
     for name, field in point['properties'].items():
         expected = {'type': 'integer'} if name in numeric else {'type': 'string'}
-        if name == 'created_at':
+        if name == 'created_at' or name in counters:
             expected = {'type': 'integer', 'format': 'int64'}
         assert {key: value for key, value in field.items() if key != 'description'} == expected
     assert 'placeholder' in point['description']
-    return {'scope': 'GET /api/data/self existing hourly series', 'query_parameters': [p['name'] for p in parameters],
+    return {'scope': 'GET /api/data/self hour/day series', 'query_parameters': [p['name'] for p in parameters],
             'database_error_status': 500, 'empty_array_and_nullable_compatibility': True,
             'collection_disabled_keeps_history': True, 'success_metadata': ['granularity', 'quota_per_unit', 'data_complete', 'enable_data_export'],
             'historical_completeness': False, 'live_http': False}

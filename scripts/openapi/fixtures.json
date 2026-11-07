@@ -16581,7 +16581,7 @@
           "quota": 19
         }
       ],
-      "granularity": "day",
+      "granularity": "week",
       "quota_per_unit": 12345.5,
       "data_complete": false,
       "enable_data_export": true
@@ -17284,6 +17284,50 @@
         "total": 0,
         "items": []
       }
+    },
+    "valid": true
+  },
+  {
+    "name": "personal daily quota series collection off retains historical row",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaDataResult",
+    "value": {
+      "success": true,
+      "message": "",
+      "data": [
+        {
+          "id": 0,
+          "user_id": 1,
+          "username": "fixture",
+          "model_name": "fixture-model",
+          "created_at": 1704067200,
+          "use_group": "",
+          "token_id": 0,
+          "channel_id": 0,
+          "node_name": "",
+          "token_used": 8,
+          "count": 2,
+          "quota": 19,
+          "cache_read_tokens": 30,
+          "cache_creation_tokens": 34
+        }
+      ],
+      "granularity": "day",
+      "quota_per_unit": 12345.5,
+      "data_complete": false,
+      "enable_data_export": false
+    },
+    "valid": true
+  },
+  {
+    "name": "personal quota granularity error",
+    "document": "api",
+    "schema": "#/components/schemas/PersonalQuotaGranularityError",
+    "value": {
+      "success": false,
+      "code": "INVALID_GRANULARITY",
+      "message": "Invalid parameters",
+      "message_key": "Invalid parameters"
     },
     "valid": true
   }
