@@ -16,10 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
@@ -30,6 +31,8 @@ import { formatTimestamp } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getMyOrganizationInvitations } from './api'
+import { useAcceptInvitation } from './use-accept-invitation'
+import { useDeclineInvitation } from './use-decline-invitation'
 
 export function OrganizationInvitationsCard() {
   const actorId = useAuthStore((state) => state.auth.user?.id)
@@ -42,6 +45,7 @@ export function OrganizationInvitationsCard() {
 
 function InvitationInbox(props: { actorId: number; sid: string }) {
   const { t } = useTranslation()
+  const client = useQueryClient()
   const [cursors, setCursors] = useState(['0'])
   const afterId = cursors.at(-1) ?? '0'
   const query = useQuery({
@@ -61,7 +65,24 @@ function InvitationInbox(props: { actorId: number; sid: string }) {
     refetchOnWindowFocus: 'always',
     meta: { errorToast: false },
   })
-  const busy = query.isFetching || query.isPending
+  const decline = useDeclineInvitation(props.actorId, props.sid, () => {
+    void query.refetch()
+  })
+  const accept = useAcceptInvitation(props.actorId, props.sid, () => {
+    void query.refetch()
+    // Joining may have committed even if the response was lost.
+    void client.invalidateQueries({
+      queryKey: [
+        'organizations',
+        props.actorId,
+        props.sid,
+        'personal',
+        'directory',
+      ],
+    })
+  })
+  const busy =
+    query.isFetching || query.isPending || decline.pending || accept.pending
   let content
   if (busy) {
     content = <LoadingState />
@@ -78,7 +99,10 @@ function InvitationInbox(props: { actorId: number; sid: string }) {
     content = (
       <ul className='divide-y' aria-label={t('Organization invitations')}>
         {query.data.items.map((invitation) => (
-          <li key={invitation.object_id} className='min-w-0 space-y-2 py-3'>
+          <li
+            key={invitation.object_id}
+            className='flex min-w-0 flex-col gap-2 py-3'
+          >
             <div className='flex min-w-0 flex-wrap items-center justify-between gap-2'>
               <span className='min-w-0 break-all'>
                 {invitation.organization_name}
@@ -99,6 +123,23 @@ function InvitationInbox(props: { actorId: number; sid: string }) {
                 time: formatTimestamp(invitation.expires_at),
               })}
             </p>
+            <div className='flex flex-wrap gap-2'>
+              <Button
+                size='sm'
+                disabled={decline.selected !== null || accept.selected !== null}
+                onClick={() => accept.select(invitation)}
+              >
+                {t('Accept invitation')}
+              </Button>
+              <Button
+                variant='outline'
+                size='sm'
+                disabled={decline.selected !== null || accept.selected !== null}
+                onClick={() => decline.select(invitation)}
+              >
+                {t('Decline invitation')}
+              </Button>
+            </div>
           </li>
         ))}
       </ul>
@@ -108,7 +149,7 @@ function InvitationInbox(props: { actorId: number; sid: string }) {
     <TitledCard
       title={t('Organization invitations')}
       description={t(
-        'Pending invitations for your account. This view is read-only.'
+        'Review pending invitations and choose whether to join an organization.'
       )}
       action={
         <Button
@@ -122,7 +163,57 @@ function InvitationInbox(props: { actorId: number; sid: string }) {
         </Button>
       }
     >
+      {accept.outcome && (
+        <p role='status' className='mb-3 text-sm'>
+          {accept.outcome === 'success'
+            ? t(
+                'Organization invitation accepted. You have joined the organization.'
+              )
+            : t(
+                'Acceptance was not confirmed. Review the refreshed invitation status before trying again.'
+              )}
+        </p>
+      )}
+      {decline.outcome && (
+        <p role='status' className='mb-3 text-sm'>
+          {decline.outcome === 'success'
+            ? t('Organization invitation declined.')
+            : t(
+                'Decline was not confirmed. Review the refreshed invitation status before trying again.'
+              )}
+        </p>
+      )}
       <div aria-busy={busy}>{content}</div>
+      <ConfirmDialog
+        open={accept.selected !== null}
+        onOpenChange={(open) => {
+          if (!open) accept.cancel()
+        }}
+        title={t('Accept organization invitation?')}
+        desc={t(
+          'Accept the invitation to {{organization}}? You will join this organization.',
+          { organization: accept.selected?.organization_name ?? '' }
+        )}
+        confirmText={t('Accept invitation')}
+        disabled={query.isFetching || query.isError}
+        isLoading={accept.pending}
+        handleConfirm={() => void accept.confirm()}
+      />
+      <ConfirmDialog
+        open={decline.selected !== null}
+        onOpenChange={(open) => {
+          if (!open) decline.cancel()
+        }}
+        title={t('Decline organization invitation?')}
+        desc={t(
+          'Decline the invitation to {{organization}}? You will not join the organization.',
+          { organization: decline.selected?.organization_name ?? '' }
+        )}
+        confirmText={t('Decline invitation')}
+        destructive
+        isLoading={decline.pending}
+        handleConfirm={() => void decline.confirm()}
+      />
       <div className='mt-3 flex flex-wrap justify-between gap-2'>
         <Button
           variant='outline'
