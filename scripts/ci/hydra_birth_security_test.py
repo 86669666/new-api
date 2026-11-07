@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Negative checks for the hydra-birth custody boundary. No root tier is started."""
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import bootstrap_test_runner as runner
@@ -326,32 +328,72 @@ class HydraBirthSecurityTest(unittest.TestCase):
         finally:
             shutil.rmtree(root)
 
-    def test_startup_failure_reports_exit_without_secrets(self):
+    def test_startup_report_is_a_fixed_category(self):
         secret = 'ab' * 32
-        raw = 'schema mismatch\n' + secret + '\n-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n'
-        note = runner.redact_hydra_diagnostic(raw, secret)
-        self.assertIn('schema mismatch', note)
-        self.assertNotIn(secret, note)
-        self.assertNotIn('PRIVATE KEY', note)
-        self.assertNotIn('AAAA', note)
-        error = runner.report_hydra_failure('migrate', 2, raw, secret)
-        self.assertEqual(str(error), 'hydra migrate exit 2: ' + note)
-        self.assertNotIn(secret, str(error))
-        config = runner.render_hydra_config('/owned/hydra.sqlite', '/owned/cert.pem', '/owned/key.pem', secret)
-        trimmed = runner.redact_hydra_diagnostic(config + 'startup refused\n', secret)
-        self.assertIn('startup refused', trimmed)
-        self.assertNotIn(secret, trimmed)
-        self.assertNotIn('secrets:', trimmed)
-        proc = subprocess.Popen(
-            [sys.executable, '-c', 'import sys; sys.stderr.write("startup refused\\nsecret %s\\n"); sys.exit(1)' % secret],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        tail = runner.read_stream_tail(proc.stderr).decode()
-        proc.stderr.close()
-        proc.wait(timeout=5)
-        served = runner.report_hydra_failure('serve', proc.returncode, tail, secret)
-        self.assertIn('hydra serve exit 1: ', str(served))
-        self.assertIn('startup refused', str(served))
-        self.assertNotIn(secret, str(served))
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            error = runner.report_hydra_failure('migrate', 'exited', 2)
+            refused = None
+            try:
+                runner.report_hydra_failure('serve ' + secret, 'exited', 1)
+            except RuntimeError as caught:
+                refused = caught
+            timed = runner.report_hydra_failure('serve', 'ready_timeout', -15)
+        text = captured.getvalue() + str(error) + str(timed) + str(refused)
+        self.assertEqual(str(error), 'hydra start failed: migrate exited exit 2')
+        self.assertIn('"phase":"migrate"', captured.getvalue())
+        self.assertIn('"failure":"exited"', captured.getvalue())
+        self.assertIn('"exit":2', captured.getvalue())
+        self.assertEqual(str(timed), 'hydra start failed: serve ready_timeout exit null')
+        self.assertIn('"exit":null', captured.getvalue())
+        self.assertNotIn('-15', text)
+        self.assertNotIn(secret, text)
+        self.assertNotIn('note', captured.getvalue())
+
+    def test_owned_serve_reader_reports_status_without_output(self):
+        cookie = 'cookie=' + ('c0ffee' * 8)
+        jwk = '"d":"jwk-d-7f3a91c0","p":"jwk-p-88ab12"'
+        partial_key = '-----BEGIN PRIVATE KEY-----\nMIIEpartialkeymaterial'
+        dsn = 'postgres://hydra:s3cret-pass@10.1.2.3/hydra'
+        blob = '\n'.join((cookie, jwk, partial_key, dsn, 'sqlite:///var/lib/hydra.sqlite?_fk=true'))
+        root = Path(tempfile.mkdtemp(dir=Path.home()))
+        try:
+            owned = runner.OwnedHydra(root, os.getuid(), b'payload', runner.digest_bytes(b'payload'))
+            proc = subprocess.Popen(
+                [sys.executable, '-c', 'import os,sys; sys.stdout.write(os.environ["BLOB"]); sys.exit(4)'],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=dict(os.environ, BLOB=blob * 400))
+            owned.process = proc
+            owned.start_output_reader()
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                with self.assertRaises(RuntimeError) as caught:
+                    owned.finish_serve(timeout=3)
+            text = captured.getvalue() + str(caught.exception)
+            self.assertIn('serve exited exit 4', text)
+            self.assertIn('"exit":4', captured.getvalue())
+            for planted in (cookie, jwk, 'jwk-d-7f3a91c0', 'jwk-p-88ab12', partial_key, 'MIIEpartial', dsn, 's3cret-pass', 'sqlite:///var/lib/hydra.sqlite'):
+                self.assertNotIn(planted, text)
+            self.assertIsNone(owned._serve_reader)
+            self.assertTrue(proc.stdout.closed)
+            self.assertEqual(proc.poll(), 4)
+            sleeper = subprocess.Popen(['/bin/sleep', '30'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            owned.process = sleeper
+            owned.start_output_reader()
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                with self.assertRaises(RuntimeError) as timed:
+                    owned.finish_serve(timeout=0.3)
+            timed_text = captured.getvalue() + str(timed.exception)
+            self.assertIn('ready_timeout', timed_text)
+            self.assertIn('exit null', timed_text)
+            self.assertIn('"exit":null', captured.getvalue())
+            self.assertNotIn('-15', timed_text)
+            self.assertNotIn('143', timed_text)
+            self.assertIsNone(owned._serve_reader)
+            self.assertTrue(sleeper.stdout.closed)
+            self.assertIsNotNone(sleeper.poll())
+        finally:
+            shutil.rmtree(root)
 
     def test_exited_process_is_not_ready_and_close_is_idempotent(self):
         root = Path(tempfile.mkdtemp())
@@ -360,7 +402,7 @@ class HydraBirthSecurityTest(unittest.TestCase):
             proc = subprocess.Popen(['/bin/false'])
             proc.wait(timeout=5)
             owned.process = proc
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(runner.HydraExited):
                 owned.wait_ready()
             owned.close()
             owned.close()
