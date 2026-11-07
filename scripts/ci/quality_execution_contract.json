@@ -13,6 +13,16 @@
   "authenticated_quality_rule": "quality_results independently requires the exact nine formal tier names and successful complete backend, formal, frontend, database and policy groups, including both policy-tests and consumer-tests, even when optional raw execution evidence is absent; admission binds details but cannot reduce these inventories",
   "formal_state": "BLOCKED_STOPPED_INVENTORY_AND_UNPROVED_SANCTIONED_TRANSPORT",
   "formal_source": "scripts/ci/bootstrap_test_runner.py:resource_partitions/execute_prepared/validate_tier_receipt",
+  "raw_optional_external_skip": {
+    "test": "TestOAuthPublicHydraHTTP",
+    "tier": "sqlite",
+    "entry_cwd": "router",
+    "phase": "ordinary",
+    "input_gate": "NEWAPI_W01_HYDRA_INPUT",
+    "source": "router/oauth_public_test.go:TestOAuthPublicHydraHTTP",
+    "rule": "Only the exact top-level skip with the existing absent-input reason, explicit frozen compiled selector membership and complete frozen-plan marker sequence is structurally accepted. Every START/END pair must match its frozen entry/phase and END must have integer-zero exit; missing, duplicate, dangling, contradictory or unknown entry evidence rejects. SQLite producer and selected dialect pairs remain required: dialect START overrides run with the exact known test/sqlite selector while END retains the original frozen selector. No required leaf, other skip, failure, duplicate event, wildcard router selector or missing context is exempt. This is fixed inspector policy, not an admission-configurable allowlist."
+  },
+  "stopped_scope_note": "The legacy default includes the stopped root producer. Real Hydra HTTP is separately input-gated; isolated authorization regressions and Boxnai-named local fixtures do not by themselves start external Hydra/Boxnai acceptance. No stopped test is authorized by this classification.",
   "authenticated_receipt_authority": ".github/actions/box-formal-consumer/consumer.py",
   "runtime_configuration": "Trusted installed launcher object only, never candidate JSON or a dynamic import",
   "runtime_prerequisites": [

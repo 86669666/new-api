@@ -303,9 +303,10 @@ def run_child(argv, cwd, env, timeout, output_limit=8 * 1024 * 1024):
 def execute(request, runtime):
     """Run fixed non-formal commands serially and return unauthenticated evidence.
 
-    Full formal scope is deliberately blocked: invoking the existing default
-    runner would restart stopped real authorization inventory. No fallback to
-    sudo, legacy dispatch, hosted tests, or receipt synthesis is permitted.
+    Full formal scope is deliberately blocked: the legacy default includes the
+    stopped root producer, and sanctioned transport remains unproved. Its Hydra
+    HTTP integration is separately input-gated, not automatically restarted.
+    No fallback to sudo, legacy dispatch, hosted tests, or receipt synthesis is permitted.
     """
     validate_request(request)
     request = dict(request)
@@ -398,6 +399,92 @@ def execute(request, runtime):
     return result
 
 
+def validate_optional_external_skip(tier, plan, text, events):
+    """Recognize only the runner's input-gated SQLite/router Hydra omission.
+
+    The frozen router selector represents compiled inventory, not a caller's
+    optional-test list. Markers and the Go skip reason bind structural context
+    only; candidate-written logs cannot establish authenticated provenance.
+    """
+    test = 'TestOAuthPublicHydraHTTP'
+    if (tier != 'sqlite' or
+            [(status, name) for status, name in events if status != 'PASS'] != [('SKIP', test)] or
+            sum(name == test for _, name in events) != 1 or
+            any(leaf == test or leaf.startswith(test + '/') for leaf in plan['required_leaves'])):
+        raise ExecutionError('unexpected_formal_skip')
+    routers = [entry for entry in plan['entries'] if entry['cwd'] == 'router']
+    if len(routers) != 1:
+        raise ExecutionError('missing_optional_test_inventory')
+    entry = routers[0]
+    selector = entry['run']
+    if (not re.fullmatch(r'test-[0-9]+', entry['binary']) or
+            not re.fullmatch(r'\^\([A-Za-z_][A-Za-z_0-9]*(\|[A-Za-z_][A-Za-z_0-9]*)*\)\$', selector)):
+        raise ExecutionError('invalid_optional_test_inventory')
+    names = selector[2:-2].split('|')
+    if test not in names or len(names) != len(set(names)):
+        raise ExecutionError('missing_optional_test_inventory')
+    start = dict(entry, phase='ordinary')
+    # Match trusted_run's full SQLite sequence, including its asymmetric dialect
+    # markers: START selects one dialect test; END retains the frozen selector.
+    dialect_tests = {
+        'service': ('TestOAuthDerivedTextRawUsageRejection', 'TestOAuthDerivedTransportDatabaseCASWire'),
+        'controller': ('TestOAuthDerivedSelectedHTTP',),
+    }
+    pairs = []
+    binaries, directories = set(), set()
+    for frozen in plan['entries']:
+        if (set(frozen) != {'binary', 'cwd', 'run'} or
+                not re.fullmatch(r'test-[0-9]+', frozen['binary']) or
+                frozen['binary'] in binaries or frozen['cwd'] in directories):
+            raise ExecutionError('invalid_formal_entry_inventory')
+        binaries.add(frozen['binary'])
+        directories.add(frozen['cwd'])
+        if frozen['cwd'] == 'model':
+            producer = dict(frozen, phase='producer')
+            pairs.append((producer, dict(producer, exit=0)))
+    for frozen in plan['entries']:
+        ordinary = dict(frozen, phase='ordinary')
+        pairs.append((ordinary, dict(ordinary, exit=0)))
+        if frozen['cwd'] in dialect_tests:
+            selector = frozen['run']
+            if not re.fullmatch(r'\^\([A-Za-z_][A-Za-z_0-9]*(\|[A-Za-z_][A-Za-z_0-9]*)*\)\$', selector):
+                raise ExecutionError('invalid_dialect_inventory')
+            selected = selector[2:-2].split('|')
+            if len(selected) != len(set(selected)):
+                raise ExecutionError('duplicate_dialect_inventory')
+            for name in dialect_tests[frozen['cwd']]:
+                if name in selected:
+                    pairs.append((dict(frozen, phase='sqlite-dialect', run='^' + name + '$/sqlite'),
+                                  dict(frozen, phase='sqlite-dialect', exit=0)))
+    active = None
+    completed = 0
+    bound_skip = False
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith('BOOTSTRAP_TEST_START '):
+            if active is not None or completed >= len(pairs):
+                raise ExecutionError('nested_or_extra_formal_entry')
+            active = json.loads(line.removeprefix('BOOTSTRAP_TEST_START '))
+            if active != pairs[completed][0]:
+                raise ExecutionError('mismatched_formal_entry_start')
+        elif line.startswith('BOOTSTRAP_TEST_END '):
+            end = json.loads(line.removeprefix('BOOTSTRAP_TEST_END '))
+            if active is None:
+                raise ExecutionError('unmatched_formal_entry')
+            if end != pairs[completed][1] or type(end['exit']) is not int:
+                raise ExecutionError('failed_or_mismatched_formal_entry_end')
+            active = None
+            completed += 1
+        elif re.fullmatch(r'\s*--- SKIP: ' + test + r' \([0-9.]+s\)', line):
+            if (active != start or index < 2 or lines[index - 2] != '=== RUN   ' + test or
+                    not re.fullmatch(r'\s+oauth_public_test\.go:[0-9]+: requires isolated real Hydra runtime; '
+                                     r'local HTTP checks run separately', lines[index - 1])):
+                raise ExecutionError('unbound_optional_test_skip')
+            bound_skip = True
+    if active is not None or completed != len(pairs) or not bound_skip:
+        raise ExecutionError('incomplete_optional_test_context')
+
+
 def inspect_formal_result(summary, expected, process_exit, logs):
     """Inspect the existing runner's raw result, without authenticating it.
 
@@ -447,9 +534,10 @@ def inspect_formal_result(summary, expected, process_exit, logs):
             if canonical(receipts) != canonical([required]):
                 raise ExecutionError('missing_formal_log_receipt')
             events = re.findall(r'^\s*--- (PASS|FAIL|SKIP): (\S+) \(', text, re.M)
-            if any(status != 'PASS' for status, _ in events) or any(
-                    events.count(('PASS', leaf)) != 1 for leaf in plan['required_leaves']):
+            if any(events.count(('PASS', leaf)) != 1 for leaf in plan['required_leaves']):
                 raise ExecutionError('missing_formal_leaves')
+            if any(status != 'PASS' for status, _ in events):
+                validate_optional_external_skip(tier, plan, text, events)
         return {'authentication': 'UNAUTHENTICATED', 'structurally_complete': True,
                 'summary_sha256': hashlib.sha256(canonical(summary)).hexdigest(),
                 'provenance_authenticated': False}

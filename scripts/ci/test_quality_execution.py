@@ -299,6 +299,218 @@ class FormalEvidenceTests(unittest.TestCase):
         self.assertNotIn('binding', result)
         self.assertNotIn('exit', result)
 
+    def optional_hydra_fixture(self, *, tier='sqlite', mutation=None):
+        """Synthetic runner text only; never executes the external Hydra test."""
+        summary, expected, logs = self.fixture()
+        plan = expected['tiers'][tier]
+        entry = dict(binary='test-1', cwd='router',
+                     run='^(TestOAuthPublicHydraHTTP|TestOAuthPublicHTTP)$')
+        plan['entries'].append(entry)
+        start = dict(entry, phase='ordinary')
+        end = dict(start, exit=0)
+        test = 'TestOAuthPublicHydraHTTP'
+        lines = ['BOOTSTRAP_TEST_START ' + json.dumps(start),
+                 '=== RUN   ' + test,
+                 '    oauth_public_test.go:345: requires isolated real Hydra runtime; local HTTP checks run separately',
+                 '--- SKIP: ' + test + ' (0.00s)',
+                 'BOOTSTRAP_TEST_END ' + json.dumps(end)]
+        if mutation:
+            mutation(plan, lines)
+        record = next(r for r in summary['tiers'] if r['tier'] == tier)
+        record['receipt'].update(entries=plan['entries'], required_leaves=plan['required_leaves'])
+        mandatory = dict(binary='test-0', cwd='fixture', run='.', phase='ordinary')
+        prefix = ('BOOTSTRAP_TEST_START ' + json.dumps(mandatory) + '\n' +
+                  '--- PASS: TestFixture/required (0.00s)\n' +
+                  'BOOTSTRAP_TEST_END ' + json.dumps(dict(mandatory, exit=0)) + '\n')
+        logs[tier] = (prefix + '\n'.join(lines) +
+                      '\nBOOTSTRAP_TIER_RESULT ' + json.dumps(record['receipt']) + '\n').encode()
+        record['log_sha256'] = hashlib.sha256(logs[tier]).hexdigest()
+        return summary, expected, logs
+
+    def test_exact_optional_hydra_skip_is_unauthenticated_structural_evidence(self):
+        summary, expected, logs = self.optional_hydra_fixture()
+        result = execution.inspect_formal_result(summary, expected, 0, logs)
+        self.assertTrue(result['structurally_complete'])
+        self.assertEqual('UNAUTHENTICATED', result['authentication'])
+        self.assertFalse(result['provenance_authenticated'])
+        self.assertEqual(set(execution.FORMAL_TIERS), set(expected['tiers']))
+
+    def test_original_runner_partition_and_sqlite_receipt_allow_optional_skip(self):
+        # Pure partition/receipt functions only; no runner entrypoint or child.
+        import bootstrap_test_runner as runner
+
+        entries = [dict(binary='test-' + str(i), cwd=cwd, run='.')
+                   for i, cwd in enumerate(('service', 'router', 'controller'))]
+        inventory = {'test-0': [*runner.WALLET_TESTS, 'TestServiceLocal'],
+                     'test-1': ['TestOAuthPublicHydraHTTP', 'TestOAuthPublicHTTP',
+                                'TestSessionRevocationS1Namespace', 'TestSessionRevocationS1RealRedis'],
+                     'test-2': ['TestOAuthDerivedTokenOwnerLifecycle', 'TestControllerLocal']}
+        partitions = runner.resource_partitions(entries, inventory)
+        summary, expected, logs = self.optional_hydra_fixture(
+            mutation=lambda p, l: p.update(required_leaves=runner.required_leaves('sqlite')))
+        plan = expected['tiers']['sqlite']
+        self.assertIn(plan['entries'][-1], partitions['sqlite'])
+        metadata = dict(tier='sqlite', invocation=expected['invocation'], entries=plan['entries'],
+                        files={'new-api': expected['producer_sha256'], 'runner.py': expected['runner_sha256']})
+        receipt = runner.validate_tier_receipt(metadata, plan['manifest_sha256'], logs['sqlite'].decode(), 0)
+        self.assertEqual(receipt, summary['tiers'][-1]['receipt'])
+        self.assertTrue(execution.inspect_formal_result(summary, expected, 0, logs)['structurally_complete'])
+
+    def mandatory_entry_fixture(self, *, end_mutation=None, dialect=False):
+        """Append a frozen mandatory entry to the optional-skip parser fixture."""
+        def append_entry(plan, lines):
+            entry = dict(binary='test-2', cwd='service' if dialect else 'fixture-other',
+                         run='^(TestOAuthDerivedTextRawUsageRejection|TestLocal)$' if dialect else '.')
+            plan['entries'].append(entry)
+            start = dict(entry, phase='ordinary')
+            end = dict(start, exit=0)
+            if end_mutation:
+                end_mutation(end)
+            lines.extend(['BOOTSTRAP_TEST_START ' + json.dumps(start),
+                          '--- PASS: TestLocal (0.00s)',
+                          'BOOTSTRAP_TEST_END ' + json.dumps(end)])
+            if dialect:
+                lines.extend([
+                    'BOOTSTRAP_TEST_START ' + json.dumps(dict(entry, phase='sqlite-dialect',
+                                                              run='^TestOAuthDerivedTextRawUsageRejection$/sqlite')),
+                    '--- PASS: TestOAuthDerivedTextRawUsageRejection/sqlite (0.00s)',
+                    'BOOTSTRAP_TEST_END ' + json.dumps(dict(entry, phase='sqlite-dialect', exit=0))])
+        return self.optional_hydra_fixture(mutation=append_entry)
+
+    def test_review_non_router_failed_exit_rejects(self):
+        summary, expected, logs = self.mandatory_entry_fixture(end_mutation=lambda end: end.update(exit=7))
+        with self.assertRaises(execution.ExecutionError):
+            execution.inspect_formal_result(summary, expected, 0, logs)
+
+    def test_review_non_router_mismatched_end_rejects(self):
+        summary, expected, logs = self.mandatory_entry_fixture(end_mutation=lambda end: end.update(binary='test-99'))
+        with self.assertRaises(execution.ExecutionError):
+            execution.inspect_formal_result(summary, expected, 0, logs)
+
+    def test_genuine_sqlite_dialect_start_override_and_original_end_selector(self):
+        summary, expected, logs = self.mandatory_entry_fixture(dialect=True)
+        result = execution.inspect_formal_result(summary, expected, 0, logs)
+        self.assertTrue(result['structurally_complete'])
+        self.assertEqual('UNAUTHENTICATED', result['authentication'])
+        self.assertFalse(result['provenance_authenticated'])
+
+    def test_sqlite_producer_pair_is_required_structural_text_only(self):
+        # These are log strings, not invocation of the stopped producer test.
+        model = dict(binary='test-2', cwd='model', run='.')
+        producer = ['BOOTSTRAP_TEST_START ' + json.dumps(dict(model, phase='producer')),
+                    'BOOTSTRAP_TEST_END ' + json.dumps(dict(model, phase='producer', exit=0))]
+
+        def add_model(plan, lines):
+            plan['entries'].append(model)
+            lines.extend(['BOOTSTRAP_TEST_START ' + json.dumps(dict(model, phase='ordinary')),
+                          'BOOTSTRAP_TEST_END ' + json.dumps(dict(model, phase='ordinary', exit=0))])
+
+        for mode in ('complete', 'missing', 'failed', 'duplicate'):
+            summary, expected, logs = self.optional_hydra_fixture(mutation=add_model)
+            prefix = list(producer)
+            if mode == 'missing':
+                prefix = []
+            elif mode == 'failed':
+                prefix[-1] = prefix[-1].replace('"exit": 0', '"exit": 7')
+            elif mode == 'duplicate':
+                prefix += producer
+            logs['sqlite'] = ('\n'.join(prefix) + '\n').encode() + logs['sqlite']
+            summary['tiers'][-1]['log_sha256'] = hashlib.sha256(logs['sqlite']).hexdigest()
+            with self.subTest(mode=mode):
+                if mode == 'complete':
+                    self.assertTrue(execution.inspect_formal_result(summary, expected, 0, logs)['structurally_complete'])
+                else:
+                    with self.assertRaises(execution.ExecutionError):
+                        execution.inspect_formal_result(summary, expected, 0, logs)
+
+    def test_every_mandatory_pair_requires_complete_consistent_evidence(self):
+        for mode in ('bool-exit', 'missing-exit', 'wrong-phase', 'wrong-selector', 'wrong-cwd',
+                     'missing-entry', 'missing-dialect', 'dangling-start', 'dangling-end',
+                     'duplicate-entry', 'duplicate-dialect', 'unknown-entry', 'unknown-dialect',
+                     'dialect-end-override', 'dialect-failure', 'dialect-wrong-binary'):
+            summary, expected, logs = self.mandatory_entry_fixture(dialect=True)
+            lines = logs['sqlite'].decode().splitlines()
+            start = next(i for i, line in enumerate(lines) if line.startswith('BOOTSTRAP_TEST_START ') and 'test-2' in line)
+            end = start + 2
+            dialect = end + 1
+            if mode in ('bool-exit', 'missing-exit', 'wrong-phase', 'wrong-selector', 'wrong-cwd'):
+                value = json.loads(lines[end].removeprefix('BOOTSTRAP_TEST_END '))
+                if mode == 'missing-exit':
+                    value.pop('exit')
+                else:
+                    key, val = {'bool-exit': ('exit', False), 'wrong-phase': ('phase', 'producer'),
+                                'wrong-selector': ('run', '.'), 'wrong-cwd': ('cwd', 'router')}[mode]
+                    value[key] = val
+                lines[end] = 'BOOTSTRAP_TEST_END ' + json.dumps(value)
+            elif mode == 'missing-entry':
+                del lines[start:dialect + 3]
+            elif mode == 'missing-dialect':
+                del lines[dialect:dialect + 3]
+            elif mode == 'dangling-start':
+                del lines[end]
+            elif mode == 'dangling-end':
+                del lines[start]
+            elif mode in ('duplicate-entry', 'duplicate-dialect'):
+                pos = start if mode == 'duplicate-entry' else dialect
+                lines[pos:pos] = lines[pos:pos + 3]
+            elif mode == 'unknown-entry':
+                lines[start] = lines[start].replace('test-2', 'test-99')
+            elif mode == 'unknown-dialect':
+                lines[dialect] = lines[dialect].replace('TestOAuthDerivedTextRawUsageRejection', 'TestUnknown')
+            else:
+                value = json.loads(lines[dialect + 2].removeprefix('BOOTSTRAP_TEST_END '))
+                if mode == 'dialect-end-override':
+                    value['run'] = '^TestOAuthDerivedTextRawUsageRejection$/sqlite'
+                elif mode == 'dialect-failure':
+                    value['exit'] = 7
+                else:
+                    value['binary'] = 'test-99'
+                lines[dialect + 2] = 'BOOTSTRAP_TEST_END ' + json.dumps(value)
+            logs['sqlite'] = ('\n'.join(lines) + '\n').encode()
+            summary['tiers'][-1]['log_sha256'] = hashlib.sha256(logs['sqlite']).hexdigest()
+            with self.subTest(mode=mode), self.assertRaises(execution.ExecutionError):
+                execution.inspect_formal_result(summary, expected, 0, logs)
+
+    def test_optional_skip_cannot_override_inventory_context_or_required_tests(self):
+        mutations = {
+            'missing-router-inventory': lambda p, l: p['entries'].pop(),
+            'missing-all-inventory': lambda p, l: p.update(entries=[]),
+            'substituted-inventory': lambda p, l: p['entries'][-1].update(cwd='service'),
+            'missing-selected-test': lambda p, l: p['entries'][-1].update(run='^(TestOAuthPublicHTTP)$'),
+            'wildcard-selector': lambda p, l: p['entries'][-1].update(run='.'),
+            'required-leaf': lambda p, l: p['required_leaves'].append('TestOAuthPublicHydraHTTP'),
+            'missing-required-leaf': lambda p, l: p['required_leaves'].append('TestMandatory'),
+            'missing-start': lambda p, l: l.pop(0),
+            'missing-end': lambda p, l: l.pop(),
+            'wrong-phase': lambda p, l: l.__setitem__(0, l[0].replace('ordinary', 'producer')),
+            'wrong-binary': lambda p, l: l.__setitem__(0, l[0].replace('test-1', 'test-2')),
+            'failed-entry': lambda p, l: l.__setitem__(-1, l[-1].replace('"exit": 0', '"exit": 7')),
+            'boolean-exit': lambda p, l: l.__setitem__(-1, l[-1].replace('"exit": 0', '"exit": false')),
+            'missing-run': lambda p, l: l.pop(1),
+            'missing-reason': lambda p, l: l.pop(2),
+            'wrong-reason': lambda p, l: l.__setitem__(2, '    oauth_public_test.go:345: arbitrary skip'),
+            'wrong-reason-source': lambda p, l: l.__setitem__(2, l[2].replace('oauth_public_test.go', 'other_test.go')),
+            'unknown-skip': lambda p, l: l.insert(4, '--- SKIP: TestUnknown (0.00s)'),
+            'lookalike-skip': lambda p, l: l.__setitem__(3, l[3].replace('HydraHTTP', 'HydraHTTPFake')),
+            'subtest-skip': lambda p, l: l.__setitem__(3, l[3].replace('HydraHTTP', 'HydraHTTP/child')),
+            'mandatory-skip': lambda p, l: l.insert(4, '--- SKIP: TestFixture/required (0.00s)'),
+            'mandatory-failure': lambda p, l: l.insert(4, '--- FAIL: TestFixture/required (0.00s)'),
+            'optional-failure': lambda p, l: l.__setitem__(3, l[3].replace('SKIP', 'FAIL')),
+            'duplicate-skip': lambda p, l: l.insert(4, l[3]),
+            'pass-and-skip': lambda p, l: l.insert(4, l[3].replace('SKIP', 'PASS')),
+            'nested-entry': lambda p, l: l.insert(1, l[0]),
+        }
+        for name, mutation in mutations.items():
+            summary, expected, logs = self.optional_hydra_fixture(mutation=mutation)
+            with self.subTest(name=name), self.assertRaises(execution.ExecutionError):
+                execution.inspect_formal_result(summary, expected, 0, logs)
+        for tier in execution.FORMAL_TIERS:
+            if tier == 'sqlite':
+                continue
+            summary, expected, logs = self.optional_hydra_fixture(tier=tier)
+            with self.subTest(tier=tier), self.assertRaises(execution.ExecutionError):
+                execution.inspect_formal_result(summary, expected, 0, logs)
+
     def test_partial_replayed_failed_and_cleanup_evidence_reject(self):
         mutations = [lambda s: s.update(unexecuted=['sqlite']),
                      lambda s: s['tiers'].pop(),
