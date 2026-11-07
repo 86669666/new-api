@@ -496,7 +496,16 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	resp, err := relayClient.Do(req)
 	if err != nil {
-		logger.LogError(c, common2.LogText("do request failed: %s", err.Error()))
+		logMessage := err.Error()
+		if urlErr, ok := err.(*url.Error); ok {
+			// Project only the URL for logging; keep the request and returned error intact.
+			logURL := *req.URL
+			logURL.User = nil
+			logErr := *urlErr
+			logErr.URL = common.SanitizeURLForLog(logURL.String())
+			logMessage = logErr.Error()
+		}
+		logger.LogError(c, common2.LogText("do request failed: %s", logMessage))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {

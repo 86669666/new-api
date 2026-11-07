@@ -1,12 +1,18 @@
 package channel
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	common2 "github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -215,5 +221,73 @@ func TestToWebSocketURL(t *testing.T) {
 		"ws://127.0.0.1:3000/backend-api/codex/responses": "ws://127.0.0.1:3000/backend-api/codex/responses",
 	} {
 		assert.Equal(t, want, toWebSocketURL(input), input)
+	}
+}
+
+// outboundLogTransport never opens a connection.
+type outboundLogTransport func(*http.Request) (*http.Response, error)
+
+func (f outboundLogTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestDoRequestTransportErrorLogRedaction(t *testing.T) {
+	var logs bytes.Buffer
+	common2.LogWriterMu.Lock()
+	oldWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logs
+	common2.LogWriterMu.Unlock()
+	oldDebug := common2.DebugEnabled
+	common2.DebugEnabled = false
+	t.Cleanup(func() {
+		common2.DebugEnabled = oldDebug
+		common2.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = oldWriter
+		common2.LogWriterMu.Unlock()
+	})
+
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	client, err := service.GetHttpClientWithProxySettings("", info.ChannelSetting)
+	require.NoError(t, err)
+	oldTransport := client.Transport
+	t.Cleanup(func() { client.Transport = oldTransport })
+	transportErr := errors.New("synthetic transport failure")
+
+	for _, tc := range []struct {
+		name    string
+		rawURL  string
+		markers []string
+	}{
+		{"query", "https://upstream.invalid/v1/chat?api_key=T68U_QUERY_MARKER&mode=normal", []string{"T68U_QUERY_MARKER"}},
+		{"userinfo", "https://T68U_USER_MARKER:T68U_PASSWORD_MARKER@upstream.invalid/v1/chat", []string{"T68U_USER_MARKER", "T68U_PASSWORD_MARKER"}},
+		{"ordinary", "https://upstream.invalid/v1/chat?mode=normal", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs.Reset()
+			var sentURL string
+			client.Transport = outboundLogTransport(func(req *http.Request) (*http.Response, error) {
+				sentURL = req.URL.String()
+				return nil, transportErr
+			})
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
+			req, requestErr := http.NewRequest(http.MethodPost, tc.rawURL, nil)
+			require.True(t, requestErr == nil)
+			resp, requestErr := DoRequest(c, req, info)
+			assert.Nil(t, resp)
+			require.True(t, requestErr != nil)
+			assert.True(t, sentURL == tc.rawURL, "transport URL unchanged")
+			assert.True(t, req.URL.String() == tc.rawURL, "request URL unchanged")
+			var apiErr *types.NewAPIError
+			require.True(t, errors.As(requestErr, &apiErr))
+			assert.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
+			assert.True(t, requestErr.Error() == "upstream error: do request failed", "existing hidden error message retained")
+			assert.True(t, strings.Contains(logs.String(), transportErr.Error()), "diagnostic retained")
+			assert.True(t, strings.Contains(logs.String(), "upstream.invalid/v1/chat"), "endpoint retained")
+			// Assert only presence booleans so failures never print captured logs.
+			for _, marker := range tc.markers {
+				assert.False(t, strings.Contains(logs.String(), marker), "credential marker present in captured log")
+			}
+		})
 	}
 }
