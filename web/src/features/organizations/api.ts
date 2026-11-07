@@ -612,6 +612,81 @@ export async function declineOrganizationInvitation(
   }
 }
 
+const acceptedInvitationSchema = z.object({
+  organization_id: wireIdSchema,
+  revision: wireIdSchema,
+  action: z.literal('invitation_accept'),
+  event_id: wireIdSchema,
+  object_kind: z.literal('invitation'),
+  object_id: wireIdSchema,
+  generation: wireIdSchema,
+  status: z.literal('accepted'),
+})
+
+/** Accept only the selected invitation under its original session and versions. */
+export async function acceptOrganizationInvitation(
+  actorId: number,
+  sid: string,
+  selected: OrganizationInvitation,
+  signal: AbortSignal
+) {
+  const identityChanged = new AbortController()
+  const unsubscribe = useAuthStore.subscribe((state) => {
+    if (state.auth.user?.id !== actorId || state.auth.session?.sid !== sid) {
+      identityChanged.abort()
+    }
+  })
+  const boundSignal = AbortSignal.any([signal, identityChanged.signal])
+  const assertIdentity = () => {
+    const auth = useAuthStore.getState().auth
+    if (
+      boundSignal.aborted ||
+      auth.user?.id !== actorId ||
+      auth.session?.sid !== sid
+    ) {
+      throw new CanceledError('Organization identity changed')
+    }
+  }
+  try {
+    assertIdentity()
+    const intent = invitationSchema.parse(selected)
+    if (
+      !Number.isSafeInteger(actorId) ||
+      actorId <= 0 ||
+      !sid ||
+      intent.target_user_id !== String(actorId) ||
+      intent.expires_at <= Date.now() / 1000
+    ) {
+      throw new Error()
+    }
+    const response = await api.post(
+      `/api/organizations/${intent.organization_id}/invitations/${intent.object_id}/accept`,
+      { revision: intent.organization_revision, generation: intent.generation },
+      organizationRequestOptions({ userId: actorId, sid }, boundSignal)
+    )
+    assertIdentity()
+    if (response.status !== 200) throw new Error()
+    const receipt = acceptedInvitationSchema.parse(
+      z
+        .object({ success: z.literal(true), data: z.unknown() })
+        .parse(requireServerSuccess(response.data)).data
+    )
+    if (
+      receipt.organization_id !== intent.organization_id ||
+      receipt.object_id !== intent.object_id ||
+      receipt.generation !== intent.generation ||
+      BigInt(receipt.revision) <= BigInt(intent.organization_revision)
+    ) {
+      throw new Error()
+    }
+    return receipt
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, boundSignal)
+  } finally {
+    unsubscribe()
+  }
+}
+
 export type OrganizationTransfer = z.infer<typeof transferSchema>
 
 const declinedTransferSchema = z.object({
