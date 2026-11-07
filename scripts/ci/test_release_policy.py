@@ -116,10 +116,14 @@ class DatabaseGateTests(unittest.TestCase):
                 validate_environment(dict(valid, **{key: 'shared'}))
 
     def test_database_results_require_real_dialect_execution(self):
-        events = [{'Action': 'pass', 'Test': name} for name in sorted(REQUIRED)]
+        events = [{'Action': 'pass', 'Test': name, 'Package': 'github.com/QuantumNous/new-api/model'}
+                  for name in sorted(REQUIRED)]
         events += [{'Action': 'pass', 'Package': 'github.com/QuantumNous/new-api/model'}]
         validate_events(events, 0)
-        for bad in ([], events[1:], events[:-1], events + [{'Action': 'skip'}],
+        for bad in ([], events[1:], events[:-1],
+                    [dict(event, Package='other/package') for event in events],
+                    [{k: v for k, v in event.items() if k != 'Package'} for event in events],
+                    events + [{'Action': 'skip'}],
                     events + [{'Action': 'fail'}]):
             with self.assertRaises(ValueError):
                 validate_events(bad, 0)

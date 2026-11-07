@@ -45,9 +45,12 @@ def validate_receipt(receipt, admission, now):
     require(expected['attempt_id'] and expected['admission_id'] and expected['invocation'], 'missing attempt')
     require(expected['test_binaries'] and all(re.fullmatch('[0-9a-f]{64}', v)
             for v in expected['test_binaries'].values()), 'missing test identities')
+    require(all(type(value) is int for value in (expected['not_before'], expected['expires_at'],
+            receipt['started_at'], receipt['completed_at'], now)), 'invalid receipt times')
     require(expected['not_before'] <= receipt['started_at'] <= receipt['completed_at'] <= now
             <= expected['expires_at'], 'stale or future receipt')
-    require(receipt['process_exit'] == 0 and receipt['exit'] == 0
+    require(type(receipt['process_exit']) is int and type(receipt['exit']) is int
+            and receipt['process_exit'] == 0 and receipt['exit'] == 0
             and receipt['cleanup'] is True and receipt['unexecuted'] == [], 'incomplete execution')
     plan = expected['tiers']
     require(plan and len(receipt['tiers']) == len(plan), 'missing or duplicate tier')
@@ -56,7 +59,7 @@ def validate_receipt(receipt, admission, now):
         name = tier['tier']
         require(name in plan and name not in seen, 'unexpected or duplicate tier')
         seen.add(name)
-        require(tier['exit'] == 0 and tier['cleanup'] is True, 'failed tier')
+        require(type(tier['exit']) is int and tier['exit'] == 0 and tier['cleanup'] is True, 'failed tier')
         require(tier['invocation'] == expected['invocation'], 'replayed tier')
         require(tier['entries'] == plan[name]['entries'] and
                 tier['required_leaves'] == plan[name]['required_leaves'], 'partial tier inventory')
@@ -68,7 +71,9 @@ def validate_receipt(receipt, admission, now):
 def validate_check(check, receipt, admission, now):
     receipt_hash = validate_receipt(receipt, admission, now)
     require(check['app']['id'] == APP and check['app']['slug'] == 'new-api-box-formal', 'wrong App')
-    require(check['id'] == admission['check_run_id'], 'wrong check or replay')
+    require(type(admission['check_run_id']) is int and admission['check_run_id'] > 0
+            and type(check['id']) is int and check['id'] == admission['check_run_id'],
+            'wrong check or replay')
     require(check['name'] == CHECK and check['head_sha'] == admission['expected']['execution_sha'],
             'wrong check candidate')
     require(check['status'] == 'completed' and check['conclusion'] == 'success', 'check not successful')
@@ -81,10 +86,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError('API redirect refused')
 
 
-def api(path, token, method='GET', payload=None):
+def api(path, token):
     require(path.startswith('/') and not path.startswith('//'), 'invalid API path')
     request = urllib.request.Request('https://api.github.com' + path,
-        data=None if payload is None else canonical(payload), method=method,
+        method='GET',
         headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
                  'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'})
     with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:

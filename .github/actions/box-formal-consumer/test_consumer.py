@@ -43,6 +43,23 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_environment(environment, admission, 301)
 
+    def test_boolean_exit_codes_and_non_integer_times_are_not_process_evidence(self):
+        for field, value in [('process_exit', False), ('exit', False), ('started_at', 110.0),
+                             ('completed_at', True)]:
+            receipt, admission, _ = fixture()
+            receipt[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_receipt(receipt, admission, 200)
+        receipt, admission, _ = fixture()
+        receipt['tiers'][0]['exit'] = False
+        with self.assertRaises(ValueError):
+            validate_receipt(receipt, admission, 200)
+        for check_id in (0, -1, True):
+            receipt, admission, check = fixture()
+            admission['check_run_id'] = check['id'] = check_id
+            with self.subTest(check_id=check_id), self.assertRaises(ValueError):
+                validate_check(check, receipt, admission, 200)
+
     def test_exact_authenticated_receipt(self):
         receipt, admission, check = fixture()
         self.assertEqual(digest(receipt), validate_check(check, receipt, admission, 200))
