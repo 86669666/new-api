@@ -380,10 +380,19 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 	var introspections atomic.Int64
 	var changeAt atomic.Int64
 	var consentFault atomic.Int32
+	var loginFault atomic.Int32
+	var loginPuts atomic.Int64
 	var consentPuts atomic.Int64
 	var trustedConsentIDs sync.Map
+	var cleanupMu sync.Mutex
+	var cleanupQueries []url.Values
 	mutations := make(chan func() error, 1)
 	adminProxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/admin/oauth2/auth/sessions/") {
+			cleanupMu.Lock()
+			cleanupQueries = append(cleanupQueries, r.URL.Query())
+			cleanupMu.Unlock()
+		}
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, input.Admin+r.URL.RequestURI(), r.Body)
 		if err != nil {
 			w.WriteHeader(503)
@@ -407,6 +416,27 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 				w.WriteHeader(503)
 				return
 			}
+		}
+		if r.URL.Path == "/admin/oauth2/auth/requests/login/accept" && r.Method == http.MethodPut {
+			loginPuts.Add(1)
+		}
+		if r.URL.Path == "/admin/oauth2/auth/requests/login" && r.Method == http.MethodGet && loginFault.Load() != 0 {
+			var fields map[string]common.RawMessage
+			if common.Unmarshal(data, &fields) != nil {
+				w.WriteHeader(503)
+				return
+			}
+			if loginFault.Load() == 1 {
+				delete(fields, "session_id")
+			} else {
+				fields["session_id"] = common.RawMessage(`"changed-target"`)
+			}
+			data, err = common.Marshal(fields)
+			if err != nil {
+				w.WriteHeader(503)
+				return
+			}
+			response.Header.Del("Content-Length")
 		}
 		if r.URL.Path == "/admin/oauth2/auth/requests/consent" && r.Method == "GET" {
 			var trusted struct {
@@ -1272,6 +1302,184 @@ func TestOAuthPublicHydraHTTP(t *testing.T) {
 			assert.Equal(t, 400, status)
 		})
 		c.t = t
+	})
+
+	t.Run("login_target_binding_rejections", func(t *testing.T) {
+		c.t = t
+		for _, fault := range []int32{1, 2} {
+			t.Run(fmt.Sprintf("issuer_target_%d", fault), func(t *testing.T) {
+				c.t = t
+				pkce := sha256.Sum256([]byte("attribution-negative-control-verifier"))
+				q := url.Values{"client_id": {c.clientID}, "response_type": {"code"}, "redirect_uri": {c.redirect}, "scope": {"profile"}, "state": {strings.Repeat("s", 32)}, "code_challenge": {base64.RawURLEncoding.EncodeToString(pkce[:])}, "code_challenge_method": {"S256"}}
+				status, headers, _ := c.request("GET", input.Issuer+"oauth2/auth?"+q.Encode(), "", "", "")
+				require.Equal(t, 302, status)
+				location, err := url.Parse(headers.Get("Location"))
+				require.NoError(t, err)
+				challenge := location.Query().Get("login_challenge")
+				body, err := common.Marshal(map[string]string{"challenge": challenge})
+				require.NoError(t, err)
+				status, _, data := c.request("POST", input.Issuer+"api/oauth/provider/login/preview", "application/json", string(body), f.bearer["owner"])
+				require.Equal(t, 200, status)
+				var preview service.OAuthProviderPreview
+				require.NoError(t, common.Unmarshal(data, &preview))
+				c.secrets = append(c.secrets, challenge, preview.PreviewToken)
+				var before int64
+				require.NoError(t, f.db.Model(&model.OAuthOperation{}).Count(&before).Error)
+				puts := loginPuts.Load()
+				loginFault.Store(fault)
+				body, err = common.Marshal(service.OAuthProviderDecision{Challenge: challenge, PreviewToken: preview.PreviewToken, Decision: "continue"})
+				require.NoError(t, err)
+				status, _, _ = c.request("POST", input.Issuer+"api/oauth/provider/login", "application/json", string(body), f.bearer["owner"])
+				loginFault.Store(0)
+				assert.Equal(t, 403, status)
+				assert.Equal(t, puts, loginPuts.Load(), "invalid issuer target cannot reach accept")
+				var after int64
+				require.NoError(t, f.db.Model(&model.OAuthOperation{}).Count(&after).Error)
+				assert.Equal(t, before, after, "invalid target cannot be persisted")
+			})
+		}
+		c.t = t
+	})
+
+	t.Run("login_only_target_attribution", func(t *testing.T) {
+		c.t = t
+		other := c.grant("openid profile offline_access")
+		originalSID, originalBearer := f.sids["owner"], f.bearer["owner"]
+		for _, stage := range []string{"before_preview", "denied", "rate_limited"} {
+			t.Run(stage, func(t *testing.T) {
+				c.t = t
+				var session model.UserSession
+				require.NoError(t, f.db.Where("sid = ?", originalSID).First(&session).Error)
+				session.SID = "attribution-" + stage
+				require.NoError(t, model.CreateUserSession(&session))
+				bearer, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: session.UserID, SessionID: session.SID, UserAuthVersion: session.UserAuthVersion, SessionVersion: session.Version})
+				require.NoError(t, err)
+				f.sids["owner"], f.bearer["owner"] = session.SID, bearer
+				t.Cleanup(func() { f.sids["owner"], f.bearer["owner"] = originalSID, originalBearer })
+				challenge, _, _ := c.consent("openid profile offline_access")
+				// Query the real pinned issuer only as an independent test oracle.
+				// No preview/approval has run, and no local grant exists for this SID.
+				status, _, data := c.request("GET", input.Admin+"/admin/oauth2/auth/requests/consent?"+url.Values{"consent_challenge": {challenge}}.Encode(), "", "", "")
+				require.Equal(t, 200, status)
+				var trusted struct {
+					Login string `json:"login_session_id"`
+				}
+				require.NoError(t, common.Unmarshal(data, &trusted))
+				require.NotEmpty(t, trusted.Login)
+				var ops []model.OAuthOperation
+				require.NoError(t, f.db.Where("origin_sid = ?", session.SID).Find(&ops).Error)
+				require.Len(t, ops, 2)
+				for _, op := range ops {
+					assert.True(t, op.HydraLoginSessionID == trusted.Login, "issuer target must match without exposing ID")
+					assert.Equal(t, "observed", op.State)
+					assert.Equal(t, c.clientID, op.ClientID)
+					assert.Equal(t, session.UserID, op.UserID)
+				}
+				if stage != "before_preview" {
+					body, err := common.Marshal(map[string]string{"challenge": challenge})
+					require.NoError(t, err)
+					status, _, data := c.request("POST", input.Issuer+"api/oauth/provider/consent/preview", "application/json", string(body), bearer)
+					require.Equal(t, 200, status)
+					var preview service.OAuthProviderPreview
+					require.NoError(t, common.Unmarshal(data, &preview))
+					body, err = common.Marshal(map[string]any{"challenge": challenge, "preview_token": preview.PreviewToken, "decision": "deny", "selected_scopes": []string{}})
+					require.NoError(t, err)
+					if stage == "denied" {
+						status, _, _ = c.request("POST", input.Issuer+"api/oauth/provider/consent", "application/json", string(body), bearer)
+						require.Equal(t, 200, status)
+					} else {
+						// Register the same official route with its real critical limiter.
+						oldEnabled, oldNum := common.CriticalRateLimitEnable, common.CriticalRateLimitNum
+						common.CriticalRateLimitEnable, common.CriticalRateLimitNum = true, 1
+						limited := gin.New()
+						require.NoError(t, limited.SetTrustedProxies(nil))
+						SetOAuthProviderRouter(limited, service.CurrentOAuthProviderBridge())
+						common.CriticalRateLimitEnable, common.CriticalRateLimitNum = oldEnabled, oldNum
+						for index, want := range []int{400, 429} {
+							payload := "{}"
+							if index == 1 {
+								payload = string(body)
+							}
+							req := httptest.NewRequest("POST", "/api/oauth/provider/consent", strings.NewReader(payload))
+							req.RemoteAddr = "192.0.2.174:17400"
+							req.Header.Set("Content-Type", "application/json")
+							req.Header.Set("Origin", strings.TrimSuffix(input.Issuer, "/"))
+							req.Header.Set("Authorization", "Bearer "+bearer)
+							response := httptest.NewRecorder()
+							limited.ServeHTTP(response, req)
+							require.Equal(t, want, response.Code)
+						}
+					}
+				}
+				ok, err := model.RevokeUserSession(session.UserID, session.SID, "logout")
+				require.NoError(t, err)
+				require.True(t, ok)
+				var jobs []model.OAuthCleanupJob
+				require.NoError(t, f.db.Where("scope = ? AND value = ?", "sid", session.SID).Find(&jobs).Error)
+				require.NotEmpty(t, jobs)
+				for _, job := range jobs {
+					var targets []model.OAuthCleanupTarget
+					require.NoError(t, common.UnmarshalJsonStr(job.Targets, &targets))
+					require.NotEmpty(t, targets)
+					for _, target := range targets {
+						assert.True(t, target.LoginSID == trusted.Login)
+						assert.Empty(t, target.ConsentID)
+					}
+				}
+				cleanupMu.Lock()
+				before := len(cleanupQueries)
+				cleanupMu.Unlock()
+				_, err = service.RunOAuthCleanup(t.Context(), service.CurrentOAuthProviderBridge(), "attribution-worker")
+				require.NoError(t, err)
+				for _, old := range jobs {
+					var done model.OAuthCleanupJob
+					require.NoError(t, f.db.Where("job_ref = ?", old.JobRef).First(&done).Error)
+					assert.Equal(t, "complete", done.State)
+					assert.Equal(t, old.Targets, done.Targets)
+				}
+				cleanupMu.Lock()
+				observed := slices.Clone(cleanupQueries[before:])
+				cleanupMu.Unlock()
+				require.NotEmpty(t, observed)
+				for _, query := range observed {
+					assert.True(t, reflect.DeepEqual(query, url.Values{"sid": {trusted.Login}}), "only exact session DELETE, no subject/client widening")
+				}
+				assert.True(t, c.active(other.Access), "other local session remains usable")
+				t.Log("exact target captured before preview; issuer DELETE acknowledged; physical nonremembered-row deletion is not claimed")
+			})
+		}
+		c.t = t
+	})
+
+	t.Run("legacy_unattributed_stays_blocked", func(t *testing.T) {
+		c.t = t
+		// A new synthetic legacy row models absent attribution. No historical
+		// deployment job is read or repaired, and no issuer target is invented.
+		var session model.UserSession
+		require.NoError(t, f.db.Where("sid = ?", f.sids["owner"]).First(&session).Error)
+		session.SID = "attribution-legacy-no-target"
+		require.NoError(t, model.CreateUserSession(&session))
+		op := model.OAuthOperation{Issuer: input.Issuer, UserID: session.UserID, ClientID: c.clientID, OriginSID: session.SID, AuthVersion: session.UserAuthVersion, SessionVersion: session.Version, Kind: "login_accept"}
+		require.NoError(t, model.ReserveOAuthOperation(t.Context(), &op))
+		require.NoError(t, model.SendOAuthOperation(t.Context(), &op))
+		require.NoError(t, model.ObserveOAuthOperation(t.Context(), &op, nil))
+		require.NoError(t, model.RevokeOAuth(t.Context(), session.UserID, "sid", session.SID))
+		var job model.OAuthCleanupJob
+		require.NoError(t, f.db.Where("scope = ? AND value = ?", "sid", session.SID).First(&job).Error)
+		require.Equal(t, "null", job.Targets)
+		cleanupMu.Lock()
+		before := len(cleanupQueries)
+		cleanupMu.Unlock()
+		_, err := service.RunOAuthCleanup(t.Context(), service.CurrentOAuthProviderBridge(), "legacy-no-target-worker")
+		require.NoError(t, err)
+		var after model.OAuthCleanupJob
+		require.NoError(t, f.db.Where("job_ref = ?", job.JobRef).First(&after).Error)
+		assert.Equal(t, "blocked", after.State)
+		assert.Equal(t, "configuration", after.ErrorCode)
+		assert.Equal(t, job.Targets, after.Targets)
+		cleanupMu.Lock()
+		assert.Equal(t, before, len(cleanupQueries), "missing attribution must not issue a broad cleanup")
+		cleanupMu.Unlock()
 	})
 
 	for _, scope := range []string{"grant", "client", "sid", "others", "user"} {
@@ -5319,4 +5527,60 @@ func (c *oauthHydraClient) tokenMetadata(token string, want int) map[string]any 
 	assert.Equal(c.t, "", body["message"])
 	assert.Equal(c.t, common.QuotaPerUnit, body["quota_per_unit"])
 	return body
+}
+
+// The nullable attribution column is additive: legacy rows remain unattributed,
+// while new operations retain an exact target across startup and revocation.
+func TestOAuthLoginAttributionStore(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	oldMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() { common.IsMasterNode = oldMaster })
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	userID := f.users["owner"].Id
+	legacy := model.OAuthOperation{Issuer: "https://attribution.example/", UserID: userID, ClientID: "desktop", OriginSID: f.sids["owner"], AuthVersion: 1, SessionVersion: 1, Kind: "login_accept"}
+	require.NoError(t, model.ReserveOAuthOperation(t.Context(), &legacy))
+	require.NoError(t, model.SendOAuthOperation(t.Context(), &legacy))
+	require.NoError(t, model.ObserveOAuthOperation(t.Context(), &legacy, nil))
+	// Reconstruct the prior released schema in this exclusively owned fixture.
+	require.NoError(t, f.db.Migrator().DropColumn(&model.OAuthOperation{}, "HydraLoginSessionID"))
+	for range 2 {
+		require.NoError(t, model.InitOAuthCleanupStore(true))
+		var restored model.OAuthOperation
+		require.NoError(t, f.db.Where("operation_ref = ?", legacy.OperationRef).First(&restored).Error)
+		assert.Empty(t, restored.HydraLoginSessionID)
+		assert.Equal(t, "observed", restored.State)
+		assert.Equal(t, legacy.OriginSID, restored.OriginSID)
+		assert.True(t, f.db.Migrator().HasIndex(&model.OAuthOperation{}, "idx_oauth_operations_user"))
+	}
+	require.NoError(t, model.RevokeOAuth(t.Context(), userID, "sid", legacy.OriginSID))
+	var historical model.OAuthCleanupJob
+	require.NoError(t, f.db.Where("value = ?", legacy.OriginSID).First(&historical).Error)
+	assert.Equal(t, "null", historical.Targets)
+	_, err := service.RunOAuthCleanup(t.Context(), nil, "legacy-attribution-worker")
+	require.NoError(t, err)
+	var blocked model.OAuthCleanupJob
+	require.NoError(t, f.db.Where("job_ref = ?", historical.JobRef).First(&blocked).Error)
+	assert.Equal(t, "blocked", blocked.State)
+	assert.Equal(t, historical.Targets, blocked.Targets)
+
+	var other model.UserSession
+	require.NoError(t, f.db.Where("sid = ?", legacy.OriginSID).First(&other).Error)
+	other.SID = "new-attribution-session"
+	require.NoError(t, model.CreateUserSession(&other))
+	op := model.OAuthOperation{Issuer: legacy.Issuer, UserID: userID, ClientID: legacy.ClientID, OriginSID: other.SID, AuthVersion: 1, SessionVersion: 1, Kind: "login_accept", HydraLoginSessionID: "trusted-future-login"}
+	require.NoError(t, model.ReserveOAuthOperation(t.Context(), &op))
+	require.NoError(t, model.SendOAuthOperation(t.Context(), &op))
+	require.NoError(t, model.RevokeOAuth(t.Context(), userID, "sid", other.SID))
+	var job model.OAuthCleanupJob
+	require.NoError(t, f.db.Where("value = ?", other.SID).First(&job).Error)
+	assert.JSONEq(t, `[{"consent_id":"","login_sid":"trusted-future-login"}]`, job.Targets)
+	claimed, err := model.ClaimOAuthCleanup(t.Context(), job.JobRef, "future-worker", time.Now().Unix())
+	require.NoError(t, err)
+	require.Nil(t, claimed, "target attribution cannot discharge a sent/unknown operation")
+	require.NoError(t, model.ObserveOAuthOperation(t.Context(), &op, nil))
+	require.Error(t, model.ValidateOAuthOperationPublication(t.Context(), &op), "late response cannot publish through revocation")
+	var preserved model.OAuthCleanupJob
+	require.NoError(t, f.db.Where("job_ref = ?", job.JobRef).First(&preserved).Error)
+	assert.Equal(t, job.Targets, preserved.Targets)
 }

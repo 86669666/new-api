@@ -383,7 +383,7 @@ func (p *OAuthPublic) Authorize(ctx context.Context, request *http.Request) (*OA
 			if origin.ClientID != client.ID || artifact.ExpiresAt <= time.Now().Unix() || artifact.PKCE != q.Get("code_challenge") || artifact.RedirectHash != model.OAuthArtifactRef(p.bridge.resource.issuer, "redirect", q.Get("redirect_uri")) {
 				return nil, ErrOAuthProviderReplay
 			}
-			operation = &model.OAuthOperation{Issuer: origin.Issuer, UserID: origin.UserID, ClientID: origin.ClientID, OriginSID: origin.OriginSID, AuthVersion: origin.AuthVersion, SessionVersion: origin.SessionVersion, GrantRef: origin.GrantRef, Kind: kind + "_resume"}
+			operation = &model.OAuthOperation{Issuer: origin.Issuer, UserID: origin.UserID, ClientID: origin.ClientID, OriginSID: origin.OriginSID, AuthVersion: origin.AuthVersion, SessionVersion: origin.SessionVersion, GrantRef: origin.GrantRef, Kind: kind + "_resume", HydraLoginSessionID: origin.HydraLoginSessionID}
 			if err := model.ReserveOAuthOperation(ctx, operation); err != nil {
 				return nil, oauthGrantError(err)
 			}

@@ -85,6 +85,7 @@ type oauthProviderChallenge struct {
 	Challenge        string               `json:"challenge"`
 	ConsentRequestID *string              `json:"consent_request_id"`
 	LoginSessionID   *string              `json:"login_session_id"`
+	SessionID        *string              `json:"session_id"`
 	Subject          *string              `json:"subject"`
 	Skip             *bool                `json:"skip"`
 	RequestURL       *string              `json:"request_url"`
@@ -371,6 +372,9 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 			ref = prepared.GrantRef
 		}
 		operation = oauthOperationFromActor(b.resource.issuer, request.clientID, phase+"_accept", ref, actor)
+		// The pinned issuer assigns this target before login acceptance. Persist
+		// it before sending, including login-only flows that never reach preview.
+		operation.HydraLoginSessionID = request.loginSessionID
 		if err := model.ReserveOAuthOperation(ctx, operation); err != nil {
 			return nil, oauthGrantError(err)
 		}
@@ -448,8 +452,12 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 	if phase == "consent" && *value.Subject != strconv.Itoa(actor.UserID) || phase == "login" && *value.Subject != "" && *value.Subject != strconv.Itoa(actor.UserID) {
 		return nil, ErrOAuthProviderDenied
 	}
-	if b.public != nil && phase == "consent" {
-		for _, id := range []*string{value.ConsentRequestID, value.LoginSessionID} {
+	if b.public != nil {
+		ids := []*string{value.SessionID}
+		if phase == "consent" {
+			ids = []*string{value.ConsentRequestID, value.LoginSessionID}
+		}
+		for _, id := range ids {
 			if id == nil || len(*id) == 0 || len(*id) > 256 {
 				return nil, ErrOAuthProviderDenied
 			}
@@ -528,8 +536,12 @@ func (b *OAuthProviderBridge) readRequest(ctx context.Context, actor AuthIdentit
 			ChallengeHash: fmt.Sprintf("%x", sha256.Sum256([]byte(challenge))), RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded))},
 		clientID: client.ID, clientName: name, requested: requested, allowed: allowed, query: q,
 	}
-	if b.public != nil && phase == "consent" {
-		request.consentRequestID, request.loginSessionID = *value.ConsentRequestID, *value.LoginSessionID
+	if b.public != nil {
+		if phase == "consent" {
+			request.consentRequestID, request.loginSessionID = *value.ConsentRequestID, *value.LoginSessionID
+		} else {
+			request.loginSessionID = *value.SessionID
+		}
 	}
 	return request, nil
 }

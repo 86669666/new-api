@@ -22,19 +22,22 @@ var oauthCleanupDB atomic.Pointer[gorm.DB]
 // A sent request remains uncertain until its own response is durably observed.
 // No timer or worker lease can turn an unknown issuer operation into completion.
 type OAuthOperation struct {
-	OperationRef   string `gorm:"type:char(64);primaryKey"`
-	Issuer         string `gorm:"type:text;not null"`
-	UserID         int    `gorm:"not null;index:idx_oauth_operations_user"`
-	ClientID       string `gorm:"type:text;not null"`
-	OriginSID      string `gorm:"column:origin_sid;type:varchar(64);not null"`
-	GrantRef       string `gorm:"type:varchar(64);not null;index:idx_oauth_operations_grant"`
-	AuthVersion    int64  `gorm:"not null"`
-	SessionVersion int64  `gorm:"not null"`
-	GrantRevision  int64  `gorm:"not null"`
-	Kind           string `gorm:"type:varchar(32);not null"`
-	State          string `gorm:"type:varchar(16);not null"`
-	CreatedAt      int64  `gorm:"autoCreateTime:false;not null"`
-	ObservedAt     int64  `gorm:"not null"`
+	// Nullable for pre-attribution operations. Only a validated issuer response
+	// supplies this ID; an empty legacy value cannot authorize scoped cleanup.
+	HydraLoginSessionID string `gorm:"type:varchar(256)"`
+	OperationRef        string `gorm:"type:char(64);primaryKey"`
+	Issuer              string `gorm:"type:text;not null"`
+	UserID              int    `gorm:"not null;index:idx_oauth_operations_user"`
+	ClientID            string `gorm:"type:text;not null"`
+	OriginSID           string `gorm:"column:origin_sid;type:varchar(64);not null"`
+	GrantRef            string `gorm:"type:varchar(64);not null;index:idx_oauth_operations_grant"`
+	AuthVersion         int64  `gorm:"not null"`
+	SessionVersion      int64  `gorm:"not null"`
+	GrantRevision       int64  `gorm:"not null"`
+	Kind                string `gorm:"type:varchar(32);not null"`
+	State               string `gorm:"type:varchar(16);not null"`
+	CreatedAt           int64  `gorm:"autoCreateTime:false;not null"`
+	ObservedAt          int64  `gorm:"not null"`
 }
 
 // OAuthArtifact stores only domain-separated credential digests and trusted
@@ -272,7 +275,12 @@ func RevokeOAuthWithTx(tx *gorm.DB, userID int, scope, value, reason string, ses
 					return err
 				}
 			}
-			if _, ok := issuers[op.Issuer]; !ok {
+			if op.HydraLoginSessionID != "" {
+				target := OAuthCleanupTarget{LoginSID: op.HydraLoginSessionID}
+				if !slices.Contains(issuers[op.Issuer], target) {
+					issuers[op.Issuer] = append(issuers[op.Issuer], target)
+				}
+			} else if _, ok := issuers[op.Issuer]; !ok {
 				issuers[op.Issuer] = nil
 			}
 		}
@@ -280,6 +288,12 @@ func RevokeOAuthWithTx(tx *gorm.DB, userID int, scope, value, reason string, ses
 	for issuer, targets := range issuers {
 		// Keep a shared login session if any unaffected grant still uses it.
 		for i := range targets {
+			for _, op := range operations {
+				if op.Issuer == issuer && op.HydraLoginSessionID == targets[i].LoginSID && !match.matches(op.ClientID, op.OriginSID, "") && (scope == "sid" || scope == "others" || scope == "client") {
+					targets[i].LoginSID = ""
+					break
+				}
+			}
 			for _, grant := range grants {
 				if grant.Issuer == issuer && grant.HydraLoginSessionID == targets[i].LoginSID && grant.RevokedAt == 0 && grant.ExpiresAt > now && !match.matches(grant.ClientID, grant.OriginSID, grant.GrantRef) {
 					targets[i].LoginSID = ""
@@ -338,7 +352,7 @@ func ReserveOAuthOperation(ctx context.Context, op *OAuthOperation) error {
 			}
 			op.GrantRevision = grant.Revision
 		}
-		if err := CheckOAuthCleanupWithTx(tx, op.Issuer, op.UserID, op.ClientID, op.OriginSID, op.GrantRef, ""); err != nil {
+		if err := CheckOAuthCleanupWithTx(tx, op.Issuer, op.UserID, op.ClientID, op.OriginSID, op.GrantRef, op.HydraLoginSessionID); err != nil {
 			return err
 		}
 		var nonce [32]byte
@@ -367,7 +381,7 @@ func SendOAuthOperation(ctx context.Context, op *OAuthOperation) error {
 				return ErrOAuthGrantInvalid
 			}
 		}
-		if err := CheckOAuthCleanupWithTx(tx, op.Issuer, op.UserID, op.ClientID, op.OriginSID, op.GrantRef, ""); err != nil {
+		if err := CheckOAuthCleanupWithTx(tx, op.Issuer, op.UserID, op.ClientID, op.OriginSID, op.GrantRef, op.HydraLoginSessionID); err != nil {
 			return err
 		}
 		result := tx.Model(&OAuthOperation{}).Where("operation_ref = ? AND state = ?", op.OperationRef, "reserved").Update("state", "sent")
