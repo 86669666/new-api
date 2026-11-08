@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,8 @@ import (
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -166,6 +169,43 @@ func TestIncrementFailedAttemptsCountsConcurrentFailures(t *testing.T) {
 	assert.Equal(t, attempts, reloaded.FailedAttempts)
 }
 
+func TestTwoFALockoutDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var driver gorm.Dialector
+			if dialect == "mysql" {
+				dsn := os.Getenv("TEST_MYSQL_DSN")
+				if dsn == "" {
+					t.Skip("TEST_MYSQL_DSN not configured")
+				}
+				driver = mysql.Open(dsn)
+			} else {
+				dsn := os.Getenv("TEST_POSTGRES_DSN")
+				if dsn == "" {
+					t.Skip("TEST_POSTGRES_DSN not configured")
+				}
+				driver = postgres.Open(dsn)
+			}
+			db, err := gorm.Open(driver, &gorm.Config{})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			previousDB := DB
+			DB = db
+			t.Cleanup(func() {
+				DB = previousDB
+				require.NoError(t, db.Migrator().DropTable(&TwoFA{}, &User{}))
+				require.NoError(t, sqlDB.Close())
+			})
+			require.NoError(t, db.AutoMigrate(&User{}, &TwoFA{}))
+			var version string
+			require.NoError(t, db.Raw("SELECT version()").Scan(&version).Error)
+			t.Logf("database version: %s", version)
+			TestIncrementFailedAttemptsRestartsWindowAfterLockoutExpires(t)
+		})
+	}
+}
+
 func TestIncrementFailedAttemptsRestartsWindowAfterLockoutExpires(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
@@ -180,7 +220,10 @@ func TestIncrementFailedAttemptsRestartsWindowAfterLockoutExpires(t *testing.T) 
 		{name: "failure during active lockout", lockedUntil: time.Minute, failures: 1, wantAttempts: common.MaxFailAttempts, wantLocked: true, keepLockedUntil: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			truncateTables(t)
+			t.Cleanup(func() {
+				require.NoError(t, DB.Where("user_id IN (?)", DB.Model(&User{}).Select("id").Where("username = ?", "twofa-expiry-user")).Delete(&TwoFA{}).Error)
+				require.NoError(t, DB.Unscoped().Where("username = ?", "twofa-expiry-user").Delete(&User{}).Error)
+			})
 
 			user := User{Username: "twofa-expiry-user", Password: "password"}
 			require.NoError(t, DB.Create(&user).Error)
