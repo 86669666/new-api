@@ -289,7 +289,7 @@ func RunOAuthDatabaseBootstrap(args []string, out io.Writer) int {
 	target := fs.String("target", "", "new absolute SQLite file or new database name")
 	journal := fs.String("journal", "", "installer-root-owned absolute journal path")
 	if len(args) == 0 {
-		fmt.Fprintln(out, "db-bootstrap fresh|resume --engine ... --target ... --journal ...; admin credentials via BOOTSTRAP_ADMIN_DSN only")
+		fmt.Fprintln(out, "db-bootstrap fresh|resume|terminal-prepare|terminal-install --engine ... --target ... --journal ...; admin credentials via BOOTSTRAP_ADMIN_DSN only")
 		return 2
 	}
 	mode := args[0]
@@ -297,7 +297,7 @@ func RunOAuthDatabaseBootstrap(args []string, out io.Writer) int {
 		fs.PrintDefaults()
 		return 0
 	}
-	if mode != "fresh" && mode != "resume" {
+	if mode != "fresh" && mode != "resume" && mode != "terminal-prepare" && mode != "terminal-install" {
 		return 2
 	}
 	if fs.Parse(args[1:]) != nil || fs.NArg() != 0 {

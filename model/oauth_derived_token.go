@@ -455,7 +455,15 @@ func oauthTokenSource(tx *gorm.DB, token *Token, locked bool) (*OAuthDerivedToke
 		return nil, ErrOAuthDerivedTokenUnknown
 	}
 	if locked {
-		if err := lockForUpdate(tx).Where("grant_ref = ?", source.GrantRef).First(source).Error; err != nil {
+		installed, err := lockOAuthTerminalSource(tx, token.UserId, source.GrantRef)
+		if err != nil {
+			return nil, err
+		}
+		sourceQuery := tx
+		if !installed {
+			sourceQuery = lockForUpdate(tx)
+		}
+		if err := sourceQuery.Where("grant_ref = ?", source.GrantRef).First(source).Error; err != nil {
 			return nil, ErrOAuthDerivedTokenUnknown
 		}
 		if err := lockForUpdate(tx.Unscoped()).Where("user_id = ?", token.UserId).First(token, token.Id).Error; err != nil {
@@ -613,6 +621,9 @@ func oauthOwnerToken(tx *gorm.DB, userID, tokenID int) (*Token, *OAuthDerivedTok
 // terminalOAuthToken preserves the successful issuance tuple and monetary
 // fields. Deletion is a stronger tombstone; other terminal reasons never reopen.
 func terminalOAuthToken(tx *gorm.DB, source *OAuthDerivedTokenSource, reason string, now int64) error {
+	if installed, err := applyOAuthTerminal(tx, source, reason); installed || err != nil {
+		return err
+	}
 	if source.TerminalAt != nil && reason != "deleted" {
 		return nil
 	}
@@ -661,8 +672,16 @@ func revokeOAuthDerivedTokens(tx *gorm.DB, userID int, grants []OAuthGrant, matc
 			}
 		}
 	}
+	installed, err := oauthTerminalInstalled(tx)
+	if err != nil {
+		return err
+	}
+	sourceQuery := tx
+	if !installed {
+		sourceQuery = lockForUpdate(tx)
+	}
 	var sources []OAuthDerivedTokenSource
-	if err := lockForUpdate(tx).Where("user_id = ?", userID).Order("grant_ref").Find(&sources).Error; err != nil {
+	if err := sourceQuery.Where("user_id = ?", userID).Order("grant_ref").Find(&sources).Error; err != nil {
 		return ErrOAuthDerivedTokenUnknown
 	}
 	byRef := make(map[string]*OAuthGrant, len(grants))
@@ -671,6 +690,14 @@ func revokeOAuthDerivedTokens(tx *gorm.DB, userID int, grants []OAuthGrant, matc
 	}
 	for i := range sources {
 		source := &sources[i]
+		if installed {
+			if _, err := lockOAuthTerminalSource(tx, userID, source.GrantRef); err != nil {
+				return err
+			}
+			if tx.Where("grant_ref = ? AND user_id = ?", source.GrantRef, userID).First(source).Error != nil {
+				return ErrOAuthDerivedTokenUnknown
+			}
+		}
 		grant := byRef[source.GrantRef]
 		if grant == nil {
 			return ErrOAuthDerivedTokenUnknown

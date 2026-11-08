@@ -70,33 +70,92 @@ func InitOAuthGrantStore(enabled bool) error {
 	if err := DB.Select(stmt.Schema.DBNames).Limit(1).Find(&[]OAuthGrant{}).Error; err != nil {
 		return err
 	}
-	indexes, err := DB.Migrator().GetIndexes(&OAuthGrant{})
-	if err != nil {
-		return err
-	}
-	columns, err := DB.Migrator().ColumnTypes(&OAuthGrant{})
-	if err != nil {
-		return err
-	}
-	var primaryColumns []string
-	for _, column := range columns {
-		if primary, _ := column.PrimaryKey(); primary {
-			primaryColumns = append(primaryColumns, column.Name())
+	var grantUnique, consentUnique bool
+	if DB.Dialector.Name() == "postgres" {
+		var err error
+		grantUnique, err = oauthPostgresKey(DB, &OAuthGrant{}, []string{"grant_ref"}, false)
+		if err != nil {
+			return err
 		}
-	}
-	grantUnique, consentUnique := slices.Equal(primaryColumns, []string{"grant_ref"}), false
-	for _, index := range indexes {
-		unique, _ := index.Unique()
-		primary, _ := index.PrimaryKey()
-		if unique || primary {
-			grantUnique = grantUnique || slices.Equal(index.Columns(), []string{"grant_ref"})
-			consentUnique = consentUnique || slices.Equal(index.Columns(), []string{"consent_ref"})
+		consentUnique, err = oauthPostgresKey(DB, &OAuthGrant{}, []string{"consent_ref"}, false)
+		if err != nil {
+			return err
+		}
+	} else {
+		indexes, err := DB.Migrator().GetIndexes(&OAuthGrant{})
+		if err != nil {
+			return err
+		}
+		columns, err := DB.Migrator().ColumnTypes(&OAuthGrant{})
+		if err != nil {
+			return err
+		}
+		var primaryColumns []string
+		for _, column := range columns {
+			if primary, _ := column.PrimaryKey(); primary {
+				primaryColumns = append(primaryColumns, column.Name())
+			}
+		}
+		grantUnique, consentUnique = slices.Equal(primaryColumns, []string{"grant_ref"}), false
+		for _, index := range indexes {
+			unique, _ := index.Unique()
+			primary, _ := index.PrimaryKey()
+			if unique || primary {
+				grantUnique = grantUnique || slices.Equal(index.Columns(), []string{"grant_ref"})
+				consentUnique = consentUnique || slices.Equal(index.Columns(), []string{"consent_ref"})
+			}
 		}
 	}
 	if !grantUnique || !consentUnique {
 		return errors.New("OAuth grant uniqueness unavailable")
 	}
 	return InitOAuthCleanupStore(true)
+}
+
+// oauthPostgresKey verifies the actual relation selected by GORM without the
+// owner-only information_schema constraint views. The catalog fields and
+// ordinality are available in PostgreSQL 9.6. INCLUDE columns are not mistaken
+// for unique key columns on later versions.
+func oauthPostgresKey(db *gorm.DB, value any, columns []string, primary bool) (bool, error) {
+	statement := &gorm.Statement{DB: db}
+	if err := statement.Parse(value); err != nil {
+		return false, err
+	}
+	var keys []struct {
+		IndexID    int64
+		ColumnName string
+		Position   int
+	}
+	err := db.Raw(`SELECT i.indexrelid::bigint AS index_id,a.attname AS column_name,k.position
+ FROM pg_catalog.pg_index i
+ JOIN pg_catalog.pg_class r ON r.oid=i.indrelid
+ JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
+ JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid AND c.relnamespace=n.oid
+ CROSS JOIN LATERAL pg_catalog.unnest(i.indkey::smallint[]) WITH ORDINALITY AS k(attnum,position)
+ JOIN pg_catalog.pg_attribute a ON a.attrelid=r.oid AND a.attnum=k.attnum AND NOT a.attisdropped
+ WHERE r.oid=pg_catalog.to_regclass(?) AND r.relkind='r'
+ AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive AND i.indimmediate
+ AND (NOT ? OR i.indisprimary) AND i.indpred IS NULL AND i.indexprs IS NULL
+ AND i.indnatts=? AND pg_catalog.array_length(i.indclass::oid[],1)=?
+ ORDER BY i.indexrelid,k.position`, statement.Quote(statement.Table), primary, len(columns), len(columns)).Scan(&keys).Error
+	if err != nil {
+		return false, err
+	}
+	var current int64
+	var found []string
+	for _, key := range keys {
+		if key.IndexID != current {
+			if len(found) > 0 && slices.Equal(found, columns) {
+				return true, nil
+			}
+			current, found = key.IndexID, nil
+		}
+		if key.Position != len(found)+1 {
+			return false, errors.New("OAuth key metadata unavailable")
+		}
+		found = append(found, key.ColumnName)
+	}
+	return len(found) > 0 && slices.Equal(found, columns), nil
 }
 
 // CreateOAuthGrantWithTx joins preview consumption and the issuer attempt claim.

@@ -101,15 +101,23 @@ func InitOAuthCleanupStore(enabled bool) error {
 		if err := DB.Model(value).Select(statement.Schema.DBNames).Limit(1).Find(value).Error; err != nil {
 			return err
 		}
-		columns, err := DB.Migrator().ColumnTypes(value)
-		if err != nil {
-			return err
-		}
 		primary := false
-		for _, column := range columns {
-			yes, _ := column.PrimaryKey()
-			if yes && column.Name() == statement.Schema.PrioritizedPrimaryField.DBName {
-				primary = true
+		if DB.Dialector.Name() == "postgres" {
+			var err error
+			primary, err = oauthPostgresKey(DB, value, []string{statement.Schema.PrioritizedPrimaryField.DBName}, true)
+			if err != nil {
+				return err
+			}
+		} else {
+			columns, err := DB.Migrator().ColumnTypes(value)
+			if err != nil {
+				return err
+			}
+			for _, column := range columns {
+				yes, _ := column.PrimaryKey()
+				if yes && column.Name() == statement.Schema.PrioritizedPrimaryField.DBName {
+					primary = true
+				}
 			}
 		}
 		if !primary {

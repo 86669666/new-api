@@ -1978,8 +1978,15 @@ func TestOAuthDerivedTokenOwnerLifecycle(t *testing.T) {
 		other, otherSource, otherToken := ownerDerivedFixture(t, db, 1, "other", false)
 		unusedGrant, unused, _ := ownerDerivedFixture(t, db, 1, "unused", true)
 		for _, table := range []string{"oauth_derived_token_sources", "tokens", "o_auth_cleanup_jobs"} {
+			sourceWriteObserved := false
 			require.NoError(t, db.Callback().Update().After("gorm:update").Register("owner:rollback", func(tx *gorm.DB) {
 				if tx.Statement.Table == table {
+					if table == "oauth_derived_token_sources" && tx.Error == nil {
+						var written model.OAuthDerivedTokenSource
+						require.NoError(t, tx.Session(&gorm.Session{NewDB: true}).First(&written, "grant_ref = ?", source.GrantRef).Error)
+						require.NotNil(t, written.TerminalAt)
+						sourceWriteObserved = true
+					}
 					tx.AddError(errors.New("forced rollback"))
 				}
 			}))
@@ -1988,7 +1995,24 @@ func TestOAuthDerivedTokenOwnerLifecycle(t *testing.T) {
 					tx.AddError(errors.New("forced rollback"))
 				}
 			}))
+			if table == "oauth_derived_token_sources" {
+				require.NoError(t, db.Callback().Raw().After("gorm:raw").Register("owner:terminal-rollback", func(tx *gorm.DB) {
+					query := tx.Statement.SQL.String()
+					if tx.Error != nil || (!strings.Contains(query, "newapi_terminal.apply_v1(") && !strings.Contains(query, "nat_apply_v1(")) {
+						return
+					}
+					var written model.OAuthDerivedTokenSource
+					require.NoError(t, tx.Session(&gorm.Session{NewDB: true}).First(&written, "grant_ref = ?", source.GrantRef).Error)
+					require.NotNil(t, written.TerminalAt, "fault must follow the actual SQL write")
+					sourceWriteObserved = true
+					tx.AddError(errors.New("failure after protected terminal SQL"))
+				}))
+			}
 			require.Error(t, model.RevokeOAuth(context.Background(), 1, "grant", grant.GrantRef))
+			if table == "oauth_derived_token_sources" {
+				require.NoError(t, db.Callback().Raw().Remove("owner:terminal-rollback"))
+				require.True(t, sourceWriteObserved, "source write must occur before the outer rollback")
+			}
 			require.NoError(t, db.Callback().Update().Remove("owner:rollback"))
 			require.NoError(t, db.Callback().Create().Remove("owner:rollback"))
 			require.NoError(t, db.First(grant, "grant_ref = ?", grant.GrantRef).Error)

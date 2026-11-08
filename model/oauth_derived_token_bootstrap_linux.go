@@ -196,6 +196,9 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 			return errOAuthBootstrap
 		}
 	}
+	if (mode == "terminal-install" || mode == "terminal-prepare") && (j.Phase != "READY" || engine == "sqlite") {
+		return errOAuthBootstrap
+	}
 	var db *gorm.DB
 	var maintenance *sql.DB
 	var session *sql.Conn
@@ -334,7 +337,22 @@ func oauthBootstrap(ctx context.Context, mode, engine, target, journal string, o
 		return errOAuthBootstrap
 	}
 	if j.Phase == "READY" {
-		return validateOAuthBirth(db, j, true)
+		if err := validateOAuthBirth(db, j, true); err != nil {
+			return err
+		}
+		if mode == "terminal-install" || mode == "terminal-prepare" {
+			if err := validateOAuthDerivedTokenSchema(db); err != nil {
+				return err
+			}
+			if err := prepareOAuthTerminalStores(db, out); err != nil {
+				return err
+			}
+			if mode == "terminal-prepare" {
+				return nil
+			}
+			return installOAuthTerminal(db, j)
+		}
+		return nil
 	}
 	if j.Phase != "CREATED_BOUND" && j.Phase != "MIGRATING" && j.Phase != "SEAL_PENDING" {
 		return errOAuthBootstrap

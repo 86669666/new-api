@@ -54,9 +54,12 @@ LIFECYCLE_CASES = ('owner_reveal_and_mutation', 'revoke_and_rollback', 'disable_
                    'unknown_is_not_manual', 'same_user_creation_limit', 'registration_default_token',
                    'historical_finalize_after_revoke', 'real_redis', 'create_revoke_order')
 LIFECYCLE_TIERS = tuple('lifecycle-'+e for e in WALLET_ENGINES)
+TERMINAL_TIERS = ('terminal-mysql', 'terminal-postgres')
+TERMINAL_SELECTOR = '^TestOAuthDerivedTerminalOperations$'
+TERMINAL_CASES = ('absent_capability', 'rollback_and_revoke', 'owner_terminal', 'permissions')
 
 
-JOINT_CASES = ('nonempty_source_restricted_rollback', 'deny_wrong_type', 'outbox_rollback', 'late_active_fill', 'credential_rollback')
+JOINT_CASES = ('nonempty_source_restricted_rollback', 'nonempty_source_terminal_operation', 'deny_wrong_type', 'outbox_rollback', 'late_active_fill', 'credential_rollback')
 
 
 def digest(path):
@@ -78,6 +81,10 @@ def prepare(args):
         raise ValueError('trusted provenance test runner requires Linux')
     if args.tier == 'all' and (args.package or args.run != '.'):
         raise ValueError('bounded selectors require an explicit resource --tier')
+    if args.tier in TERMINAL_TIERS:
+        if args.package not in (None, ['./router']) or args.run not in ('.', TERMINAL_SELECTOR):
+            raise ValueError('terminal tier requires exact ordinary-role inventory')
+        args.package, args.run = ['./router'], TERMINAL_SELECTOR
     if args.tier in LIFECYCLE_TIERS:
         if args.package not in (None, ['./controller']) or args.run not in ('.', LIFECYCLE_SELECTOR):
             raise ValueError('lifecycle tier requires the exact controller lifecycle inventory')
@@ -179,7 +186,7 @@ def resource_partitions(entries, inventory):
     lifecycle_name = LIFECYCLE_SELECTOR[1:-1]
     if lifecycle_name not in inventory[controller['binary']]:
         raise ValueError('required lifecycle inventory missing')
-    required = {'postgres': PG_SELECTOR[1:-1], 'postgres-redis': JOINT_SELECTOR[1:-1]}
+    required = {'postgres': PG_SELECTOR[1:-1], 'postgres-redis': JOINT_SELECTOR[1:-1], **{tier:TERMINAL_SELECTOR[1:-1] for tier in TERMINAL_TIERS}}
     if (not set(required.values()).issubset(inventory[router['binary']]) or
             not set(WALLET_TESTS).issubset(inventory[service['binary']])):
         raise ValueError('required compiled test missing')
@@ -198,14 +205,14 @@ def resource_partitions(entries, inventory):
         assigned.extend((entry['binary'], n, '') for n in ordinary)
     for tier, name in required.items():
         partitions[tier] = [dict(router, run='^'+name+'$')]
-        assigned.append((router['binary'], name, ''))
+        assigned.append((router['binary'], name, tier.removeprefix('terminal-') if tier in TERMINAL_TIERS else ''))
     for engine in WALLET_ENGINES:
         partitions['wallet-'+engine] = [dict(service, run=wallet_selector(engine))]
         assigned.extend((service['binary'], name, engine) for name in WALLET_TESTS)
         partitions['lifecycle-'+engine] = [dict(controller, run=LIFECYCLE_SELECTOR)]
         assigned.append((controller['binary'], lifecycle_name, engine))
     expected = {(b, n, engine) for b, names in inventory.items() for n in names
-                for engine in (WALLET_ENGINES if (b == service['binary'] and n in WALLET_TESTS or b == controller['binary'] and n == lifecycle_name) else ('',))}
+                for engine in (('mysql','postgres') if b == router['binary'] and n == TERMINAL_SELECTOR[1:-1] else WALLET_ENGINES if (b == service['binary'] and n in WALLET_TESTS or b == controller['binary'] and n == lifecycle_name) else ('',))}
     if len(assigned) != len(set(assigned)) or set(assigned) != expected:
         raise ValueError('resource partitions overlap or omit tests')
     return partitions
@@ -236,6 +243,8 @@ def verified_manifest(bundle):
 
 
 def required_leaves(tier):
+    if tier in TERMINAL_TIERS:
+        return ["TestOAuthDerivedTerminalOperations/"+case for case in TERMINAL_CASES]
     if tier in LIFECYCLE_TIERS:
         return ['TestOAuthDerivedTokenOwnerLifecycle/'+case for case in LIFECYCLE_CASES]
     if tier in METADATA_TIERS:
@@ -279,7 +288,7 @@ def validate_tier_receipt(metadata, manifest_hash, output, exit_code):
 
 def dispatch_tier(bundle, tier):
     metadata = verified_manifest(bundle)
-    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
+    if tier not in ('sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *TERMINAL_TIERS, *('wallet-'+e for e in WALLET_ENGINES)) or metadata['tier'] != tier:
         raise ValueError('dispatch tier mismatch')
     if tier == 'admission':
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
@@ -288,7 +297,7 @@ def dispatch_tier(bundle, tier):
             raise RuntimeError('admission bundle exceeds private tmpfs safety budget')
         command(['sudo', '-n', 'unshare', '--mount', '--net', '--pid', '--fork', 'sh', '-c', 'mount --make-rprivate / && mount -t tmpfs -o size=1G,mode=0755,nosuid,nodev tmpfs /run && mount -t proc proc /proc && exec "$@"', 'admission-tests', sys.executable, str(bundle/'runner.py'), '_admission_run', str(bundle)])
         return
-    if tier.startswith('wallet-') or tier in METADATA_TIERS or tier in LIFECYCLE_TIERS:
+    if tier.startswith('wallet-') or tier in METADATA_TIERS or tier in LIFECYCLE_TIERS or tier in TERMINAL_TIERS:
         available=int(re.search(r'^MemAvailable:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)[1])*1024
         size=sum((bundle/name).stat().st_size for name in metadata['files'])
         if size*2+1024**3 >= 4*1024**3 or available < size*2+1024**3+3*1024**3:
@@ -448,7 +457,7 @@ def client(sock, action="fresh"):
             conn.settimeout(120)
             phase = 'connect'
             conn.connect(sock)
-            if action not in ('fresh', 'redis') and not re.fullmatch(r'(pg|s1-seed):[0-9a-f]{32}', action):
+            if action not in ('fresh', 'redis') and not re.fullmatch(r'(pg|s1-seed|s1-terminal):[0-9a-f]{32}', action):
                 raise ValueError('unsupported installer request')
             phase = 'peer_check'
             _, peer_uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
@@ -524,6 +533,27 @@ class Installer:
         rows = '\n'.join(self.pg_resource.sql(database, 'SELECT row_to_json(t)::text FROM '+table+' t ORDER BY id;')
                          for table in ('oauth_derived_token_history', 'oauth_derived_token_bootstrap_identity'))
         return hashlib.sha256(rows.encode()).hexdigest()
+
+    def install_s1_terminal(self, ident, peer):
+        record = self.seed_births[ident]
+        if not record['used'] or time.monotonic() >= record['deadline'] or peer != record['peer']:
+            raise ValueError('S1 terminal caller unavailable')
+        receipt = self.pg_resource.qualify(ident)
+        journal = Path(receipt['journal'])
+        before = digest(journal), self.s1_provenance(receipt['database'])
+        admin = 'postgresql://bootstrap:'+self.pg_resource.password+'@/postgres?host='+str(self.pg_resource.socket_dir)+'&sslmode=disable'
+        for _ in range(2):
+            q = subprocess.run([str(self.root/'bundle/new-api'),'db-bootstrap','terminal-install','--engine','postgres',
+                                '--target',receipt['database'],'--journal',str(journal)],
+                               env={'PATH':'/usr/bin:/bin','GOMAXPROCS':'2','BOOTSTRAP_ADMIN_DSN':admin,
+                                    'BOOTSTRAP_TERMINAL_ROLE':receipt['role']},
+                               stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=120)
+            self.receipts.append({'operation':'terminal-install','exit':q.returncode,'output_sha256':hashlib.sha256(q.stdout+q.stderr).hexdigest()})
+            if q.returncode:
+                raise ValueError('permanent terminal installation refused')
+        if before != (digest(journal),self.s1_provenance(receipt['database'])):
+            raise ValueError('terminal installation changed birth provenance')
+        return {'installed':True,'repeated':True,'birth_unchanged':True}
 
     def seed_s1(self, ident, peer):
         record = self.seed_births[ident]
@@ -623,6 +653,12 @@ class Installer:
                             self.redis_resource.verify()
                             phase = 'reply_write'
                             conn.sendall(json.dumps(self.redis_resource.receipt).encode())
+                            outcome = 'success'
+                            continue
+                        if re.fullmatch(rb's1-terminal:[0-9a-f]{32}\n', request) and self.pg_resource is not None:
+                            peer = self.s1_peer(pid)
+                            reply = self.install_s1_terminal(request[12:-1].decode(),peer)
+                            conn.sendall(json.dumps(reply).encode())
                             outcome = 'success'
                             continue
                         if re.fullmatch(rb's1-seed:[0-9a-f]{32}\n', request) and self.pg_resource is not None:
@@ -1298,7 +1334,7 @@ class CombinedPostgres(OwnedPostgres):
 def postgres_container(bundle, tier='postgres'):
     # Host controller alone operates Docker. No socket, host mount, privileged
     # flag, SYS_ADMIN, sudo/ip or nested namespace tools enter the container.
-    image_id = LIFECYCLE_MYSQL_IMAGE if tier == 'lifecycle-mysql' else MYSQL_IMAGE if tier in ('wallet-mysql', 'metadata-mysql') else PG_IMAGE if tier in ('postgres', 'wallet-postgres', 'metadata-postgres') else JOINT_IMAGE
+    image_id = LIFECYCLE_MYSQL_IMAGE if tier in ('lifecycle-mysql','terminal-mysql') else MYSQL_IMAGE if tier in ('wallet-mysql', 'metadata-mysql') else PG_IMAGE if tier in ('postgres', 'wallet-postgres', 'metadata-postgres') else JOINT_IMAGE
     nonce = secrets.token_hex(12)
     image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', image_id]))[0]
     if image['Id'] != image_id:
@@ -1309,7 +1345,7 @@ def postgres_container(bundle, tier='postgres'):
             '--cap-drop=ALL', '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER',
             '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL', *(['--cap-add=SYS_PTRACE'] if tier == 'postgres' else []),
             '--tmpfs', '/run:rw,exec,nosuid,nodev,size=4g,mode=0755',
-            '--tmpfs', ('/var/lib/mysql' if tier in ('wallet-mysql', 'metadata-mysql', 'lifecycle-mysql') else '/var/lib/postgresql/data')+':rw,noexec,nosuid,nodev,size=1m,mode=0700',
+            '--tmpfs', ('/var/lib/mysql' if tier in ('wallet-mysql', 'metadata-mysql', 'lifecycle-mysql', 'terminal-mysql') else '/var/lib/postgresql/data')+':rw,noexec,nosuid,nodev,size=1m,mode=0700',
             '--entrypoint', '/bin/sh', image_id, '-c', 'exec sleep 600']
     cid = subprocess.check_output(argv, text=True).strip()
     try:
@@ -1331,7 +1367,7 @@ def postgres_container(bundle, tier='postgres'):
         # Detached execution keeps the authoritative result inside the owned
         # container; a Docker attach EOF cannot be mistaken for test completion.
         command(['docker','exec','-d',cid,'/bin/sh','-c',
-                 'python3 /run/input/runner.py '+('_wallet_run' if tier.startswith('wallet-') or tier in METADATA_TIERS or tier in LIFECYCLE_TIERS else '_run')+' /run/input '+tier+' > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
+                 'python3 /run/input/runner.py '+('_wallet_run' if tier.startswith('wallet-') or tier in METADATA_TIERS or tier in LIFECYCLE_TIERS or tier in TERMINAL_TIERS else '_run')+' /run/input '+tier+' > /run/result.log 2>&1; printf "%s\\n" "$?" > /run/result.exit'])
         deadline = time.monotonic() + 300
         while True:
             receipt = subprocess.run(['docker','exec',cid,'cat','/run/result.exit'], capture_output=True, text=True)
@@ -2204,6 +2240,17 @@ class OwnedWalletMySQL:
         self.commands.append({'operation':'installer SQL', 'exit':q.returncode,
                               'error_sha256':hashlib.sha256(q.stderr).hexdigest()})
         if q.returncode:
+            # Only numeric server code/SQLSTATE and a fixed operation category.
+            # Never emit the SQL text, values, credentials or original error.
+            diagnostic = re.search(rb'ERROR ([0-9]{1,5}) \(([A-Z0-9]{5})\)', q.stderr)
+            category = statement.split(None,1)[0].upper()
+            if category not in ('GRANT','SELECT','CREATE','ALTER','INSERT','UPDATE','DELETE'):
+                category = 'OTHER'
+            failure = {'mysql_installer_failure': True, 'operation_class': category,
+                       'server_code': int(diagnostic[1]) if diagnostic else None,
+                       'sqlstate': diagnostic[2].decode() if diagnostic else None}
+            self.commands.append(failure)
+            print(json.dumps(failure),flush=True)
             raise RuntimeError('MySQL installer SQL failed')
         return q.stdout.decode().strip()
 
@@ -2355,7 +2402,7 @@ class WalletInstaller:
             acl_query = "SELECT relacl::text FROM pg_class WHERE oid='public.oauth_derived_token_history'::regclass;"
             before_acl = self.resource.sql(database,acl_query) if self.engine=='postgres' and label=='grant' else None
             result=subprocess.run(argv,input=statement.encode(),env=env,preexec_fn=lambda:demote(self.uid),capture_output=True,timeout=10)
-            expected=label.startswith('select_')
+            expected=label.startswith('select_') and not (isinstance(self, TerminalInstaller) and label=='select_source_state')
             print(json.dumps({'wallet_owner_permission':label,'engine':self.engine,'exit':result.returncode,
                 'expected_success':expected,'stderr_sha256':hashlib.sha256(result.stderr).hexdigest()}),flush=True)
             if before_acl is not None:
@@ -2392,6 +2439,25 @@ class WalletInstaller:
         if j['phase'] != 'READY' or j['engine'] != self.engine or j['target'] != database:
             raise RuntimeError('wallet birth identity mismatch')
         provenance = self.snapshot(database)
+        if isinstance(self,TerminalInstaller):
+            # Optional auth stores are installer-owned prerequisites. Never
+            # hand DDL permissions to the ordinary terminal service.
+            for attempt in range(2):
+                prepared = subprocess.run([str(self.root/'bundle/new-api'),'db-bootstrap','terminal-prepare',
+                    '--engine',self.engine,'--target',database,'--journal',str(journal)],
+                    env=env,capture_output=True,timeout=120)
+                facts = []
+                for line in prepared.stdout.splitlines():
+                    try: item=json.loads(line)
+                    except (ValueError,UnicodeError): continue
+                    if isinstance(item,dict) and set(item)=={'terminal_prerequisites_before'}:
+                        values=item['terminal_prerequisites_before']
+                        if isinstance(values,dict) and set(values)=={'oauth_grants','o_auth_operations','o_auth_artifacts','o_auth_cleanup_jobs'} and all(type(v) is bool for v in values.values()):
+                            facts.append(values)
+                print(json.dumps({'terminal_prepare':self.engine,'attempt':attempt,'exit':prepared.returncode,
+                    'facts':facts,'output_sha256':hashlib.sha256(prepared.stdout+prepared.stderr).hexdigest()}),flush=True)
+                if prepared.returncode or len(facts)!=1 or self.snapshot(database)!=provenance or json.loads(journal.read_text())!=j:
+                    raise RuntimeError('permanent terminal prerequisite preparation failed')
         file_identity = None
         if self.engine == 'sqlite':
             os.chown(database,self.uid,self.uid);os.chmod(database,0o600)
@@ -2399,14 +2465,15 @@ class WalletInstaller:
             st = Path(database).stat();file_identity=(st.st_dev,st.st_ino,st.st_uid)
             dsn, endpoint, role = database, database, 'file-owner'
         elif self.engine == 'postgres':
-            self.resource.sql(database, f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}'; REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE,CREATE ON SCHEMA public TO {role};")
+            self.resource.sql(database, f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}'; REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT {'USAGE' if isinstance(self,TerminalInstaller) else 'USAGE,CREATE'} ON SCHEMA public TO {role};")
             existing = set(self.resource.sql(database,"SELECT tablename FROM pg_tables WHERE schemaname='public';").splitlines())
             for table in self.mutable_tables:
-                if table in existing:self.resource.sql(database,f'ALTER TABLE public.{table} OWNER TO {role};')
+                if table in existing:
+                    self.resource.sql(database,f'GRANT SELECT,INSERT,UPDATE,DELETE ON public.{table} TO {role};' if isinstance(self,TerminalInstaller) else f'ALTER TABLE public.{table} OWNER TO {role};')
             for table in WALLET_IMMUTABLE:
                 self.resource.sql(database,f'GRANT SELECT ON public.{table} TO {role};')
             self.resource.sql(database,f'GRANT {self.source_access} ON public.oauth_derived_token_sources TO {role};')
-            if not isinstance(self,LifecycleInstaller):
+            if not isinstance(self,LifecycleInstaller) or isinstance(self,TerminalInstaller):
                 self.resource.sql(database,f'GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO {role};')
             self.resource.sql('postgres',f'REVOKE ALL ON DATABASE {database} FROM PUBLIC; GRANT CONNECT ON DATABASE {database} TO {role}; ALTER DATABASE {database} CONNECTION LIMIT 20;')
             endpoint = str(self.resource.socket_path)
@@ -2414,14 +2481,14 @@ class WalletInstaller:
         else:
             self.resource.sql(database,f"CREATE USER '{role}'@'localhost' IDENTIFIED BY '{password}';")
             for table in self.mutable_tables:
-                self.resource.sql(database,f"GRANT SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,DROP,INDEX,REFERENCES ON {database}.{table} TO '{role}'@'localhost';")
+                self.resource.sql(database,f"GRANT {'SELECT,INSERT,UPDATE,DELETE' if isinstance(self,TerminalInstaller) else 'SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,DROP,INDEX,REFERENCES'} ON {database}.{table} TO '{role}'@'localhost';")
             for table in WALLET_IMMUTABLE:
                 self.resource.sql(database,f"GRANT SELECT ON {database}.{table} TO '{role}'@'localhost';")
             self.resource.sql(database,f"GRANT {self.source_access} ON {database}.oauth_derived_token_sources TO '{role}'@'localhost';")
             endpoint = str(self.resource.socket_path)
             dsn = role+':'+password+'@unix('+endpoint+')/'+database+'?parseTime=true&loc=Local'
         if not self.births:self.audit_owner_permissions(database,role,password)
-        receipt = {'ID':ident,'RoleClass':'TRUSTED_DB_TEST_OWNER','Engine':self.engine,'Database':database,
+        receipt = {'ID':ident,'RoleClass':'TERMINAL_SERVICE' if isinstance(self,TerminalInstaller) else 'TRUSTED_DB_TEST_OWNER','Engine':self.engine,'Database':database,
             'DBUser':role,'Endpoint':endpoint,'OwnerUID':self.uid,'Journal':str(journal),
             'JournalSHA256':digest(journal),'ProvenanceSHA256':provenance,
             'DSNSHA256':hashlib.sha256(dsn.encode()).hexdigest(),'BinarySHA256':self.metadata['files'][self.metadata['entries'][0]['binary']],
@@ -2553,8 +2620,136 @@ class LifecycleInstaller(WalletInstaller):
         return {'fixture_action':action,'applied':True}
 
 
+class TerminalInstaller(LifecycleInstaller):
+    # The service gets DML only on the existing auth consumers, no ownership,
+    # DDL or financial permissions. The fixed root fixture remains synthetic.
+    mutable_tables = ('users','tokens','user_sessions','session_revocation_events',
+                      'user_access_tokens','oauth_grants','o_auth_operations',
+                      'o_auth_artifacts','o_auth_cleanup_jobs')
+    source_access = 'SELECT'
+
+    def fixture_action(self, request):
+        gap=re.fullmatch(rb'terminal_gap:([0-9a-f]{32})\n',request)
+        if gap:
+            if self.engine!='mysql':raise ValueError('terminal interruption engine denied')
+            ident=gap[1].decode();receipt=self.qualify(ident)
+            used=getattr(self,'terminal_gaps',set());self.terminal_gaps=used
+            if ident in used:raise ValueError('terminal interruption replay denied')
+            database=receipt['Database'];journal=json.loads(Path(receipt['Journal']).read_text())
+            expected='nat_'+hashlib.sha256(journal['binding'].encode()).hexdigest()[:24]
+            if self.resource.sql(database,"SELECT COUNT(*) FROM oauth_grants WHERE issuer='https://terminal-fixture.invalid/' AND client_id IN ('terminal-primary','terminal-other');")!='2':raise ValueError('terminal interruption fixture denied')
+            if self.resource.sql(database,"SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE() AND ROUTINE_NAME='nat_attest_v1' AND SECURITY_TYPE='DEFINER' AND DEFINER='"+expected+"@localhost';")!='1':raise ValueError('terminal interruption object denied')
+            used.add(ident)
+            self.resource.sql(database,'DROP FUNCTION nat_attest_v1;')
+            self.qualify(ident)
+            return {'removed_fixed_attestor':True}
+        keymatch=re.fullmatch(rb'keys:([0-9a-f]{32}):(missing|reverse|partial|expression|invalid|cleanup|restore)\n',request)
+        if keymatch:
+            if self.engine!='postgres':raise ValueError('key fixture engine denied')
+            ident,kind=keymatch[1].decode(),keymatch[2].decode()
+            receipt=self.qualify(ident);database=receipt['Database']
+            states=getattr(self,'key_states',{});self.key_states=states
+            state=states.setdefault(ident,{'active':None,'used':set()})
+            if kind=='restore':
+                previous=state['active']
+                if previous is None:raise ValueError('key fixture restore denied')
+                if previous=='cleanup':
+                    self.resource.sql(database,'ALTER TABLE public.o_auth_operations ADD PRIMARY KEY(operation_ref);')
+                else:
+                    self.resource.sql(database,'DROP INDEX IF EXISTS public.idx_oauth_grants_consent;')
+                    if previous=='invalid':
+                        for grant,consent in state['bindings']:
+                            self.resource.sql(database,"UPDATE public.oauth_grants SET consent_ref='"+consent+"' WHERE grant_ref='"+grant+"';")
+                    self.resource.sql(database,'CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(consent_ref);')
+                state['active']=None
+            else:
+                if state['active'] is not None or kind in state['used']:raise ValueError('key fixture replay denied')
+                bindings=self.resource.sql(database,"SELECT grant_ref,consent_ref FROM public.oauth_grants WHERE issuer='https://terminal-fixture.invalid/' AND client_id IN ('terminal-primary','terminal-other') ORDER BY grant_ref;")
+                bindings=[row.split('|') for row in bindings.splitlines()]
+                if len(bindings)!=2 or any(len(row)!=2 or any(not re.fullmatch(r'[0-9a-f]{64}',v) for v in row) for row in bindings):raise ValueError('key fixture binding denied')
+                if self.resource.sql(database,'SELECT COUNT(*) FROM public.oauth_grants;')!='2':raise ValueError('key fixture scope denied')
+                state['bindings']=bindings;state['active']=kind;state['used'].add(kind)
+                if kind=='cleanup':
+                    self.resource.sql(database,'ALTER TABLE public.o_auth_operations DROP CONSTRAINT o_auth_operations_pkey;')
+                else:
+                    self.resource.sql(database,'DROP INDEX public.idx_oauth_grants_consent;')
+                    statements={'reverse':'CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(grant_ref,consent_ref);',
+                                'partial':"CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(consent_ref) WHERE state='active';",
+                                'expression':'CREATE UNIQUE INDEX idx_oauth_grants_consent ON public.oauth_grants(lower(consent_ref));'}
+                    if kind in statements:self.resource.sql(database,statements[kind])
+                    if kind=='invalid':
+                        self.resource.sql(database,"UPDATE public.oauth_grants SET consent_ref='"+bindings[0][1]+"' WHERE grant_ref='"+bindings[1][0]+"';")
+                        failed=False
+                        try:self.resource.sql(database,'CREATE UNIQUE INDEX CONCURRENTLY idx_oauth_grants_consent ON public.oauth_grants(consent_ref);')
+                        except RuntimeError:failed=True
+                        # Failed concurrent build creates a real invalid index;
+                        # do not write pg_catalog or manufacture validity flags.
+                        if not failed or self.resource.sql(database,"SELECT indisvalid FROM pg_catalog.pg_index WHERE indexrelid=pg_catalog.to_regclass('public.idx_oauth_grants_consent');")!='f':raise RuntimeError('invalid key fixture not established')
+            self.qualify(ident)
+            return {'key_fixture':kind,'applied':True}
+        if re.fullmatch(rb'seed:[0-9a-f]{32}:[0-9a-f]{64}:[0-9]{1,10}\n',request):
+            return super().fixture_action(request)
+        if not re.fullmatch(rb'terminal:[0-9a-f]{32}\n',request):
+            raise ValueError('terminal fixture action denied')
+        ident=request[9:-1].decode();receipt=self.qualify(ident)
+        env={'PATH':'/usr/bin:/bin','GOMAXPROCS':'2','BOOTSTRAP_TERMINAL_ROLE':receipt['DBUser']}
+        if self.engine=='postgres':
+            env['BOOTSTRAP_ADMIN_DSN']='postgresql://bootstrap:'+self.resource.password+'@/postgres?host='+str(self.resource.socket_dir)+'&sslmode=disable'
+        else:
+            env['BOOTSTRAP_ADMIN_DSN']='root:'+self.resource.password+'@unix('+str(self.resource.socket_path)+')/mysql?parseTime=true'
+        for _ in range(2):
+            q=subprocess.run([str(self.root/'bundle/new-api'),'db-bootstrap','terminal-install','--engine',self.engine,
+                              '--target',receipt['Database'],'--journal',receipt['Journal']],
+                             env=env,capture_output=True,timeout=120)
+            print(json.dumps({'terminal_install':self.engine,'exit':q.returncode,
+                              'output_sha256':hashlib.sha256(q.stdout+q.stderr).hexdigest()}),flush=True)
+            if q.returncode:
+                if self.engine=='mysql':
+                    # Only fixed object metadata digests, never routine text,
+                    # principal names, SQL parameters or raw database errors.
+                    rows=self.resource.sql(receipt['Database'], "SELECT ROUTINE_NAME,COALESCE(SHA2(ROUTINE_DEFINITION,256),'NULL'),SECURITY_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE() AND ROUTINE_NAME IN ('nat_lock_v1','nat_apply_v1','nat_attest_v1') ORDER BY ROUTINE_NAME;")
+                    facts=[]
+                    for row in rows.splitlines():
+                        cols=row.split('\t')
+                        if len(cols)==3 and cols[0] in ('nat_lock_v1','nat_apply_v1','nat_attest_v1') and re.fullmatch(r'[0-9a-f]{64}|NULL',cols[1]) and cols[2] in ('DEFINER','INVOKER'):
+                            facts.append({'operation':cols[0],'definition_sha256':cols[1],'security':cols[2]})
+                    attestation=self.resource.sql(receipt['Database'],"SELECT COALESCE(nat_attest_v1(),'NULL');").strip()
+                    if not re.fullmatch(r'[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}|NULL',attestation):raise RuntimeError('terminal attestation shape unavailable')
+                    print(json.dumps({'terminal_install_failure_metadata':facts,'attestation':attestation}),flush=True)
+                raise RuntimeError('permanent terminal installation refused')
+            self.qualify(ident)
+        if self.engine=='mysql':
+            # Fixed-object and privilege projection only; no account names,
+            # credentials or SQL parameters leave the installer.
+            journal=json.loads(Path(receipt['Journal']).read_text())
+            expected='nat_'+hashlib.sha256(journal['binding'].encode()).hexdigest()[:24]
+            rows=self.resource.sql(receipt['Database'], "SELECT ROUTINE_NAME,COALESCE(SHA2(ROUTINE_DEFINITION,256),'NULL'),SECURITY_TYPE,DEFINER FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE() AND ROUTINE_NAME IN ('nat_lock_v1','nat_apply_v1','nat_attest_v1') ORDER BY ROUTINE_NAME;")
+            facts=[]
+            for row in rows.splitlines():
+                name,digest,security,owner=row.split('\t')
+                if name not in ('nat_lock_v1','nat_apply_v1','nat_attest_v1') or not re.fullmatch(r'[0-9a-f]{64}',digest) or security!='DEFINER':raise RuntimeError('fixed routine metadata refused')
+                facts.append({'operation':name,'definition_sha256':digest,'security':security,'expected_definer':owner==expected+'@localhost'})
+            locked=self.resource.sql('mysql',"SELECT account_locked FROM mysql.user WHERE User='"+expected+"' AND Host='localhost';").strip()
+            projections={}
+            for label,account in (('definer',expected),('service',receipt['DBUser'])):
+                if not re.fullmatch(r'[a-zA-Z0-9_]+',account):raise RuntimeError('principal projection refused')
+                grantee="CONCAT(CHAR(39),'"+account+"',CHAR(39),'@',CHAR(39),'localhost',CHAR(39))"
+                table=self.resource.sql(receipt['Database'],"SELECT TABLE_NAME,PRIVILEGE_TYPE,IS_GRANTABLE FROM information_schema.TABLE_PRIVILEGES WHERE TABLE_SCHEMA=DATABASE() AND GRANTEE="+grantee+" AND TABLE_NAME IN ('users','tokens','oauth_grants','oauth_derived_token_sources') ORDER BY TABLE_NAME,PRIVILEGE_TYPE;")
+                column=self.resource.sql(receipt['Database'],"SELECT TABLE_NAME,COLUMN_NAME,PRIVILEGE_TYPE,IS_GRANTABLE FROM information_schema.COLUMN_PRIVILEGES WHERE TABLE_SCHEMA=DATABASE() AND GRANTEE="+grantee+" AND TABLE_NAME IN ('users','tokens','oauth_grants','oauth_derived_token_sources') ORDER BY TABLE_NAME,COLUMN_NAME,PRIVILEGE_TYPE;")
+                projected=[]
+                for kind,raw in (('table',table),('column',column)):
+                    for row in raw.splitlines():
+                        cols=row.split('\t')
+                        if cols[0] not in ('users','tokens','oauth_grants','oauth_derived_token_sources') or cols[-2] not in ('SELECT','UPDATE','INSERT','DELETE','ALTER','REFERENCES','INDEX','CREATE VIEW','SHOW VIEW','TRIGGER') or cols[-1] not in ('YES','NO'):raise RuntimeError('privilege projection refused')
+                        if kind=='column' and cols[1] not in ('auth_version','revision','status','terminal_at','terminal_reason'):raise RuntimeError('column projection refused')
+                        projected.append({'kind':kind,'table':cols[0],'column':cols[1] if kind=='column' else None,'privilege':cols[-2],'grantable':cols[-1]})
+                projections[label]=projected
+            print(json.dumps({'terminal_fixed_metadata':facts,'definer_locked':locked=='Y','privileges':projections}),flush=True)
+        return {'installed':True,'repeated':True,'birth_unchanged':True}
+
+
 def wallet_client(path, action):
-    if os.geteuid()==0 or (action!='fresh' and not re.fullmatch(r'(qualify:[0-9a-f]{32}|seed:[0-9a-f]{32}:[0-9a-f]{64}:[0-9]{1,10}|source_absent:[0-9a-f]{32})',action)):
+    if os.geteuid()==0 or (action!='fresh' and not re.fullmatch(r'(terminal_gap:[0-9a-f]{32}|keys:[0-9a-f]{32}:(?:missing|reverse|partial|expression|invalid|cleanup|restore)|terminal:[0-9a-f]{32}|qualify:[0-9a-f]{32}|seed:[0-9a-f]{32}:[0-9a-f]{64}:[0-9]{1,10}|source_absent:[0-9a-f]{32})',action)):
         raise ValueError('wallet client action or UID denied')
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(150);conn.connect(path)
@@ -2573,11 +2768,12 @@ def wallet_client(path, action):
 
 def trusted_wallet_run(bundle,tier):
     metadata=verified_manifest(bundle)
+    terminal_tier = tier in TERMINAL_TIERS
     metadata_tier = tier in METADATA_TIERS
     lifecycle_tier = tier in LIFECYCLE_TIERS
-    engine=tier.removeprefix('lifecycle-' if lifecycle_tier else 'metadata-' if metadata_tier else 'wallet-')
-    expected_cwd = 'controller' if lifecycle_tier else 'router' if metadata_tier else 'service'
-    expected_selector = LIFECYCLE_SELECTOR if lifecycle_tier else METADATA_SELECTOR if metadata_tier else wallet_selector(engine)
+    engine=tier.removeprefix('terminal-' if terminal_tier else 'lifecycle-' if lifecycle_tier else 'metadata-' if metadata_tier else 'wallet-')
+    expected_cwd = 'router' if terminal_tier else 'controller' if lifecycle_tier else 'router' if metadata_tier else 'service'
+    expected_selector = TERMINAL_SELECTOR if terminal_tier else LIFECYCLE_SELECTOR if lifecycle_tier else METADATA_SELECTOR if metadata_tier else wallet_selector(engine)
     if (os.geteuid()!=0 or metadata['tier']!=tier or len(metadata['entries'])!=1 or
         metadata['entries'][0]['cwd']!=expected_cwd or metadata['entries'][0]['run']!=expected_selector):
         raise ValueError('wallet trusted owner inventory mismatch')
@@ -2612,13 +2808,13 @@ def trusted_wallet_run(bundle,tier):
         (root/'journals').mkdir(mode=0o755);(root/'tmp').mkdir(mode=0o700);os.chown(root/'tmp',uid,uid)
         launcher=root/'owner-client'
         launcher.write_text('#!/bin/sh\nexec /usr/bin/python3 '+str(root/'bundle/runner.py')+' _wallet_client '+str(root/'wallet.sock')+' "$@"\n');launcher.chmod(0o755)
-        installer=(LifecycleInstaller if lifecycle_tier else WalletInstaller)(root,uid,engine,metadata);installer.start()
+        installer=(TerminalInstaller if terminal_tier else LifecycleInstaller if lifecycle_tier else WalletInstaller)(root,uid,engine,metadata);installer.start()
         env={'PATH':'/usr/bin:/bin','HOME':str(root/'tmp'),'TMPDIR':str(root/'tmp'),'GOMAXPROCS':'2',
             'NEWAPI_BOOTSTRAP_CLIENT':str(launcher),'NEWAPI_BOOTSTRAP_ENGINE':engine,
-            'NEWAPI_DB_TEST_ROLE':'TRUSTED_DB_TEST_OWNER'}
-        if metadata_tier or lifecycle_tier:
+            'NEWAPI_DB_TEST_ROLE':'TERMINAL_SERVICE' if terminal_tier else 'TRUSTED_DB_TEST_OWNER'}
+        if metadata_tier or lifecycle_tier or terminal_tier:
             env['NEWAPI_BOOTSTRAP_TIER'] = tier
-        if lifecycle_tier:
+        if lifecycle_tier or terminal_tier:
             env['NEWAPI_LIFECYCLE_REDIS_RECEIPT'] = str(installer.redis_path)
         entry=metadata['entries'][0]
         print('BOOTSTRAP_TEST_START '+json.dumps(dict(entry,phase='trusted-db-test-owner',engine=engine,uid=uid)),flush=True)
@@ -2631,7 +2827,7 @@ def trusted_wallet_run(bundle,tier):
             raise RuntimeError('wallet first birth unavailable')
         # A separate non-root service receives no owner env or credentials. It
         # cannot request them through the owner IPC, or write the root journal.
-        denied_uid=uid+(2 if lifecycle_tier else 1)
+        denied_uid=uid+(2 if lifecycle_tier or terminal_tier else 1)
         try:pwd.getpwuid(denied_uid);raise ValueError('restricted probe UID occupied')
         except KeyError:pass
         for proc in Path('/proc').glob('[0-9]*/status'):
@@ -2656,7 +2852,7 @@ assert os.getgroups()==[] and 'NoNewPrivs:\\t1' in open('/proc/self/status').rea
         if engine=='sqlite':protected.append(first['Database'])
         command(['/usr/bin/python3','-c',probe,str(root/'wallet.sock'),*protected],
             env={'PATH':'/usr/bin:/bin'},preexec_fn=lambda:demote(denied_uid))
-        if lifecycle_tier:
+        if lifecycle_tier or terminal_tier:
             command(['/usr/bin/python3','-c',probe,str(root/'wallet.sock'),first['Journal']],
                 env={'PATH':'/usr/bin:/bin'},preexec_fn=lambda:demote(uid))
             print(json.dumps({'lifecycle_same_uid_unrelated_parent_denied':True}),flush=True)
@@ -2715,7 +2911,7 @@ def main():
         dispatch_tier(Path(sys.argv[2]), sys.argv[3])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
+    parser.add_argument('--tier', choices=('all', 'sqlite', 'postgres', 'postgres-redis', 'admission', *METADATA_TIERS, *LIFECYCLE_TIERS, *TERMINAL_TIERS, *('wallet-'+e for e in WALLET_ENGINES)), default='all', help='separate required resource tier; no PG-to-SQLite fallback')
     parser.add_argument('--admission-assets', help='existing real embed assets, explicit admission prepare only')
     parser.add_argument('--bundle', required=True, help='new dedicated build output directory')
     parser.add_argument('--execute-prepared', action='store_true', help='verify and execute an existing prepared bundle through its outer resource scheduler')
