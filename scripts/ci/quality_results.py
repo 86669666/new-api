@@ -175,7 +175,10 @@ def validate_gate(check, request, *, completed):
             'wrong gate App')
     require(check['name'] == GATE and check['head_sha'] == request['candidate_sha'] and
             check['external_id'] == consumer.digest(request), 'wrong quality publication')
-    require(json.loads(check['output']['text']) == request, 'partial or substituted quality publication')
+    # Ordinary equality aliases JSON booleans, integers and floats. Compare
+    # canonical data to preserve types; this does not authenticate the source.
+    require(consumer.canonical(json.loads(check['output']['text'])) == consumer.canonical(request),
+            'partial or substituted quality publication')
     if completed:
         require(check['status'] == 'completed' and check['conclusion'] == 'success', 'gate is not successful')
     else:
@@ -400,7 +403,8 @@ def collect_result(admission, environment, reader, publisher, journal, *, clock=
     # Re-read the published object as well: incomplete/changed publication cannot
     # be substituted between receipt verification and final result consumption.
     published = reader.check(check_id)
-    require(published == check, 'publication changed during collection')
+    require(consumer.canonical(published) == consumer.canonical(check),
+            'publication changed during collection')
     verify_current_head(reader, admission)
     consumer.validate_environment(environment, admission, int(clock()))
     journal.consume(verified, check_id)

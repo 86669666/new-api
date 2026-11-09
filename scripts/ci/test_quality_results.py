@@ -258,6 +258,9 @@ class QualityResultsTests(unittest.TestCase):
             quality.collect_result(self.admission, self.environment, self.reader, self.publisher,
                                    self.journal, clock=lambda: 200)
         self.http.finish_fixture()
+        # Equivalent JSON formatting is allowed; typed values must remain exact.
+        self.reader.gate_value['output']['text'] = json.dumps(
+            json.loads(self.reader.gate_value['output']['text']), indent=2, sort_keys=True)
         result = quality.collect_result(self.admission, self.environment, self.reader, self.publisher,
                                         self.journal, clock=lambda: 200)
         self.assertEqual('verified', result['state'])
@@ -266,6 +269,67 @@ class QualityResultsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             quality.collect_result(self.admission, self.environment, self.reader, self.publisher,
                                    self.journal, clock=lambda: 200)
+        self.assertEqual(1, len(self.http.posts))
+
+    def test_publication_rejects_equal_values_with_wrong_json_types(self):
+        # Python equality aliases False/0, 0.0/0 and 1/True. An App check must
+        # echo the exact typed result, even when its external_id is unchanged.
+        for field, value in [('exit', False), ('exit', 0.0), ('cleanup', 1)]:
+            for route in ('stage', 'collect'):
+                with self.subTest(field=field, value=value, route=route):
+                    self.setUp()
+                    request = self.verify()
+
+                    def substitute(check):
+                        output = json.loads(check['output']['text'])
+                        output['quality']['results']['backend']['commands'][0][field] = value
+                        check['output']['text'] = json.dumps(output)
+                        return check
+
+                    if route == 'stage':
+                        def response(method, path, payload):
+                            check = self.http.installation_request(method, path, payload)
+                            return substitute(check) if method == 'POST' else check
+
+                        with patch.object(self.publisher, '_installation_request', side_effect=response):
+                            with self.assertRaisesRegex(ValueError, 'substituted quality publication'):
+                                self.publish()
+                        self.assertFalse(self.http.green)
+                        # An ambiguous POST acknowledgement still burns the claim.
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            self.publish()
+                    else:
+                        self.publish()
+                        self.http.finish_fixture()
+                        substitute(self.reader.gate_value)
+                        with self.assertRaisesRegex(ValueError, 'substituted quality publication'):
+                            quality.collect_result(self.admission, self.environment, self.reader,
+                                self.publisher, self.journal, clock=lambda: 200)
+                        self.assertEqual(43, self.journal.pending(request))
+                    self.assertEqual(1, len(self.http.posts))
+
+    def test_collection_rejects_json_type_drift_on_final_publication_read(self):
+        self.publish()
+        self.http.finish_fixture()
+        request = self.verify()
+        read = self.reader.check
+        gate_reads = 0
+
+        def response(check_id):
+            nonlocal gate_reads
+            check = read(check_id)
+            if check_id == 43:
+                gate_reads += 1
+                if gate_reads == 2:
+                    check['id'] = 43.0
+            return check
+
+        with patch.object(self.reader, 'check', side_effect=response):
+            with self.assertRaisesRegex(ValueError, 'publication changed during collection'):
+                quality.collect_result(self.admission, self.environment, self.reader,
+                    self.publisher, self.journal, clock=lambda: 200)
+        self.assertEqual(2, gate_reads)
+        self.assertEqual(43, self.journal.pending(request))
         self.assertEqual(1, len(self.http.posts))
 
     def test_raw_execution_report_cannot_replace_authenticated_receipt(self):
