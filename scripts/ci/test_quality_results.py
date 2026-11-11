@@ -8,8 +8,9 @@ import json
 import io
 import os
 import re
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 import sqlite3
 from pathlib import Path
 import subprocess
@@ -578,6 +579,36 @@ class QualityResultsTests(unittest.TestCase):
             self.assertEqual('Quality evidence rejected; no publication authorization granted.\n', child.stderr)
 
 
+class CIEnvironmentWatch(Mapping):
+    """Inert fixture environment; observe indexing, get and os.getenv alike."""
+
+    def __init__(self, values, trace, *, block_admission=False, block_token=False):
+        self.values = values
+        self.trace = trace
+        self.block_admission = block_admission
+        self.block_token = block_token
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __len__(self):
+        return len(self.values)
+
+    def read(self, operation, key, default=None):
+        self.trace.append((operation, key))
+        if key == 'GITHUB_TOKEN' and self.block_token:
+            raise AssertionError('credential accessed before local binding')
+        if key == 'BOX_FORMAL_ADMISSION' and self.block_admission:
+            raise AssertionError('admission accessed before native validation')
+        return self.values[key] if operation == 'index' else self.values.get(key, default)
+
+    def __getitem__(self, key):
+        return self.read('index', key)
+
+    def get(self, key, default=None):
+        return self.read('get', key, default)
+
+
 class QualityWiringTests(unittest.TestCase):
     """CI wiring contracts: all remote authentication/approvals are OFFLINE MOCKS."""
 
@@ -589,11 +620,14 @@ class QualityWiringTests(unittest.TestCase):
         event_dir = tempfile.TemporaryDirectory()
         self.addCleanup(event_dir.cleanup)
         self.event_path = Path(event_dir.name) / 'event.json'
-        self.event = dict(action='synchronize', number=1, pull_request=dict(
-            number=1, state='open', merged=False, head={'sha': 'a' * 40}, base={'sha': 'b' * 40}))
+        self.event = dict(action='synchronize', number=1,
+            repository=dict(id=123, full_name='86669666/new-api'), pull_request=dict(
+                number=1, state='open', merged=False,
+                head=dict(sha='a' * 40, repo=dict(id=456, full_name='fixture-fork/new-api')),
+                base=dict(sha='b' * 40, ref='main', repo=dict(id=123, full_name='86669666/new-api'))))
         self.event_path.write_text(json.dumps(self.event))
         self.environment.update(GITHUB_EVENT_NAME='pull_request', GITHUB_REF='refs/pull/1/merge',
-                                GITHUB_EVENT_PATH=str(self.event_path))
+                                GITHUB_EVENT_PATH=str(self.event_path), GITHUB_REPOSITORY_ID='123')
         self.reader = MockReader(self.receipt, self.admission)
         self.reader.run_value.update(status='completed', conclusion='success', triggering_actor={'id': 8})
         self.latest = copy.deepcopy(self.reader.run_value)
@@ -916,6 +950,243 @@ class QualityWiringTests(unittest.TestCase):
                 self.assertIn('needs.quality.outputs.verified_sha', workflow)
                 self.assertRegex(workflow, r'needs: \[[^\]\n]*\bquality\b[^\]\n]*\]')
                 self.assertNotIn('continue-on-error: true', workflow)
+
+    def observe_ci_input_main(self, case, phase, *, event_text=None, admission_text=None, omit_admission=False):
+        """Actual main + real verifier; only reader transport and clock are MOCK."""
+        self.event_path.write_text(json.dumps(self.event) if event_text is None else event_text)
+        trace = []
+        values = dict(self.environment, BOX_FORMAL_ADMISSION=json.dumps(self.admission),
+                      GITHUB_TOKEN='OFFLINE-NOT-A-CREDENTIAL')
+        if admission_text is not None:
+            values['BOX_FORMAL_ADMISSION'] = admission_text
+        if omit_admission:
+            del values['BOX_FORMAL_ADMISSION']
+        watch = CIEnvironmentWatch(values, trace, block_admission=phase == 'NATIVE',
+                                    block_token=phase != 'VALID')
+        output = io.StringIO()
+        error = None
+        original = quality.verify_ci_result
+        methods = ('repository', 'pull', 'check', 'commit', 'run', 'latest_run', 'approvals')
+        api = {name: getattr(self.reader, name) for name in methods}
+
+        def construct(token):
+            self.assertEqual('OFFLINE-NOT-A-CREDENTIAL', token)
+            trace.append(('reader', 'construct'))
+            return self.reader
+
+        def read(name, *args):
+            trace.append(('api', name))
+            return api[name](*args)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(quality.os, 'environ', watch))
+            stack.enter_context(patch.object(sys, 'argv', ['quality_results.py', 'ci']))
+            stack.enter_context(patch.object(quality, 'GitHubReader', side_effect=construct))
+            stack.enter_context(patch.object(quality, 'verify_ci_result',
+                side_effect=lambda *args: original(*args, clock=lambda: 200)))
+            stack.enter_context(patch.object(quality.consumer, 'api',
+                side_effect=AssertionError('real network is forbidden in this fixture')))
+            for name in methods:
+                stack.enter_context(patch.object(self.reader, name,
+                    side_effect=lambda *args, method=name: read(method, *args)))
+            with redirect_stdout(output):
+                try:
+                    quality.main()
+                except Exception as caught:
+                    error = caught
+        # No environment values or usable credentials are logged.
+        print(json.dumps(dict(case=case, phase=phase, entry='actual main(argv=[quality_results.py,ci])',
+            trace=trace, stdout=output.getvalue(), exception=type(error).__name__ if error else None,
+            reason=str(error) if error else None,
+            proof='OFFLINE MOCK App/API/approval; inert token; no network'), sort_keys=True))
+        if phase == 'VALID':
+            self.assertIsNone(error)
+            self.assertEqual('a' * 40, json.loads(output.getvalue())['candidate_sha'])
+            self.assertLess(trace.index(('index', 'BOX_FORMAL_ADMISSION')),
+                            trace.index(('index', 'GITHUB_TOKEN')))
+            self.assertLess(trace.index(('index', 'GITHUB_TOKEN')), trace.index(('reader', 'construct')))
+            self.assertLess(trace.index(('reader', 'construct')), trace.index(('api', 'repository')))
+            self.assertEqual(2, trace.count(('api', 'pull')))
+        else:
+            # Sentinel AssertionError is deliberately NOT an accepted rejection.
+            self.assertIsInstance(error, (ValueError, KeyError, TypeError))
+            self.assertEqual('', output.getvalue())
+            self.assertFalse(any(key == 'GITHUB_TOKEN' or operation in ('reader', 'api')
+                                 for operation, key in trace))
+            admission_reads = [item for item in trace if item[1] == 'BOX_FORMAL_ADMISSION']
+            self.assertEqual(phase == 'ADMISSION_BINDING', bool(admission_reads))
+        return error
+
+    def test_ci_input_contract_valid_same_repo_and_fork(self):
+        for case, head_id, name, action in (
+                ('same-repo', 123, '86669666/new-api', 'opened'),
+                ('fork', 456, 'fixture-fork/new-api', 'reopened'),
+                ('fork-display-omitted', 456, None, 'synchronize'),
+                ('fork-display-renamed-no-local-name-authority', 456, 'another-display/new-api', 'synchronize')):
+            with self.subTest(case=case):
+                self.setUp()
+                self.event['action'] = action
+                self.event['pull_request']['head']['repo'] = dict(id=head_id)
+                if name is not None:
+                    self.event['pull_request']['head']['repo']['full_name'] = name
+                self.admission['quality']['head_repository_id'] = head_id
+                self.receipt['quality']['head_repository_id'] = head_id
+                self.reader.pr['head']['repo'] = dict(id=head_id)
+                # Refresh independently authored MOCK object hashes only.
+                self.admission['receipt_sha256'] = quality.consumer.digest(self.receipt)
+                self.reader.check_value.update(external_id=self.admission['receipt_sha256'],
+                                               output={'text': json.dumps(self.receipt)})
+                gate = json.loads(self.reader.gate_value['output']['text'])
+                gate.update(quality=copy.deepcopy(self.admission['quality']),
+                            receipt_sha256=self.admission['receipt_sha256'])
+                self.reader.gate_value.update(external_id=quality.consumer.digest(gate),
+                                              output={'text': json.dumps(gate)})
+                self.environment['GITHUB_SHA'] = 'f' * 40  # Synthetic merge is NOT the PR head.
+                self.observe_ci_input_main(case, 'VALID')
+
+    def test_ci_input_contract_native_rejections_precede_admission(self):
+        # Partition by mandatory absence, malformed type/shape and ownership
+        # contradiction. No Cartesian product or unrelated authenticated tests.
+        missing = [
+            ('env', 'GITHUB_EVENT_NAME'),
+            ('env', 'GITHUB_REPOSITORY'), ('env', 'GITHUB_REPOSITORY_ID'),
+            ('env', 'GITHUB_REF'), ('env', 'GITHUB_EVENT_PATH'), ('env', 'EXPECTED_SHA'),
+            ('event', 'repository'), ('event', 'repository.id'), ('event', 'repository.full_name'),
+            ('event', 'action'), ('event', 'number'), ('event', 'pull_request'),
+            ('event', 'pull_request.state'), ('event', 'pull_request.merged'), ('event', 'pull_request.number'),
+            ('event', 'pull_request.head'), ('event', 'pull_request.head.repo'),
+            ('event', 'pull_request.head.repo.id'), ('event', 'pull_request.head.sha'),
+            ('event', 'pull_request.base'), ('event', 'pull_request.base.repo'),
+            ('event', 'pull_request.base.repo.id'), ('event', 'pull_request.base.repo.full_name'),
+            ('event', 'pull_request.base.ref'), ('event', 'pull_request.base.sha')]
+        malformed = [
+            ('env', 'GITHUB_REPOSITORY', False),
+            ('env', 'GITHUB_REPOSITORY_ID', True), ('env', 'GITHUB_REPOSITORY_ID', 'abc'),
+            ('env', 'GITHUB_REF', True), ('env', 'EXPECTED_SHA', True), ('env', 'EXPECTED_SHA', 'bad-sha'),
+            ('event', 'repository', []), ('event', 'pull_request', []),
+            ('event', 'pull_request.head', []), ('event', 'pull_request.base', []),
+            ('event', 'pull_request.head.repo', None), ('event', 'pull_request.base.repo', []),
+            ('event', 'repository.id', True), ('event', 'repository.id', '123'), ('event', 'repository.id', 0),
+            ('event', 'pull_request.base.repo.id', True), ('event', 'pull_request.head.repo.id', True),
+            ('event', 'pull_request.head.repo.id', 456.0), ('event', 'pull_request.head.repo.id', -1),
+            ('event', 'number', True),
+            ('event', 'pull_request.number', True), ('event', 'pull_request.head.repo.full_name', True),
+            ('event', 'pull_request.head.repo.full_name', None),
+            ('event', 'pull_request.head.repo.full_name', 'bad/name/shape'),
+            ('event', 'pull_request.head.sha', True), ('event', 'pull_request.base.sha', 'bad-sha')]
+        drift = [
+            ('env', 'GITHUB_REPOSITORY', 'other/project'), ('env', 'GITHUB_REPOSITORY_ID', '999'),
+            ('env', 'GITHUB_REF', 'refs/pull/2/merge'), ('env', 'EXPECTED_SHA', 'd' * 40),
+            ('event', 'repository.id', 999), ('event', 'repository.full_name', 'other/project'),
+            ('event', 'pull_request.base.repo.id', 999),
+            ('event', 'pull_request.base.repo.full_name', 'other/project'),
+            ('event', 'pull_request.head.repo.full_name', '86669666/new-api'),
+            ('event', 'pull_request.head.repo.id', 123), ('event', 'pull_request.number', 2),
+            ('event', 'pull_request.base.ref', 'another-branch'),
+            ('event', 'pull_request.head.sha', 'd' * 40)]
+        cases = [(owner, path, None, True) for owner, path in missing]
+        cases += [(owner, path, value, False) for owner, path, value in malformed + drift]
+        for index, (owner, path, value, remove) in enumerate(cases):
+            case = f'native-{index}:{owner}.{path}:{"missing" if remove else "invalid"}'
+            with self.subTest(case=case):
+                self.setUp()
+                target = self.environment if owner == 'env' else self.event
+                parts = path.split('.')
+                for part in parts[:-1]:
+                    target = target[part]
+                if remove:
+                    del target[parts[-1]]
+                    if path == 'EXPECTED_SHA':
+                        self.environment['GITHUB_SHA'] = 'a' * 40  # No fallback, even when equal.
+                else:
+                    target[parts[-1]] = value
+                self.observe_ci_input_main(case, 'NATIVE')
+        for case, text in (('event-json-array', '[]'), ('event-json-null', 'null'),
+                           ('event-json-malformed', '{'),
+                           ('event-json-duplicate', None)):
+            with self.subTest(case=case):
+                self.setUp()
+                if case.endswith('duplicate'):
+                    text = '{"number":2,' + json.dumps(self.event)[1:]
+                error = self.observe_ci_input_main(case, 'NATIVE', event_text=text)
+                if case.endswith('duplicate'):
+                    self.assertIn('duplicate receipt field', str(error))
+
+    def test_ci_input_contract_admission_rejections_precede_token(self):
+        missing = ['repository', 'repository_id', 'expected', 'quality', 'quality.pull_number',
+            'quality.head_repository_id', 'quality.base_sha', 'expected.candidate_sha',
+            'expected.candidate_tree', 'expected.execution_sha', 'expected.consumer_sha',
+            'quality.candidate_sha', 'quality.candidate_tree', 'quality.execution_sha',
+            'expected.admission_id', 'expected.attempt_id', 'expected.invocation',
+            'quality.admission_id', 'quality.attempt_id', 'quality.invocation',
+            'check_run_id', 'quality_check_run_id']
+        invalid = [('repository', 'other/project'), ('repository_id', 999), ('repository_id', True),
+            ('repository_id', '123'), ('expected', []), ('quality', []),
+            ('quality.pull_number', True), ('quality.pull_number', 2),
+            ('quality.head_repository_id', True), ('quality.head_repository_id', 999),
+            ('quality.base_sha', 'd' * 40), ('expected.candidate_sha', 'd' * 40),
+            ('expected.candidate_tree', 'bad-tree'), ('expected.execution_sha', 'd' * 40),
+            ('quality.candidate_sha', 'd' * 40), ('quality.candidate_tree', 'd' * 40),
+            ('quality.execution_sha', 'd' * 40), ('expected.consumer_sha', 'd' * 40),
+            ('quality.admission_id', 'different'), ('quality.attempt_id', 'different'),
+            ('quality.invocation', 'different'), ('check_run_id', True), ('quality_check_run_id', True)]
+        cases = [(path, None, True) for path in missing] + [(path, value, False) for path, value in invalid]
+        for index, (path, value, remove) in enumerate(cases):
+            case = f'admission-{index}:{path}:{"missing" if remove else "invalid"}'
+            with self.subTest(case=case):
+                self.setUp()
+                target = self.admission
+                parts = path.split('.')
+                for part in parts[:-1]:
+                    target = target[part]
+                if remove:
+                    del target[parts[-1]]
+                else:
+                    target[parts[-1]] = value
+                self.observe_ci_input_main(case, 'ADMISSION_BINDING')
+        for case, text, omitted in (
+                ('admission-json-array', '[]', False), ('admission-json-null', 'null', False),
+                ('admission-json-malformed', '{', False),
+                ('admission-json-duplicate', None, False),
+                ('admission-env-missing', None, True)):
+            with self.subTest(case=case):
+                self.setUp()
+                if case.endswith('duplicate'):
+                    text = '{"repository_id":999,' + json.dumps(self.admission)[1:]
+                error = self.observe_ci_input_main(case, 'ADMISSION_BINDING', admission_text=text, omit_admission=omitted)
+                if case.endswith('duplicate'):
+                    self.assertIn('duplicate receipt field', str(error))
+        for case in ('event-base-sha', 'event-head-and-input', 'event-fork-id', 'consistent-native-id'):
+            with self.subTest(case=case):
+                self.setUp()
+                if case == 'event-base-sha':
+                    self.event['pull_request']['base']['sha'] = 'd' * 40
+                elif case == 'event-head-and-input':
+                    self.event['pull_request']['head']['sha'] = 'd' * 40
+                    self.environment['EXPECTED_SHA'] = 'd' * 40
+                elif case == 'event-fork-id':
+                    self.event['pull_request']['head']['repo']['id'] = 999
+                else:
+                    # No fixed numeric ID is invented: the consistent native
+                    # context can only be compared with admission after loading it.
+                    self.event['repository']['id'] = 999
+                    self.event['pull_request']['base']['repo']['id'] = 999
+                    self.environment['GITHUB_REPOSITORY_ID'] = '999'
+                self.observe_ci_input_main(case, 'ADMISSION_BINDING')
+
+    def test_ci_input_contract_monitor_covers_index_get_and_getenv(self):
+        for operation in ('index', 'get', 'getenv'):
+            trace = []
+            watch = CIEnvironmentWatch({'GITHUB_TOKEN': 'INERT'}, trace, block_token=True)
+            with self.subTest(operation=operation), patch.object(quality.os, 'environ', watch):
+                with self.assertRaisesRegex(AssertionError, 'credential accessed'):
+                    if operation == 'index':
+                        watch['GITHUB_TOKEN']
+                    elif operation == 'get':
+                        watch.get('GITHUB_TOKEN')
+                    else:
+                        os.getenv('GITHUB_TOKEN')
+            self.assertEqual([('index' if operation == 'index' else 'get', 'GITHUB_TOKEN')], trace)
 
 
 if __name__ == '__main__':

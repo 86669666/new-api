@@ -394,19 +394,52 @@ def ci_premerge_event(environment):
     """
     if environment['GITHUB_EVENT_NAME'] != 'pull_request':
         raise UnsupportedCIEvent('only open-PR premerge verification is supported')
+    require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong native repository')
+    native_id = environment['GITHUB_REPOSITORY_ID']
+    require(isinstance(native_id, str) and re.fullmatch('[1-9][0-9]*', native_id) is not None,
+            'invalid native repository ID')
     event = json.loads(Path(environment['GITHUB_EVENT_PATH']).read_text(),
                        object_pairs_hook=consumer.unique_json_fields)
+    require(type(event) is dict and type(event['pull_request']) is dict,
+            'invalid PR event structure')
     pull = event['pull_request']
     number = event['number']
     if (event['action'] not in ('opened', 'reopened', 'synchronize') or
             pull['state'] != 'open' or pull['merged'] is not False or
-            type(number) is not int or number <= 0 or pull['number'] != number or
+            type(number) is not int or number <= 0 or type(pull['number']) is not int or
+            pull['number'] != number or
             environment['GITHUB_REF'] != f'refs/pull/{number}/merge'):
         raise UnsupportedCIEvent('only open-PR premerge verification is supported')
+    require(type(pull['head']) is dict and type(pull['base']) is dict,
+            'invalid PR source structure')
+    root = event['repository']
+    base = pull['base']['repo']
+    head = pull['head']['repo']
+    for repository in (root, base, head):
+        require(type(repository) is dict and type(repository['id']) is int and repository['id'] > 0,
+                'invalid event repository identity')
+    require(root['full_name'] == base['full_name'] == REPOSITORY and
+            root['id'] == base['id'] == int(native_id), 'event repository ownership mismatch')
+    require(pull['base']['ref'] == 'main', 'wrong event PR target')
+    # A fork's display name has no independent admitted local authority. It is
+    # optional here; validate its shape when present, and bind its immutable ID
+    # below. If it identifies the already-owned target, ID/name must agree.
+    if 'full_name' in head:
+        name = head['full_name']
+        require(isinstance(name, str) and re.fullmatch(r'[^/\s]+/[^/\s]+', name) is not None,
+                'invalid head repository display name')
+        require((head['id'] == root['id']) == (name == REPOSITORY),
+                'head repository conflicts with owned target identity')
+    for source in (pull['head'], pull['base']):
+        require(isinstance(source['sha'], str) and re.fullmatch('[0-9a-f]{40}', source['sha']) is not None,
+                'invalid event source SHA')
+    supplied_sha = environment['EXPECTED_SHA']
+    require(isinstance(supplied_sha, str) and re.fullmatch('[0-9a-f]{40}', supplied_sha) is not None and
+            supplied_sha == pull['head']['sha'], 'wrong CI input SHA')
     return event
 
 
-def verify_ci_result(admission, environment, reader, *, clock=time.time):
+def verify_ci_result(admission, environment, reader=None, *, clock=time.time):
     """GET-only revalidation of a PRE-EXISTING App quality success for CI.
 
     Only premerge open-PR current-head/current-base validation is supported.
@@ -420,14 +453,28 @@ def verify_ci_result(admission, environment, reader, *, clock=time.time):
     """
     event = ci_premerge_event(environment)
     release_policy.quality_results(json.loads(environment['QUALITY_RESULTS']))
+    require(type(admission) is dict and type(admission['expected']) is dict and
+            type(admission['quality']) is dict, 'invalid admission structure')
     expected = admission['expected']
-    require(event['number'] == admission['quality']['pull_number'] and
+    admitted_quality = admission['quality']
+    require(admission['repository'] == REPOSITORY and type(admission['repository_id']) is int and
+            admission['repository_id'] > 0 and admission['repository_id'] == event['repository']['id'],
+            'admission repository ownership mismatch')
+    require(type(admitted_quality['pull_number']) is int and admitted_quality['pull_number'] > 0 and
+            type(admitted_quality['head_repository_id']) is int and admitted_quality['head_repository_id'] > 0,
+            'invalid admitted PR identity')
+    require(event['number'] == admitted_quality['pull_number'] and
+            event['pull_request']['head']['repo']['id'] == admitted_quality['head_repository_id'] and
             event['pull_request']['head']['sha'] == expected['candidate_sha'] and
-            event['pull_request']['base']['sha'] == admission['quality']['base_sha'],
-            'CI event does not match admitted PR head or base')
-    require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong repository')
-    require(re.fullmatch('[0-9a-f]{40}', environment['EXPECTED_SHA']) is not None and
-            environment['EXPECTED_SHA'] == expected['candidate_sha'], 'wrong CI candidate')
+            event['pull_request']['base']['sha'] == admitted_quality['base_sha'],
+            'CI event does not match admitted PR ownership, head or base')
+    for key in ('candidate_sha', 'candidate_tree', 'execution_sha'):
+        require(isinstance(expected[key], str) and re.fullmatch('[0-9a-f]{40}', expected[key]) is not None and
+                admitted_quality[key] == expected[key], 'inconsistent admitted source identity')
+    require(expected['execution_sha'] == expected['candidate_sha'], 'build and execution SHA differ')
+    for key in ('admission_id', 'attempt_id', 'invocation'):
+        require(consumer.canonical(admitted_quality[key]) == consumer.canonical(expected[key]),
+                'inconsistent admitted attempt identity')
     trusted = environment['BOX_FORMAL_CONSUMER_SHA']
     require(re.fullmatch('[0-9a-f]{40}', trusted) is not None and
             trusted == expected['consumer_sha'], 'unapproved consumer revision')
@@ -436,8 +483,14 @@ def verify_ci_result(admission, environment, reader, *, clock=time.time):
             all(type(user) is int and user > 0 for user in reviewers) and
             len(set(reviewers)) == len(reviewers), 'trusted reviewer IDs required')
     gate_id = admission['quality_check_run_id']
-    require(type(gate_id) is int and gate_id > 0 and gate_id != admission['check_run_id'],
+    require(type(admission['check_run_id']) is int and admission['check_run_id'] > 0 and
+            type(gate_id) is int and gate_id > 0 and gate_id != admission['check_run_id'],
             'finalized quality check ID required')
+    # The CLI leaves reader unset. All native/admission/input bindings above
+    # must finish before even accessing the credential or constructing a client.
+    # Trusted offline callers may still inject their existing reader object.
+    if reader is None:
+        reader = GitHubReader(environment['GITHUB_TOKEN'])
     repository = reader.repository()
     require(repository['id'] == admission['repository_id'] and repository['full_name'] == REPOSITORY,
             'repository identity changed')
@@ -550,9 +603,12 @@ def main():
     require(sys.argv[1:] in ([], ['ci']), 'unknown quality operation')
     if sys.argv[1:] == ['ci']:
         ci_premerge_event(os.environ)
-    admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'])
-    verifier = verify_ci_result if sys.argv[1:] == ['ci'] else verify
-    result = verifier(admission, os.environ, GitHubReader(os.environ['GITHUB_TOKEN']))
+        admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'],
+                               object_pairs_hook=consumer.unique_json_fields)
+        result = verify_ci_result(admission, os.environ)
+    else:
+        admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'])
+        result = verify(admission, os.environ, GitHubReader(os.environ['GITHUB_TOKEN']))
     print(json.dumps({key: result[key] for key in
                       ('schema', 'candidate_sha', 'candidate_tree', 'check_run_id', 'receipt_sha256')},
                      sort_keys=True))
