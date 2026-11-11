@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import time
 import urllib.request
 from typing import Protocol
@@ -37,6 +38,10 @@ _DATABASE = Path(__file__).resolve().with_name('database_gate.py')
 _database_spec = importlib.util.spec_from_file_location('_trusted_database_policy', _DATABASE)
 database_policy = importlib.util.module_from_spec(_database_spec)
 _database_spec.loader.exec_module(database_policy)
+_release_spec = importlib.util.spec_from_file_location(
+    '_trusted_release_policy', Path(__file__).with_name('release_policy.py'))
+release_policy = importlib.util.module_from_spec(_release_spec)
+_release_spec.loader.exec_module(release_policy)
 require = consumer.require
 REPOSITORY = consumer.REPOSITORY
 GATE = 'Required quality gate'
@@ -60,6 +65,8 @@ class Reader(Protocol):
     def commit(self, sha): ...
     def check(self, check_id): ...
     def run(self, run_id, attempt): ...
+    def latest_run(self, run_id): ...
+    def approvals(self, run_id): ...
 
 
 class AdmissionJournal:
@@ -177,7 +184,8 @@ def validate_gate(check, request, *, completed):
             check['external_id'] == consumer.digest(request), 'wrong quality publication')
     # Ordinary equality aliases JSON booleans, integers and floats. Compare
     # canonical data to preserve types; this does not authenticate the source.
-    require(consumer.canonical(json.loads(check['output']['text'])) == consumer.canonical(request),
+    require(consumer.canonical(json.loads(check['output']['text'],
+            object_pairs_hook=consumer.unique_json_fields)) == consumer.canonical(request),
             'partial or substituted quality publication')
     if completed:
         require(check['status'] == 'completed' and check['conclusion'] == 'success', 'gate is not successful')
@@ -209,6 +217,14 @@ class GitHubReader:
         require(type(run_id) is int and run_id > 0 and type(attempt) is int and attempt > 0,
                 'invalid run identity')
         return consumer.api(f'/repos/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}', self._token)
+
+    def latest_run(self, run_id):
+        require(type(run_id) is int and run_id > 0, 'invalid run identity')
+        return consumer.api(f'/repos/{REPOSITORY}/actions/runs/{run_id}', self._token)
+
+    def approvals(self, run_id):
+        require(type(run_id) is int and run_id > 0, 'invalid run identity')
+        return consumer.api(f'/repos/{REPOSITORY}/actions/runs/{run_id}/approvals', self._token)
 
 
 def validate_quality(receipt, admission):
@@ -353,12 +369,98 @@ def verify(admission, environment, reader, *, clock=time.time, execution_evidenc
             'consumer run is not active')
     verify_current_head(reader, admission)
     consumer.validate_environment(environment, admission, int(clock()))
+    return verified_request(admission, receipt_hash, quality)
+
+
+def verified_request(admission, receipt_hash, quality):
+    """The exact data envelope already used by App staging and collection."""
     return {'schema': SCHEMA, 'name': GATE, 'repository': REPOSITORY,
             'repository_id': admission['repository_id'], 'candidate_sha': admission['expected']['candidate_sha'],
             'candidate_tree': admission['expected']['candidate_tree'], 'receipt_sha256': receipt_hash,
             'check_run_id': admission['check_run_id'], 'admission_id': admission['expected']['admission_id'],
             'invocation': admission['expected']['invocation'], 'attempt_id': admission['expected']['attempt_id'],
             'expires_at': admission['expected']['expires_at'], 'quality': copy.deepcopy(quality)}
+
+
+def verify_ci_result(admission, environment, reader, *, clock=time.time):
+    """GET-only revalidation of a PRE-EXISTING App quality success for CI.
+
+    Unlike verify(), this runs downstream of the protected dispatch. It cannot
+    stage/consume a host journal claim or turn a raw report into a result. The
+    immutable checkout and all BOX_FORMAL_* values belong to the protected
+    box-formal-consumer environment, never workflow inputs or candidate code.
+    Re-reading the same immutable check is idempotent, not a new execution or
+    attempt; another candidate/admission/run attempt cannot reuse it.
+    """
+    release_policy.quality_results(json.loads(environment['QUALITY_RESULTS']))
+    expected = admission['expected']
+    require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong repository')
+    require(re.fullmatch('[0-9a-f]{40}', environment['EXPECTED_SHA']) is not None and
+            environment['EXPECTED_SHA'] == expected['candidate_sha'], 'wrong CI candidate')
+    trusted = environment['BOX_FORMAL_CONSUMER_SHA']
+    require(re.fullmatch('[0-9a-f]{40}', trusted) is not None and
+            trusted == expected['consumer_sha'], 'unapproved consumer revision')
+    reviewers = json.loads(environment['BOX_FORMAL_REVIEWER_IDS'])
+    require(isinstance(reviewers, list) and reviewers and
+            all(type(user) is int and user > 0 for user in reviewers) and
+            len(set(reviewers)) == len(reviewers), 'trusted reviewer IDs required')
+    gate_id = admission['quality_check_run_id']
+    require(type(gate_id) is int and gate_id > 0 and gate_id != admission['check_run_id'],
+            'finalized quality check ID required')
+    repository = reader.repository()
+    require(repository['id'] == admission['repository_id'] and repository['full_name'] == REPOSITORY,
+            'repository identity changed')
+    verify_current_head(reader, admission)
+    check = reader.check(admission['check_run_id'])
+    receipt = json.loads(check['output']['text'])
+    receipt_hash = consumer.validate_check(check, receipt, admission, int(clock()))
+    quality = validate_quality(receipt, admission)
+    request = verified_request(admission, receipt_hash, quality)
+    gate = reader.check(gate_id)
+    require(gate['id'] == gate_id, 'wrong quality check ID')
+    validate_gate(gate, request, completed=True)
+    commit = reader.commit(expected['candidate_sha'])
+    require(commit['sha'] == expected['candidate_sha'] and
+            commit['tree']['sha'] == expected['candidate_tree'], 'tested tree mismatch')
+    workflow = quality['workflow']
+    require(workflow['path'] == '.github/workflows/box-formal-receipt.yml' and
+            workflow['ref'] == 'refs/heads/main' and workflow['event'] == 'workflow_dispatch' and
+            workflow['sha'] == trusted, 'untrusted workflow origin')
+    require(all(type(workflow[key]) is int and workflow[key] > 0
+                for key in ('run_id', 'run_attempt', 'workflow_id')), 'invalid workflow identity')
+    run = reader.run(workflow['run_id'], workflow['run_attempt'])
+    require(run['id'] == workflow['run_id'] and run['run_attempt'] == workflow['run_attempt'] and
+            run['workflow_id'] == workflow['workflow_id'] and run['path'] == workflow['path'] and
+            run['event'] == workflow['event'] and run['head_branch'] == 'main' and
+            run['head_sha'] == trusted and run['repository']['id'] == admission['repository_id'] and
+            run['repository']['full_name'] == REPOSITORY and
+            run['head_repository']['id'] == admission['repository_id'] and
+            run['status'] == 'completed' and run['conclusion'] == 'success',
+            'consumer workflow did not complete successfully')
+    identity_keys = ('id', 'run_attempt', 'workflow_id', 'path', 'event', 'head_branch',
+                     'head_sha', 'repository', 'head_repository', 'status', 'conclusion', 'triggering_actor')
+    run_identity = consumer.canonical({key: run[key] for key in identity_keys})
+    latest = reader.latest_run(workflow['run_id'])
+    require(consumer.canonical({key: latest[key] for key in identity_keys}) == run_identity,
+            'consumer run replay or rerun')
+    approvals = reader.approvals(workflow['run_id'])
+    reviews = [review for review in approvals
+               if any(env['name'] == 'box-formal-consumer' for env in review['environments'])]
+    require(reviews and all(review['state'] == 'approved' and
+            type(review['user']['id']) is int and review['user']['id'] in reviewers and
+            review['user']['id'] != run['triggering_actor']['id'] for review in reviews),
+            'missing or untrusted environment reviewer')
+    # Reread both authenticated objects and the latest run, then head and clock.
+    # No write or new green publication occurs across this read-only boundary.
+    latest = reader.latest_run(workflow['run_id'])
+    require(consumer.canonical(reader.check(admission['check_run_id'])) == consumer.canonical(check) and
+            consumer.canonical(reader.check(gate_id)) == consumer.canonical(gate) and
+            consumer.canonical({key: latest[key] for key in identity_keys}) == run_identity and
+            consumer.canonical(reader.approvals(workflow['run_id'])) == consumer.canonical(approvals),
+            'quality evidence changed during CI consumption')
+    verify_current_head(reader, admission)
+    consumer.validate_check(check, receipt, admission, int(clock()))
+    return request
 
 
 def stage_publication(admission, environment, reader, publisher, journal, *, clock=time.time,
@@ -415,7 +517,9 @@ def main():
     # This entry point performs reads only, on the protected consumer checkout.
     # Publication is available solely through the trusted host's injected object.
     admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'])
-    result = verify(admission, os.environ, GitHubReader(os.environ['GITHUB_TOKEN']))
+    require(sys.argv[1:] in ([], ['ci']), 'unknown quality operation')
+    verifier = verify_ci_result if sys.argv[1:] == ['ci'] else verify
+    result = verifier(admission, os.environ, GitHubReader(os.environ['GITHUB_TOKEN']))
     print(json.dumps({key: result[key] for key in
                       ('schema', 'candidate_sha', 'candidate_tree', 'check_run_id', 'receipt_sha256')},
                      sort_keys=True))

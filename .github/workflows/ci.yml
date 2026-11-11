@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ github.repository }}
-          ref: ${{ inputs.sha || github.sha }}
+          ref: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -74,14 +74,13 @@ jobs:
         working-directory: tokenkit
         run: go build ./...
 
-      # Formal bootstrap tiers require the approved box-local fixed images.
-      # Keep this required result failing until a trusted, exact-candidate box
-      # verification route is wired. Hosted checks are not formal test evidence.
-      # Do not attach untrusted PR code to a self-hosted runner automatically.
-      - name: Require formal box verification (execution route not configured)
+      # Formal execution remains separate. The final gate independently reads
+      # the authenticated, complete App quality result for this exact SHA.
+      # Candidate code is never attached to a self-hosted runner by this CI.
+      - name: Policy and consumer regression tests
         run: |
-          echo "::error::Formal box verification is required for this exact candidate. The trusted execution/evidence route is not configured; hosted vet/build cannot satisfy it."
-          exit 1
+          python3 -I -B -m unittest discover -s scripts/ci -p 'test_*.py'
+          python3 -I -B -m unittest discover -s .github/actions/box-formal-consumer -p 'test_*.py'
 
   frontend:
     name: Frontend typecheck and test
@@ -97,7 +96,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ github.repository }}
-          ref: ${{ inputs.sha || github.sha }}
+          ref: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -142,7 +141,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: ${{ inputs.sha || github.sha }}
+          ref: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version-file: go.mod
@@ -158,20 +157,35 @@ jobs:
     needs: [backend, frontend, database]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: box-formal-consumer
+    permissions:
+      contents: read
+      checks: read
+      actions: read
     outputs:
       sha: ${{ steps.verify.outputs.sha }}
     steps:
+      - name: Require immutable trusted quality reader
+        env:
+          TRUSTED_SHA: ${{ vars.BOX_FORMAL_READER_SHA }}
+        run: '[[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      # Never execute the candidate's verifier with protected admission data.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: ${{ inputs.sha || github.sha }}
-      - name: Verify every required result and candidate
+          repository: 86669666/new-api
+          ref: ${{ vars.BOX_FORMAL_READER_SHA }}
+          path: trusted-quality
+          persist-credentials: false
+      - name: Verify hosted jobs and authenticated exact-candidate quality
         id: verify
         env:
-          EXPECTED_SHA: ${{ inputs.sha || github.sha }}
+          EXPECTED_SHA: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
           QUALITY_RESULTS: '{"backend":"${{ needs.backend.result }}","frontend":"${{ needs.frontend.result }}","database":"${{ needs.database.result }}"}'
+          BOX_FORMAL_CONSUMER_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          BOX_FORMAL_ADMISSION: ${{ vars.BOX_FORMAL_ADMISSION }}
+          BOX_FORMAL_REVIEWER_IDS: ${{ vars.BOX_FORMAL_REVIEWER_IDS }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/ci/release_policy.py quality
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 -I -B trusted-quality/scripts/ci/quality_results.py ci
           echo "sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
-      - name: Release policy regression tests
-        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'

@@ -45,6 +45,10 @@ jobs:
 
   quality:
     needs: prepare
+    permissions:
+      contents: read
+      checks: read
+      actions: read
     uses: ./.github/workflows/ci.yml
     with:
       sha: ${{ needs.prepare.outputs.sha }}

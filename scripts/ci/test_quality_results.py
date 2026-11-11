@@ -6,12 +6,16 @@ children. No test executes Go/Node/database/formal inventories or network writes
 import copy
 import json
 import io
+import os
+import re
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 import sqlite3
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -572,6 +576,234 @@ class QualityResultsTests(unittest.TestCase):
             self.assertFalse(marker.exists())
             self.assertNotIn('DO-NOT-LOG', child.stdout + child.stderr)
             self.assertEqual('Quality evidence rejected; no publication authorization granted.\n', child.stderr)
+
+
+class QualityWiringTests(unittest.TestCase):
+    """CI wiring contracts: all remote authentication/approvals are OFFLINE MOCKS."""
+
+    def setUp(self):
+        self.receipt, self.admission, self.environment = fixture()
+        self.admission['quality_check_run_id'] = 43
+        self.environment.update(EXPECTED_SHA='a' * 40, BOX_FORMAL_REVIEWER_IDS='[7]',
+            QUALITY_RESULTS=json.dumps(dict.fromkeys(('backend', 'frontend', 'database'), 'success')))
+        self.reader = MockReader(self.receipt, self.admission)
+        self.reader.run_value.update(status='completed', conclusion='success', triggering_actor={'id': 8})
+        self.latest = copy.deepcopy(self.reader.run_value)
+        self.reviews = [dict(environments=[{'name': 'box-formal-consumer'}],
+                             state='approved', user={'id': 7})]
+        self.reader.latest_run = lambda run_id: copy.deepcopy(self.latest)
+        self.reader.approvals = lambda run_id: copy.deepcopy(self.reviews)
+        # Independently authored App response fixture; never stage or publish it.
+        expected = self.admission['expected']
+        request = dict(schema='box-quality-result/v1', name='Required quality gate',
+            repository='86669666/new-api', repository_id=123,
+            candidate_sha=expected['candidate_sha'], candidate_tree=expected['candidate_tree'],
+            receipt_sha256=self.admission['receipt_sha256'], check_run_id=42,
+            admission_id=expected['admission_id'], invocation=expected['invocation'],
+            attempt_id=expected['attempt_id'], expires_at=expected['expires_at'],
+            quality=copy.deepcopy(self.admission['quality']))
+        self.reader.gate_value = dict(id=43, name='Required quality gate', head_sha='a' * 40,
+            app=dict(id=5498942, slug='new-api-box-formal'), status='completed', conclusion='success',
+            external_id=quality.consumer.digest(request), output={'text': json.dumps(request)})
+
+    def verify(self, now=200):
+        return quality.verify_ci_result(self.admission, self.environment, self.reader, clock=lambda: now)
+
+    def test_ci_entry_accepts_only_complete_existing_authenticated_result(self):
+        output = io.StringIO()
+        original = quality.verify_ci_result
+        with patch.dict(os.environ, dict(self.environment, BOX_FORMAL_ADMISSION=json.dumps(self.admission),
+                GITHUB_TOKEN='OFFLINE-NOT-A-CREDENTIAL'), clear=True), \
+                patch.object(sys, 'argv', ['quality_results.py', 'ci']), \
+                patch.object(quality, 'GitHubReader', return_value=self.reader), \
+                patch.object(quality, 'verify_ci_result', side_effect=lambda *args: original(
+                    *args, clock=lambda: 200)), \
+                redirect_stdout(output):
+            # Invoke the actual workflow CLI entry, not stage/collect/publisher.
+            quality.main()
+        self.assertEqual('a' * 40, json.loads(output.getvalue())['candidate_sha'])
+        self.assertEqual(42, json.loads(output.getvalue())['check_run_id'])
+
+    def test_ci_rejects_missing_failed_skipped_or_partial_hosted_jobs(self):
+        for job in ('backend', 'frontend', 'database'):
+            for state in (None, 'failure', 'skipped', 'cancelled', '', 'pending'):
+                with self.subTest(job=job, state=state):
+                    values = dict.fromkeys(('backend', 'frontend', 'database'), 'success')
+                    if state is None:
+                        del values[job]
+                    else:
+                        values[job] = state
+                    self.environment['QUALITY_RESULTS'] = json.dumps(values)
+                    with self.assertRaises(ValueError):
+                        self.verify()
+
+    def test_ci_rejects_wrong_candidate_missing_failed_forged_and_replayed_results(self):
+        mutations = ('sha', 'tree', 'missing-check', 'missing-quality', 'failed-receipt',
+            'skipped-command', 'missing-tier', 'cleanup', 'gate-failure', 'gate-skip',
+            'gate-pending', 'gate-app', 'receipt-app', 'replay-invocation', 'replay-admission',
+            'replay-attempt', 'replay-check', 'gate-sha', 'inactive', 'raw-report')
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                if mutation == 'sha':
+                    self.environment['EXPECTED_SHA'] = 'd' * 40
+                elif mutation == 'tree':
+                    self.reader.commit_value['tree']['sha'] = 'd' * 40
+                elif mutation == 'missing-check':
+                    del self.admission['quality_check_run_id']
+                elif mutation == 'missing-quality':
+                    del self.receipt['quality']['results']['formal']
+                elif mutation == 'failed-receipt':
+                    self.receipt['process_exit'] = 7
+                elif mutation == 'skipped-command':
+                    self.receipt['quality']['results']['policy']['commands'][0]['skipped'] = True
+                elif mutation == 'missing-tier':
+                    self.receipt['tiers'].pop()
+                elif mutation == 'cleanup':
+                    self.receipt['cleanup'] = False
+                elif mutation.startswith('gate-') and mutation[5:] in ('failure', 'skip'):
+                    self.reader.gate_value['conclusion'] = 'skipped' if mutation == 'gate-skip' else 'failure'
+                elif mutation == 'gate-pending':
+                    self.reader.gate_value.update(status='in_progress', conclusion=None)
+                elif mutation in ('gate-app', 'receipt-app'):
+                    check = self.reader.gate_value if mutation == 'gate-app' else self.reader.check_value
+                    check['app']['id'] = 1
+                elif mutation.startswith('replay-') and mutation != 'replay-check':
+                    key = {'invocation': 'invocation', 'admission': 'admission_id',
+                           'attempt': 'attempt_id'}[mutation[7:]]
+                    self.admission['expected'][key] = 'different-attempt'
+                elif mutation == 'replay-check':
+                    self.admission['quality_check_run_id'] = 44
+                elif mutation == 'gate-sha':
+                    self.reader.gate_value['head_sha'] = 'd' * 40
+                elif mutation == 'inactive':
+                    self.admission['active'] = False
+                else:
+                    self.receipt = dict(schema='quality-execution-evidence/v1', authentication='UNAUTHENTICATED')
+                # Even agree on fixture hashes: data cannot replace App origin,
+                # successful inventories, or the pre-existing exact gate envelope.
+                if 'quality' in self.receipt:
+                    self.admission['quality'] = copy.deepcopy(self.receipt['quality'])
+                self.reader.check_value['output']['text'] = json.dumps(self.receipt)
+                self.admission['receipt_sha256'] = quality.consumer.digest(self.receipt)
+                self.reader.check_value['external_id'] = self.admission['receipt_sha256']
+                request = json.loads(self.reader.gate_value['output']['text'])
+                request.update(receipt_sha256=self.admission['receipt_sha256'],
+                               quality=copy.deepcopy(self.admission['quality']))
+                self.reader.gate_value.update(external_id=quality.consumer.digest(request),
+                                             output={'text': json.dumps(request)})
+                with self.assertRaises((ValueError, KeyError)):
+                    self.verify()
+
+    def test_ci_rejects_untrusted_workflows_reviewers_reruns_expiry_and_head_drift(self):
+        for mutation in ('workflow', 'consumer-sha', 'workflow-failed', 'workflow-skipped',
+                         'rerun', 'reviewer', 'self-review', 'no-review', 'rejected-review',
+                         'wrong-environment', 'unconfigured-reviewers', 'head', 'base', 'future', 'expired'):
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                if mutation == 'workflow':
+                    self.reader.run_value['path'] = '.github/workflows/untrusted.yml'
+                elif mutation == 'consumer-sha':
+                    self.environment['BOX_FORMAL_CONSUMER_SHA'] = 'd' * 40
+                elif mutation.startswith('workflow-'):
+                    self.reader.run_value['conclusion'] = mutation[9:]
+                elif mutation == 'rerun':
+                    self.latest['run_attempt'] = 2
+                elif mutation == 'reviewer':
+                    self.reviews[0]['user']['id'] = 9
+                elif mutation == 'self-review':
+                    self.reader.run_value['triggering_actor']['id'] = 7
+                    self.latest = copy.deepcopy(self.reader.run_value)
+                elif mutation == 'no-review':
+                    self.reviews.clear()
+                elif mutation == 'rejected-review':
+                    self.reviews[0]['state'] = 'rejected'
+                elif mutation == 'wrong-environment':
+                    self.reviews[0]['environments'][0]['name'] = 'untrusted'
+                elif mutation == 'unconfigured-reviewers':
+                    self.environment['BOX_FORMAL_REVIEWER_IDS'] = '[]'
+                elif mutation in ('head', 'base'):
+                    self.reader.pr[mutation]['sha'] = 'd' * 40
+                with self.assertRaises(ValueError):
+                    self.verify(now={'future': 99, 'expired': 301}.get(mutation, 200))
+
+    def test_ci_rejects_final_read_drift_without_any_publication(self):
+        read = self.reader.check
+        count = 0
+
+        def drifting_check(check_id):
+            nonlocal count
+            check = read(check_id)
+            if check_id == 43:
+                count += 1
+                if count == 2:
+                    check['conclusion'] = 'failure'
+            return check
+
+        self.reader.check = drifting_check
+        with self.assertRaisesRegex(ValueError, 'evidence changed'):
+            self.verify()
+
+    def test_ci_run_reads_are_fixed_gets_and_compare_identity_not_response_extras(self):
+        reader = quality.GitHubReader('OFFLINE-NOT-A-CREDENTIAL')
+        with patch.object(quality.consumer, 'api', return_value={}) as api:
+            reader.latest_run(100)
+            reader.approvals(100)
+            self.assertEqual(['/repos/86669666/new-api/actions/runs/100',
+                              '/repos/86669666/new-api/actions/runs/100/approvals'],
+                             [call.args[0] for call in api.call_args_list])
+            for method in (reader.latest_run, reader.approvals):
+                for run_id in (True, 0, '100/../../x'):
+                    with self.assertRaises(ValueError):
+                        method(run_id)
+            self.assertEqual(2, api.call_count)
+        self.latest['previous_attempt_url'] = None  # Endpoint-specific metadata.
+        self.assertEqual('a' * 40, self.verify()['candidate_sha'])
+
+    def test_ci_gate_rejects_duplicate_fields_and_accepts_json_formatting_only(self):
+        output = self.reader.gate_value['output']
+        value = json.loads(output['text'])
+        output['text'] = json.dumps(value, indent=2, sort_keys=True)
+        self.assertEqual('a' * 40, self.verify()['candidate_sha'])
+        output['text'] = '{"candidate_sha":"forged",' + json.dumps(value)[1:]
+        with self.assertRaisesRegex(ValueError, 'duplicate receipt field'):
+            self.verify()
+
+    def test_actual_workflow_entry_cannot_emit_sha_after_verifier_failure(self):
+        root = Path(quality.__file__).resolve().parents[2]
+        workflow = (root / '.github/workflows/ci.yml').read_text()
+        gate = workflow.split('  quality-gate:\n', 1)[1]
+        self.assertIn('environment: box-formal-consumer', gate)
+        self.assertIn('ref: ${{ vars.BOX_FORMAL_READER_SHA }}', gate)
+        self.assertIn('BOX_FORMAL_REVIEWER_IDS: ${{ vars.BOX_FORMAL_REVIEWER_IDS }}', gate)
+        self.assertIn('github.event.pull_request.head.sha', gate)
+        self.assertNotIn('execution route not configured', workflow)
+        for name in ('docker-build.yml', 'docker-image-branch.yml', 'electron-build.yml',
+                     'release.yml', 'sync-release-to-gitcode.yml'):
+            caller = (root / '.github/workflows' / name).read_text().split('  quality:\n', 1)[1]
+            caller = re.split(r'^  [a-zA-Z][\w-]*:\n', caller, maxsplit=1, flags=re.MULTILINE)[0]
+            self.assertIn('uses: ./.github/workflows/ci.yml', caller)
+            self.assertIn('permissions:\n      contents: read\n      checks: read\n      actions: read', caller)
+        block = re.search(r'        run: \|\n((?:          .*\n)+)', gate)
+        self.assertIsNotNone(block)
+        script = textwrap.dedent(block.group(1))
+        self.assertEqual('python3 -I -B trusted-quality/scripts/ci/quality_results.py ci',
+                         script.splitlines()[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'output'
+            calls = Path(tmp) / 'calls'
+            env = dict(os.environ, EXPECTED_SHA='a' * 40, GITHUB_OUTPUT=str(output), CALLS=str(calls))
+            for code in (0, 7):
+                if output.exists():
+                    output.unlink()
+                # Shell command shim only: the real verifier itself is exercised
+                # by test_ci_entry_* with independently authored HTTP fixtures.
+                prefix = 'python3() { printf "%s\\n" "$*" > "$CALLS"; return ' + str(code) + '; }\n'
+                child = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', prefix + script],
+                    env=env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(code, child.returncode)
+                self.assertEqual('-I -B trusted-quality/scripts/ci/quality_results.py ci\n', calls.read_text())
+                self.assertEqual(code == 0, output.exists())
 
 
 if __name__ == '__main__':
