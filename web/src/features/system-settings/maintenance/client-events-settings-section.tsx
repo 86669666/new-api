@@ -50,11 +50,13 @@ import { safeNumberFieldProps } from '../utils/numeric-field'
 
 const configSchema = z.object({
   enabled: z.boolean(),
+  allow_anonymous: z.boolean(),
   retention_days: z.number().int().min(8).max(365),
   rate_limit: z.number().int().min(1).max(600),
 })
 const snapshotSchema = configSchema
   .extend({
+    allow_anonymous: z.boolean().optional().default(false),
     source: z.enum(['environment', 'option']),
     valid: z.boolean(),
   })
@@ -224,6 +226,22 @@ export function ClientEventsSettingsSection() {
                 controlId='client-events-enabled'
                 label={t('Enable client event collection')}
                 checked={field.value}
+                onCheckedChange={field.onChange}
+                disabled={isSaving}
+              />
+            )}
+          />
+          <FormField
+            control={form.control}
+            name='allow_anonymous'
+            render={({ field }) => (
+              <SettingsSwitchField
+                controlId='client-events-allow-anonymous'
+                label={t('Allow anonymous client events')}
+                description={t(
+                  'Unverified self-reports require Redis and TRUSTED_PROXIES=none. No user or device identity is verified.'
+                )}
+                checked={field.value ?? false}
                 onCheckedChange={field.onChange}
                 disabled={isSaving}
               />

@@ -670,7 +670,7 @@ def check_client_events(api, source_root):
     operation = api['paths']['/api/events']['post']
     schemas = api['components']['schemas']
     assert operation['operationId'] == 'receiveClientEvents'
-    assert operation['security'] == [{'ClientEventsBearer': []}]
+    assert operation['security'] == [{'ClientEventsBearer': []}, {}]
     assert operation['x-default-enabled'] is False and operation['x-query-policy'] == 'forbidden'
     assert set(operation['responses']) == {'200', '400', '401', '403', '404', '413', '429', '503'}
     assert operation['requestBody']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/ClientEventsInput'}
@@ -729,8 +729,14 @@ def check_client_event_stats(api, source_root):
     option = (source_root / 'controller/option.go').read_text()
     assert 'model.UpdateClientEventsConfigOption(value)' in option
     config = (source_root / 'setting/operation_setting/client_events_setting.go').read_text()
-    assert 'len(fields) != 3' in config
-    return {'authenticated_admin': True, 'pat_scope': 'log:read', 'anonymous': False, 'live_http': False}
+    assert 'len(fields) != 3' in config and 'allow_anonymous' in config
+    for kind in ('Usage', 'Clients'):
+        op = api['paths']['/api/events/' + kind.lower()]['get']
+        cohort = next(p for p in op['parameters'] if p.get('name') == 'authentication')
+        assert cohort['schema'] == {'type': 'string', 'enum': ['authenticated', 'anonymous'], 'default': 'authenticated'}
+        assert 'authentication' in schemas['ClientEvent' + kind + 'Page']['required']
+    assert schemas['ClientEventsConfigValue']['properties']['allow_anonymous']['default'] is False
+    return {'authenticated_admin': True, 'pat_scope': 'log:read', 'anonymous': 'explicit admin cohort; default authenticated', 'live_http': False}
 
 
 def check_model_capability_metadata(api, relay):
@@ -1581,10 +1587,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root', type=Path, default=ROOT, help='Explicit business source checkout for combined-candidate checks; defaults to this checkout. No source is copied or modified.')
     parser.add_argument('--claude-wire-fixtures', type=Path, help='Optional JSON array of recorded {status, body} results from local Claude relay/middleware tests; never fetched from a server.')
-    parser.add_argument('--design-gate', type=Path, required=True, help='Effective frozen S3 v1.1 contract JSON; its exact SHA and required wire structures are verified offline.')
+    parser.add_argument('--design-gate', type=Path, help='Effective frozen S3 v1.1 contract JSON; its exact SHA and required wire structures are verified offline.')
+    parser.add_argument('--client-events-only', action='store_true', help='Validate only the affected client event contracts/fixtures')
     args = parser.parse_args()
     source_root = args.source_root.resolve()
     documents = {}
+    if not args.client_events_only and args.design_gate is None:
+        parser.error('--design-gate is required outside --client-events-only')
+    if args.client_events_only:
+        api = json.loads((source_root / 'docs/openapi/api.json').read_text(), object_pairs_hook=unique_object)
+        OpenAPIV30SpecValidator(api).validate()
+        result = {'intake': check_client_events(api, source_root), 'stats': check_client_event_stats(api, source_root), 'fixtures': []}
+        fixtures = json.loads((source_root / 'scripts/openapi/fixtures.json').read_text())
+        for fixture in fixtures:
+            if not (fixture['name'].startswith(('issue25 ', 'client-stats ')) or fixture.get('schema') in ('#/components/schemas/ClientEventsConfigValue', '#/components/schemas/ClientEventsConfigSnapshot')):
+                continue
+            schema = pointer(api, fixture['schema'])
+            errors = list(OAS30Validator(schema, resolver=RefResolver.from_schema(api)).iter_errors(fixture['value']))
+            assert (not errors) == fixture['valid'], (fixture['name'], [error.message for error in errors])
+            result['fixtures'].append(fixture['name'])
+        print(json.dumps(result, indent=2))
+        return
     results = {'specs': {}, 'fixtures': [], 'source_auth_routes_checked': 0, 'source_root': str(source_root)}
     for name in ['api', 'relay']:
         document = json.loads((ROOT / 'docs/openapi' / (name + '.json')).read_text(), object_pairs_hook=unique_object)

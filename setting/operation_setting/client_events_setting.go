@@ -16,9 +16,10 @@ const ClientEventsConfigKey = "ClientEventsConfig"
 var ErrClientEventsConfig = errors.New("invalid client events configuration")
 
 type ClientEventsConfig struct {
-	Enabled       bool `json:"enabled"`
-	RetentionDays int  `json:"retention_days"`
-	RateLimit     int  `json:"rate_limit"`
+	Enabled        bool `json:"enabled"`
+	AllowAnonymous bool `json:"allow_anonymous"`
+	RetentionDays  int  `json:"retention_days"`
+	RateLimit      int  `json:"rate_limit"`
 }
 
 type ClientEventsSnapshot struct {
@@ -40,7 +41,15 @@ func ParseClientEventsConfig(value string) (ClientEventsConfig, error) {
 		return config, ErrClientEventsConfig
 	}
 	fields, err := common.DecodeRawJSONObject([]byte(value))
-	if err != nil || len(fields) != 3 {
+	if err != nil || (len(fields) != 3 && len(fields) != 4) {
+		return config, ErrClientEventsConfig
+	}
+	if raw, present := fields["allow_anonymous"]; present {
+		if !bytes.Equal(bytes.TrimSpace(raw), []byte("true")) && !bytes.Equal(bytes.TrimSpace(raw), []byte("false")) {
+			return config, ErrClientEventsConfig
+		}
+		config.AllowAnonymous = bytes.Equal(bytes.TrimSpace(raw), []byte("true"))
+	} else if len(fields) != 3 {
 		return config, ErrClientEventsConfig
 	}
 	enabled, ok := fields["enabled"]
@@ -123,6 +132,7 @@ func ApplyClientEventsOption(value *string, readErr error) error {
 	if err != nil {
 		previous := CurrentClientEventsSnapshot()
 		previous.Enabled = false
+		previous.AllowAnonymous = false
 		previous.Valid = false
 		previous.Source = "option"
 		clientEventsSnapshot.Store(&previous)

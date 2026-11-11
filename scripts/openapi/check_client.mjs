@@ -22,7 +22,7 @@ const codegen = require('openapi-typescript-codegen');
 assert.equal(require('openapi-typescript-codegen/package.json').version, '0.29.0');
 assert.equal(require('typescript/package.json').version, '5.9.3');
 await mkdir(output, { recursive: true });
-for (const name of ['api', 'relay']) {
+for (const name of (args.includes('--client-events-only') ? ['api'] : ['api', 'relay'])) {
   // Union types preserve the empty-string success message without generating
   // an invalid enum member. Wire schemas and pinned dependencies are unchanged.
   await codegen.generate({ input: path.join(root, 'docs/openapi', name + '.json'), output: path.join(output, 'generated', name), httpClient: 'fetch', useOptions: true, useUnionTypes: true });
@@ -49,6 +49,60 @@ const adaptation = {
   raw_generation_adapted_before_compile: true,
 };
 await writeFile(path.join(output, 'generator-adaptation.json'), JSON.stringify(adaptation, null, 2) + '\n');
+// Narrow issue25 validation reuses this pinned generator and its existing
+// organization query adaptation, without replaying unrelated consumer suites.
+if (args.includes('--client-events-only')) {
+  const consumer = path.join(output, 'generated/client-events-consumer.ts');
+  await writeFile(consumer, `import * as api from './api';
+const full: api.ClientEventsConfigValue = { enabled: false, allow_anonymous: true, retention_days: 30, rate_limit: 60 };
+const legacy: api.ClientEventsConfigValue = { enabled: false, retention_days: 30, rate_limit: 60 };
+// @ts-expect-error anonymous switch must be boolean
+const invalid: api.ClientEventsConfigValue = { ...full, allow_anonymous: 1 };
+const cohort: api.ClientEventClientsPage['authentication'] = 'anonymous';
+// @ts-expect-error combining cohorts is unsupported
+const all: api.ClientEventClientsPage['authentication'] = 'all';
+export { full, legacy, invalid, cohort, all };
+`);
+  execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'), '--strict', '--target', 'ES2020', '--module', 'commonjs', '--lib', 'ES2020,DOM', '--rootDir', path.join(output, 'generated'), '--outDir', path.join(output, 'compiled'), path.join(output, 'generated/api/index.ts'), consumer], { stdio: 'inherit' });
+  const api = require(path.join(output, 'compiled/api/index.js'));
+  api.OpenAPI.BASE = 'https://client-events-fixture.invalid';
+  const fixtures = JSON.parse(await readFile(path.join(root, 'scripts/openapi/fixtures.json'), 'utf8'));
+  const service = method => Object.values(api).find(value => typeof value?.[method] === 'function');
+  const calls = [];
+  let status = 200, body = { success: true, count: 1 };
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  };
+  const payload = { client_id: '8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11', channel: 'fixture', events: [{ event_type: 'app_launch', data: { version: '1', os: 'linux' } }] };
+  for (const token of ['sk-fixture-client-events', undefined]) {
+    api.OpenAPI.TOKEN = token;
+    await service('receiveClientEvents').receiveClientEvents({ requestBody: payload });
+    assert.equal(new Headers(calls.at(-1).init.headers).get('Authorization'), token ? 'Bearer ' + token : null);
+    assert.deepEqual(JSON.parse(calls.at(-1).init.body), payload);
+  }
+  status = 503; body = { success: false, code: 'CLIENT_EVENTS_UNAVAILABLE', message: 'fixture', message_key: 'fixture' };
+  const before = calls.length;
+  await assert.rejects(service('receiveClientEvents').receiveClientEvents({ requestBody: payload }), error => error.status === 503);
+  assert.equal(calls.length, before + 1, 'no automatic retry of uncertain event writes');
+  api.OpenAPI.TOKEN = 'fixture-admin'; status = 200;
+  for (const kind of ['Usage', 'Clients']) {
+    body = fixtures.find(f => f.name === 'issue25 anonymous ' + kind + ' cohort').value;
+    const method = 'getClientEvent' + kind;
+    assert.deepEqual(await service(method)[method]({ authentication: 'anonymous' }), body);
+    assert.equal(new URL(calls.at(-1).url).searchParams.get('authentication'), 'anonymous');
+  }
+  const config = { enabled: false, allow_anonymous: true, retention_days: 30, rate_limit: 60 };
+  body = { success: true, data: [{ key: 'ClientEventsConfig', value: JSON.stringify({ ...config, source: 'option', valid: true }) }] };
+  assert.deepEqual(await service('getApiOptionCollection').getApiOptionCollection({}), body);
+  body = { success: true, message: '' };
+  const requestBody = { key: 'ClientEventsConfig', value: JSON.stringify(config) };
+  await service('putApiOptionCollection').putApiOptionCollection({ requestBody });
+  assert.deepEqual(JSON.parse(calls.at(-1).init.body), requestBody);
+  console.log(JSON.stringify({ scope: 'client-events-only', generator: 'openapi-typescript-codegen@0.29.0', compiler: 'typescript@5.9.3', compile: 'PASS', stubbed_requests: calls.length, type_negatives: 2, real_HTTP: false, App_authentication: false, adaptation }, null, 2));
+  process.exit(0);
+}
+
 const searchServices = await Promise.all((await readdir(path.join(output, 'generated/relay/services'))).filter(name => name.endsWith('.ts')).map(async name => ({ name: name.slice(0, -3), source: await readFile(path.join(output, 'generated/relay/services', name), 'utf8') })));
 const nativeSearchServices = searchServices.filter(service => service.source.includes('    public static searchDeepSeekTools('));
 assert.equal(nativeSearchServices.length, 1, 'Exactly one native tools/search method is required');
@@ -60,7 +114,7 @@ const apiDocument = JSON.parse(await readFile(path.join(root, 'docs/openapi/api.
 const allFixtures = JSON.parse(await readFile(path.join(root, 'scripts/openapi/fixtures.json'), 'utf8'));
 const cacheFixtures = allFixtures.filter(fixture => fixture.kind === 'cache_control');
 assert(cacheFixtures.length > 0, 'Cache-Control contract fixtures are required');
-for (const name of ['api', 'relay']) {
+for (const name of (args.includes('--client-events-only') ? ['api'] : ['api', 'relay'])) {
   const document = JSON.parse(await readFile(path.join(root, 'docs/openapi', name + '.json'), 'utf8'));
   const schema = document.components.schemas.OrganizationCacheControl;
   assert.equal(schema.type, 'string');
@@ -1370,21 +1424,25 @@ for (const [status, code] of [[400, 'INVALID'], [401, 'UNAUTHORIZED'], [403, 'FO
 }
 api.OpenAPI.TOKEN = undefined;
 api.OpenAPI.HEADERS = undefined;
+responseStatus = 200;
+responseBody = { success: true, count: 1 };
+assert.deepEqual(await api[clientEventsService].receiveClientEvents({ requestBody: eventPayload }), responseBody);
+assert.equal(new Headers(calls.at(-1).init.headers).has('Authorization'), false);
 const clientEventsStubbedRequests = calls.length - beforeClientEventsRequests;
 const beforeClientStatsRequests = calls.length;
 api.OpenAPI.TOKEN = 'fixture-admin-stats';
 for (const op of clientStatsServices) {
-  const args = { startTime: 1700000000, endTime: 1700003600, page: 2, pageSize: 1, resultVersion: 'sha256:' + 'a'.repeat(64), channel: 'fixture' };
+  const args = { startTime: 1700000000, endTime: 1700003600, page: 2, pageSize: 1, resultVersion: 'sha256:' + 'a'.repeat(64), channel: 'fixture', authentication: 'anonymous' };
   if (op.suffix === 'Clients') args.version = '';
   else args.source = 'chat';
   responseStatus = 200;
-  responseBody = structuredClone(allFixtures.find(fixture => fixture.name === 'client-stats ' + op.suffix + ' empty result').value);
+  responseBody = structuredClone(allFixtures.find(fixture => fixture.name === 'issue25 anonymous ' + op.suffix + ' cohort').value);
   Object.assign(responseBody.data, { page: 2, page_size: 1, start_time: 1700000000, end_time: 1700003600, result_version: args.resultVersion });
   assert.deepEqual(await api[op.service][op.method](args), responseBody);
   const request = calls.at(-1);
   const url = new URL(request.url);
   assert.equal(url.pathname, '/api/events/' + op.suffix.toLowerCase());
-  for (const [key, value] of Object.entries({ start_time: '1700000000', end_time: '1700003600', page: '2', page_size: '1', result_version: args.resultVersion, channel: 'fixture' })) assert.equal(url.searchParams.get(key), value);
+  for (const [key, value] of Object.entries({ start_time: '1700000000', end_time: '1700003600', page: '2', page_size: '1', result_version: args.resultVersion, channel: 'fixture', authentication: 'anonymous' })) assert.equal(url.searchParams.get(key), value);
   if (op.suffix === 'Clients') { assert(url.searchParams.has('version')); assert.equal(url.searchParams.get('version'), ''); }
   else assert.equal(url.searchParams.get('source'), 'chat');
   assert.equal(request.init.method, 'GET');
@@ -1411,7 +1469,7 @@ const optionService = optionServices[0].name;
 const beforeClientConfigRequests = calls.length;
 api.OpenAPI.TOKEN = 'fixture-root-settings';
 responseStatus = 200;
-const settingsSnapshot = { enabled: false, retention_days: 30, rate_limit: 60, source: 'option', valid: false };
+const settingsSnapshot = { enabled: false, allow_anonymous: true, retention_days: 30, rate_limit: 60, source: 'option', valid: false };
 responseBody = { success: true, data: [{ key: 'ClientEventsConfig', value: JSON.stringify(settingsSnapshot) }] };
 assert.deepEqual(await api[optionService].getApiOptionCollection({}), responseBody);
 const settingsRead = calls.at(-1);
@@ -1419,7 +1477,7 @@ assert.equal(settingsRead.url, api.OpenAPI.BASE + '/api/option/');
 assert.equal(settingsRead.init.method, 'GET');
 assert.equal(settingsRead.init.body, undefined);
 assert.deepEqual(JSON.parse(responseBody.data[0].value), settingsSnapshot);
-const settingsBody = { key: 'ClientEventsConfig', value: JSON.stringify({ enabled: false, retention_days: 30, rate_limit: 60 }) };
+const settingsBody = { key: 'ClientEventsConfig', value: JSON.stringify({ enabled: false, allow_anonymous: true, retention_days: 30, rate_limit: 60 }) };
 responseStatus = 200;
 responseBody = { success: true, message: '' };
 assert.deepEqual(await api[optionService].putApiOptionCollection({ requestBody: settingsBody }), responseBody);

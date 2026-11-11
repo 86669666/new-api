@@ -21244,16 +21244,17 @@
     "/api/events": {
       "post": {
         "operationId": "receiveClientEvents",
-        "summary": "Receive authenticated client self-reported events",
+        "summary": "Receive authenticated or explicitly enabled anonymous client self-reports",
         "tags": [
           "Client Events"
         ],
         "security": [
           {
             "ClientEventsBearer": []
-          }
+          },
+          {}
         ],
-        "description": "Startup CLIENT_EVENTS_ENABLED=false by default. Authenticated native-client receiver only, no anonymous mode. Current enabled/nondeleted owner and unexpired enabled/exhausted token are rechecked under user->token locks, including post-wait key byte equality/IP and expiry immediately before commit. No cache grants authority and no quota/status/access-time/accounting/cache value is changed. Exhaustion is not revocation, but intake still consumes HTTP/CPU/database/storage resources. Initial valid identity authorizes a dedicated default60/min token-ID limiter outside the transaction; existing global IP limiter runs exactly once. Redis failure is503, never memory fallback; intentionally disabled Redis uses per-process memory limits. Body-only events; no query parameters. Existing positive organization selection is refused; no organization proof or dashboard identity is created. Persist one typed main-DB table, separate from usage/accounting. Owner-scoped SHA256 fingerprint binds canonical UUID/channel/type/millisecond client time/normalized allowed fields. Same-owner key rotation is duplicate; other owner separate. Same-ms identical real actions may merge. Missing timestamp is receipt time and cannot guarantee cross-request retry deduplication; the merged Cherry PR44 always sends stable timestamp but no event_id. Count only after one whole transaction commits; duplicate/ignored count0. Any storage/commit uncertainty returns503; timestamped retry converges. Default retention30days (8..365) from server receive time; row/fingerprint deleted together. Hourly bounded1000-ID cleanup uses existing master/lease runner with30s context budget even when intake disabled. Without a running master there is no guaranteed hourly removal. User deletion does not imply anonymity or immediate erasure; strings can be maliciously mislabelled and are not provider-verified billing facts. No real upload/client/deployment acceptance is implied. Canonical POST and its slash rejection return no-store JSON; other methods remain absent and retain existing framework behavior. Runtime ClientEventsConfig overrides startup environment only after an authoritative Option read. Initial authority unavailable or invalid stored option disables intake and new cleanup; read failure keeps last observed snapshot. Valid disabled intake still allows cleanup. This route remains authenticated; anonymous receiver is not implemented or enabled.",
+        "description": "Startup CLIENT_EVENTS_ENABLED=false by default. Authenticated intake by default. Anonymous intake requires both enabled and allow_anonymous=true in the canonical persisted ClientEventsConfig. Current enabled/nondeleted owner and unexpired enabled/exhausted token are rechecked under user->token locks, including post-wait key byte equality/IP and expiry immediately before commit. No cache grants authority and no quota/status/access-time/accounting/cache value is changed. Exhaustion is not revocation, but intake still consumes HTTP/CPU/database/storage resources. Initial valid identity authorizes a dedicated default60/min token-ID limiter outside the transaction; existing global IP limiter runs exactly once. Redis failure is503, never memory fallback; intentionally disabled Redis uses per-process memory limits. Body-only events; no query parameters. Existing positive organization selection is refused; no organization proof or dashboard identity is created. Persist one typed main-DB table, separate from usage/accounting. Owner-scoped SHA256 fingerprint binds canonical UUID/channel/type/millisecond client time/normalized allowed fields. Same-owner key rotation is duplicate; other owner separate. Same-ms identical real actions may merge. Missing timestamp is receipt time and cannot guarantee cross-request retry deduplication; the merged Cherry PR44 always sends stable timestamp but no event_id. Count only after one whole transaction commits; duplicate/ignored count0. Any storage/commit uncertainty returns503; timestamped retry converges. Default retention30days (8..365) from server receive time; row/fingerprint deleted together. Hourly bounded1000-ID cleanup uses existing master/lease runner with30s context budget even when intake disabled. Without a running master there is no guaranteed hourly removal. User deletion does not imply anonymity or immediate erasure; strings can be maliciously mislabelled and are not provider-verified billing facts. No real upload/client/deployment acceptance is implied. Canonical POST and its slash rejection return no-store JSON; other methods remain absent and retain existing framework behavior. Runtime ClientEventsConfig overrides startup environment only after an authoritative Option read. Initial authority unavailable or invalid stored option disables intake and new cleanup; read failure keeps last observed snapshot. Valid disabled intake still allows cleanup. Only a truly absent Authorization header may select anonymous; present empty, duplicate, malformed, invalid, disabled, expired or revoked credentials never downgrade. Valid credentials retain authenticated checks independently of anonymous readiness. Anonymous requires healthy shared Redis and exact TRUSTED_PROXIES=none; missing readiness returns503 without local fallback. The transport peer is canonical IPv4 (including unmapped IPv4) or IPv6 /64 for the network bucket; forwarded headers are ignored. Anonymous-only fixed-window budgets are site600/min, network min(rate_limit,60)/min and full-IP+claimed-UUID rate_limit/min, with positive Retry-After on429; counters are not reset on policy updates. Site/network gates precede UUID key creation; at most8 anonymous requests/process, immediate503 on saturation, no queue. Reserved zero user/token IDs and client-event-anonymous-v1 fingerprint namespace never authenticate a user or device. The canonical Option row serializes anonymous dedup,100000 retained-row capacity and disable updates, with all-or-nothing inserts and actual newly committed count; capacity returns503 even without cleanup. All-duplicate batches at capacity return0. Enabling rejects unrecognized reserved-zero history and failed zero-ID storage constraints; no user0/schema migration. No IP, headers, credentials or raw body stored in event rows, no new sensitive application logs; Redis peer identifiers are short-lived operational metadata, not anonymity, and existing access/proxy logs require operator retention review. A forged UUID may collide; missing timestamps cannot promise retry dedup. No production enablement or deployment acceptance is implied.",
         "parameters": [
           {
             "$ref": "#/components/parameters/PersonalOrganizationHeader"
@@ -21324,7 +21325,7 @@
             }
           },
           "401": {
-            "description": "Missing, ambiguous, wrong-kind, disabled/deleted/expired/nonexact credential.",
+            "description": "Missing credential while anonymous disabled, or any present invalid/wrong-kind/disabled/deleted/expired credential; never downgraded.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -21403,7 +21404,7 @@
             }
           },
           "429": {
-            "description": "Global IP or dedicated token-ID limit. JSON error, positive Retry-After.",
+            "description": "Existing global limiter or dedicated authenticated token / anonymous site, network, pair budget; positive Retry-After.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -21428,7 +21429,7 @@
             }
           },
           "503": {
-            "description": "Temporary authority/storage/commit/limiter backend failure. Retry same timestamped payload; ambiguous commit may have persisted rows and retry then counts0.",
+            "description": "Temporary authority/storage/commit/limiter backend failure. Retry same timestamped payload; ambiguous commit may have persisted rows and retry then counts0. Anonymous readiness, in-flight or retained capacity failure also returns this safe unavailable envelope; no memory fallback.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -24621,7 +24622,7 @@
         "tags": [
           "Client event statistics"
         ],
-        "description": "Authenticated administrator aggregate of retained client self-reports across users; personal-only selector boundary, not anonymous or organization scoped. Dashboard session or PAT (including root) with log:read ceiling; legacy PAT retains existing retirement policy. Relay/OAuth resource credentials are not accepted. No request body. Only the listed query fields are allowed (including org_id query values, even 0, rejected by the strict handler whitelist); duplicate, unknown, noncanonical numeric, control-character and empty filters are rejected except version= is the explicit unknown-version filter. Default window is last 7 days, [start_time,end_time), UTC; endpoints must be supplied together, span <=31 days, end <=now+1h. Page default1, size50; offset <=2000. Page>1 requires explicit window and result_version. Version hashes normalized query and complete sorted result, excluding pagination; mismatch is409, not a snapshot pin. Bound 50000 candidate rows and2000 groups; exceeds yields422 without partial results. Two process slots and5s deadline,503 on unavailable. Direct authority rechecked before response publication. Reads remain available when intake disabled. data_complete=false means retained self-reports are not authoritative billing/usage totals. intake_enabled/retention_days are operational hints, not proof of complete history. Group by UTC day/model/provider/source. Token sums are arbitrary precision decimal strings or null when every value missing; zero is known zero. Missing-event counters and counter_data_complete describe counter coverage. Existing rate-limit middleware may return empty HTTP429 before the handler. The handler query-error envelope is distinct from existing authentication/selector middleware errors. Do not send an organization selector: positive organization header selection is rejected by the shared boundary; org_id is not a query filter.",
+        "description": "Authenticated administrator aggregate of retained client self-reports across users; personal-only selector boundary, never publicly readable or organization scoped. Dashboard session or PAT (including root) with log:read ceiling; legacy PAT retains existing retirement policy. Relay/OAuth resource credentials are not accepted. No request body. Only the listed query fields are allowed (including org_id query values, even 0, rejected by the strict handler whitelist); duplicate, unknown, noncanonical numeric, control-character and empty filters are rejected except version= is the explicit unknown-version filter. Default window is last 7 days, [start_time,end_time), UTC; endpoints must be supplied together, span <=31 days, end <=now+1h. Page default1, size50; offset <=2000. Page>1 requires explicit window and result_version. Version hashes normalized query and complete sorted result, excluding pagination; mismatch is409, not a snapshot pin. Bound 50000 candidate rows and2000 groups; exceeds yields422 without partial results. Two process slots and5s deadline,503 on unavailable. Direct authority rechecked before response publication. Reads remain available when intake disabled. data_complete=false means retained self-reports are not authoritative billing/usage totals. intake_enabled/retention_days are operational hints, not proof of complete history. Group by UTC day/model/provider/source. Token sums are arbitrary precision decimal strings or null when every value missing; zero is known zero. Missing-event counters and counter_data_complete describe counter coverage. Existing rate-limit middleware may return empty HTTP429 before the handler. The handler query-error envelope is distinct from existing authentication/selector middleware errors. Do not send an organization selector: positive organization header selection is rejected by the shared boundary; org_id is not a query filter. authentication defaults to authenticated; explicit anonymous is a separate SQL cohort with zero IDs and recognized anonymous fingerprints, filtered before LIMIT. No all cohort. Cohort binds result_version and metadata. Anonymous provenance=unverified_client_self_reported; clients identity_basis=unverified_channel_client and count_basis=claimed_client_identifiers: active_clients counts claimed UUIDs, never verified users or devices.",
         "security": [
           {
             "DashboardJWT": []
@@ -24720,6 +24721,20 @@
                 "agent"
               ]
             }
+          },
+          {
+            "in": "query",
+            "name": "authentication",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "authenticated",
+                "anonymous"
+              ],
+              "default": "authenticated"
+            },
+            "description": "One cohort only; SQL filters before the candidate LIMIT. Anonymous identifiers and counters are unverified self-reports, not people/devices or billed usage."
           }
         ],
         "responses": {
@@ -24837,7 +24852,7 @@
         "tags": [
           "Client event statistics"
         ],
-        "description": "Authenticated administrator aggregate of retained client self-reports across users; personal-only selector boundary, not anonymous or organization scoped. Dashboard session or PAT (including root) with log:read ceiling; legacy PAT retains existing retirement policy. Relay/OAuth resource credentials are not accepted. No request body. Only the listed query fields are allowed (including org_id query values, even 0, rejected by the strict handler whitelist); duplicate, unknown, noncanonical numeric, control-character and empty filters are rejected except version= is the explicit unknown-version filter. Default window is last 7 days, [start_time,end_time), UTC; endpoints must be supplied together, span <=31 days, end <=now+1h. Page default1, size50; offset <=2000. Page>1 requires explicit window and result_version. Version hashes normalized query and complete sorted result, excluding pagination; mismatch is409, not a snapshot pin. Bound 50000 candidate rows and2000 groups; exceeds yields422 without partial results. Two process slots and5s deadline,503 on unavailable. Direct authority rechecked before response publication. Reads remain available when intake disabled. data_complete=false means retained self-reports are not authoritative billing/usage totals. intake_enabled/retention_days are operational hints, not proof of complete history. Activity is app_launch only; identity=(user,channel,client UUID), version/OS groups overlap so groups_additive=false. Empty version is unknown. app_update is not activity. Existing rate-limit middleware may return empty HTTP429 before the handler. The handler query-error envelope is distinct from existing authentication/selector middleware errors. Do not send an organization selector: positive organization header selection is rejected by the shared boundary; org_id is not a query filter.",
+        "description": "Authenticated administrator aggregate of retained client self-reports across users; personal-only selector boundary, never publicly readable or organization scoped. Dashboard session or PAT (including root) with log:read ceiling; legacy PAT retains existing retirement policy. Relay/OAuth resource credentials are not accepted. No request body. Only the listed query fields are allowed (including org_id query values, even 0, rejected by the strict handler whitelist); duplicate, unknown, noncanonical numeric, control-character and empty filters are rejected except version= is the explicit unknown-version filter. Default window is last 7 days, [start_time,end_time), UTC; endpoints must be supplied together, span <=31 days, end <=now+1h. Page default1, size50; offset <=2000. Page>1 requires explicit window and result_version. Version hashes normalized query and complete sorted result, excluding pagination; mismatch is409, not a snapshot pin. Bound 50000 candidate rows and2000 groups; exceeds yields422 without partial results. Two process slots and5s deadline,503 on unavailable. Direct authority rechecked before response publication. Reads remain available when intake disabled. data_complete=false means retained self-reports are not authoritative billing/usage totals. intake_enabled/retention_days are operational hints, not proof of complete history. Activity is app_launch only; authenticated identity=(user,channel,client UUID), version/OS groups overlap so groups_additive=false. Empty version is unknown. app_update is not activity. Existing rate-limit middleware may return empty HTTP429 before the handler. The handler query-error envelope is distinct from existing authentication/selector middleware errors. Do not send an organization selector: positive organization header selection is rejected by the shared boundary; org_id is not a query filter. authentication defaults to authenticated; explicit anonymous is a separate SQL cohort with zero IDs and recognized anonymous fingerprints, filtered before LIMIT. No all cohort. Cohort binds result_version and metadata. Anonymous provenance=unverified_client_self_reported; clients identity_basis=unverified_channel_client and count_basis=claimed_client_identifiers: active_clients counts claimed UUIDs, never verified users or devices.",
         "security": [
           {
             "DashboardJWT": []
@@ -24926,6 +24941,20 @@
                 "linux"
               ]
             }
+          },
+          {
+            "in": "query",
+            "name": "authentication",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "authenticated",
+                "anonymous"
+              ],
+              "default": "authenticated"
+            },
+            "description": "One cohort only; SQL filters before the candidate LIMIT. Anonymous identifiers and counters are unverified self-reports, not people/devices or billed usage."
           }
         ],
         "responses": {
@@ -35755,6 +35784,11 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 600
+          },
+          "allow_anonymous": {
+            "type": "boolean",
+            "default": false,
+            "description": "Default false; no environment enable flag. Legacy three-field objects read as false."
           }
         }
       },
@@ -35791,6 +35825,11 @@
           },
           "valid": {
             "type": "boolean"
+          },
+          "allow_anonymous": {
+            "type": "boolean",
+            "default": false,
+            "description": "Default false; no environment enable flag. Legacy three-field objects read as false."
           }
         }
       },
@@ -35810,7 +35849,7 @@
           "value": {
             "type": "string",
             "maxLength": 4096,
-            "description": "JSON-encoded ClientEventsConfigValue, exactly three fields. Boolean and canonical integer JSON tokens required; duplicate/unknown fields, exponent/fraction numbers and null rejected. source and valid are read-only."
+            "description": "JSON-encoded ClientEventsConfigValue, complete four-field writes recommended. A legacy exact three-field write is accepted only while persisted allow_anonymous=false, atomically checked under the canonical Option row lock; otherwise400 with no mutation. Duplicates/unknown fields, wrong types, exponent/fraction numbers and null rejected. source/valid are read-only. Old binaries reject four-field storage; coordinated rollback must disable anonymous and explicitly convert before running old binaries."
           }
         }
       },
@@ -35928,7 +35967,8 @@
           "coverage",
           "data_complete",
           "intake_enabled",
-          "retention_days"
+          "retention_days",
+          "authentication"
         ],
         "properties": {
           "items": {
@@ -35972,7 +36012,8 @@
           "provenance": {
             "type": "string",
             "enum": [
-              "client_self_reported"
+              "client_self_reported",
+              "unverified_client_self_reported"
             ]
           },
           "coverage": {
@@ -35994,8 +36035,45 @@
             "type": "integer",
             "minimum": 8,
             "maximum": 365
+          },
+          "authentication": {
+            "type": "string",
+            "enum": [
+              "authenticated",
+              "anonymous"
+            ]
           }
-        }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "authentication": {
+                "enum": [
+                  "authenticated"
+                ]
+              },
+              "provenance": {
+                "enum": [
+                  "client_self_reported"
+                ]
+              }
+            }
+          },
+          {
+            "properties": {
+              "authentication": {
+                "enum": [
+                  "anonymous"
+                ]
+              },
+              "provenance": {
+                "enum": [
+                  "unverified_client_self_reported"
+                ]
+              }
+            }
+          }
+        ]
       },
       "ClientEventUsageResult": {
         "type": "object",
@@ -36035,7 +36113,8 @@
           "retention_days",
           "activity_basis",
           "identity_basis",
-          "groups_additive"
+          "groups_additive",
+          "authentication"
         ],
         "properties": {
           "items": {
@@ -36079,7 +36158,8 @@
           "provenance": {
             "type": "string",
             "enum": [
-              "client_self_reported"
+              "client_self_reported",
+              "unverified_client_self_reported"
             ]
           },
           "coverage": {
@@ -36111,7 +36191,8 @@
           "identity_basis": {
             "type": "string",
             "enum": [
-              "user_channel_client"
+              "user_channel_client",
+              "unverified_channel_client"
             ]
           },
           "groups_additive": {
@@ -36119,8 +36200,69 @@
             "enum": [
               false
             ]
+          },
+          "authentication": {
+            "type": "string",
+            "enum": [
+              "authenticated",
+              "anonymous"
+            ]
+          },
+          "count_basis": {
+            "type": "string",
+            "enum": [
+              "claimed_client_identifiers"
+            ]
           }
-        }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "authentication": {
+                "enum": [
+                  "authenticated"
+                ]
+              },
+              "provenance": {
+                "enum": [
+                  "client_self_reported"
+                ]
+              },
+              "identity_basis": {
+                "enum": [
+                  "user_channel_client"
+                ]
+              }
+            },
+            "not": {
+              "required": [
+                "count_basis"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "authentication": {
+                "enum": [
+                  "anonymous"
+                ]
+              },
+              "provenance": {
+                "enum": [
+                  "unverified_client_self_reported"
+                ]
+              },
+              "identity_basis": {
+                "enum": [
+                  "unverified_channel_client"
+                ]
+              }
+            },
+            "required": [
+              "count_basis"
+            ]
+          }
+        ]
       },
       "ClientEventClientsResult": {
         "type": "object",
