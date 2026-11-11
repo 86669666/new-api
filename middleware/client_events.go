@@ -39,6 +39,9 @@ func WriteClientEventError(c *gin.Context, status int) {
 }
 
 func ClientEventErrorStatus(err error) int {
+	if errors.Is(err, model.ErrClientEventDisabled) {
+		return 404
+	}
 	if errors.Is(err, model.ErrClientEventUnauthorized) {
 		return 401
 	}
@@ -63,6 +66,22 @@ func ClientEventsBoundary() gin.HandlerFunc {
 		if !config.Enabled {
 			WriteClientEventError(c, 404)
 			return
+		}
+		// Presence is distinct from Header.Get: an empty credential never downgrades.
+		authorizationPresent := false
+		for name := range c.Request.Header {
+			if strings.EqualFold(name, "Authorization") {
+				authorizationPresent = true
+			}
+		}
+		if !authorizationPresent && config.AllowAnonymous {
+			// Hold anonymous admission through the global limiter and downstream
+			// handlers, so rejected traffic cannot create or wait on peer keys.
+			release := admitAnonymousClientEvents(c, config.RateLimit)
+			if release == nil {
+				return
+			}
+			defer release()
 		}
 		if common.GlobalApiRateLimitEnable {
 			// Enabled GlobalAPIRateLimit contains no c.Next. Calling defNext when
@@ -99,6 +118,10 @@ func ClientEventsBoundary() gin.HandlerFunc {
 		media, params, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 		if err != nil || media != "application/json" || len(params) > 1 || len(params) == 1 && !strings.EqualFold(params["charset"], "utf-8") || c.GetHeader("Content-Encoding") != "" {
 			WriteClientEventError(c, 400)
+			return
+		}
+		if !authorizationPresent && config.AllowAnonymous {
+			c.Next()
 			return
 		}
 		scheme, bearer, found := strings.Cut(c.GetHeader("Authorization"), " ")

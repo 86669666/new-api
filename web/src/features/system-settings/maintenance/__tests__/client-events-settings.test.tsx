@@ -45,7 +45,7 @@ const initial = {
   source: 'option',
   valid: true,
 }
-let server = { ...initial }
+let server: typeof initial & { allow_anonymous?: boolean } = { ...initial }
 let readFails = false
 let client: QueryClient
 
@@ -103,6 +103,70 @@ async function renderReady() {
 }
 
 describe('Client event settings', () => {
+  it('maps legacy snapshots to anonymous off and saves all four fields', async () => {
+    await renderReady()
+    const toggle = screen.getByRole('switch', {
+      name: 'Allow anonymous client events',
+    })
+    expect(toggle).not.toBeChecked()
+    await userEvent.click(toggle)
+    expect(toggle).toBeChecked()
+    vi.mocked(api.put).mockImplementation(async () => {
+      server = { ...server, allow_anonymous: true }
+      return { data: { success: true, message: '' } }
+    })
+    await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Save Changes' })
+      ).toBeDisabled()
+    )
+    expect(api.put).toHaveBeenCalledWith('/api/option/', {
+      key: 'ClientEventsConfig',
+      value: JSON.stringify({
+        enabled: false,
+        allow_anonymous: true,
+        retention_days: 30,
+        rate_limit: 60,
+      }),
+    })
+    expect(toggle).toBeChecked()
+  })
+
+  it('preserves anonymous true when editing other fields and on dirty refetch', async () => {
+    server = { ...server, allow_anonymous: true }
+    const retention = await renderReady()
+    const toggle = screen.getByRole('switch', {
+      name: 'Allow anonymous client events',
+    })
+    await waitFor(() => expect(toggle).toBeChecked())
+    fireEvent.change(retention, { target: { value: '45' } })
+    server = { ...server, allow_anonymous: false }
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['system-options'] })
+    })
+    expect(toggle).toBeChecked()
+    vi.mocked(api.put).mockImplementation(async () => {
+      server = { ...server, allow_anonymous: true, retention_days: 45 }
+      return { data: { success: true, message: '' } }
+    })
+    await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Save Changes' })
+      ).toBeDisabled()
+    )
+    expect(api.put).toHaveBeenCalledWith('/api/option/', {
+      key: 'ClientEventsConfig',
+      value: JSON.stringify({
+        enabled: false,
+        allow_anonymous: true,
+        retention_days: 45,
+        rate_limit: 60,
+      }),
+    })
+  })
+
   it('preserves dirty edits when background options change', async () => {
     const retention = await renderReady()
     fireEvent.change(retention, { target: { value: '45' } })
@@ -128,6 +192,7 @@ describe('Client event settings', () => {
       key: 'ClientEventsConfig',
       value: JSON.stringify({
         enabled: false,
+        allow_anonymous: false,
         retention_days: 45,
         rate_limit: 60,
       }),

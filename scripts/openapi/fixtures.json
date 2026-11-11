@@ -15070,7 +15070,8 @@
         "data_complete": false,
         "intake_enabled": false,
         "retention_days": 30,
-        "items": []
+        "items": [],
+        "authentication": "authenticated"
       }
     },
     "valid": true
@@ -15094,7 +15095,8 @@
         "data_complete": true,
         "intake_enabled": false,
         "retention_days": 30,
-        "items": []
+        "items": [],
+        "authentication": "authenticated"
       }
     },
     "valid": false
@@ -15118,7 +15120,8 @@
         "data_complete": false,
         "intake_enabled": false,
         "retention_days": 30,
-        "items": []
+        "items": [],
+        "authentication": "authenticated"
       }
     },
     "valid": false
@@ -15142,7 +15145,8 @@
         "data_complete": false,
         "intake_enabled": false,
         "retention_days": 7,
-        "items": []
+        "items": [],
+        "authentication": "authenticated"
       }
     },
     "valid": false
@@ -15169,7 +15173,8 @@
         "items": [],
         "activity_basis": "app_launch",
         "identity_basis": "user_channel_client",
-        "groups_additive": false
+        "groups_additive": false,
+        "authentication": "authenticated"
       }
     },
     "valid": true
@@ -15196,7 +15201,8 @@
         "items": [],
         "activity_basis": "app_launch",
         "identity_basis": "user_channel_client",
-        "groups_additive": false
+        "groups_additive": false,
+        "authentication": "authenticated"
       }
     },
     "valid": false
@@ -15223,7 +15229,8 @@
         "items": [],
         "activity_basis": "app_launch",
         "identity_basis": "user_channel_client",
-        "groups_additive": false
+        "groups_additive": false,
+        "authentication": "authenticated"
       }
     },
     "valid": false
@@ -15250,7 +15257,8 @@
         "items": [],
         "activity_basis": "app_launch",
         "identity_basis": "user_channel_client",
-        "groups_additive": false
+        "groups_additive": false,
+        "authentication": "authenticated"
       }
     },
     "valid": false
@@ -15573,7 +15581,8 @@
         "data_complete": false,
         "intake_enabled": false,
         "retention_days": 30,
-        "items": []
+        "items": [],
+        "authentication": "authenticated"
       }
     },
     "valid": false
@@ -17286,5 +17295,149 @@
       }
     },
     "valid": true
+  },
+  {
+    "name": "issue25 anonymous Usage cohort",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "unverified_client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": [],
+        "authentication": "anonymous"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "issue25 mismatched Usage cohort",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventUsageResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "unverified_client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": [],
+        "authentication": "authenticated"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "issue25 anonymous Clients cohort",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventClientsResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "unverified_client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": [],
+        "activity_basis": "app_launch",
+        "identity_basis": "unverified_channel_client",
+        "groups_additive": false,
+        "authentication": "anonymous",
+        "count_basis": "claimed_client_identifiers"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "issue25 mismatched Clients cohort",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventClientsResult",
+    "value": {
+      "success": true,
+      "data": {
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+        "start_time": 1,
+        "end_time": 1,
+        "timezone": "UTC",
+        "result_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provenance": "unverified_client_self_reported",
+        "coverage": "retained_events",
+        "data_complete": false,
+        "intake_enabled": false,
+        "retention_days": 30,
+        "items": [],
+        "activity_basis": "app_launch",
+        "identity_basis": "unverified_channel_client",
+        "groups_additive": false,
+        "authentication": "authenticated",
+        "count_basis": "claimed_client_identifiers"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "issue25 allow_anonymous False",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigValue",
+    "value": {
+      "enabled": false,
+      "retention_days": 30,
+      "rate_limit": 60,
+      "allow_anonymous": false
+    },
+    "valid": true
+  },
+  {
+    "name": "issue25 allow_anonymous True",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigValue",
+    "value": {
+      "enabled": false,
+      "retention_days": 30,
+      "rate_limit": 60,
+      "allow_anonymous": true
+    },
+    "valid": true
+  },
+  {
+    "name": "issue25 allow_anonymous wrong",
+    "document": "api",
+    "schema": "#/components/schemas/ClientEventsConfigValue",
+    "value": {
+      "enabled": false,
+      "retention_days": 30,
+      "rate_limit": 60,
+      "allow_anonymous": "wrong"
+    },
+    "valid": false
   }
 ]

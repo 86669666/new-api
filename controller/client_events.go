@@ -27,7 +27,7 @@ const clientEventBodyLimit = 256 * 1024
 
 func ReceiveClientEvents(c *gin.Context) {
 	credential, ok := middleware.GetClientEventCredential(c)
-	if !ok {
+	if !ok && !middleware.IsAnonymousClientEvent(c) {
 		middleware.WriteClientEventError(c, 401)
 		return
 	}
@@ -63,6 +63,9 @@ func ReceiveClientEvents(c *gin.Context) {
 			return
 		}
 	}
+	if middleware.IsAnonymousClientEvent(c) && !middleware.TakeAnonymousClientEventPair(c, clientID) {
+		return
+	}
 	channel, valid := clientEventString(fields["channel"], 64, false)
 	if !valid || common.GetJsonType(fields["events"]) != "array" {
 		middleware.WriteClientEventError(c, 400)
@@ -95,7 +98,12 @@ func ReceiveClientEvents(c *gin.Context) {
 			events = append(events, event)
 		}
 	}
-	count, err := model.ReceiveClientEvents(c.Request.Context(), credential, c.ClientIP(), events)
+	var count int
+	if middleware.IsAnonymousClientEvent(c) {
+		count, err = model.ReceiveAnonymousClientEvents(c.Request.Context(), events)
+	} else {
+		count, err = model.ReceiveClientEvents(c.Request.Context(), credential, c.ClientIP(), events)
+	}
 	if err != nil {
 		middleware.WriteClientEventError(c, middleware.ClientEventErrorStatus(err))
 		return
@@ -209,7 +217,7 @@ func GetClientEventClients(c *gin.Context) { getClientEventStats(c, "clients") }
 // parseClientEventStatsQuery rejects ambiguous and noncanonical query values.
 // The result version binds the normalized window/filters, never page size.
 func parseClientEventStatsQuery(raw, kind string, now time.Time) (model.ClientEventStatsQuery, int, int, string, error) {
-	query := model.ClientEventStatsQuery{Kind: kind, StartTime: now.Unix() - 7*86400, EndTime: now.Unix()}
+	query := model.ClientEventStatsQuery{Kind: kind, Authentication: "authenticated", StartTime: now.Unix() - 7*86400, EndTime: now.Unix()}
 	invalid := errors.New("invalid client event query")
 	page, size := 1, 50
 	if len(raw) > 4096 {
@@ -252,6 +260,11 @@ func parseClientEventStatsQuery(raw, kind string, now time.Time) (model.ClientEv
 				}
 				size = int(n)
 			}
+		case "authentication":
+			if value != "authenticated" && value != "anonymous" {
+				return query, page, size, "", invalid
+			}
+			query.Authentication = value
 		case "result_version":
 			if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
 				return query, page, size, "", invalid
@@ -415,9 +428,16 @@ func getClientEventStats(c *gin.Context, kind string) {
 		items = result.Usage[start:end]
 	}
 	config := service.CurrentClientEventsConfig()
-	data := gin.H{"items": items, "total": total, "page": page, "page_size": size, "start_time": query.StartTime, "end_time": query.EndTime, "timezone": "UTC", "result_version": version, "provenance": "client_self_reported", "coverage": "retained_events", "data_complete": false, "intake_enabled": config.Enabled, "retention_days": config.RetentionDays}
+	data := gin.H{"items": items, "total": total, "page": page, "page_size": size, "start_time": query.StartTime, "end_time": query.EndTime, "timezone": "UTC", "result_version": version, "provenance": "client_self_reported", "authentication": query.Authentication, "coverage": "retained_events", "data_complete": false, "intake_enabled": config.Enabled, "retention_days": config.RetentionDays}
 	if kind == "clients" {
 		data["activity_basis"], data["identity_basis"], data["groups_additive"] = "app_launch", "user_channel_client", false
+	}
+	if query.Authentication == "anonymous" {
+		data["provenance"] = "unverified_client_self_reported"
+		if kind == "clients" {
+			data["identity_basis"] = "unverified_channel_client"
+			data["count_basis"] = "claimed_client_identifiers"
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }

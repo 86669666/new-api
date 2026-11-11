@@ -23,7 +23,8 @@ var (
 	ErrClientEventForbidden    = errors.New("client event access denied")
 )
 
-// ClientEvent is an authenticated client self-report, never a billing record.
+// ClientEvent is a client self-report, never a billing record. Anonymous rows
+// reserve both zero IDs and a separate fingerprint domain; they are unverified.
 // ReceivedAt bounds retention; removing a row also removes its deduplication key.
 type ClientEvent struct {
 	ID           int64 `gorm:"primaryKey"`
@@ -194,15 +195,16 @@ func DeleteClientEventBatch(ctx context.Context, before int64) (int64, error) {
 // ClientEventStatsQuery describes the two fixed, retained self-report views.
 // String comparisons are deliberately performed in Go, independent of SQL collation.
 type ClientEventStatsQuery struct {
-	Kind      string  `json:"kind"`
-	StartTime int64   `json:"start_time"`
-	EndTime   int64   `json:"end_time"`
-	Channel   string  `json:"channel"`
-	Model     string  `json:"model"`
-	Provider  string  `json:"provider"`
-	Source    string  `json:"source"`
-	Version   *string `json:"version"`
-	OS        string  `json:"os"`
+	Kind           string  `json:"kind"`
+	Authentication string  `json:"authentication"`
+	StartTime      int64   `json:"start_time"`
+	EndTime        int64   `json:"end_time"`
+	Channel        string  `json:"channel"`
+	Model          string  `json:"model"`
+	Provider       string  `json:"provider"`
+	Source         string  `json:"source"`
+	Version        *string `json:"version"`
+	OS             string  `json:"os"`
 }
 
 type ClientEventUsageStats struct {
@@ -241,10 +243,19 @@ func QueryClientEventStats(ctx context.Context, query ClientEventStatsQuery) (Cl
 	if query.Kind != "usage" && query.Kind != "clients" || query.StartTime < 0 || query.EndTime <= query.StartTime || query.EndTime > math.MaxInt64/1000 || query.EndTime-query.StartTime > 31*86400 {
 		return result, errors.New("invalid client event query window")
 	}
+	if query.Authentication == "" {
+		query.Authentication = "authenticated"
+	}
+	cohort := "user_id > 0"
+	if query.Authentication == "anonymous" {
+		cohort = "user_id = 0 AND token_id = 0"
+	} else if query.Authentication != "authenticated" {
+		return result, errors.New("invalid client event authentication cohort")
+	}
 	var rows []ClientEvent
 	err := DB.WithContext(ctx).Model(&ClientEvent{}).
-		Select("user_id", "client_id", "channel", "event_type", "event_time_ms", "received_at", "app_version", "os", "provider", "model", "source", "input_tokens", "output_tokens").
-		Where("received_at >= ? AND received_at < ?", max(int64(0), query.StartTime-3600), query.EndTime+7*86400).
+		Select("user_id", "token_id", "fingerprint", "client_id", "channel", "event_type", "event_time_ms", "received_at", "app_version", "os", "provider", "model", "source", "input_tokens", "output_tokens").
+		Where(cohort).Where("received_at >= ? AND received_at < ?", max(int64(0), query.StartTime-3600), query.EndTime+7*86400).
 		Order("received_at ASC").Limit(50001).Find(&rows).Error
 	if err != nil {
 		return result, err
@@ -267,6 +278,12 @@ func QueryClientEventStats(ctx context.Context, query ClientEventStatsQuery) (Cl
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return result, err
+		}
+		if query.Authentication == "anonymous" {
+			fingerprint, err := anonymousClientEventFingerprint(row)
+			if err != nil || row.Fingerprint != fingerprint {
+				return result, errors.New("unrecognized anonymous client event")
+			}
 		}
 		if row.EventTimeMS < query.StartTime*1000 || row.EventTimeMS >= query.EndTime*1000 || query.Channel != "" && row.Channel != query.Channel {
 			continue
