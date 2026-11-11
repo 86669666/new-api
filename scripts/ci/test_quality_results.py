@@ -586,6 +586,14 @@ class QualityWiringTests(unittest.TestCase):
         self.admission['quality_check_run_id'] = 43
         self.environment.update(EXPECTED_SHA='a' * 40, BOX_FORMAL_REVIEWER_IDS='[7]',
             QUALITY_RESULTS=json.dumps(dict.fromkeys(('backend', 'frontend', 'database'), 'success')))
+        event_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(event_dir.cleanup)
+        self.event_path = Path(event_dir.name) / 'event.json'
+        self.event = dict(action='synchronize', number=1, pull_request=dict(
+            number=1, state='open', merged=False, head={'sha': 'a' * 40}, base={'sha': 'b' * 40}))
+        self.event_path.write_text(json.dumps(self.event))
+        self.environment.update(GITHUB_EVENT_NAME='pull_request', GITHUB_REF='refs/pull/1/merge',
+                                GITHUB_EVENT_PATH=str(self.event_path))
         self.reader = MockReader(self.receipt, self.admission)
         self.reader.run_value.update(status='completed', conclusion='success', triggering_actor={'id': 8})
         self.latest = copy.deepcopy(self.reader.run_value)
@@ -804,6 +812,110 @@ class QualityWiringTests(unittest.TestCase):
                 self.assertEqual(code, child.returncode)
                 self.assertEqual('-I -B trusted-quality/scripts/ci/quality_results.py ci\n', calls.read_text())
                 self.assertEqual(code == 0, output.exists())
+
+    def test_premerge_contract_open_pr_keeps_strict_binding_and_result_failures(self):
+        self.assertEqual('a' * 40, self.verify()['candidate_sha'])
+        for mutation in ('event-head', 'event-base', 'event-number', 'live-head', 'live-base',
+                         'live-merged', 'hosted-failed', 'app-failed'):
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                if mutation in ('event-head', 'event-base'):
+                    self.event['pull_request'][mutation[6:]]['sha'] = 'd' * 40
+                elif mutation == 'event-number':
+                    self.event['number'] = self.event['pull_request']['number'] = 2
+                    self.environment['GITHUB_REF'] = 'refs/pull/2/merge'
+                elif mutation in ('live-head', 'live-base'):
+                    self.reader.pr[mutation[5:]]['sha'] = 'd' * 40
+                elif mutation == 'live-merged':
+                    self.reader.pr.update(state='closed', merged=True)
+                elif mutation == 'hosted-failed':
+                    self.environment['QUALITY_RESULTS'] = json.dumps(
+                        dict(backend='failure', frontend='success', database='success'))
+                else:
+                    self.reader.gate_value['conclusion'] = 'failure'
+                self.event_path.write_text(json.dumps(self.event))
+                with self.assertRaises(ValueError):
+                    self.verify()
+
+    def test_premerge_contract_rejects_unsupported_event_before_api_reads(self):
+        for event_name, action, state, merged, ref in (
+                ('push', '', 'open', False, 'refs/tags/v1.0.0'),
+                ('workflow_dispatch', '', 'open', False, 'refs/heads/main'),
+                ('release', '', 'closed', True, 'refs/tags/v1.0.0'),
+                ('workflow_call', '', 'open', False, 'refs/heads/main'),
+                ('pull_request', 'closed', 'closed', True, 'refs/heads/main'),
+                ('pull_request', 'closed', 'closed', False, 'refs/pull/1/merge'),
+                ('pull_request', 'synchronize', 'closed', True, 'refs/pull/1/merge'),
+                ('pull_request', 'synchronize', 'open', False, 'refs/tags/v1.0.0')):
+            with self.subTest(event=event_name, action=action, merged=merged, ref=ref):
+                self.setUp()
+                self.environment.update(GITHUB_EVENT_NAME=event_name, GITHUB_REF=ref)
+                self.event.update(action=action)
+                self.event['pull_request'].update(state=state, merged=merged)
+                self.event_path.write_text(json.dumps(self.event))
+                with patch.object(self.reader, 'repository') as api, \
+                        self.assertRaisesRegex(quality.UnsupportedCIEvent, 'only open-PR premerge'):
+                    self.verify()
+                api.assert_not_called()
+
+    def test_premerge_contract_actual_cli_rejects_without_admission_or_sha_output(self):
+        for event_name, action, merged in (('push', '', False), ('workflow_dispatch', '', False),
+                                           ('release', '', True), ('pull_request', 'closed', True)):
+            with self.subTest(event=event_name):
+                self.event.update(action=action)
+                self.event['pull_request'].update(state='closed', merged=merged)
+                self.event_path.write_text(json.dumps(self.event))
+                # Intentionally NO admission/token. Unsupported capability must
+                # be diagnosed before missing external configuration or APIs.
+                child = subprocess.run([sys.executable, '-I', '-B', quality.__file__, 'ci'],
+                    env=dict(GITHUB_EVENT_NAME=event_name, GITHUB_REF='refs/tags/v1.0.0',
+                             GITHUB_EVENT_PATH=str(self.event_path)),
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(1, child.returncode)
+                self.assertEqual('', child.stdout)
+                self.assertEqual('Unsupported CI lifecycle: only open-PR premerge verification is supported; '
+                                 'postmerge, tag and publication reuse cannot authorize a SHA.\n', child.stderr)
+
+    def test_premerge_contract_actual_capability_step_and_trigger_declarations(self):
+        root = Path(quality.__file__).resolve().parents[2]
+        workflow = (root / '.github/workflows/ci.yml').read_text()
+        self.assertIn('types: [opened, reopened, synchronize]\n', workflow)
+        self.assertNotIn("github.event.action != 'closed'", workflow)
+        self.assertIn('no release authorization', workflow)
+        gate = workflow.split('  quality-gate:\n', 1)[1]
+        self.assertIn('needs: [premerge, backend, frontend, database]', gate)
+        self.assertIn('if: always()', gate)
+        for name in ('backend', 'frontend', 'database'):
+            job = workflow.split('  ' + name + ':\n', 1)[1]
+            job = re.split(r'^  [a-zA-Z][\w-]*:\n', job, maxsplit=1, flags=re.MULTILINE)[0]
+            self.assertIn('needs: premerge', job)
+        premerge = workflow.split('  premerge:\n', 1)[1].split('  backend:\n', 1)[0]
+        block = re.search(r'        run: \|\n((?:          .*\n)+)', premerge)
+        self.assertIsNotNone(block)
+        script = textwrap.dedent(block.group(1))
+        for event, action, expected_exit in (('pull_request', 'opened', 0),
+                ('pull_request', 'reopened', 0), ('pull_request', 'synchronize', 0),
+                ('pull_request', 'closed', 1), ('push', '', 1),
+                ('workflow_dispatch', '', 1), ('release', '', 1)):
+            with self.subTest(event=event, action=action):
+                child = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script],
+                    env=dict(EVENT_NAME=event, EVENT_ACTION=action), capture_output=True, text=True, timeout=5)
+                self.assertEqual(expected_exit, child.returncode)
+                self.assertNotIn('sha=', child.stdout + child.stderr)
+                if expected_exit:
+                    self.assertIn('publication callers are unsupported', child.stdout)
+
+    def test_premerge_contract_publication_callers_remain_blocked_with_quality_needs(self):
+        root = Path(quality.__file__).resolve().parents[2]
+        for name in ('docker-build.yml', 'docker-image-branch.yml', 'electron-build.yml',
+                     'release.yml', 'sync-release-to-gitcode.yml'):
+            with self.subTest(caller=name):
+                workflow = (root / '.github/workflows' / name).read_text()
+                self.assertIn('postmerge/tag/release\n  # verification remains unsupported', workflow)
+                self.assertIn('uses: ./.github/workflows/ci.yml', workflow)
+                self.assertIn('needs.quality.outputs.verified_sha', workflow)
+                self.assertRegex(workflow, r'needs: \[[^\]\n]*\bquality\b[^\]\n]*\]')
+                self.assertNotIn('continue-on-error: true', workflow)
 
 
 if __name__ == '__main__':

@@ -43,6 +43,8 @@ jobs:
           test "${#VERSION}" -le 128
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+  # Premerge-only CI rejects this publication caller; postmerge/tag/release
+  # verification remains unsupported. Keep this required quality dependency.
   quality:
     needs: prepare
     permissions:

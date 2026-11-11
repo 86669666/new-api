@@ -382,9 +382,35 @@ def verified_request(admission, receipt_hash, quality):
             'expires_at': admission['expected']['expires_at'], 'quality': copy.deepcopy(quality)}
 
 
+class UnsupportedCIEvent(ValueError):
+    """This reader cannot authorize postmerge, tag or publication lifecycles."""
+
+
+def ci_premerge_event(environment):
+    """Check the native event before consulting admission, credentials or APIs.
+
+    A reusable workflow inherits its caller's event; workflow_call itself is not
+    an authorization. Only an open PR event is supported, including for reuse.
+    """
+    if environment['GITHUB_EVENT_NAME'] != 'pull_request':
+        raise UnsupportedCIEvent('only open-PR premerge verification is supported')
+    event = json.loads(Path(environment['GITHUB_EVENT_PATH']).read_text(),
+                       object_pairs_hook=consumer.unique_json_fields)
+    pull = event['pull_request']
+    number = event['number']
+    if (event['action'] not in ('opened', 'reopened', 'synchronize') or
+            pull['state'] != 'open' or pull['merged'] is not False or
+            type(number) is not int or number <= 0 or pull['number'] != number or
+            environment['GITHUB_REF'] != f'refs/pull/{number}/merge'):
+        raise UnsupportedCIEvent('only open-PR premerge verification is supported')
+    return event
+
+
 def verify_ci_result(admission, environment, reader, *, clock=time.time):
     """GET-only revalidation of a PRE-EXISTING App quality success for CI.
 
+    Only premerge open-PR current-head/current-base validation is supported.
+    Closed/merged, tag and publication reuse cannot authorize any output SHA.
     Unlike verify(), this runs downstream of the protected dispatch. It cannot
     stage/consume a host journal claim or turn a raw report into a result. The
     immutable checkout and all BOX_FORMAL_* values belong to the protected
@@ -392,8 +418,13 @@ def verify_ci_result(admission, environment, reader, *, clock=time.time):
     Re-reading the same immutable check is idempotent, not a new execution or
     attempt; another candidate/admission/run attempt cannot reuse it.
     """
+    event = ci_premerge_event(environment)
     release_policy.quality_results(json.loads(environment['QUALITY_RESULTS']))
     expected = admission['expected']
+    require(event['number'] == admission['quality']['pull_number'] and
+            event['pull_request']['head']['sha'] == expected['candidate_sha'] and
+            event['pull_request']['base']['sha'] == admission['quality']['base_sha'],
+            'CI event does not match admitted PR head or base')
     require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong repository')
     require(re.fullmatch('[0-9a-f]{40}', environment['EXPECTED_SHA']) is not None and
             environment['EXPECTED_SHA'] == expected['candidate_sha'], 'wrong CI candidate')
@@ -516,8 +547,10 @@ def collect_result(admission, environment, reader, publisher, journal, *, clock=
 def main():
     # This entry point performs reads only, on the protected consumer checkout.
     # Publication is available solely through the trusted host's injected object.
-    admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'])
     require(sys.argv[1:] in ([], ['ci']), 'unknown quality operation')
+    if sys.argv[1:] == ['ci']:
+        ci_premerge_event(os.environ)
+    admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'])
     verifier = verify_ci_result if sys.argv[1:] == ['ci'] else verify
     result = verifier(admission, os.environ, GitHubReader(os.environ['GITHUB_TOKEN']))
     print(json.dumps({key: result[key] for key in
@@ -528,5 +561,8 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except UnsupportedCIEvent:
+        raise SystemExit('Unsupported CI lifecycle: only open-PR premerge verification is supported; '
+                         'postmerge, tag and publication reuse cannot authorize a SHA.')
     except Exception:
         raise SystemExit('Quality evidence rejected; no publication authorization granted.')

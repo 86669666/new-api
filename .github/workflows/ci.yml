@@ -2,15 +2,18 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, closed]
+    types: [opened, reopened, synchronize]
+  # Reusable only from the same open-PR event. Publication callers stay blocked:
+  # postmerge, tag and release verification is not implemented by this reader.
   workflow_call:
     inputs:
       sha:
-        description: Frozen full candidate commit
+        description: Exact current open-PR head (premerge only; no release authorization)
         required: true
         type: string
     outputs:
       verified_sha:
+        description: Verified open-PR head only; never a merge/tag/release authorization
         value: ${{ jobs.quality-gate.outputs.sha }}
 
 permissions:
@@ -20,12 +23,27 @@ concurrency:
   group: quality-${{ github.workflow }}-${{ github.event_name }}-${{ inputs.sha || github.ref }}
   cancel-in-progress: true
 
-# Checkout the event commit in both jobs. A PR merge ref can disappear while
-# queued runs start, and a base branch can advance after the merge event.
+# Validate only an open PR's exact head and current base. A merge/squash/tag SHA
+# needs its own authenticated lifecycle contract, which is not supported here.
 jobs:
+  premerge:
+    name: Require supported premerge event
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Reject unsupported lifecycle or publication caller
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          if [[ "$EVENT_NAME" != pull_request ]] || [[ "$EVENT_ACTION" != opened && "$EVENT_ACTION" != reopened && "$EVENT_ACTION" != synchronize ]]; then
+            echo "::error::Only open-PR premerge verification is supported; postmerge, tag and publication callers are unsupported."
+            exit 1
+          fi
+
   backend:
     name: Backend vet, build, and test
-    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    needs: premerge
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -84,7 +102,7 @@ jobs:
 
   frontend:
     name: Frontend typecheck and test
-    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    needs: premerge
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -114,7 +132,7 @@ jobs:
 
   database:
     name: Required real database contracts
-    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    needs: premerge
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -154,7 +172,7 @@ jobs:
 
   quality-gate:
     name: Required quality gate
-    needs: [backend, frontend, database]
+    needs: [premerge, backend, frontend, database]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
