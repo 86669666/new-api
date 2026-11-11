@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -28,6 +29,271 @@ import (
 type clientEventRedisBarrier struct {
 	entered chan<- struct{}
 	release <-chan struct{}
+}
+
+// This hook controls only transport timing/errors for the original GA script.
+// Unblocked commands use the real exclusive Redis instance, never canned replies.
+type clientEventGlobalRedisProbe struct {
+	calls     atomic.Int32
+	entered   chan time.Time
+	cancelled chan struct{}
+	release   <-chan struct{}
+	err       error
+}
+
+func (h *clientEventGlobalRedisProbe) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	args := cmd.Args()
+	if len(args) <= 3 || args[0] != "eval" || !strings.HasPrefix(fmt.Sprint(args[3]), "rateLimit:v2:ip:GA:") {
+		return ctx, nil
+	}
+	h.calls.Add(1)
+	deadline, _ := ctx.Deadline()
+	h.entered <- deadline
+	if h.release != nil {
+		select {
+		case <-ctx.Done():
+			h.cancelled <- struct{}{}
+			return ctx, ctx.Err()
+		case <-h.release:
+		}
+	}
+	return ctx, h.err
+}
+func (*clientEventGlobalRedisProbe) AfterProcess(context.Context, redis.Cmder) error { return nil }
+func (*clientEventGlobalRedisProbe) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+func (*clientEventGlobalRedisProbe) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
+
+func TestClientEventsAnonymousEntryOrder(t *testing.T) {
+	t.Setenv("CLIENT_EVENTS_ENABLED", "false")
+	require.NoError(t, service.InitClientEventsConfig())
+	f := newOrganizationProfileFixture(t, "g4-issue25-anonymous-rework02")
+	require.NoError(t, f.db.AutoMigrate(&model.ClientEvent{}))
+	t.Setenv("TRUSTED_PROXIES", "none")
+	require.NoError(t, f.engine.SetTrustedProxies(nil))
+	socket := os.Getenv("ISSUE25_REDIS_SOCKET")
+	require.NotEmpty(t, socket, "exclusive real Redis required")
+	rdb := redis.NewClient(&redis.Options{Network: "unix", Addr: socket, MaxRetries: -1})
+	defer rdb.Close()
+	require.NoError(t, rdb.Ping(t.Context()).Err())
+	version, err := rdb.Info(t.Context(), "server").Result()
+	require.NoError(t, err)
+	t.Log(strings.Split(version, "\r\n")[1])
+	probe := &clientEventGlobalRedisProbe{entered: make(chan time.Time, 64)}
+	rdb.AddHook(probe)
+	common.RDB, common.RedisEnabled = rdb, true
+	oldNum, oldDuration := common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration
+	t.Cleanup(func() {
+		common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = oldNum, oldDuration
+	})
+	common.GlobalApiRateLimitEnable = true
+	common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = 100, 60
+	require.NoError(t, model.UpdateClientEventsConfigOption(`{"enabled":true,"allow_anonymous":true,"retention_days":30,"rate_limit":600}`))
+	payload := fmt.Sprintf(`{"client_id":"8a6c0e0e-6f3b-4c55-9d0e-2a1f7c9b1e11","channel":"issue25-order","events":[{"event_type":"app_launch","timestamp":%q,"data":{"version":"1","os":"linux"}}]}`, time.Now().UTC().Truncate(time.Second).Format(time.RFC3339))
+	// Observe real completion/peers and control request-context cancellation.
+	// HTTP/1 disconnect detection can wait for body reads while GA is blocked;
+	// cancel the server request explicitly, never replace the gateway response.
+	completed := make(chan string, 64)
+	serverCancels := make(chan context.CancelFunc, 64)
+	f.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		serverCancels <- cancel
+		f.engine.ServeHTTP(w, r.WithContext(ctx))
+		completed <- r.RemoteAddr
+	})
+	type response struct {
+		status int
+		body   string
+		err    error
+	}
+	var requests atomic.Int32
+	send := func(ctx context.Context, client *http.Client, headers http.Header) response {
+		requests.Add(1)
+		req, err := http.NewRequestWithContext(ctx, "POST", f.server.URL+"/api/events", strings.NewReader(payload))
+		if err != nil {
+			return response{err: err}
+		}
+		req.Header.Set("Content-Type", "application/json")
+		for key, values := range headers {
+			req.Header[key] = append([]string(nil), values...)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return response{err: err}
+		}
+		defer resp.Body.Close()
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return response{status: resp.StatusCode, body: string(raw), err: err}
+	}
+	check := func(t *testing.T, result response, status int) {
+		t.Helper()
+		t.Logf("HTTP status=%d body=%s error=%v", result.status, result.body, result.err)
+		require.NoError(t, result.err)
+		require.Equal(t, status, result.status, "%s", result.body)
+		var body map[string]any
+		require.NoError(t, common.UnmarshalJsonStr(result.body, &body))
+		if status != 200 {
+			assert.Equal(t, map[int]string{400: "CLIENT_EVENTS_INVALID", 401: "CLIENT_EVENTS_UNAUTHORIZED", 429: "CLIENT_EVENTS_RATE_LIMIT", 503: "CLIENT_EVENTS_UNAVAILABLE"}[status], body["code"])
+		}
+	}
+	peerClient := func(ip string) *http.Client {
+		transport := &http.Transport{DialContext: (&net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP(ip)}}).DialContext}
+		t.Cleanup(transport.CloseIdleConnections)
+		return &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	}
+	clearBudgets := func(t *testing.T) {
+		t.Helper()
+		keys, err := rdb.Keys(t.Context(), "rateLimit:v2:*").Result()
+		require.NoError(t, err)
+		if len(keys) > 0 {
+			require.NoError(t, rdb.Del(t.Context(), keys...).Err())
+		}
+	}
+	t.Cleanup(func() { t.Logf("ISSUE25_REWORK02_HTTP_POST_REQUESTS=%d", requests.Load()) })
+	t.Run("full_site_precedes_every_global_peer_key", func(t *testing.T) {
+		require.NoError(t, rdb.Set(t.Context(), "rateLimit:v2:client-events:anonymous:site", 600, time.Minute).Err())
+		before, err := rdb.Keys(t.Context(), "*").Result()
+		require.NoError(t, err)
+		for _, ip := range []string{"127.0.0.31", "127.0.0.32", "127.0.0.33"} {
+			check(t, send(t.Context(), peerClient(ip), nil), 429)
+			peer := <-completed
+			host, _, err := net.SplitHostPort(peer)
+			require.NoError(t, err)
+			assert.Equal(t, ip, host, "actual RemoteAddr, not a forwarding header")
+			t.Logf("actual_transport_peer=%s", peer)
+		}
+		after, err := rdb.Keys(t.Context(), "*").Result()
+		require.NoError(t, err)
+		assert.ElementsMatch(t, before, after, "all Redis keys, including GA, remain bounded by fixed site rejection")
+		assert.Zero(t, probe.calls.Load())
+	})
+	t.Run("admitted_global_once_and_header_present_unchanged", func(t *testing.T) {
+		clearBudgets(t)
+		common.GlobalApiRateLimitNum = 1
+		before := probe.calls.Load()
+		for _, status := range []int{200, 429} {
+			check(t, send(t.Context(), f.client, nil), status)
+		}
+		assert.Equal(t, before+2, probe.calls.Load())
+		count, err := rdb.Get(t.Context(), "rateLimit:v2:ip:GA:127.0.0.1").Int()
+		require.NoError(t, err)
+		assert.Equal(t, 2, count, "original global limiter executed exactly once per admission")
+		common.GlobalApiRateLimitNum = 100
+		require.NoError(t, rdb.Set(t.Context(), "rateLimit:v2:client-events:anonymous:site", 600, time.Minute).Err())
+		for _, tc := range []struct {
+			header http.Header
+			status int
+		}{{http.Header{"Authorization": {""}}, 401}, {http.Header{"Authorization": {"Bearer sk-a", "Bearer sk-b"}}, 400}, {http.Header{"Authorization": {"Basic invalid"}}, 401}} {
+			before := probe.calls.Load()
+			check(t, send(t.Context(), f.client, tc.header), tc.status)
+			assert.Equal(t, before+1, probe.calls.Load(), "header presence keeps original global-first path even with full anonymous site")
+		}
+		common.RedisEnabled = false
+		t.Setenv("TRUSTED_PROXIES", "")
+		check(t, send(t.Context(), f.client, http.Header{"Authorization": {"Bearer " + f.bearer["relay"]}}), 200)
+		common.RedisEnabled = true
+		t.Setenv("TRUSTED_PROXIES", "none")
+	})
+	t.Run("slots_and_deadline_precede_blocked_global_and_release_on_error_cancel", func(t *testing.T) {
+		clearBudgets(t)
+		// Drain completion observations from the preceding synchronous requests.
+		for len(completed) > 0 {
+			<-completed
+		}
+		for len(serverCancels) > 0 {
+			<-serverCancels
+		}
+		for batch := range 2 {
+			release := make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			hook := &clientEventGlobalRedisProbe{entered: make(chan time.Time, 16), cancelled: make(chan struct{}, 8), release: release}
+			if batch == 0 {
+				hook.err = errors.New("owned GA transport failure")
+			}
+			held := redis.NewClient(&redis.Options{Network: "unix", Addr: socket, MaxRetries: -1})
+			held.AddHook(hook)
+			common.RDB = held
+			results := make(chan response, 8)
+			cancels := make([]context.CancelFunc, 8)
+			var wg sync.WaitGroup
+			defer func() {
+				for _, cancel := range cancels {
+					cancel()
+				}
+				unblock()
+				wg.Wait()
+				held.Close()
+				common.RDB = rdb
+			}()
+			for i := range 8 {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancels[i] = cancel
+				wg.Go(func() { results <- send(ctx, f.client, nil) })
+			}
+			for range 8 {
+				select {
+				case deadline := <-hook.entered:
+					require.False(t, deadline.IsZero(), "anonymous deadline must already exist at GA transport")
+					assert.WithinRange(t, deadline, time.Now(), time.Now().Add(10*time.Second))
+				case <-time.After(5 * time.Second):
+					t.Fatal("eight requests did not reach GA with eight admitted slots")
+				}
+			}
+			if batch == 0 {
+				check(t, send(t.Context(), peerClient("127.0.0.39"), nil), 503)
+				assert.Equal(t, int32(8), hook.calls.Load(), "ninth request never enters blocked GA")
+				for i := range 9 {
+					cancel := <-serverCancels
+					if i < 4 {
+						cancel()
+					}
+				}
+				for range 4 {
+					select {
+					case <-hook.cancelled:
+					case <-time.After(5 * time.Second):
+						t.Fatal("GA transport did not observe request cancellation")
+					}
+				}
+				t.Log("controlled_server_request_context_cancellations=4; real TCP-disconnect propagation is not asserted")
+			}
+			unblock()
+			for range 8 {
+				result := <-results
+				if batch == 0 {
+					check(t, result, 503)
+				} else {
+					check(t, result, 200)
+				}
+			}
+			completions := 8
+			if batch == 0 {
+				completions++
+			}
+			for range completions {
+				select {
+				case <-completed:
+				case <-time.After(5 * time.Second):
+					t.Fatal("server did not complete and release anonymous admission")
+				}
+			}
+			wg.Wait()
+			common.RDB = rdb
+			assert.Equal(t, int32(8), hook.calls.Load())
+		}
+		count, err := rdb.Get(t.Context(), "rateLimit:v2:ip:GA:127.0.0.1").Int()
+		require.NoError(t, err)
+		assert.Equal(t, 8, count, "only second-batch admitted GA calls reach real Redis")
+		missing, err := rdb.Exists(t.Context(), "rateLimit:v2:ip:GA:127.0.0.39").Result()
+		require.NoError(t, err)
+		assert.Zero(t, missing)
+		check(t, send(t.Context(), f.client, nil), 200)
+	})
 }
 
 func (h clientEventRedisBarrier) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {

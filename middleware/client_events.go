@@ -67,6 +67,22 @@ func ClientEventsBoundary() gin.HandlerFunc {
 			WriteClientEventError(c, 404)
 			return
 		}
+		// Presence is distinct from Header.Get: an empty credential never downgrades.
+		authorizationPresent := false
+		for name := range c.Request.Header {
+			if strings.EqualFold(name, "Authorization") {
+				authorizationPresent = true
+			}
+		}
+		if !authorizationPresent && config.AllowAnonymous {
+			// Hold anonymous admission through the global limiter and downstream
+			// handlers, so rejected traffic cannot create or wait on peer keys.
+			release := admitAnonymousClientEvents(c, config.RateLimit)
+			if release == nil {
+				return
+			}
+			defer release()
+		}
 		if common.GlobalApiRateLimitEnable {
 			// Enabled GlobalAPIRateLimit contains no c.Next. Calling defNext when
 			// disabled would run downstream handlers before this boundary finishes.
@@ -104,15 +120,8 @@ func ClientEventsBoundary() gin.HandlerFunc {
 			WriteClientEventError(c, 400)
 			return
 		}
-		// Presence is distinct from Header.Get: an empty credential never downgrades.
-		authorizationPresent := false
-		for name := range c.Request.Header {
-			if strings.EqualFold(name, "Authorization") {
-				authorizationPresent = true
-			}
-		}
 		if !authorizationPresent && config.AllowAnonymous {
-			anonymousClientEventsBoundary(c, config.RateLimit)
+			c.Next()
 			return
 		}
 		scheme, bearer, found := strings.Cut(c.GetHeader("Authorization"), " ")
