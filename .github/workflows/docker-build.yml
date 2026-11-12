@@ -43,8 +43,14 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "version=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
+  # Premerge-only CI rejects this publication caller; postmerge/tag/release
+  # verification remains unsupported. Keep this required quality dependency.
   quality:
     needs: prepare
+    permissions:
+      contents: read
+      checks: read
+      actions: read
     uses: ./.github/workflows/ci.yml
     with:
       sha: ${{ needs.prepare.outputs.sha }}

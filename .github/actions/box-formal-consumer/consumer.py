@@ -10,6 +10,10 @@ APP = 5498942
 INSTALLATION = 175905031
 REPOSITORY = '86669666/new-api'
 CHECK = 'Box formal verification'
+# Fixed contract inventory; an admission may bind details but cannot change it.
+FORMAL_TIERS = frozenset(('postgres', 'postgres-redis', 'wallet-sqlite', 'wallet-mysql',
+                          'wallet-postgres', 'lifecycle-sqlite', 'lifecycle-mysql',
+                          'lifecycle-postgres', 'sqlite'))
 PINS = {'postgres': 'sha256:85b1ab67e7c7410b11da3f5b42913fc51b5b46f9cf5f07cc28a98e5f62083c5e',
         'mysql': 'sha256:d78bbb8f2cfdeb362aff7fcbea6b7954bef6429bef26b308f0e65ca5d9410482'}
 
@@ -33,7 +37,7 @@ def validate_receipt(receipt, admission, now):
     require(admission['repository'] == REPOSITORY, 'repository mismatch')
     require(admission['app_id'] == APP and admission['installation_id'] == INSTALLATION,
             'publisher mismatch')
-    require(receipt['binding'] == expected, 'admission binding mismatch')
+    require(canonical(receipt['binding']) == canonical(expected), 'admission binding mismatch')
     for name in ('candidate_sha', 'candidate_tree', 'execution_sha', 'consumer_sha'):
         require(re.fullmatch('[0-9a-f]{40}', expected[name]) is not None, 'invalid git identity')
     for name in ('runner_sha256', 'wrapper_sha256', 'producer_sha256', 'source_manifest_sha256',
@@ -45,18 +49,22 @@ def validate_receipt(receipt, admission, now):
     require(expected['attempt_id'] and expected['admission_id'] and expected['invocation'], 'missing attempt')
     require(expected['test_binaries'] and all(re.fullmatch('[0-9a-f]{64}', v)
             for v in expected['test_binaries'].values()), 'missing test identities')
+    require(all(type(value) is int for value in (expected['not_before'], expected['expires_at'],
+            receipt['started_at'], receipt['completed_at'], now)), 'invalid receipt times')
     require(expected['not_before'] <= receipt['started_at'] <= receipt['completed_at'] <= now
             <= expected['expires_at'], 'stale or future receipt')
-    require(receipt['process_exit'] == 0 and receipt['exit'] == 0
+    require(type(receipt['process_exit']) is int and type(receipt['exit']) is int
+            and receipt['process_exit'] == 0 and receipt['exit'] == 0
             and receipt['cleanup'] is True and receipt['unexecuted'] == [], 'incomplete execution')
     plan = expected['tiers']
-    require(plan and len(receipt['tiers']) == len(plan), 'missing or duplicate tier')
+    require(set(plan) == FORMAL_TIERS, 'required formal tier inventory changed')
+    require(len(receipt['tiers']) == len(plan), 'missing or duplicate tier')
     seen = set()
     for tier in receipt['tiers']:
         name = tier['tier']
         require(name in plan and name not in seen, 'unexpected or duplicate tier')
         seen.add(name)
-        require(tier['exit'] == 0 and tier['cleanup'] is True, 'failed tier')
+        require(type(tier['exit']) is int and tier['exit'] == 0 and tier['cleanup'] is True, 'failed tier')
         require(tier['invocation'] == expected['invocation'], 'replayed tier')
         require(tier['entries'] == plan[name]['entries'] and
                 tier['required_leaves'] == plan[name]['required_leaves'], 'partial tier inventory')
@@ -65,10 +73,22 @@ def validate_receipt(receipt, admission, now):
     return digest(receipt)
 
 
+def unique_json_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, 'duplicate receipt field')
+        result[key] = value
+    return result
+
+
 def validate_check(check, receipt, admission, now):
+    parsed = json.loads(check['output']['text'], object_pairs_hook=unique_json_fields)
+    require(canonical(parsed) == canonical(receipt), 'receipt differs from check output')
     receipt_hash = validate_receipt(receipt, admission, now)
     require(check['app']['id'] == APP and check['app']['slug'] == 'new-api-box-formal', 'wrong App')
-    require(check['id'] == admission['check_run_id'], 'wrong check or replay')
+    require(type(admission['check_run_id']) is int and admission['check_run_id'] > 0
+            and type(check['id']) is int and check['id'] == admission['check_run_id'],
+            'wrong check or replay')
     require(check['name'] == CHECK and check['head_sha'] == admission['expected']['execution_sha'],
             'wrong check candidate')
     require(check['status'] == 'completed' and check['conclusion'] == 'success', 'check not successful')
@@ -81,10 +101,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError('API redirect refused')
 
 
-def api(path, token, method='GET', payload=None):
+def api(path, token):
     require(path.startswith('/') and not path.startswith('//'), 'invalid API path')
     request = urllib.request.Request('https://api.github.com' + path,
-        data=None if payload is None else canonical(payload), method=method,
+        method='GET',
         headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
                  'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'})
     with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
@@ -123,7 +143,8 @@ def main():
     receipt = json.loads(check['output']['text'])
     validate_check(check, receipt, admission, int(time.time()))
     commit = api('/repos/' + REPOSITORY + '/git/commits/' + admission['expected']['execution_sha'], token)
-    require(commit['tree']['sha'] == admission['expected']['candidate_tree'], 'remote tree mismatch')
+    require(commit['sha'] == admission['expected']['execution_sha'] and
+            commit['tree']['sha'] == admission['expected']['candidate_tree'], 'remote commit or tree mismatch')
     print('Authenticated exact-candidate box receipt verified; no integration authorization granted.')
 
 

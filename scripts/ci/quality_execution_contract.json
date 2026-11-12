@@ -1,0 +1,47 @@
+{
+  "schema": "quality-execution-contract/v1",
+  "request_schema": "quality-execution-request/v1",
+  "evidence_schema": "quality-execution-evidence/v1",
+  "authentication": "UNAUTHENTICATED",
+  "api": "execute(request, runtime)",
+  "repository": "86669666/new-api",
+  "request_keys": ["schema", "repository", "candidate_sha", "candidate_tree", "attempt_id", "invocation"],
+  "required_commands": ["vet-root", "vet-relaykit", "vet-tokenkit", "build-root", "build-relaykit", "build-tokenkit", "frontend-install", "frontend-typecheck", "frontend-test", "database", "policy-tests", "consumer-tests"],
+  "required_scopes": ["backend/formal", "frontend", "database/sqlite", "database/mysql", "database/postgres"],
+  "formal_required_tiers": ["postgres", "postgres-redis", "wallet-sqlite", "wallet-mysql", "wallet-postgres", "lifecycle-sqlite", "lifecycle-mysql", "lifecycle-postgres", "sqlite"],
+  "authenticated_policy_tests": ["policy-tests", "consumer-tests"],
+  "authenticated_quality_rule": "quality_results independently requires the exact nine formal tier names and successful complete backend, formal, frontend, database and policy groups, including both policy-tests and consumer-tests, even when optional raw execution evidence is absent; admission binds details but cannot reduce these inventories",
+  "formal_state": "BLOCKED_STOPPED_INVENTORY_AND_UNPROVED_SANCTIONED_TRANSPORT",
+  "formal_source": "scripts/ci/bootstrap_test_runner.py:resource_partitions/execute_prepared/validate_tier_receipt",
+  "raw_optional_external_skip": {
+    "test": "TestOAuthPublicHydraHTTP",
+    "tier": "sqlite",
+    "entry_cwd": "router",
+    "phase": "ordinary",
+    "input_gate": "NEWAPI_W01_HYDRA_INPUT",
+    "source": "router/oauth_public_test.go:TestOAuthPublicHydraHTTP",
+    "rule": "Only the exact top-level skip with the existing absent-input reason, explicit frozen compiled selector membership and complete frozen-plan marker sequence is structurally accepted. Every START/END pair must match its frozen entry/phase and END must have integer-zero exit; missing, duplicate, dangling, contradictory or unknown entry evidence rejects. SQLite producer and selected dialect pairs remain required: dialect START overrides run with the exact known test/sqlite selector while END retains the original frozen selector. No required leaf, other skip, failure, duplicate event, wildcard router selector or missing context is exempt. This is fixed inspector policy, not an admission-configurable allowlist."
+  },
+  "stopped_scope_note": "The legacy default includes the stopped root producer. Real Hydra HTTP is separately input-gated; isolated authorization regressions and Boxnai-named local fixtures do not by themselves start external Hydra/Boxnai acceptance. No stopped test is authorized by this classification.",
+  "authenticated_receipt_authority": ".github/actions/box-formal-consumer/consumer.py",
+  "runtime_configuration": "Trusted installed launcher object only, never candidate JSON or a dynamic import",
+  "runtime_prerequisites": [
+    "Credential-free nonprivileged OS isolation with no publisher secrets or control transport mounted",
+    "Original shared heavy-test lease identity and ownership proved by coordinator; checked before and after each command",
+    "Clean immutable candidate checkout, exact SHA/tree and tracked file bytes",
+    "Pinned executor and contract from independent trusted installation",
+    "Pinned absolute git/go/bun/python executables outside candidate checkout",
+    "Prepared real frontend assets with frozen digest; no fabricated placeholder",
+    "Owned isolated-ci loopback MySQL/PostgreSQL resources, no application credentials",
+    "Private evidence root outside candidate checkout, exclusively created attempt directory",
+    "External sandbox resource limits and cleanup observer; local process group cleanup alone is insufficient"
+  ],
+  "result_limitations": [
+    "Hashes identify bytes only; they do not authenticate origin, custody or execution",
+    "No remote PR head observation; publisher must recheck head before and after publication",
+    "No authenticated admission, receipt, App check, workflow dispatch or status emitted",
+    "Top-level exit remains nonzero and cleanup false while formal scope and external cleanup are unproved",
+    "Full raw formal report validation is structural only, never authenticated admission",
+    "A settlement commit creates a new SHA; execute that exact SHA afresh"
+  ]
+}

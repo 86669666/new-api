@@ -2,15 +2,34 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, closed]
+    types: [opened, reopened, synchronize]
+  # Run the already-registered CI workflow on a reviewed candidate branch;
+  # its selected ref commit must equal the requested current PR head.
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: Open PR number (resolved independently through the GitHub API)
+        required: true
+        type: string
+      sha:
+        description: Exact current PR head and selected workflow ref commit
+        required: true
+        type: string
+      base_sha:
+        description: Exact current PR base commit
+        required: true
+        type: string
+  # Reusable only from the same open-PR event. Publication callers stay blocked:
+  # postmerge, tag and release verification is not implemented by this reader.
   workflow_call:
     inputs:
       sha:
-        description: Frozen full candidate commit
+        description: Exact current open-PR head (premerge only; no release authorization)
         required: true
         type: string
     outputs:
       verified_sha:
+        description: Verified open-PR head only; never a merge/tag/release authorization
         value: ${{ jobs.quality-gate.outputs.sha }}
 
 permissions:
@@ -20,12 +39,33 @@ concurrency:
   group: quality-${{ github.workflow }}-${{ github.event_name }}-${{ inputs.sha || github.ref }}
   cancel-in-progress: true
 
-# Checkout the event commit in both jobs. A PR merge ref can disappear while
-# queued runs start, and a base branch can advance after the merge event.
+# Validate only an open PR's exact head and current base. A merge/squash/tag SHA
+# needs its own authenticated lifecycle contract, which is not supported here.
 jobs:
+  premerge:
+    name: Require supported premerge event
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      repository: ${{ steps.resolve.outputs.repository }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Resolve supported current open PR through read-only API
+        id: resolve
+        env:
+          EXPECTED_SHA: ${{ inputs.sha || github.event.pull_request.head.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I -B scripts/ci/quality_results.py premerge > "$RUNNER_TEMP/premerge.json"
+          python3 -I -B -c 'import json, os; r=json.load(open(os.environ["RUNNER_TEMP"]+"/premerge.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("sha="+r["sha"]+"\nrepository="+r["repository"]+"\n")'
+
   backend:
     name: Backend vet, build, and test
-    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    needs: premerge
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -35,8 +75,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ github.repository }}
-          ref: ${{ inputs.sha || github.sha }}
+          repository: ${{ needs.premerge.outputs.repository }}
+          ref: ${{ needs.premerge.outputs.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -74,18 +114,17 @@ jobs:
         working-directory: tokenkit
         run: go build ./...
 
-      # Formal bootstrap tiers require the approved box-local fixed images.
-      # Keep this required result failing until a trusted, exact-candidate box
-      # verification route is wired. Hosted checks are not formal test evidence.
-      # Do not attach untrusted PR code to a self-hosted runner automatically.
-      - name: Require formal box verification (execution route not configured)
+      # Formal execution remains separate. The final gate independently reads
+      # the authenticated, complete App quality result for this exact SHA.
+      # Candidate code is never attached to a self-hosted runner by this CI.
+      - name: Policy and consumer regression tests
         run: |
-          echo "::error::Formal box verification is required for this exact candidate. The trusted execution/evidence route is not configured; hosted vet/build cannot satisfy it."
-          exit 1
+          python3 -I -B -m unittest discover -s scripts/ci -p 'test_*.py'
+          python3 -I -B -m unittest discover -s .github/actions/box-formal-consumer -p 'test_*.py'
 
   frontend:
     name: Frontend typecheck and test
-    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    needs: premerge
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -96,8 +135,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ github.repository }}
-          ref: ${{ inputs.sha || github.sha }}
+          repository: ${{ needs.premerge.outputs.repository }}
+          ref: ${{ needs.premerge.outputs.sha }}
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -115,7 +154,7 @@ jobs:
 
   database:
     name: Required real database contracts
-    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    needs: premerge
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -142,7 +181,8 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: ${{ inputs.sha || github.sha }}
+          repository: ${{ needs.premerge.outputs.repository }}
+          ref: ${{ needs.premerge.outputs.sha }}
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version-file: go.mod
@@ -155,23 +195,38 @@ jobs:
 
   quality-gate:
     name: Required quality gate
-    needs: [backend, frontend, database]
+    needs: [premerge, backend, frontend, database]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: box-formal-consumer
+    permissions:
+      contents: read
+      checks: read
+      actions: read
     outputs:
       sha: ${{ steps.verify.outputs.sha }}
     steps:
+      - name: Require immutable trusted quality reader
+        env:
+          TRUSTED_SHA: ${{ vars.BOX_FORMAL_READER_SHA }}
+        run: '[[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      # Never execute the candidate's verifier with protected admission data.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: ${{ inputs.sha || github.sha }}
-      - name: Verify every required result and candidate
+          repository: 86669666/new-api
+          ref: ${{ vars.BOX_FORMAL_READER_SHA }}
+          path: trusted-quality
+          persist-credentials: false
+      - name: Verify hosted jobs and authenticated exact-candidate quality
         id: verify
         env:
-          EXPECTED_SHA: ${{ inputs.sha || github.sha }}
+          EXPECTED_SHA: ${{ needs.premerge.outputs.sha }}
           QUALITY_RESULTS: '{"backend":"${{ needs.backend.result }}","frontend":"${{ needs.frontend.result }}","database":"${{ needs.database.result }}"}'
+          BOX_FORMAL_CONSUMER_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          BOX_FORMAL_ADMISSION: ${{ vars.BOX_FORMAL_ADMISSION }}
+          BOX_FORMAL_REVIEWER_IDS: ${{ vars.BOX_FORMAL_REVIEWER_IDS }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/ci/release_policy.py quality
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 -I -B trusted-quality/scripts/ci/quality_results.py ci
           echo "sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
-      - name: Release policy regression tests
-        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
