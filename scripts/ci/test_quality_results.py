@@ -818,7 +818,7 @@ class QualityWiringTests(unittest.TestCase):
         self.assertIn('environment: box-formal-consumer', gate)
         self.assertIn('ref: ${{ vars.BOX_FORMAL_READER_SHA }}', gate)
         self.assertIn('BOX_FORMAL_REVIEWER_IDS: ${{ vars.BOX_FORMAL_REVIEWER_IDS }}', gate)
-        self.assertIn('github.event.pull_request.head.sha', gate)
+        self.assertIn('EXPECTED_SHA: ${{ needs.premerge.outputs.sha }}', gate)
         self.assertNotIn('execution route not configured', workflow)
         for name in ('docker-build.yml', 'docker-image-branch.yml', 'electron-build.yml',
                      'release.yml', 'sync-release-to-gitcode.yml'):
@@ -903,6 +903,7 @@ class QualityWiringTests(unittest.TestCase):
                 # be diagnosed before missing external configuration or APIs.
                 child = subprocess.run([sys.executable, '-I', '-B', quality.__file__, 'ci'],
                     env=dict(GITHUB_EVENT_NAME=event_name, GITHUB_REF='refs/tags/v1.0.0',
+                             GITHUB_REPOSITORY=quality.REPOSITORY, GITHUB_REPOSITORY_ID='123',
                              GITHUB_EVENT_PATH=str(self.event_path)),
                     capture_output=True, text=True, timeout=5)
                 self.assertEqual(1, child.returncode)
@@ -916,6 +917,9 @@ class QualityWiringTests(unittest.TestCase):
         self.assertIn('types: [opened, reopened, synchronize]\n', workflow)
         self.assertNotIn("github.event.action != 'closed'", workflow)
         self.assertIn('no release authorization', workflow)
+        self.assertIn('  workflow_dispatch:\n', workflow)
+        for name in ('pull_number', 'sha', 'base_sha'):
+            self.assertIn('      ' + name + ':\n', workflow.split('  workflow_call:', 1)[0])
         gate = workflow.split('  quality-gate:\n', 1)[1]
         self.assertIn('needs: [premerge, backend, frontend, database]', gate)
         self.assertIn('if: always()', gate)
@@ -923,21 +927,204 @@ class QualityWiringTests(unittest.TestCase):
             job = workflow.split('  ' + name + ':\n', 1)[1]
             job = re.split(r'^  [a-zA-Z][\w-]*:\n', job, maxsplit=1, flags=re.MULTILINE)[0]
             self.assertIn('needs: premerge', job)
+            self.assertIn('repository: ${{ needs.premerge.outputs.repository }}', job)
+            self.assertIn('ref: ${{ needs.premerge.outputs.sha }}', job)
         premerge = workflow.split('  premerge:\n', 1)[1].split('  backend:\n', 1)[0]
         block = re.search(r'        run: \|\n((?:          .*\n)+)', premerge)
         self.assertIsNotNone(block)
         script = textwrap.dedent(block.group(1))
-        for event, action, expected_exit in (('pull_request', 'opened', 0),
-                ('pull_request', 'reopened', 0), ('pull_request', 'synchronize', 0),
-                ('pull_request', 'closed', 1), ('push', '', 1),
-                ('workflow_dispatch', '', 1), ('release', '', 1)):
-            with self.subTest(event=event, action=action):
+        self.assertIn('python3 -I -B scripts/ci/quality_results.py premerge', script)
+        self.assertIn('persist-credentials: false', premerge)
+        # Actual shell + JSON output stage; Python transport is exercised by
+        # the real main() fixtures below. This shim is NOT Actions execution.
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'output'
+            shim = Path(tmp) / 'python3'
+            shim.write_text('#!' + sys.executable + '\nimport sys, os, json\n'
+                'if sys.argv[-1] == "premerge":\n'
+                ' print(json.dumps(dict(sha="a"*40, repository="fixture-fork/new-api")))\n'
+                ' sys.exit(int(os.environ["MOCK_EXIT"]))\n'
+                'os.execv(sys.executable, [sys.executable]+sys.argv[1:])\n')
+            shim.chmod(0o700)
+            for code in (0, 7):
+                if output.exists():
+                    output.unlink()
                 child = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script],
-                    env=dict(EVENT_NAME=event, EVENT_ACTION=action), capture_output=True, text=True, timeout=5)
-                self.assertEqual(expected_exit, child.returncode)
-                self.assertNotIn('sha=', child.stdout + child.stderr)
-                if expected_exit:
-                    self.assertIn('publication callers are unsupported', child.stdout)
+                    env=dict(PATH=tmp + ':/usr/bin:/bin', RUNNER_TEMP=tmp,
+                             GITHUB_OUTPUT=str(output), MOCK_EXIT=str(code)),
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(code, child.returncode, child.stderr)
+                self.assertEqual(code == 0, output.exists())
+                if code == 0:
+                    self.assertEqual('sha=' + 'a' * 40 + '\nrepository=fixture-fork/new-api\n', output.read_text())
+
+    def dispatch_fixture(self, *, head_id=456, name='fixture-fork/new-api'):
+        """Inert dispatch event, never a synthesized pull_request event."""
+        self.event = dict(repository=dict(id=123, full_name=quality.REPOSITORY),
+            inputs=dict(pull_number='1', sha='a' * 40, base_sha='b' * 40))
+        self.environment.update(GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REF='refs/heads/reviewed',
+            GITHUB_SHA='a' * 40, GITHUB_WORKFLOW_SHA='a' * 40,
+            GITHUB_WORKFLOW_REF=quality.REPOSITORY + '/.github/workflows/ci.yml@refs/heads/reviewed')
+        self.reader.pr['head']['repo'] = dict(id=head_id, full_name=name)
+        self.admission['quality']['head_repository_id'] = head_id
+        self.receipt['quality']['head_repository_id'] = head_id
+        self.admission['receipt_sha256'] = quality.consumer.digest(self.receipt)
+        self.reader.check_value.update(external_id=self.admission['receipt_sha256'],
+                                      output={'text': json.dumps(self.receipt)})
+        gate = json.loads(self.reader.gate_value['output']['text'])
+        gate.update(quality=copy.deepcopy(self.admission['quality']),
+                    receipt_sha256=self.admission['receipt_sha256'])
+        self.reader.gate_value.update(external_id=quality.consumer.digest(gate),
+                                      output={'text': json.dumps(gate)})
+        self.event_path.write_text(json.dumps(self.event))
+
+    def test_dispatch_actual_entries_accept_current_same_repo_and_fork(self):
+        for head_id, name in ((123, quality.REPOSITORY), (456, 'fixture-fork/new-api')):
+            with self.subTest(head_id=head_id):
+                self.setUp()
+                self.dispatch_fixture(head_id=head_id, name=name)
+                trace = []
+                watch = CIEnvironmentWatch(dict(self.environment, GITHUB_TOKEN='OFFLINE-NOT-A-CREDENTIAL'),
+                                           trace, block_admission=True)
+                output = io.StringIO()
+                with patch.object(quality.os, 'environ', watch), \
+                        patch.object(sys, 'argv', ['quality_results.py', 'premerge']), \
+                        patch.object(quality, 'GitHubReader', return_value=self.reader), \
+                        patch.object(quality.consumer, 'api', side_effect=AssertionError('no network')), \
+                        redirect_stdout(output):
+                    quality.main()
+                self.assertEqual(dict(sha='a' * 40, repository=name), json.loads(output.getvalue()))
+                self.assertFalse(any(key == 'BOX_FORMAL_ADMISSION' for _, key in trace))
+                self.reader.reads = 0
+                self.observe_ci_input_main('dispatch-' + name, 'VALID')
+
+    def test_dispatch_native_rejections_precede_admission_and_token(self):
+        mutations = ('native-repo', 'native-id', 'root-id', 'root-name', 'root-bool-id',
+            'missing-input', 'extra-input', 'number-bool', 'number-zero', 'number-leading-zero',
+            'sha-type', 'sha-syntax', 'base-type', 'expected-sha', 'workflow-sha', 'ref-sha',
+            'tag', 'publication-caller', 'forged-pr', 'duplicate-input')
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                self.dispatch_fixture()
+                text = None
+                if mutation == 'native-repo':
+                    self.environment['GITHUB_REPOSITORY'] = 'untrusted/new-api'
+                elif mutation == 'native-id':
+                    self.environment['GITHUB_REPOSITORY_ID'] = '0123'
+                elif mutation in ('root-id', 'root-bool-id', 'root-name'):
+                    self.event['repository']['full_name' if mutation == 'root-name' else 'id'] = (
+                        'untrusted/new-api' if mutation == 'root-name' else True if mutation == 'root-bool-id' else 999)
+                elif mutation == 'missing-input':
+                    del self.event['inputs']['base_sha']
+                elif mutation == 'extra-input':
+                    self.event['inputs']['head_repository_id'] = '456'
+                elif mutation.startswith('number-'):
+                    self.event['inputs']['pull_number'] = {'number-bool': True,
+                        'number-zero': '0', 'number-leading-zero': '01'}[mutation]
+                elif mutation in ('sha-type', 'sha-syntax', 'base-type'):
+                    self.event['inputs']['base_sha' if mutation == 'base-type' else 'sha'] = (
+                        'not-a-sha' if mutation == 'sha-syntax' else True)
+                elif mutation in ('expected-sha', 'workflow-sha', 'ref-sha'):
+                    key = {'expected-sha': 'EXPECTED_SHA', 'workflow-sha': 'GITHUB_WORKFLOW_SHA',
+                           'ref-sha': 'GITHUB_SHA'}[mutation]
+                    self.environment[key] = 'd' * 40
+                elif mutation == 'tag':
+                    self.environment['GITHUB_REF'] = 'refs/tags/v1'
+                elif mutation == 'publication-caller':
+                    self.environment['GITHUB_WORKFLOW_REF'] = quality.REPOSITORY + '/.github/workflows/release.yml@refs/heads/reviewed'
+                elif mutation == 'forged-pr':
+                    self.event['pull_request'] = {}
+                else:
+                    text = json.dumps(self.event).replace('"pull_number": "1"', '"pull_number": "1", "pull_number": "2"')
+                self.observe_ci_input_main(mutation, 'NATIVE', event_text=text)
+                # The same native validator fronts hosted preflight, before its
+                # token access as well; no admission exists in that operation.
+                trace = []
+                watch = CIEnvironmentWatch(self.environment, trace, block_admission=True, block_token=True)
+                with self.assertRaises((ValueError, KeyError, TypeError)):
+                    quality.resolve_ci_candidate(watch)
+                self.assertFalse(any(key in ('GITHUB_TOKEN', 'BOX_FORMAL_ADMISSION') for _, key in trace))
+
+    def test_dispatch_admission_binding_rejections_precede_token(self):
+        for mutation in ('repository', 'repository-id', 'pull', 'head', 'base', 'attempt'):
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                self.dispatch_fixture()
+                if mutation == 'repository':
+                    self.admission['repository'] = 'untrusted/new-api'
+                elif mutation == 'repository-id':
+                    self.admission['repository_id'] = 999
+                elif mutation == 'pull':
+                    self.admission['quality']['pull_number'] = 2
+                elif mutation in ('head', 'base'):
+                    self.event['inputs']['sha' if mutation == 'head' else 'base_sha'] = 'd' * 40
+                    if mutation == 'head':
+                        self.environment.update(EXPECTED_SHA='d' * 40, GITHUB_SHA='d' * 40,
+                                                GITHUB_WORKFLOW_SHA='d' * 40)
+                else:
+                    self.admission['quality']['attempt_id'] = 'replayed-attempt'
+                self.observe_ci_input_main(mutation, 'ADMISSION_BINDING')
+
+    def test_dispatch_preflight_rejects_authenticated_pr_drift(self):
+        for mutation in ('number', 'closed', 'merged', 'head', 'base', 'target', 'head-repo', 'repo'):
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                self.dispatch_fixture()
+                if mutation == 'number':
+                    self.reader.pr['number'] = 2
+                elif mutation == 'closed':
+                    self.reader.pr['state'] = 'closed'
+                elif mutation == 'merged':
+                    self.reader.pr['merged'] = True
+                elif mutation in ('head', 'base'):
+                    self.reader.pr[mutation]['sha'] = 'd' * 40
+                elif mutation == 'target':
+                    self.reader.pr['base']['ref'] = 'untrusted'
+                elif mutation == 'head-repo':
+                    self.reader.pr['head']['repo']['full_name'] = 'unsafe\noutput=forged'
+                else:
+                    self.reader.repo['id'] = 999
+                with self.assertRaises(ValueError):
+                    quality.resolve_ci_candidate(self.environment, self.reader)
+
+    def test_dispatch_final_gate_retains_real_evidence_failure_conditions(self):
+        for mutation in ('closed', 'head', 'base', 'head-id', 'missing-app', 'wrong-app',
+                         'hosted-failed', 'hosted-skipped', 'replay', 'expiry', 'reviewer', 'final-drift'):
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                self.dispatch_fixture()
+                if mutation == 'closed':
+                    self.reader.pr.update(state='closed', merged=True)
+                elif mutation in ('head', 'base'):
+                    self.reader.pr[mutation]['sha'] = 'd' * 40
+                elif mutation == 'head-id':
+                    self.reader.pr['head']['repo']['id'] = 999
+                elif mutation == 'missing-app':
+                    self.reader.check_value = {}  # No receipt/check envelope exists.
+                elif mutation == 'wrong-app':
+                    self.reader.gate_value['app']['id'] = 1
+                elif mutation.startswith('hosted-'):
+                    self.environment['QUALITY_RESULTS'] = json.dumps(dict(backend=
+                        'failure' if mutation == 'hosted-failed' else 'skipped', frontend='success', database='success'))
+                elif mutation == 'replay':
+                    self.latest['run_attempt'] = 2
+                elif mutation == 'reviewer':
+                    self.reviews[0]['user']['id'] = 999
+                elif mutation == 'final-drift':
+                    self.reader.on_pull = lambda reader: reader.pr['head'].update(
+                        sha='d' * 40 if reader.reads > 1 else 'a' * 40)
+                output = io.StringIO()
+                original = quality.verify_ci_result
+                with patch.dict(os.environ, dict(self.environment, GITHUB_TOKEN='OFFLINE-NOT-A-CREDENTIAL',
+                        BOX_FORMAL_ADMISSION=json.dumps(self.admission)), clear=True), \
+                        patch.object(sys, 'argv', ['quality_results.py', 'ci']), \
+                        patch.object(quality, 'GitHubReader', return_value=self.reader), \
+                        patch.object(quality, 'verify_ci_result', side_effect=lambda *args: original(
+                            *args, clock=lambda: 301 if mutation == 'expiry' else 200)), \
+                        self.assertRaises((ValueError, KeyError)), redirect_stdout(output):
+                    quality.main()
+                self.assertEqual('', output.getvalue())
 
     def test_premerge_contract_publication_callers_remain_blocked_with_quality_needs(self):
         root = Path(quality.__file__).resolve().parents[2]

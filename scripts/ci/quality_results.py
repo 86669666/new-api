@@ -4,6 +4,8 @@ There is deliberately no credential-loading or write-enabled CLI. A trusted host
 injects read and staging capabilities, never module/command names from
 an admission or a candidate. Deploy this file, consumer.py, and database_gate.py at one reviewed,
 immutable revision, outside the candidate checkout; invoke Python with -I -B.
+The separate premerge CLI resolves only public checkout coordinates on a hosted
+workflow checkout, without admission data or any quality authorization.
 
 GitHub's Checks API has no atomic PR-head/replay compare-and-publish operation.
 This module can stage only an in-progress check. It never sends success. A
@@ -390,9 +392,11 @@ def ci_premerge_event(environment):
     """Check the native event before consulting admission, credentials or APIs.
 
     A reusable workflow inherits its caller's event; workflow_call itself is not
-    an authorization. Only an open PR event is supported, including for reuse.
+    an authorization. Dispatch inputs select a PR; they never supply PR metadata.
     """
-    if environment['GITHUB_EVENT_NAME'] != 'pull_request':
+    kind = environment['GITHUB_EVENT_NAME']
+    if kind not in ('pull_request', 'workflow_dispatch') or (
+            kind == 'workflow_dispatch' and not environment['GITHUB_REF'].startswith('refs/heads/')):
         raise UnsupportedCIEvent('only open-PR premerge verification is supported')
     require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong native repository')
     native_id = environment['GITHUB_REPOSITORY_ID']
@@ -400,6 +404,28 @@ def ci_premerge_event(environment):
             'invalid native repository ID')
     event = json.loads(Path(environment['GITHUB_EVENT_PATH']).read_text(),
                        object_pairs_hook=consumer.unique_json_fields)
+    if kind == 'workflow_dispatch':
+        if type(event) is not dict or 'pull_request' in event:
+            raise UnsupportedCIEvent('only open-PR premerge verification is supported')
+        root = event['repository']
+        require(type(root) is dict and type(root['id']) is int and root['id'] == int(native_id) and
+                root['full_name'] == REPOSITORY, 'dispatch repository ownership mismatch')
+        inputs = event['inputs']
+        require(type(inputs) is dict and set(inputs) == {'pull_number', 'sha', 'base_sha'},
+                'explicit PR, head and base inputs required')
+        require(isinstance(inputs['pull_number'], str) and
+                re.fullmatch('[1-9][0-9]*', inputs['pull_number']) is not None, 'invalid dispatch PR')
+        for key in ('sha', 'base_sha'):
+            require(isinstance(inputs[key], str) and re.fullmatch('[0-9a-f]{40}', inputs[key]) is not None,
+                    'invalid dispatch source SHA')
+        # Dispatch checks attach to the selected workflow ref's commit. Running
+        # another ref must not claim to qualify the requested candidate SHA.
+        require(environment['EXPECTED_SHA'] == inputs['sha'] == environment['GITHUB_SHA'] ==
+                environment['GITHUB_WORKFLOW_SHA'], 'dispatch ref must be the exact candidate')
+        require(environment['GITHUB_WORKFLOW_REF'] ==
+                REPOSITORY + '/.github/workflows/ci.yml@' + environment['GITHUB_REF'],
+                'dispatch must call CI directly, not a publication workflow')
+        return event
     require(type(event) is dict and type(event['pull_request']) is dict,
             'invalid PR event structure')
     pull = event['pull_request']
@@ -439,6 +465,38 @@ def ci_premerge_event(environment):
     return event
 
 
+def resolve_ci_candidate(environment, reader=None):
+    """Resolve public checkout coordinates through GETs, never grant quality.
+
+    Hosted preflight has no admission data. The protected final reader separately
+    binds admission and rechecks the current PR and complete App evidence.
+    """
+    event = ci_premerge_event(environment)
+    dispatch = environment['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+    number = int(event['inputs']['pull_number']) if dispatch else event['number']
+    head = event['inputs']['sha'] if dispatch else event['pull_request']['head']['sha']
+    base = event['inputs']['base_sha'] if dispatch else event['pull_request']['base']['sha']
+    if reader is None:
+        reader = GitHubReader(environment['GITHUB_TOKEN'])
+    repository = reader.repository()
+    require(repository['id'] == event['repository']['id'] and repository['full_name'] == REPOSITORY,
+            'repository identity changed')
+    pull = reader.pull(number)
+    require(type(pull['number']) is int and pull['number'] == number and pull['state'] == 'open' and
+            pull['merged'] is False, 'PR is not an open candidate')
+    require(pull['base']['repo']['id'] == repository['id'] and
+            pull['base']['repo']['full_name'] == REPOSITORY and pull['base']['ref'] == 'main' and
+            pull['base']['sha'] == base and pull['head']['sha'] == head, 'PR head, base or target changed')
+    source = pull['head']['repo']
+    require(type(source['id']) is int and source['id'] > 0 and isinstance(source['full_name'], str) and
+            re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', source['full_name']) is not None and
+            (source['id'] == repository['id']) == (source['full_name'] == REPOSITORY),
+            'invalid authenticated head repository')
+    if not dispatch:
+        require(source['id'] == event['pull_request']['head']['repo']['id'], 'event head repository changed')
+    return {'sha': head, 'repository': source['full_name']}
+
+
 def verify_ci_result(admission, environment, reader=None, *, clock=time.time):
     """GET-only revalidation of a PRE-EXISTING App quality success for CI.
 
@@ -463,11 +521,19 @@ def verify_ci_result(admission, environment, reader=None, *, clock=time.time):
     require(type(admitted_quality['pull_number']) is int and admitted_quality['pull_number'] > 0 and
             type(admitted_quality['head_repository_id']) is int and admitted_quality['head_repository_id'] > 0,
             'invalid admitted PR identity')
-    require(event['number'] == admitted_quality['pull_number'] and
-            event['pull_request']['head']['repo']['id'] == admitted_quality['head_repository_id'] and
-            event['pull_request']['head']['sha'] == expected['candidate_sha'] and
-            event['pull_request']['base']['sha'] == admitted_quality['base_sha'],
-            'CI event does not match admitted PR ownership, head or base')
+    if environment['GITHUB_EVENT_NAME'] == 'workflow_dispatch':
+        require(int(event['inputs']['pull_number']) == admitted_quality['pull_number'] and
+                event['inputs']['sha'] == expected['candidate_sha'] and
+                event['inputs']['base_sha'] == admitted_quality['base_sha'],
+                'CI dispatch does not match admitted PR, head or base')
+        # A dispatch has no authenticated head repo metadata. Its immutable ID
+        # is bound by verify_current_head below, never by caller-supplied input.
+    else:
+        require(event['number'] == admitted_quality['pull_number'] and
+                event['pull_request']['head']['repo']['id'] == admitted_quality['head_repository_id'] and
+                event['pull_request']['head']['sha'] == expected['candidate_sha'] and
+                event['pull_request']['base']['sha'] == admitted_quality['base_sha'],
+                'CI event does not match admitted PR ownership, head or base')
     for key in ('candidate_sha', 'candidate_tree', 'execution_sha'):
         require(isinstance(expected[key], str) and re.fullmatch('[0-9a-f]{40}', expected[key]) is not None and
                 admitted_quality[key] == expected[key], 'inconsistent admitted source identity')
@@ -598,9 +664,14 @@ def collect_result(admission, environment, reader, publisher, journal, *, clock=
 
 
 def main():
-    # This entry point performs reads only, on the protected consumer checkout.
+    # Quality reads use the protected consumer checkout; preflight reads only
+    # public PR metadata on the hosted workflow checkout, without admission.
     # Publication is available solely through the trusted host's injected object.
-    require(sys.argv[1:] in ([], ['ci']), 'unknown quality operation')
+    require(sys.argv[1:] in ([], ['ci'], ['premerge']), 'unknown quality operation')
+    if sys.argv[1:] == ['premerge']:
+        result = resolve_ci_candidate(os.environ)
+        print(json.dumps(result, sort_keys=True))
+        return
     if sys.argv[1:] == ['ci']:
         ci_premerge_event(os.environ)
         admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'],

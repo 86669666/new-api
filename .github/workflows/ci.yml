@@ -3,6 +3,22 @@ name: CI
 on:
   pull_request:
     types: [opened, reopened, synchronize]
+  # Run the already-registered CI workflow on a reviewed candidate branch;
+  # its selected ref commit must equal the requested current PR head.
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: Open PR number (resolved independently through the GitHub API)
+        required: true
+        type: string
+      sha:
+        description: Exact current PR head and selected workflow ref commit
+        required: true
+        type: string
+      base_sha:
+        description: Exact current PR base commit
+        required: true
+        type: string
   # Reusable only from the same open-PR event. Publication callers stay blocked:
   # postmerge, tag and release verification is not implemented by this reader.
   workflow_call:
@@ -30,16 +46,22 @@ jobs:
     name: Require supported premerge event
     runs-on: ubuntu-latest
     timeout-minutes: 1
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      repository: ${{ steps.resolve.outputs.repository }}
     steps:
-      - name: Reject unsupported lifecycle or publication caller
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Resolve supported current open PR through read-only API
+        id: resolve
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_ACTION: ${{ github.event.action }}
+          EXPECTED_SHA: ${{ inputs.sha || github.event.pull_request.head.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          if [[ "$EVENT_NAME" != pull_request ]] || [[ "$EVENT_ACTION" != opened && "$EVENT_ACTION" != reopened && "$EVENT_ACTION" != synchronize ]]; then
-            echo "::error::Only open-PR premerge verification is supported; postmerge, tag and publication callers are unsupported."
-            exit 1
-          fi
+          python3 -I -B scripts/ci/quality_results.py premerge > "$RUNNER_TEMP/premerge.json"
+          python3 -I -B -c 'import json, os; r=json.load(open(os.environ["RUNNER_TEMP"]+"/premerge.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("sha="+r["sha"]+"\nrepository="+r["repository"]+"\n")'
 
   backend:
     name: Backend vet, build, and test
@@ -53,8 +75,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ github.repository }}
-          ref: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ needs.premerge.outputs.repository }}
+          ref: ${{ needs.premerge.outputs.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -113,8 +135,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ github.repository }}
-          ref: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ needs.premerge.outputs.repository }}
+          ref: ${{ needs.premerge.outputs.sha }}
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -159,7 +181,8 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ needs.premerge.outputs.repository }}
+          ref: ${{ needs.premerge.outputs.sha }}
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version-file: go.mod
@@ -198,7 +221,7 @@ jobs:
       - name: Verify hosted jobs and authenticated exact-candidate quality
         id: verify
         env:
-          EXPECTED_SHA: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_SHA: ${{ needs.premerge.outputs.sha }}
           QUALITY_RESULTS: '{"backend":"${{ needs.backend.result }}","frontend":"${{ needs.frontend.result }}","database":"${{ needs.database.result }}"}'
           BOX_FORMAL_CONSUMER_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
           BOX_FORMAL_ADMISSION: ${{ vars.BOX_FORMAL_ADMISSION }}
