@@ -1,0 +1,123 @@
+name: PR258 independent hosted read-only preflight
+'on':
+  push:
+    branches: ['codex/pr258-hosted-preflight-r5']
+permissions:
+  contents: read
+jobs:
+  readonly:
+    if: github.event.created == true && github.event.deleted == false
+    name: Read-only pin and API probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact reader SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: 86669666/new-api
+          ref: 986d608742a9a507ffd5851612c43a3da88208e9
+          path: pin-reader
+          persist-credentials: false
+      - name: Checkout exact consumer SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: 86669666/new-api
+          ref: f35809d09c7df46b3e98c6a8be656b3c40a5e40b
+          path: pin-consumer
+          persist-credentials: false
+      - name: Record actual checkouts
+        shell: bash
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+
+          expected = {'reader': {'commit': '986d608742a9a507ffd5851612c43a3da88208e9', 'tree': 'edc407923936daf2d23396e4717392f4170a7efc', 'files': {'.github/actions/box-formal-consumer/consumer.py': {'bytes': 8410, 'sha256': '5fa24f2fe5c84e106ec9e1c970bcd9af3a93ce5e7bbfad2a5bbcb92304b7701e'}, 'scripts/ci/database_gate.py': {'bytes': 9131, 'sha256': '110b9878dd6e76454da03e485dd9879e59378b160693b60f70344b2558fbfb45'}, 'scripts/ci/quality_results.py': {'bytes': 42412, 'sha256': '3a60fdbe24cbf8d90e939efe4f103ad7e029b565c10ff8354d7d3809110b0f78'}, 'scripts/ci/release_policy.py': {'bytes': 4024, 'sha256': 'cc4c99227b5728b6d0660d3268bbfe96dcc71d0a0c87d987fe78547f58c322a0'}}}, 'consumer': {'commit': 'f35809d09c7df46b3e98c6a8be656b3c40a5e40b', 'tree': 'ff10cd5643f63988c9818682a73aa824c65840ef', 'files': {'.github/actions/box-formal-consumer/action.yml': {'bytes': 670, 'sha256': 'f2448c227a826f2c6ec45777b3579e4f99a7d8c45f372f0cd38f10f6237b8524'}, '.github/actions/box-formal-consumer/consumer.py': {'bytes': 7207, 'sha256': 'c310ddda0fdf6486610f134dc03cde18851a6b0393b62221be09ba28d2b0c58d'}, '.github/workflows/box-formal-receipt.yml': {'bytes': 985, 'sha256': 'f93667e5abb16167b7a421eab9a6bfd3b750ca6a6f7d8239ad3e0113a08af056'}}}}
+          def git(path, *args):
+              return subprocess.check_output(['git', '-C', path, *args], text=True).strip()
+
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_bytes())
+          assert os.environ['GITHUB_REPOSITORY'] == '86669666/new-api'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'push' and os.environ['GITHUB_REF'] == 'refs/heads/codex/pr258-hosted-preflight-r5'
+          assert event['created'] is True and event['deleted'] is False
+          assert os.environ['GITHUB_SHA'] == os.environ['GITHUB_WORKFLOW_SHA']
+          actual = {}
+          for role, wanted in expected.items():
+              path = 'pin-' + role
+              head = git(path, 'rev-parse', 'HEAD')
+              tree = git(path, 'rev-parse', 'HEAD^{tree}')
+              assert (head, tree) == (wanted['commit'], wanted['tree']), role
+              assert not git(path, 'status', '--porcelain'), role
+              files = {}
+              for name, pin in wanted['files'].items():
+                  raw = (Path(path) / name).read_bytes()
+                  evidence = dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                  assert evidence == pin, (role, name)
+                  files[name] = evidence
+              actual[role] = dict(head=head, tree=tree, files=files, working_tree_clean=True)
+          proof = dict(repository=os.environ['GITHUB_REPOSITORY'], repository_id=int(os.environ['GITHUB_REPOSITORY_ID']),
+                       event=os.environ['GITHUB_EVENT_NAME'], ref=os.environ['GITHUB_REF'], created=event['created'],
+                       workflow_sha=os.environ['GITHUB_WORKFLOW_SHA'], run_id=int(os.environ['GITHUB_RUN_ID']),
+                       attempt=int(os.environ['GITHUB_RUN_ATTEMPT']), checkouts=actual)
+          print('PR258_CHECKOUT_EVIDENCE=' + json.dumps(proof, sort_keys=True), flush=True)
+          PY
+      - name: Read repository PR and commits with job token
+        shell: bash
+        env:
+          PREFLIGHT_JOB_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I -B - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+
+          class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, file, code, message, headers, new_url):
+                  raise ValueError('redirect refused')
+
+          repo = '86669666/new-api'
+          repo_id = 1423238398
+          prefix = '/repos/' + repo
+          token = os.environ['PREFLIGHT_JOB_TOKEN']
+          assert token
+          client = urllib.request.build_opener(RefuseRedirect)
+          responses = []
+          def read(path):
+              request = urllib.request.Request('https://api.github.com' + path, method='GET',
+                  headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
+                           'X-GitHub-Api-Version': '2022-11-28'})
+              try:
+                  with client.open(request, timeout=15) as response:
+                      raw = response.read(1024 * 1024 + 1)
+                      meta = dict(method='GET', path=path, status=response.status,
+                                  request_id=response.headers.get('X-GitHub-Request-Id'))
+              except urllib.error.HTTPError as error:
+                  print('PR258_GET_FAILURE=' + json.dumps(dict(method='GET', path=path,
+                      status=error.code, request_id=error.headers.get('X-GitHub-Request-Id'))), flush=True)
+                  sys.exit(1)
+              except (ValueError, OSError) as error:
+                  print('PR258_GET_FAILURE=' + json.dumps(dict(method='GET', path=path,
+                      error_type=type(error).__name__)), flush=True)
+                  sys.exit(1)
+              assert meta['status'] == 200 and len(raw) <= 1024 * 1024, path
+              return meta, json.loads(raw)
+
+          entry, body = read(prefix)
+          identity = dict(id=body['id'], full_name=body['full_name'], default_branch=body['default_branch'])
+          assert identity == dict(id=repo_id, full_name=repo, default_branch='main')
+          responses.append(dict(entry, observed=identity))
+          entry, body = read(prefix + '/pulls/258')
+          identity = dict(number=body['number'], state=body['state'], merged=body['merged'])
+          for name in ('head', 'base'):
+              side = body[name]
+              identity[name] = dict(sha=side['sha'], ref=side['ref'], repo_id=side['repo']['id'])
+          assert identity == dict(number=258, state='open', merged=False,
+              head=dict(sha='15374e43f795ad64e34d38f2b7a8315691992a0a', ref='codex/t77u-quality-execution', repo_id=repo_id),
+              base=dict(sha='f35809d09c7df46b3e98c6a8be656b3c40a5e40b', ref='main', repo_id=repo_id))
+          responses.append(dict(entry, observed=identity))
+          for role, commit, tree in [('reader', '986d608742a9a507ffd5851612c43a3da88208e9', 'edc407923936daf2d23396e4717392f4170a7efc'), ('consumer', 'f35809d09c7df46b3e98c6a8be656b3c40a5e40b', 'ff10cd5643f63988c9818682a73aa824c65840ef'), ('pr-head', '15374e43f795ad64e34d38f2b7a8315691992a0a', 'e7ba57405cfce3cd6df3ceb2f708b9bbea97d846')]:
+              entry, body = read(prefix + '/git/commits/' + commit)
+              observed = dict(sha=body['sha'], tree=body['tree']['sha'])
+              assert observed == dict(sha=commit, tree=tree), role
+              responses.append(dict(entry, role=role, observed=observed))
+          print('PR258_GET_EVIDENCE=' + json.dumps(dict(repository=repo, run_id=int(os.environ['GITHUB_RUN_ID']),
+              attempt=int(os.environ['GITHUB_RUN_ATTEMPT']), requests=responses), sort_keys=True), flush=True)
+          PY
