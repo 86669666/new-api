@@ -4091,21 +4091,34 @@ func TestSessionRevocationS1RealRedis(t *testing.T) {
 			require.NotEmpty(t, physical, "observe the real cache key instead of duplicating its HMAC naming")
 			if scenario == "credential_rollback" {
 				require.NoError(t, model.PublishUserAuthCache(userID))
+				var versionKeys []string
+				hook.mu.Lock()
+				for key := range hook.keys {
+					if strings.HasPrefix(key, prefix+"auth:user:version:") {
+						versionKeys = append(versionKeys, key)
+					}
+				}
+				hook.mu.Unlock()
+				require.Len(t, versionKeys, 1, "observe the committed floor key written by the real cache")
+				versionKey := versionKeys[0]
+				floorBefore, err := control.Get(t.Context(), versionKey).Int64()
+				require.NoError(t, err)
+				require.EqualValues(t, 1, floorBefore)
 				forced := errors.New("S1 event create failed")
 				require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register("s1:redis-intent", func(tx *gorm.DB) {
 					if _, ok := tx.Statement.Dest.(*model.SessionRevocationEvent); ok {
 						tx.AddError(forced)
 					}
 				}))
-				_, err := model.BumpUserAuthVersion(userID)
-				assert.ErrorIs(t, err, forced)
+				_, err = model.BumpUserAuthVersion(userID)
+				require.ErrorIs(t, err, forced)
 				require.NoError(t, f.db.Callback().Create().Remove("s1:redis-intent"))
 				var user model.User
 				require.NoError(t, f.db.First(&user, userID).Error)
 				assert.EqualValues(t, 1, user.AuthVersion)
-				floor, err := control.Get(t.Context(), prefix+fmt.Sprintf("auth:user:version:%d", userID)).Int64()
+				floor, err := control.Get(t.Context(), versionKey).Int64()
 				require.NoError(t, err)
-				assert.EqualValues(t, 1, floor, "a rolled back credential cannot publish committed version2")
+				assert.Equal(t, floorBefore, floor, "a rolled back credential cannot publish a new committed version")
 				var count int64
 				require.NoError(t, f.db.Model(&model.SessionRevocationEvent{}).Where("user_id = ?", userID).Count(&count).Error)
 				assert.Zero(t, count)
