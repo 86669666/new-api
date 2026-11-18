@@ -764,10 +764,63 @@ class QualityWiringTests(unittest.TestCase):
                     quality.consumer.configured_evidence(environment, 200)
             fetch.assert_not_called()
 
-    def test_terminal_proof_binds_both_approvals_hosted_jobs_and_private_artifact(self):
+    def test_v3_private_seal_binds_release_to_the_original_root_capture(self):
         evidence = quality.consumer.evidence
+        admission, receipt = self.admission, self.receipt
+        summary = admission.pop('quality')
+        receipt.pop('quality')
+        for key in ('check_run_id', 'quality_check_run_id', 'receipt_sha256'):
+            del admission[key]
+        summary['workflow'].update(ref=evidence.CONTROL_REF_V3, workflow_id=quality.FORMAL_WORKFLOW_ID)
+        # Release opened at 190 and extends past the original execution deadline of 300.
+        identity = evidence.identity(dict(admission, quality=summary), receipt)
+        raw = [evidence.canonical(value) for value in (admission, receipt, summary)]
+        release = dict(identity=identity, consumer_ref=evidence.CONTROL_REF_V3,
+                       **{k + '_sha256': sha256(v).hexdigest() for k, v in
+                          zip(('admission', 'capture', 'quality'), raw)})
+        artifact = formal_evidence_publisher.seal(*raw, release, policy=quality, now=1990)
+        doc = evidence.decode(artifact)
+        self.assertEqual(evidence.ARTIFACT_SCHEMA_V3, doc['schema'])
+        reference = evidence.make_reference('d' * 40, artifact, doc['admission'])
+        config = dict(schema=evidence.CONFIG_SCHEMA_V3, artifact=reference, check_run_id=42, quality_check_run_id=None)
+        self.assertEqual(doc['receipt'], evidence.resolve_configuration(
+            config, lambda _: artifact, 1990, lambda _: None)[1][0])
+        for now in (189, 1991):
+            with self.subTest(now=now), self.assertRaises(ValueError):
+                formal_evidence_publisher.seal(*raw, release, policy=quality, now=now)
+        with self.assertRaises(ValueError):
+            formal_evidence_publisher.seal(*raw, dict(release, identity=dict(identity, release_not_before=191,
+                                                    release_expires_at=1991)), policy=quality, now=400)
+        rebound = dict(reference, identity=dict(identity, release_not_before=191, release_expires_at=1991))
+        with self.assertRaisesRegex(ValueError, 'identity drift'):
+            evidence.resolve(rebound, lambda _: artifact, 1991, lambda _: None)
+        for schema in (evidence.CONFIG_SCHEMA, 'box-formal-evidence-config/v4'):
+            with self.subTest(schema=schema), self.assertRaises(ValueError):
+                evidence.resolve_configuration(dict(config, schema=schema), lambda _: artifact, 400, lambda _: None)
+        with self.assertRaises(ValueError):
+            quality.consumer.configured_evidence({'BOX_FORMAL_ADMISSION': '{"schema":"unknown"}'}, 400)
+        for bad in (dict(receipt, completed_at=301), dict(receipt, started_at=True),
+                    dict(receipt, unexecuted=['sqlite'])):
+            with self.assertRaises(ValueError):
+                quality.consumer.validate_execution_capture(bad, admission)
+        admission['expected']['expires_at'] = receipt['binding']['expires_at'] = 7301
+        with self.assertRaisesRegex(ValueError, 'execution interval'):
+            quality.consumer.validate_execution_capture(receipt, admission)
+
+    def test_terminal_proof_binds_both_approvals_hosted_jobs_and_private_artifact(self):
+        self.exercise_terminal_proof(quality.consumer.evidence.CONTROL_REF)
+
+    def test_terminal_v3_binds_checks_and_native_approvals_to_root_completion(self):
+        self.exercise_terminal_proof(quality.consumer.evidence.CONTROL_REF_V3)
+
+    def exercise_terminal_proof(self, control_ref):
+        evidence = quality.consumer.evidence
+        v3 = control_ref == evidence.CONTROL_REF_V3
+
+        def stamp(second):
+            return '1970-01-01T00:03:%02dZ' % second  # epoch 180 + second
         for item in (self.admission, self.receipt):
-            item['quality']['workflow'].update(ref=evidence.CONTROL_REF, workflow_id=402689897)
+            item['quality']['workflow'].update(ref=control_ref, workflow_id=402689897)
         self.admission['receipt_sha256'] = quality.consumer.digest(self.receipt)
         stored = {key: value for key, value in self.admission.items()
                   if key not in ('check_run_id', 'quality_check_run_id')}
@@ -778,7 +831,7 @@ class QualityWiringTests(unittest.TestCase):
         self.reader.pr['head']['repo']['full_name'] = 'fixture-fork/new-api'
         actor = {'id': 358061300}
         runs = {n: dict(self.latest, id=n, workflow_id=402689897,
-                       head_branch=evidence.CONTROL_REF.removeprefix('refs/heads/'),
+                       head_branch=control_ref.removeprefix('refs/heads/'),
                        actor=actor, triggering_actor=actor) for n in (100, 200)}
         approvals = {
             100: [dict(state='approved', user={'id': 3104616}, environments=[
@@ -786,6 +839,12 @@ class QualityWiringTests(unittest.TestCase):
             200: [dict(state='approved', user={'id': 3104616}, environments=[
                 {'name': 'box-formal-terminal', 'id': 27663161709}])],
         }
+        if v3:
+            runs[100]['created_at'] = stamp(10)
+            runs[200]['created_at'] = stamp(16)
+            runs[100]['updated_at'] = stamp(15)
+            runs[200]['updated_at'] = stamp(18)
+            self.reader.check_value.update(started_at=stamp(11), completed_at=stamp(12))
         self.reader.latest_run = runs.__getitem__
         self.reader.approvals = approvals.__getitem__
         hosted = dict(run_id=300, attempt=1, workflow_blob='e' * 40)
@@ -814,6 +873,9 @@ class QualityWiringTests(unittest.TestCase):
                 job('Required real database contracts', 'a' * 40, 'Required three-database suite (no skips)'),
             ],
         }
+        if v3:
+            jobs[100][0]['completed_at'] = stamp(15)
+            jobs[200][0]['completed_at'] = stamp(18)
         self.reader.jobs = lambda run_id, attempt: jobs[run_id]
 
         def derive(terminal_run=200, *, active=False):
@@ -831,6 +893,10 @@ class QualityWiringTests(unittest.TestCase):
         self.assertNotIn('quality', request)
         self.reader.gate_value.update(name='Box formal quality result', output={'text': json.dumps(request)},
                                       external_id=quality.consumer.digest(request))
+        if v3:
+            self.assertEqual((190, 1990, 300), (request['release_not_before'], request['release_expires_at'],
+                                                 request['expires_at']))
+            self.reader.gate_value.update(started_at=stamp(19), completed_at=stamp(20))
         self.reader.formal_quality_check = lambda sha: self.reader.check(43)
         self.assertEqual(request, quality.verify_public_terminal(self.environment, self.reader, clock=lambda: 200))
         missing_digest = {key: value for key, value in request.items() if key != 'quality_sha256'}
@@ -853,8 +919,21 @@ class QualityWiringTests(unittest.TestCase):
                 quality.verify_public_terminal(self.environment, self.reader, clock=lambda: 200)
             row[key] = old
 
+        if v3:
+            # GitHub brackets each approval between native run creation and the protected job completion.
+            for row, key, bad in (
+                (runs[100], 'created_at', stamp(9)), (runs[100], 'created_at', None),
+                (runs[200], 'created_at', stamp(14)), (jobs[100][0], 'completed_at', stamp(11)),
+                (runs[200], 'updated_at', stamp(21)), (jobs[200][0], 'completed_at', stamp(21)), (self.reader.gate_value, 'started_at', stamp(17)),
+                (self.reader.check_value, 'completed_at', stamp(16)),
+            ):
+                with self.subTest(field=key, value=bad), patch.dict(row, {key: bad}), self.assertRaises(ValueError):
+                    quality.verify_public_terminal(self.environment, self.reader, clock=lambda: 200)
+            with self.assertRaisesRegex(ValueError, 'expired'):
+                quality.verify_public_terminal(self.environment, self.reader, clock=lambda: 1991)
+
         http = MockHTTP(self.reader)
-        publisher = quality.GitHubPublication(http.app_get, http.installation_request)
+        publisher = quality.GitHubPublication(http.app_get, http.installation_request, clock=lambda: 200)
         with tempfile.TemporaryDirectory() as tmp:
             journal = quality.AdmissionJournal(str(Path(tmp) / 'journal.sqlite'))
 
@@ -863,9 +942,23 @@ class QualityWiringTests(unittest.TestCase):
                     self.admission, bundle, self.reader, publisher, journal, 'OFFLINE-APP',
                     200, hosted, 'c' * 40, policy=quality, clock=lambda: 200)
 
-            def complete(check_id, request, token, reader, *, policy):
+            real_completion = formal_evidence_publisher.complete_terminal_check
+
+            def complete(check_id, request, token, reader, *, policy, clock):
                 self.assertEqual(check_id, journal.pending(request))
                 self.assertEqual('in_progress', reader.check(check_id)['status'])
+                if v3:
+                    def signed_response(update, timeout):
+                        self.assertEqual(update.get_method(), 'PATCH')
+                        self.assertTrue(update.full_url.endswith('/check-runs/43'))
+                        payload = json.loads(update.data)
+                        self.assertEqual(stamp(20), payload['completed_at'])
+                        self.assertNotIn('started_at', payload)
+                        reader.gate_value.update(payload)
+                        return io.BytesIO(json.dumps(reader.check(check_id)).encode())
+                    with patch.object(formal_evidence_publisher.urllib.request, 'build_opener') as transport:
+                        transport.return_value.open.side_effect = signed_response
+                        return real_completion(check_id, request, token, reader, policy=policy, clock=clock)
                 http.finish_fixture()
                 return reader.check(check_id)
 

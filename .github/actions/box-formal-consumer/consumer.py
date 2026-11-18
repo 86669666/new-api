@@ -63,8 +63,12 @@ def validate_receipt(receipt, admission, now, *, private=False):
             for v in expected['test_binaries'].values()), 'missing test identities')
     require(all(type(value) is int for value in (expected['not_before'], expected['expires_at'],
             receipt['started_at'], receipt['completed_at'], now)), 'invalid receipt times')
-    require(expected['not_before'] <= receipt['started_at'] <= receipt['completed_at'] <= now
-            <= expected['expires_at'], 'stale or future receipt')
+    if private and evidence.uses_release_window(admission):
+        window = evidence.release_times(expected, receipt)
+        require(window['release_not_before'] <= now <= window['release_expires_at'], 'expired formal release')
+    else:
+        require(expected['not_before'] <= receipt['started_at'] <= receipt['completed_at'] <= now
+                <= expected['expires_at'], 'stale or future receipt')
     require(type(receipt['process_exit']) is int and type(receipt['exit']) is int
             and receipt['process_exit'] == 0 and receipt['exit'] == 0
             and receipt['cleanup'] is True and receipt['unexecuted'] == [], 'incomplete execution')
@@ -83,6 +87,13 @@ def validate_receipt(receipt, admission, now, *, private=False):
         require(tier['manifest_sha256'] == plan[name]['manifest_sha256'], 'tier manifest mismatch')
         require(re.fullmatch('[0-9a-f]{64}', tier['log_sha256']) is not None, 'invalid log hash')
     return digest(receipt)
+
+
+def validate_execution_capture(receipt, admission):
+    """Validate historical root capture data; this does not authorize any publication."""
+    require('quality' not in receipt and 'quality' not in admission, 'unannotated root capture required')
+    evidence.release_times(admission['expected'], receipt)
+    return validate_receipt(receipt, admission, receipt['completed_at'], private=True)
 
 
 def unique_json_fields(pairs):
@@ -106,6 +117,11 @@ def validate_check(check, receipt, admission, now, *, reference=None):
             'wrong check candidate')
     require(check['status'] == 'completed' and check['conclusion'] == 'success', 'check not successful')
     require(check['external_id'] == receipt_hash == admission['receipt_sha256'], 'receipt hash mismatch')
+    if reference is not None and reference['schema'] == evidence.REFERENCE_SCHEMA_V3:
+        evidence.validate_reference(reference, now)
+        require(canonical(reference['identity']) == canonical(evidence.identity(admission, receipt)),
+                'receipt release identity differs from signed reference')
+        evidence.check_times(check, reference['identity'], now)
     return receipt_hash
 
 
@@ -150,8 +166,13 @@ def configured_evidence(environment, now, *, check_identity=None):
     record = json.loads(environment['BOX_FORMAL_ADMISSION'], object_pairs_hook=unique_json_fields,
                         parse_constant=evidence.reject_constant)
     require(type(record) is dict, 'invalid formal admission')
-    if record.get('schema') != evidence.CONFIG_SCHEMA:
+    if 'schema' not in record:
+        require(environment.get('GITHUB_REF') != evidence.CONTROL_REF_V3, 'v3 protected configuration required')
         return record, None
+    require(record['schema'] in (evidence.CONFIG_SCHEMA, evidence.CONFIG_SCHEMA_V3), 'unknown formal configuration')
+    if check_identity is None:
+        require((environment.get('GITHUB_REF') == evidence.CONTROL_REF_V3) ==
+                (record['schema'] == evidence.CONFIG_SCHEMA_V3), 'wrong protected configuration version')
     require(environment.get('GITHUB_REPOSITORY') == REPOSITORY, 'wrong repository')
 
     def check_consumer_identity(binding):
@@ -175,26 +196,30 @@ def configured_evidence(environment, now, *, check_identity=None):
 def trusted_consumer_context(environment, *, private=False):
     require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong repository')
     require(environment['GITHUB_EVENT_NAME'] == 'workflow_dispatch', 'manual admission only')
-    refs = ('refs/heads/main', evidence.CONTROL_REF) if private else ('refs/heads/main',)
+    refs = ('refs/heads/main', evidence.CONTROL_REF, evidence.CONTROL_REF_V3) if private else ('refs/heads/main',)
     require(environment['GITHUB_REF'] in refs, 'protected consumer ref required')
     trusted = environment['BOX_FORMAL_CONSUMER_SHA']
     require(re.fullmatch('[0-9a-f]{40}', trusted) is not None, 'immutable consumer SHA required')
     require(trusted == environment['GITHUB_WORKFLOW_SHA'], 'unapproved workflow revision')
-    if environment['GITHUB_REF'] == evidence.CONTROL_REF:
+    if environment['GITHUB_REF'] in (evidence.CONTROL_REF, evidence.CONTROL_REF_V3):
         require(environment['GITHUB_SHA'] == trusted and environment['GITHUB_RUN_ATTEMPT'] == '1' and
                 environment['GITHUB_ACTOR_ID'] == str(evidence.TRIGGER_ID), 'wrong native dispatch identity')
     return trusted
 
 
-def validate_environment(environment, admission, now, *, private=False):
+def validate_environment(environment, admission, now, *, private=False, receipt=None):
     trusted = trusted_consumer_context(environment, private=private)
     require(trusted == admission['expected']['consumer_sha'], 'unapproved workflow revision')
     require(admission['active'] is True and admission['repository'] == REPOSITORY,
             'inactive or foreign admission')
     require(admission['app_id'] == APP and admission['installation_id'] == INSTALLATION,
             'wrong admitted publisher')
-    require(admission['expected']['not_before'] <= now <= admission['expected']['expires_at'],
-            'expired or future admission')
+    if private and evidence.uses_release_window(admission):
+        window = evidence.release_times(admission['expected'], receipt)
+        require(window['release_not_before'] <= now <= window['release_expires_at'], 'expired formal release')
+    else:
+        require(admission['expected']['not_before'] <= now <= admission['expected']['expires_at'],
+                'expired or future admission')
     require(type(admission['check_run_id']) is int and admission['check_run_id'] > 0,
             'published check ID required')
     require(re.fullmatch('[0-9a-f]{64}', admission['receipt_sha256']) is not None,
@@ -203,7 +228,8 @@ def validate_environment(environment, admission, now, *, private=False):
 
 def main():
     admission, bundle = configured_evidence(os.environ, int(time.time()))
-    validate_environment(os.environ, admission, int(time.time()), private=bundle is not None)
+    validate_environment(os.environ, admission, int(time.time()), private=bundle is not None,
+                         receipt=bundle[0] if bundle else None)
     token = os.environ['GITHUB_TOKEN']
     check_id = admission['check_run_id']
     require(type(check_id) is int and check_id > 0, 'invalid check ID')

@@ -1,4 +1,5 @@
 """Versioned exact-byte references for formal evidence kept in a private repository."""
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 import re
@@ -9,9 +10,15 @@ EVIDENCE_PATH = 'formal-evidence.json'
 REFERENCE_SCHEMA = 'box-formal-evidence-ref/v2'
 ARTIFACT_SCHEMA = 'box-formal-evidence/v2'
 CONFIG_SCHEMA = 'box-formal-evidence-config/v2'
+REFERENCE_SCHEMA_V3 = 'box-formal-evidence-ref/v3'
+ARTIFACT_SCHEMA_V3 = 'box-formal-evidence/v3'
+CONFIG_SCHEMA_V3 = 'box-formal-evidence-config/v3'
+MAX_EXECUTION_SECONDS = 7200
+RELEASE_SECONDS = 1800
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 WORKFLOW_PATH = '.github/workflows/box-formal-receipt.yml'
 CONTROL_REF = 'refs/heads/codex/formal-quality-r2'
+CONTROL_REF_V3 = 'refs/heads/codex/formal-quality-r3'
 TRIGGER_ID = 358061300
 
 
@@ -41,10 +48,42 @@ def decode(data):
     return json.loads(data, object_pairs_hook=unique_fields, parse_constant=reject_constant)
 
 
-def identity(admission):
+def uses_release_window(admission):
+    return admission.get('quality', {}).get('workflow', {}).get('ref') == CONTROL_REF_V3
+
+
+def release_times(expected, receipt):
+    start, end = expected['not_before'], expected['expires_at']
+    began, done = receipt['started_at'], receipt['completed_at']
+    require(all(type(x) is int for x in (start, end, began, done)) and
+            0 < end - start <= MAX_EXECUTION_SECONDS and start <= began <= done <= end,
+            'invalid formal execution interval')
+    return {'release_not_before': done, 'release_expires_at': done + RELEASE_SECONDS}
+
+
+def github_time(record, field):
+    value = record.get(field)
+    require(type(value) is str and re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z', value),
+            'missing or invalid GitHub timestamp: ' + field)
+    return int(datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp())
+
+
+def check_times(check, binding, now, *, completed=True):
+    started = github_time(check, 'started_at')
+    require(binding['release_not_before'] <= started <= now <= binding['release_expires_at'],
+            'signed check outside release window')
+    if completed:
+        finished = github_time(check, 'completed_at')
+        require(started <= finished <= now, 'signed check completion outside release window')
+        return finished
+    require(check.get('completed_at') is None, 'staged check already completed')
+    return started
+
+
+def identity(admission, receipt=None):
     expected = admission['expected']
     quality = admission['quality']
-    return {
+    binding = {
         'repository': admission['repository'],
         'repository_id': admission['repository_id'],
         'pull_number': quality['pull_number'],
@@ -59,6 +98,10 @@ def identity(admission):
         'not_before': expected['not_before'],
         'expires_at': expected['expires_at'],
     }
+    if uses_release_window(admission):
+        require(type(receipt) is dict, 'v3 identity requires the root execution receipt')
+        binding.update(release_times(expected, receipt))
+    return binding
 
 
 def encode_artifact(admission, receipt):
@@ -69,21 +112,34 @@ def encode_artifact(admission, receipt):
             'receipt differs from formal evidence admission')
     require(admission.get('receipt_sha256') == sha256(canonical(receipt)).hexdigest(),
             'unbound formal receipt digest')
-    data = canonical({'schema': ARTIFACT_SCHEMA, 'admission': admission, 'receipt': receipt})
+    schema = ARTIFACT_SCHEMA
+    if uses_release_window(admission):
+        release_times(admission['expected'], receipt)
+        schema = ARTIFACT_SCHEMA_V3
+    data = canonical({'schema': schema, 'admission': admission, 'receipt': receipt})
     require(len(data) <= MAX_ARTIFACT_BYTES, 'formal evidence artifact exceeds size limit')
     return data
 
 
 def make_reference(commit, artifact_bytes, admission):
-    reference = {'schema': REFERENCE_SCHEMA, 'commit': commit, 'bytes': len(artifact_bytes),
-                 'sha256': sha256(artifact_bytes).hexdigest(), 'identity': identity(admission)}
-    validate_reference(reference, reference['identity']['not_before'])
+    v3 = uses_release_window(admission)
+    artifact = decode(artifact_bytes)
+    require(artifact['schema'] == (ARTIFACT_SCHEMA_V3 if v3 else ARTIFACT_SCHEMA),
+            'artifact and admission versions differ')
+    if v3:
+        require(canonical(artifact['admission']) == canonical(admission) and
+                artifact_bytes == encode_artifact(admission, artifact['receipt']),
+                'v3 reference requires the finalized canonical artifact')
+    binding = identity(admission, artifact['receipt'])
+    reference = {'schema': REFERENCE_SCHEMA_V3 if v3 else REFERENCE_SCHEMA, 'commit': commit, 'bytes': len(artifact_bytes),
+                 'sha256': sha256(artifact_bytes).hexdigest(), 'identity': binding}
+    validate_reference(reference, binding['release_not_before'] if v3 else binding['not_before'])
     return reference
 
 
 def validate_reference(reference, now):
     require(type(reference) is dict and set(reference) == {'schema', 'commit', 'bytes', 'sha256', 'identity'}
-            and reference['schema'] == REFERENCE_SCHEMA, 'invalid formal evidence reference')
+            and reference['schema'] in (REFERENCE_SCHEMA, REFERENCE_SCHEMA_V3), 'invalid formal evidence reference')
     require(type(reference['commit']) is str and type(reference['sha256']) is str and
             re.fullmatch('[0-9a-f]{40}', reference['commit']) is not None and
             re.fullmatch('[0-9a-f]{64}', reference['sha256']) is not None,
@@ -91,9 +147,19 @@ def validate_reference(reference, now):
     require(type(reference['bytes']) is int and 0 < reference['bytes'] <= MAX_ARTIFACT_BYTES,
             'invalid formal evidence size')
     binding = reference['identity']
-    require(type(binding) is dict and all(type(x) is int for x in
-            (now, binding['not_before'], binding['expires_at'])) and
-            binding['not_before'] <= now <= binding['expires_at'], 'formal evidence reference expired')
+    require(type(binding) is dict and type(now) is int, 'invalid formal evidence identity or clock')
+    start, end = binding['not_before'], binding['expires_at']
+    require(type(start) is int and type(end) is int, 'invalid formal execution bounds')
+    if reference['schema'] == REFERENCE_SCHEMA_V3:
+        opened, expires = binding['release_not_before'], binding['release_expires_at']
+        require(type(opened) is int and type(expires) is int and
+                0 < end - start <= MAX_EXECUTION_SECONDS and start <= opened <= end and
+                expires == opened + RELEASE_SECONDS, 'invalid formal release interval')
+        start, end = opened, expires
+    else:
+        require('release_not_before' not in binding and 'release_expires_at' not in binding,
+                'mixed formal evidence versions')
+    require(start <= now <= end, 'formal evidence reference expired')
 
 
 def resolve(reference, fetch, now, check_identity):
@@ -104,16 +170,17 @@ def resolve(reference, fetch, now, check_identity):
             sha256(data).hexdigest() == reference['sha256'], 'formal evidence bytes changed')
     artifact = decode(data)
     require(type(artifact) is dict and set(artifact) == {'schema', 'admission', 'receipt'} and
-            artifact['schema'] == ARTIFACT_SCHEMA, 'invalid formal evidence artifact')
+            artifact['schema'] == (ARTIFACT_SCHEMA_V3 if reference['schema'] == REFERENCE_SCHEMA_V3 else ARTIFACT_SCHEMA), 'invalid formal evidence artifact')
     admission, receipt = artifact['admission'], artifact['receipt']
-    require(canonical(reference['identity']) == canonical(identity(admission)), 'formal evidence identity drift')
+    require(canonical(reference['identity']) == canonical(identity(admission, receipt)), 'formal evidence identity drift')
     require(data == encode_artifact(admission, receipt), 'formal evidence bytes are not canonical')
     return admission, receipt
 
 
 def resolve_configuration(config, fetch, now, check_identity):
     require(set(config) == {'schema', 'artifact', 'check_run_id', 'quality_check_run_id'} and
-            config['schema'] == CONFIG_SCHEMA, 'invalid protected evidence configuration')
+            config['schema'] in (CONFIG_SCHEMA, CONFIG_SCHEMA_V3) and
+            config['artifact']['schema'] == (REFERENCE_SCHEMA_V3 if config['schema'] == CONFIG_SCHEMA_V3 else REFERENCE_SCHEMA), 'invalid protected evidence configuration')
     receipt_id, quality_id = config['check_run_id'], config['quality_check_run_id']
     require(type(receipt_id) is int and receipt_id > 0 and
             (quality_id is None or (type(quality_id) is int and quality_id > 0 and quality_id != receipt_id)),
