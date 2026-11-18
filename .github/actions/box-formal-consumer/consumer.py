@@ -117,7 +117,7 @@ def validate_check(check, receipt, admission, now, *, reference=None):
             'wrong check candidate')
     require(check['status'] == 'completed' and check['conclusion'] == 'success', 'check not successful')
     require(check['external_id'] == receipt_hash == admission['receipt_sha256'], 'receipt hash mismatch')
-    if reference is not None and reference['schema'] == evidence.REFERENCE_SCHEMA_V3:
+    if reference is not None and reference['schema'] == evidence.REFERENCE_SCHEMA_V4:
         evidence.validate_reference(reference, now)
         require(canonical(reference['identity']) == canonical(evidence.identity(admission, receipt)),
                 'receipt release identity differs from signed reference')
@@ -166,13 +166,15 @@ def configured_evidence(environment, now, *, check_identity=None):
     record = json.loads(environment['BOX_FORMAL_ADMISSION'], object_pairs_hook=unique_json_fields,
                         parse_constant=evidence.reject_constant)
     require(type(record) is dict, 'invalid formal admission')
+    require(environment.get('GITHUB_REF') != 'refs/heads/codex/formal-quality-r3',
+            'r3 evidence requires its original reader')
     if 'schema' not in record:
-        require(environment.get('GITHUB_REF') != evidence.CONTROL_REF_V3, 'v3 protected configuration required')
+        require(environment.get('GITHUB_REF') != evidence.CONTROL_REF_V4, 'v4 protected configuration required')
         return record, None
-    require(record['schema'] in (evidence.CONFIG_SCHEMA, evidence.CONFIG_SCHEMA_V3), 'unknown formal configuration')
+    require(record['schema'] in (evidence.CONFIG_SCHEMA, evidence.CONFIG_SCHEMA_V4), 'unknown formal configuration')
     if check_identity is None:
-        require((environment.get('GITHUB_REF') == evidence.CONTROL_REF_V3) ==
-                (record['schema'] == evidence.CONFIG_SCHEMA_V3), 'wrong protected configuration version')
+        require((environment.get('GITHUB_REF') == evidence.CONTROL_REF_V4) ==
+                (record['schema'] == evidence.CONFIG_SCHEMA_V4), 'wrong protected configuration version')
     require(environment.get('GITHUB_REPOSITORY') == REPOSITORY, 'wrong repository')
 
     def check_consumer_identity(binding):
@@ -196,12 +198,12 @@ def configured_evidence(environment, now, *, check_identity=None):
 def trusted_consumer_context(environment, *, private=False):
     require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong repository')
     require(environment['GITHUB_EVENT_NAME'] == 'workflow_dispatch', 'manual admission only')
-    refs = ('refs/heads/main', evidence.CONTROL_REF, evidence.CONTROL_REF_V3) if private else ('refs/heads/main',)
+    refs = ('refs/heads/main', evidence.CONTROL_REF, evidence.CONTROL_REF_V4) if private else ('refs/heads/main',)
     require(environment['GITHUB_REF'] in refs, 'protected consumer ref required')
     trusted = environment['BOX_FORMAL_CONSUMER_SHA']
     require(re.fullmatch('[0-9a-f]{40}', trusted) is not None, 'immutable consumer SHA required')
     require(trusted == environment['GITHUB_WORKFLOW_SHA'], 'unapproved workflow revision')
-    if environment['GITHUB_REF'] in (evidence.CONTROL_REF, evidence.CONTROL_REF_V3):
+    if environment['GITHUB_REF'] in (evidence.CONTROL_REF, evidence.CONTROL_REF_V4):
         require(environment['GITHUB_SHA'] == trusted and environment['GITHUB_RUN_ATTEMPT'] == '1' and
                 environment['GITHUB_ACTOR_ID'] == str(evidence.TRIGGER_ID), 'wrong native dispatch identity')
     return trusted

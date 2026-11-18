@@ -28,13 +28,13 @@ def seal(admission_bytes, capture_bytes, quality_bytes, release, *, policy, now)
                      workflow.get('path') == evidence.WORKFLOW_PATH and
                      workflow.get('event') == 'workflow_dispatch' and
                      workflow.get('ref') == release.get('consumer_ref') and
-                     workflow['ref'] in ('refs/heads/main', evidence.CONTROL_REF, evidence.CONTROL_REF_V3) and
+                     workflow['ref'] in ('refs/heads/main', evidence.CONTROL_REF, evidence.CONTROL_REF_V4) and
                      workflow.get('sha') == admission['expected']['consumer_sha'] and
                      all(type(workflow.get(key)) is int and workflow[key] > 0 for key in
                          ('run_id', 'run_attempt', 'workflow_id')), 'unbound protected consumer run')
-    if workflow['ref'] == evidence.CONTROL_REF_V3:
+    if workflow['ref'] == evidence.CONTROL_REF_V4:
         evidence.require(workflow['run_attempt'] == 1 and workflow['workflow_id'] == policy.FORMAL_WORKFLOW_ID,
-                         'unexpected r3 consumer workflow or attempt')
+                         'unexpected r4 consumer workflow or attempt')
         policy.consumer.validate_execution_capture(receipt, admission)
     admission = dict(admission, quality=quality)
     receipt = dict(receipt, quality=quality)
@@ -52,7 +52,7 @@ def seal(admission_bytes, capture_bytes, quality_bytes, release, *, policy, now)
 def complete_terminal_check(check_id, request, token, reader, *, policy, clock=time.time):
     """Update precisely one already-staged check using a supplied App token."""
     policy.require(type(check_id) is int and check_id > 0 and
-                   request['schema'] in (policy.TERMINAL_SCHEMA, policy.TERMINAL_SCHEMA_V3) and
+                   request['schema'] in (policy.TERMINAL_SCHEMA, policy.TERMINAL_SCHEMA_V4) and
                    request['name'] == policy.PRIVATE_EVIDENCE_GATE, 'invalid terminal completion')
     staged = reader.check(check_id)
     policy.require(staged['id'] == check_id, 'wrong staged check ID')
@@ -62,7 +62,7 @@ def complete_terminal_check(check_id, request, token, reader, *, policy, clock=t
         'summary': 'Complete formal evidence and both independent approvals were verified.',
         'text': policy.consumer.canonical(request).decode(),
     }}
-    if request['schema'] == policy.TERMINAL_SCHEMA_V3:
+    if request['schema'] == policy.TERMINAL_SCHEMA_V4:
         now = int(clock())
         reference = request['artifact']
         policy.consumer.evidence.validate_reference(reference, now)
@@ -74,7 +74,7 @@ def complete_terminal_check(check_id, request, token, reader, *, policy, clock=t
                  'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'})
     with urllib.request.build_opener(policy.consumer.NoRedirect).open(update, timeout=30) as response:
         result = json.load(response)
-    if request['schema'] == policy.TERMINAL_SCHEMA_V3:
+    if request['schema'] == policy.TERMINAL_SCHEMA_V4:
         policy.require(result.get('completed_at') == payload['completed_at'] and
                        result.get('started_at') == staged['started_at'], 'signed check times changed')
     return result
@@ -86,14 +86,14 @@ def publish_terminal(admission, bundle, reader, publisher, journal, installation
     request = policy.verify_terminal_evidence(admission, bundle, reader, terminal_run, hosted,
                                               trusted_sha, int(clock()))
     publisher.verify_installation(admission['repository_id'])
-    if request['schema'] == policy.TERMINAL_SCHEMA_V3:
+    if request['schema'] == policy.TERMINAL_SCHEMA_V4:
         policy.consumer.evidence.validate_reference(bundle[1], int(clock()))
     journal.claim(request)
     check_id = publisher.stage(request)
     journal.stage(request, check_id)
     policy.require(journal.pending(request) == check_id, 'missing exact pending terminal check')
     staged_at = None
-    if request['schema'] == policy.TERMINAL_SCHEMA_V3:
+    if request['schema'] == policy.TERMINAL_SCHEMA_V4:
         staged = reader.check(check_id)
         policy.require(staged['id'] == check_id, 'staged check changed')
         policy.validate_gate(staged, request, completed=False)
@@ -108,7 +108,7 @@ def publish_terminal(admission, bundle, reader, publisher, journal, installation
     policy.require(policy.consumer.canonical(current) == policy.consumer.canonical(published),
                    'signed quality check changed on readback')
     policy.verify_current_head(reader, admission)
-    if request['schema'] == policy.TERMINAL_SCHEMA_V3:
+    if request['schema'] == policy.TERMINAL_SCHEMA_V4:
         policy.consumer.evidence.validate_reference(bundle[1], int(clock()))
         policy.consumer.evidence.check_times(current, bundle[1]['identity'], int(clock()))
         policy.require(policy.consumer.evidence.github_time(current, 'started_at') == staged_at,
