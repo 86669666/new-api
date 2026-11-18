@@ -199,7 +199,6 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    environment: box-formal-consumer
     permissions:
       contents: read
       checks: read
@@ -224,9 +223,7 @@ jobs:
           EXPECTED_SHA: ${{ needs.premerge.outputs.sha }}
           QUALITY_RESULTS: '{"backend":"${{ needs.backend.result }}","frontend":"${{ needs.frontend.result }}","database":"${{ needs.database.result }}"}'
           BOX_FORMAL_CONSUMER_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
-          BOX_FORMAL_ADMISSION: ${{ vars.BOX_FORMAL_ADMISSION }}
-          BOX_FORMAL_REVIEWER_IDS: ${{ vars.BOX_FORMAL_REVIEWER_IDS }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 -I -B trusted-quality/scripts/ci/quality_results.py ci
+          python3 -I -B trusted-quality/scripts/ci/quality_results.py public-terminal
           echo "sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"

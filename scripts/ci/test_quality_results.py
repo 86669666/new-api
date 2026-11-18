@@ -4,6 +4,7 @@ Only test_real_child_failure and the isolated CLI tests execute real tiny Python
 children. No test executes Go/Node/database/formal inventories or network writes.
 """
 import copy
+from hashlib import sha256
 import json
 import io
 import os
@@ -20,6 +21,7 @@ import textwrap
 import unittest
 from unittest.mock import patch
 
+import formal_evidence_publisher
 import quality_results as quality
 
 
@@ -596,7 +598,7 @@ class CIEnvironmentWatch(Mapping):
 
     def read(self, operation, key, default=None):
         self.trace.append((operation, key))
-        if key == 'GITHUB_TOKEN' and self.block_token:
+        if key in ('GITHUB_TOKEN', 'BOX_FORMAL_EVIDENCE_TOKEN') and self.block_token:
             raise AssertionError('credential accessed before local binding')
         if key == 'BOX_FORMAL_ADMISSION' and self.block_admission:
             raise AssertionError('admission accessed before native validation')
@@ -665,6 +667,207 @@ class QualityWiringTests(unittest.TestCase):
             quality.main()
         self.assertEqual('a' * 40, json.loads(output.getvalue())['candidate_sha'])
         self.assertEqual(42, json.loads(output.getvalue())['check_run_id'])
+
+    def test_private_evidence_keeps_large_full_receipt_and_enforces_app_binding(self):
+        evidence = quality.consumer.evidence
+        admission, receipt = copy.deepcopy(self.admission), copy.deepcopy(self.receipt)
+        # Exact transport boundary fixture: keep the real tier inventory and matching full leaf lists.
+        leaves = [f'TestPrivateTransportFixture/leaf-{i:05d}' for i in range(2000)]
+        admission['expected']['tiers']['sqlite']['required_leaves'] = leaves
+        receipt['binding']['tiers']['sqlite']['required_leaves'] = leaves
+        next(tier for tier in receipt['tiers'] if tier['tier'] == 'sqlite')['required_leaves'] = leaves
+        identity = evidence.identity(admission)
+        summary = admission.pop('quality')
+        summary['private_fixture_metadata'] = 'private-only-' * 6000
+        receipt.pop('quality')
+        admission.pop('check_run_id')
+        admission.pop('quality_check_run_id')
+        admission['receipt_sha256'] = None
+        a, b, c = (evidence.canonical(item) for item in (admission, receipt, summary))
+        release = dict(identity=identity, consumer_ref='refs/heads/main', admission_sha256=sha256(a).hexdigest(),
+                       capture_sha256=sha256(b).hexdigest(), quality_sha256=sha256(c).hexdigest())
+        with self.assertRaisesRegex(ValueError, 'protected consumer run'):
+            formal_evidence_publisher.seal(a, b, c, dict(release, consumer_ref=None), policy=quality, now=200)
+        artifact = formal_evidence_publisher.seal(a, b, c, release, policy=quality, now=200)
+        self.assertGreater(len(artifact), 190159)
+        reference = evidence.make_reference('d' * 40, artifact, dict(admission, quality=summary))
+        config = dict(schema=evidence.CONFIG_SCHEMA, artifact=reference, check_run_id=42, quality_check_run_id=43)
+        self.assertLess(len(evidence.canonical(config)), 48 * 1024)
+        self.environment.update(BOX_FORMAL_ADMISSION=evidence.canonical(config).decode(),
+                                BOX_FORMAL_EVIDENCE_TOKEN='FIXTURE-PRIVATE-READ', GITHUB_TOKEN='FIXTURE-APP-READ')
+        def check_identity(binding):
+            event = quality.ci_premerge_event(self.environment)
+            quality.validate_ci_evidence_reference(event, self.environment, binding)
+
+        with patch.object(quality.consumer, 'read_private_evidence', return_value=artifact) as fetch:
+            full, bundle = quality.consumer.configured_evidence(self.environment, 200, check_identity=check_identity)
+            fetch.assert_called_once_with('d' * 40, 'FIXTURE-PRIVATE-READ')
+        self.assertEqual(bundle[0]['binding']['tiers']['sqlite']['required_leaves'], leaves)
+        self.reader.check_value['output']['text'] = evidence.canonical(reference).decode()
+        self.reader.check_value['external_id'] = full['receipt_sha256']
+        request = quality.verified_request(full, full['receipt_sha256'], full['quality'], bundle)
+        self.assertEqual(request['artifact'], reference)
+        self.assertNotIn('quality', request)
+        self.assertNotIn(b'private-only-', evidence.canonical(request))
+        self.assertNotIn(b'private-only-', evidence.canonical(reference))
+        self.assertLess(len(evidence.canonical(request)), 65535)
+        self.reader.gate_value['name'] = 'Box formal quality result'
+        self.reader.gate_value['output']['text'] = evidence.canonical(request).decode()
+        self.reader.gate_value['external_id'] = quality.consumer.digest(request)
+        result = quality.verify_ci_result(full, self.environment, self.reader, clock=lambda: 200, evidence_bundle=bundle)
+        self.assertEqual(result['receipt_sha256'], full['receipt_sha256'])
+        self.reader.check_value['output']['text'] = evidence.canonical(dict(reference, commit='e' * 40)).decode()
+        with self.assertRaisesRegex(ValueError, 'differs from check output'):
+            quality.verify_ci_result(full, self.environment, self.reader, clock=lambda: 200, evidence_bundle=bundle)
+        with patch.object(quality.consumer, 'read_private_evidence', return_value=artifact[:-1]) as fetch:
+            with self.assertRaisesRegex(ValueError, 'bytes changed'):
+                quality.consumer.configured_evidence(self.environment, 200, check_identity=check_identity)
+            fetch.reset_mock()
+            with self.assertRaisesRegex(ValueError, 'reference expired'):
+                quality.consumer.configured_evidence(self.environment, 301, check_identity=check_identity)
+            fetch.assert_not_called()
+
+        with patch.object(quality.consumer, 'read_private_evidence') as fetch:
+            for key, value in (('pull_number', 2), ('candidate_sha', 'e' * 40),
+                               ('base_sha', 'e' * 40), ('repository_id', 999)):
+                tampered = copy.deepcopy(config)
+                tampered['artifact']['identity'][key] = value
+                environment = CIEnvironmentWatch(dict(self.environment, BOX_FORMAL_ADMISSION=
+                    evidence.canonical(tampered).decode()), [], block_token=True)
+                with self.subTest(field=key), self.assertRaisesRegex(ValueError, 'native CI event'):
+                    quality.consumer.configured_evidence(environment, 200, check_identity=check_identity)
+            self.environment['QUALITY_RESULTS'] = '{"backend":"failure","frontend":"success","database":"success"}'
+            with self.assertRaises(ValueError):
+                quality.consumer.configured_evidence(self.environment, 200, check_identity=check_identity)
+            fetch.assert_not_called()
+
+        consumer_env = fixture()[2]
+        consumer_env.update(BOX_FORMAL_ADMISSION=evidence.canonical(config).decode(),
+                            GITHUB_REPOSITORY_ID='123', BOX_FORMAL_EVIDENCE_TOKEN='FIXTURE-PRIVATE-READ')
+        with patch.object(quality.consumer, 'read_private_evidence') as fetch:
+            for key, value in (('GITHUB_REF', 'refs/heads/other'), ('GITHUB_WORKFLOW_SHA', 'e' * 40),
+                               ('GITHUB_EVENT_NAME', 'pull_request'), ('GITHUB_WORKFLOW_REF', 'wrong')):
+                environment = CIEnvironmentWatch(dict(consumer_env, **{key: value}), [], block_token=True)
+                with self.subTest(field=key), self.assertRaises(ValueError):
+                    quality.consumer.configured_evidence(environment, 200)
+            fetch.assert_not_called()
+
+    def test_terminal_proof_binds_both_approvals_hosted_jobs_and_private_artifact(self):
+        evidence = quality.consumer.evidence
+        for item in (self.admission, self.receipt):
+            item['quality']['workflow'].update(ref=evidence.CONTROL_REF, workflow_id=402689897)
+        self.admission['receipt_sha256'] = quality.consumer.digest(self.receipt)
+        stored = {key: value for key, value in self.admission.items()
+                  if key not in ('check_run_id', 'quality_check_run_id')}
+        reference = evidence.make_reference('d' * 40, evidence.encode_artifact(stored, self.receipt), stored)
+        bundle = (self.receipt, reference)
+        self.reader.check_value.update(output={'text': json.dumps(reference)},
+                                       external_id=self.admission['receipt_sha256'])
+        self.reader.pr['head']['repo']['full_name'] = 'fixture-fork/new-api'
+        actor = {'id': 358061300}
+        runs = {n: dict(self.latest, id=n, workflow_id=402689897, head_branch='codex/formal-quality',
+                       actor=actor, triggering_actor=actor) for n in (100, 200)}
+        approvals = {
+            100: [dict(state='approved', user={'id': 3104616}, environments=[
+                {'name': 'box-formal-consumer-v2', 'id': 27663161499}])],
+            200: [dict(state='approved', user={'id': 3104616}, environments=[
+                {'name': 'box-formal-terminal', 'id': 27663161709}])],
+        }
+        self.reader.latest_run = runs.__getitem__
+        self.reader.approvals = approvals.__getitem__
+        hosted = dict(run_id=300, attempt=1, workflow_blob='e' * 40)
+        intent = dict(artifact=reference, receipt_check_id=42, consumer_run=100, hosted=hosted,
+                      quality_sha256=quality.consumer.digest(self.receipt['quality']))
+        runs[200]['display_title'] = 'Formal terminal ' + quality.consumer.digest(intent)
+        self.reader.hosted_workflow_blob = lambda sha: 'e' * 40
+        self.reader.run = lambda run_id, attempt: dict(id=300, run_attempt=1, workflow_id=389317795,
+            path='.github/workflows/ci.yml', event='pull_request', head_sha='a' * 40, repository=self.reader.repo,
+            head_repository={'id': 456}, pull_requests=[self.reader.pr])
+
+        def job(name, sha, *steps):
+            return dict(name=name, head_sha=sha, status='completed', conclusion='success',
+                        steps=[dict(name=step, status='completed', conclusion='success') for step in steps])
+
+        jobs = {
+            100: [job('Verify authenticated box receipt', 'c' * 40, 'Verify complete private evidence')],
+            200: [job('Review formal quality evidence', 'c' * 40, 'Verify reviewed execution')],
+            300: [
+                job('Require supported premerge event', 'a' * 40,
+                    'Resolve supported current open PR through read-only API'),
+                job('Backend vet, build, and test', 'a' * 40, 'Vet root module', 'Vet relaykit independently',
+                    'Vet tokenkit independently', 'Build root module', 'Build relaykit independently',
+                    'Build tokenkit independently', 'Policy and consumer regression tests'),
+                job('Frontend typecheck and test', 'a' * 40, 'Install dependencies', 'Typecheck', 'Test'),
+                job('Required real database contracts', 'a' * 40, 'Required three-database suite (no skips)'),
+            ],
+        }
+        self.reader.jobs = lambda run_id, attempt: jobs[run_id]
+
+        def derive(terminal_run=200, *, active=False):
+            return quality.verify_terminal_evidence(self.admission, bundle, self.reader, terminal_run,
+                                                     hosted, 'c' * 40, 200, active=active)
+
+        runs[200].update(status='in_progress', conclusion=None)
+        self.assertEqual(200, derive(active=True)['terminal_run'])
+        with self.assertRaisesRegex(ValueError, 'reviewed workflow did not pass'):
+            derive()
+        runs[200].update(status='completed', conclusion='success')
+        request = derive()
+        with self.assertRaisesRegex(ValueError, 'independently reviewed workflow'):
+            derive(100)
+        self.assertNotIn('quality', request)
+        self.reader.gate_value.update(name='Box formal quality result', output={'text': json.dumps(request)},
+                                      external_id=quality.consumer.digest(request))
+        self.reader.formal_quality_check = lambda sha: self.reader.check(43)
+        self.assertEqual(request, quality.verify_public_terminal(self.environment, self.reader, clock=lambda: 200))
+        missing_digest = {key: value for key, value in request.items() if key != 'quality_sha256'}
+        original_gate = self.reader.gate_value.copy()
+        self.reader.gate_value.update(output={'text': json.dumps(missing_digest)},
+                                      external_id=quality.consumer.digest(missing_digest))
+        with self.assertRaisesRegex(ValueError, 'independent terminal quality proof'):
+            quality.verify_public_terminal(self.environment, self.reader, clock=lambda: 200)
+        self.reader.gate_value = original_gate
+        for row, key, bad in (
+            (runs[100], 'run_attempt', 2), (runs[200], 'triggering_actor', {'id': 3104616}),
+            (runs[200], 'display_title', 'Formal terminal ' + 'f' * 64),
+            (approvals[200][0], 'user', {'id': 999}), (approvals[100][0], 'state', 'rejected'),
+            (jobs[100][0]['steps'][0], 'conclusion', 'skipped'),
+            (jobs[300][-1], 'conclusion', 'failure'),
+        ):
+            old = row[key]
+            row[key] = bad
+            with self.subTest(field=key, value=bad), self.assertRaises(ValueError):
+                quality.verify_public_terminal(self.environment, self.reader, clock=lambda: 200)
+            row[key] = old
+
+        http = MockHTTP(self.reader)
+        publisher = quality.GitHubPublication(http.app_get, http.installation_request)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = quality.AdmissionJournal(str(Path(tmp) / 'journal.sqlite'))
+
+            def publish():
+                return formal_evidence_publisher.publish_terminal(
+                    self.admission, bundle, self.reader, publisher, journal, 'OFFLINE-APP',
+                    200, hosted, 'c' * 40, policy=quality, clock=lambda: 200)
+
+            def complete(check_id, request, token, reader, *, policy):
+                self.assertEqual(check_id, journal.pending(request))
+                self.assertEqual('in_progress', reader.check(check_id)['status'])
+                http.finish_fixture()
+                return reader.check(check_id)
+
+            with patch.object(formal_evidence_publisher, 'complete_terminal_check', side_effect=complete) as signer:
+                runs[200].update(status='in_progress', conclusion=None)
+                with self.assertRaisesRegex(ValueError, 'reviewed workflow did not pass'):
+                    publish()
+                signer.assert_not_called()
+                self.assertEqual([], http.posts)
+                runs[200].update(status='completed', conclusion='success')
+                self.assertEqual(43, publish())
+                signer.assert_called_once()
+                with self.assertRaises(sqlite3.IntegrityError):
+                    publish()
+                self.assertEqual(1, len(http.posts))
 
     def test_ci_rejects_missing_failed_skipped_or_partial_hosted_jobs(self):
         for job in ('backend', 'frontend', 'database'):
@@ -815,9 +1018,10 @@ class QualityWiringTests(unittest.TestCase):
         root = Path(quality.__file__).resolve().parents[2]
         workflow = (root / '.github/workflows/ci.yml').read_text()
         gate = workflow.split('  quality-gate:\n', 1)[1]
-        self.assertIn('environment: box-formal-consumer', gate)
+        self.assertNotIn('environment:', gate)
         self.assertIn('ref: ${{ vars.BOX_FORMAL_READER_SHA }}', gate)
-        self.assertIn('BOX_FORMAL_REVIEWER_IDS: ${{ vars.BOX_FORMAL_REVIEWER_IDS }}', gate)
+        self.assertNotIn('BOX_FORMAL_ADMISSION', gate)
+        self.assertNotIn('secrets.', gate)
         self.assertIn('EXPECTED_SHA: ${{ needs.premerge.outputs.sha }}', gate)
         self.assertNotIn('execution route not configured', workflow)
         for name in ('docker-build.yml', 'docker-image-branch.yml', 'electron-build.yml',
@@ -829,7 +1033,7 @@ class QualityWiringTests(unittest.TestCase):
         block = re.search(r'        run: \|\n((?:          .*\n)+)', gate)
         self.assertIsNotNone(block)
         script = textwrap.dedent(block.group(1))
-        self.assertEqual('python3 -I -B trusted-quality/scripts/ci/quality_results.py ci',
+        self.assertEqual('python3 -I -B trusted-quality/scripts/ci/quality_results.py public-terminal',
                          script.splitlines()[0])
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / 'output'
@@ -844,7 +1048,8 @@ class QualityWiringTests(unittest.TestCase):
                 child = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', prefix + script],
                     env=env, capture_output=True, text=True, timeout=5)
                 self.assertEqual(code, child.returncode)
-                self.assertEqual('-I -B trusted-quality/scripts/ci/quality_results.py ci\n', calls.read_text())
+                self.assertEqual('-I -B trusted-quality/scripts/ci/quality_results.py public-terminal\n',
+                                 calls.read_text())
                 self.assertEqual(code == 0, output.exists())
 
     def test_premerge_contract_open_pr_keeps_strict_binding_and_result_failures(self):

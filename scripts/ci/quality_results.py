@@ -47,7 +47,16 @@ _release_spec.loader.exec_module(release_policy)
 require = consumer.require
 REPOSITORY = consumer.REPOSITORY
 GATE = 'Required quality gate'
+PRIVATE_EVIDENCE_GATE = 'Box formal quality result'
 SCHEMA = 'box-quality-result/v1'
+PRIVATE_EVIDENCE_SCHEMA = 'box-quality-result/v2'
+TERMINAL_SCHEMA = 'box-quality-terminal/v2'
+FORMAL_WORKFLOW_ID = 402689897
+CI_WORKFLOW_ID = 389317795
+REVIEWER_ID = 3104616
+CONSUMER_JOB = ('box-formal-consumer-v2', 27663161499, 'Verify authenticated box receipt',
+                'Verify complete private evidence')
+TERMINAL_JOB = ('box-formal-terminal', 27663161709, 'Review formal quality evidence', 'Verify reviewed execution')
 BACKEND = ('vet-root', 'vet-relaykit', 'vet-tokenkit', 'build-root', 'build-relaykit', 'build-tokenkit')
 FRONTEND = ('frontend-install', 'frontend-typecheck', 'frontend-test')
 DIALECTS = ('sqlite', 'mysql', 'postgres')
@@ -129,7 +138,7 @@ class GitHubStagingHTTP:
         require(listing or staging, 'HTTP operation outside staging allowlist')
         if staging:
             require(set(payload) == {'name', 'head_sha', 'status', 'external_id', 'output'} and
-                    payload['name'] == GATE and payload['status'] == 'in_progress' and
+                    payload['name'] in (GATE, PRIVATE_EVIDENCE_GATE) and payload['status'] == 'in_progress' and
                     re.fullmatch('[0-9a-f]{40}', payload['head_sha']) is not None and
                     re.fullmatch('[0-9a-f]{64}', payload['external_id']) is not None,
                     'only non-green exact-SHA staging is allowed')
@@ -167,7 +176,7 @@ class GitHubPublication:
                     for repo in accessible['repositories']), 'installation cannot access repository')
 
     def stage(self, request):
-        payload = {'name': GATE, 'head_sha': request['candidate_sha'], 'status': 'in_progress',
+        payload = {'name': request['name'], 'head_sha': request['candidate_sha'], 'status': 'in_progress',
                    'external_id': consumer.digest(request), 'output': {
                        'title': 'Awaiting authenticated quality publication',
                        'summary': 'Pending sanctioned publisher completion; this is not a quality success.',
@@ -182,7 +191,8 @@ def validate_gate(check, request, *, completed):
     require(type(check['id']) is int and check['id'] > 0, 'invalid quality check ID')
     require(check['app']['id'] == consumer.APP and check['app']['slug'] == 'new-api-box-formal',
             'wrong gate App')
-    require(check['name'] == GATE and check['head_sha'] == request['candidate_sha'] and
+    require(check['name'] == request['name'] in (GATE, PRIVATE_EVIDENCE_GATE) and
+            check['head_sha'] == request['candidate_sha'] and
             check['external_id'] == consumer.digest(request), 'wrong quality publication')
     # Ordinary equality aliases JSON booleans, integers and floats. Compare
     # canonical data to preserve types; this does not authenticate the source.
@@ -228,6 +238,171 @@ class GitHubReader:
         require(type(run_id) is int and run_id > 0, 'invalid run identity')
         return consumer.api(f'/repos/{REPOSITORY}/actions/runs/{run_id}/approvals', self._token)
 
+    def jobs(self, run_id, attempt):
+        require(type(run_id) is int and run_id > 0 and type(attempt) is int and attempt > 0,
+                'invalid job query')
+        response = consumer.api(
+            f'/repos/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100', self._token)
+        require(response['total_count'] == len(response['jobs']), 'incomplete job inventory')
+        return response['jobs']
+
+    def hosted_workflow_blob(self, sha):
+        require(re.fullmatch('[0-9a-f]{40}', sha) is not None, 'invalid hosted source')
+        return consumer.api(f'/repos/{REPOSITORY}/contents/.github/workflows/ci.yml?ref={sha}',
+                            self._token)['sha']
+
+    def formal_quality_check(self, sha):
+        require(re.fullmatch('[0-9a-f]{40}', sha) is not None, 'invalid quality source')
+        response = consumer.api(f'/repos/{REPOSITORY}/commits/{sha}/check-runs?'
+                                f'check_name=Box%20formal%20quality%20result&app_id={consumer.APP}',
+                                self._token)
+        require(response['total_count'] == 1 and len(response['check_runs']) == 1,
+                'unique signed formal quality result required')
+        return response['check_runs'][0]
+
+
+def successful_job(jobs, name, sha, steps):
+    selected = [job for job in jobs if job['name'] == name]
+    require(len(selected) == 1, 'missing or ambiguous required job')
+    job = selected[0]
+    passed = {step['name'] for step in job['steps']
+              if step['status'] == 'completed' and step['conclusion'] == 'success'}
+    require(job['head_sha'] == sha and job['status'] == 'completed' and
+            job['conclusion'] == 'success' and set(steps) <= passed, 'required job did not pass')
+
+
+def verify_reviewed_dispatch(reader, run_id, identity, job, *, active=False, title=None):
+    evidence = consumer.evidence
+    require(type(run_id) is int and run_id > 0, 'invalid dispatch run ID')
+    run = reader.latest_run(run_id)
+    require(run['id'] == run_id and run['run_attempt'] == 1 and
+            run['workflow_id'] == FORMAL_WORKFLOW_ID and run['path'] == evidence.WORKFLOW_PATH and
+            run['event'] == 'workflow_dispatch' and run['head_branch'] == evidence.CONTROL_REF.removeprefix('refs/heads/') and
+            run['head_sha'] == identity['consumer_sha'] and run['repository']['id'] == identity['repository_id'] and
+            run['repository']['full_name'] == REPOSITORY and run['head_repository']['id'] == identity['repository_id'] and
+            run['actor']['id'] == run['triggering_actor']['id'] == evidence.TRIGGER_ID, 'wrong protected App dispatch')
+    if title is not None:
+        require(run['display_title'] == title, 'terminal run reviewed a different admission')
+    environment_name, environment_id, job_name, step_name = job
+    approvals = [review for review in reader.approvals(run_id) if any(
+        env['name'] == environment_name and env['id'] == environment_id for env in review['environments'])]
+    require(len(approvals) == 1 and approvals[0]['state'] == 'approved' and
+            approvals[0]['user']['id'] == REVIEWER_ID, 'missing independent deployment approval')
+    if active:
+        require(run['status'] == 'in_progress' and run['conclusion'] is None, 'wrong active terminal run')
+    else:
+        require(run['status'] == 'completed' and run['conclusion'] == 'success', 'reviewed workflow did not pass')
+        successful_job(reader.jobs(run_id, 1), job_name, identity['consumer_sha'], (step_name,))
+
+
+def verify_hosted_jobs(reader, hosted, identity):
+    require(type(hosted) is dict and set(hosted) == {'run_id', 'attempt', 'workflow_blob'},
+            'invalid hosted run binding')
+    run_id, attempt, blob = hosted['run_id'], hosted['attempt'], hosted['workflow_blob']
+    run = reader.run(run_id, attempt)
+    require(run['id'] == run_id and run['run_attempt'] == attempt and run['workflow_id'] == CI_WORKFLOW_ID and
+            run['path'] == '.github/workflows/ci.yml' and run['event'] == 'pull_request' and
+            run['repository']['id'] == identity['repository_id'] and
+            run['head_repository']['id'] == identity['head_repository_id'] and
+            run['head_sha'] == identity['candidate_sha'], 'wrong hosted premerge run')
+    require(any(pull['number'] == identity['pull_number'] and pull['head']['sha'] == identity['candidate_sha'] and
+                pull['head']['repo']['id'] == identity['head_repository_id'] and pull['base']['ref'] == 'main' and
+                pull['base']['sha'] == identity['base_sha'] and pull['base']['repo']['id'] == identity['repository_id']
+                for pull in run['pull_requests']), 'hosted run does not belong to the admitted PR')
+    require(re.fullmatch('[0-9a-f]{40}', blob) is not None and
+            reader.hosted_workflow_blob(identity['candidate_sha']) == blob, 'unreviewed hosted CI definition')
+    jobs = reader.jobs(run_id, attempt)
+    for name, steps in (
+        ('Require supported premerge event', ('Resolve supported current open PR through read-only API',)),
+        ('Backend vet, build, and test', ('Vet root module', 'Vet relaykit independently', 'Vet tokenkit independently',
+            'Build root module', 'Build relaykit independently', 'Build tokenkit independently',
+            'Policy and consumer regression tests')),
+        ('Frontend typecheck and test', ('Install dependencies', 'Typecheck', 'Test')),
+        ('Required real database contracts', ('Required three-database suite (no skips)',)),
+    ):
+        successful_job(jobs, name, identity['candidate_sha'], steps)
+
+
+def terminal_run_title(reference, receipt_check_id, consumer_run, hosted, quality_sha256):
+    intent = dict(artifact=reference, receipt_check_id=receipt_check_id, consumer_run=consumer_run,
+                  hosted=hosted, quality_sha256=quality_sha256)
+    return 'Formal terminal ' + consumer.digest(intent)
+
+
+def verify_terminal_evidence(admission, bundle, reader, terminal_run, hosted, trusted_sha, now, *, active=False):
+    """Derive a compact result only from the private evidence and genuine run readbacks."""
+    receipt, reference = bundle
+    identity = reference['identity']
+    evidence = consumer.evidence
+    evidence.validate_reference(reference, now)
+    private_admission = {key: value for key, value in admission.items()
+                         if key not in ('check_run_id', 'quality_check_run_id')}
+    artifact = evidence.encode_artifact(private_admission, receipt)
+    require(evidence.make_reference(reference['commit'], artifact, private_admission) == reference and
+            identity['consumer_sha'] == trusted_sha,
+            'terminal admission identity changed')
+    verify_current_head(reader, admission)
+    _, receipt_hash = consumer.validate_evidence_check(reader.check(admission['check_run_id']), admission, now, bundle)
+    quality = validate_quality(receipt, admission)
+    workflow = quality['workflow']
+    require(workflow['run_attempt'] == 1 and workflow['workflow_id'] == FORMAL_WORKFLOW_ID and
+            workflow['sha'] == trusted_sha and workflow['path'] == consumer.evidence.WORKFLOW_PATH and
+            workflow['ref'] == consumer.evidence.CONTROL_REF and workflow['event'] == 'workflow_dispatch' and
+            workflow['run_id'] != terminal_run, 'wrong independently reviewed workflow bindings')
+    verify_reviewed_dispatch(reader, workflow['run_id'], identity, CONSUMER_JOB)
+    title = terminal_run_title(reference, admission['check_run_id'], workflow['run_id'], hosted,
+                               consumer.digest(quality))
+    verify_reviewed_dispatch(reader, terminal_run, identity, TERMINAL_JOB, active=active, title=title)
+    verify_hosted_jobs(reader, hosted, identity)
+    commit = reader.commit(identity['candidate_sha'])
+    require(commit['sha'] == identity['candidate_sha'] and commit['tree']['sha'] == identity['candidate_tree'],
+            'terminal tested tree mismatch')
+    verify_current_head(reader, admission)
+    return dict(verified_request(admission, receipt_hash, quality, bundle), schema=TERMINAL_SCHEMA,
+                consumer_run=workflow['run_id'], terminal_run=terminal_run, hosted=hosted)
+
+
+def verify_public_terminal(environment, reader, *, clock=time.time):
+    """Verify the App result from the native PR gate using public metadata only."""
+    event = ci_premerge_event(environment)
+    require(environment['GITHUB_EVENT_NAME'] == 'pull_request', 'native PR event required')
+    sha = event['pull_request']['head']['sha']
+    check = reader.formal_quality_check(sha)
+    result = consumer.evidence.decode(check['output']['text'])
+    fields = {'schema', 'name', 'artifact', 'quality_sha256', 'repository', 'repository_id', 'candidate_sha',
+              'candidate_tree', 'receipt_sha256', 'check_run_id', 'admission_id', 'invocation', 'attempt_id',
+              'expires_at', 'consumer_run', 'terminal_run', 'hosted'}
+    require(type(result) is dict and set(result) == fields and result['schema'] == TERMINAL_SCHEMA and
+            result['name'] == PRIVATE_EVIDENCE_GATE and result['consumer_run'] != result['terminal_run'] and
+            all(type(result[key]) is int and result[key] > 0 for key in ('check_run_id', 'consumer_run', 'terminal_run')) and
+            all(type(result[key]) is str and re.fullmatch('[0-9a-f]{64}', result[key]) is not None
+                for key in ('receipt_sha256', 'quality_sha256')),
+            'independent terminal quality proof required')
+    validate_gate(check, result, completed=True)
+    reference = result['artifact']
+    consumer.evidence.validate_reference(reference, int(clock()))
+    identity = reference['identity']
+    validate_ci_evidence_reference(event, environment, identity)
+    require(all(result[key] == identity[key] for key in ('repository', 'repository_id', 'candidate_sha',
+            'candidate_tree', 'admission_id', 'invocation', 'attempt_id', 'expires_at')),
+            'terminal result differs from its immutable artifact')
+    c1 = reader.check(result['check_run_id'])
+    require(c1['id'] == result['check_run_id'] and c1['app']['id'] == consumer.APP and
+            c1['app']['slug'] == 'new-api-box-formal' and c1['name'] == consumer.CHECK and
+            c1['head_sha'] == sha and c1['status'] == 'completed' and c1['conclusion'] == 'success' and
+            c1['external_id'] == result['receipt_sha256'] and
+            consumer.canonical(consumer.evidence.decode(c1['output']['text'])) == consumer.canonical(reference),
+            'published signed receipt does not match terminal proof')
+    verify_reviewed_dispatch(reader, result['consumer_run'], identity, CONSUMER_JOB)
+    title = terminal_run_title(reference, result['check_run_id'], result['consumer_run'], result['hosted'],
+                               result['quality_sha256'])
+    verify_reviewed_dispatch(reader, result['terminal_run'], identity, TERMINAL_JOB, title=title)
+    verify_hosted_jobs(reader, result['hosted'], identity)
+    resolve_ci_candidate(environment, reader)
+    commit = reader.commit(sha)
+    require(commit['sha'] == sha and commit['tree']['sha'] == identity['candidate_tree'], 'tested tree changed')
+    consumer.evidence.validate_reference(reference, int(clock()))
+    return result
 
 def validate_quality(receipt, admission):
     """Additional complete-quality contract; existing receipt policy is unchanged."""
@@ -330,16 +505,16 @@ def validate_execution_support(report, admission):
             'execution evidence outside admission window')
 
 
-def verify(admission, environment, reader, *, clock=time.time, execution_evidence=None):
+def verify(admission, environment, reader, *, clock=time.time, execution_evidence=None, evidence_bundle=None):
     """Return verified DATA, never an admission token or publication authority."""
-    consumer.validate_environment(environment, admission, int(clock()))
+    private = evidence_bundle is not None
+    consumer.validate_environment(environment, admission, int(clock()), private=private)
     repository = reader.repository()
     require(repository['id'] == admission['repository_id'] and repository['full_name'] == REPOSITORY,
             'repository identity changed')
     verify_current_head(reader, admission)
     check = reader.check(admission['check_run_id'])
-    receipt = json.loads(check['output']['text'])
-    receipt_hash = consumer.validate_check(check, receipt, admission, int(clock()))
+    receipt, receipt_hash = consumer.validate_evidence_check(check, admission, int(clock()), evidence_bundle)
     quality = validate_quality(receipt, admission)
     if execution_evidence is not None:
         validate_execution_support(execution_evidence, admission)
@@ -347,14 +522,15 @@ def verify(admission, environment, reader, *, clock=time.time, execution_evidenc
     require(commit['sha'] == admission['expected']['candidate_sha'] and
             commit['tree']['sha'] == admission['expected']['candidate_tree'], 'tested tree mismatch')
     workflow = quality['workflow']
-    require(workflow['path'] == '.github/workflows/box-formal-receipt.yml'
-            and workflow['ref'] == 'refs/heads/main' and workflow['event'] == 'workflow_dispatch'
+    workflow_ref = environment['GITHUB_REF']
+    require(workflow['path'] == consumer.evidence.WORKFLOW_PATH
+            and workflow['ref'] == workflow_ref and workflow['event'] == 'workflow_dispatch'
             and workflow['sha'] == admission['expected']['consumer_sha'], 'untrusted workflow origin')
     for key in ('run_id', 'run_attempt', 'workflow_id'):
         require(type(workflow[key]) is int and workflow[key] > 0, 'invalid workflow identity')
     require(str(workflow['run_id']) == environment['GITHUB_RUN_ID'] and
             str(workflow['run_attempt']) == environment['GITHUB_RUN_ATTEMPT'] and
-            environment['GITHUB_WORKFLOW_REF'] == REPOSITORY + '/' + workflow['path'] + '@refs/heads/main',
+            environment['GITHUB_WORKFLOW_REF'] == REPOSITORY + '/' + workflow['path'] + '@' + workflow_ref,
             'wrong consuming workflow invocation')
     # This is the current protected CONSUMER run, not evidence that Actions ran
     # candidate tests. Complete execution is proved only by the App receipt. The
@@ -362,26 +538,33 @@ def verify(admission, environment, reader, *, clock=time.time, execution_evidenc
     run = reader.run(workflow['run_id'], workflow['run_attempt'])
     require(run['id'] == workflow['run_id'] and run['run_attempt'] == workflow['run_attempt'] and
             run['workflow_id'] == workflow['workflow_id'] and run['path'] == workflow['path'] and
-            run['event'] == workflow['event'] and run['head_branch'] == 'main' and
+            run['event'] == workflow['event'] and run['head_branch'] == workflow_ref.removeprefix('refs/heads/') and
             run['head_sha'] == workflow['sha'] and
             run['repository']['id'] == admission['repository_id'] and
             run['repository']['full_name'] == REPOSITORY and
             run['head_repository']['id'] == admission['repository_id'], 'wrong consumer run')
     require(run['status'] == 'in_progress' and run['conclusion'] is None,
             'consumer run is not active')
+    if workflow_ref == consumer.evidence.CONTROL_REF:
+        verify_reviewed_dispatch(reader, workflow['run_id'], consumer.evidence.identity(admission),
+                                 CONSUMER_JOB, active=True)
     verify_current_head(reader, admission)
-    consumer.validate_environment(environment, admission, int(clock()))
-    return verified_request(admission, receipt_hash, quality)
+    consumer.validate_environment(environment, admission, int(clock()), private=private)
+    return verified_request(admission, receipt_hash, quality, evidence_bundle)
 
 
-def verified_request(admission, receipt_hash, quality):
-    """The exact data envelope already used by App staging and collection."""
-    return {'schema': SCHEMA, 'name': GATE, 'repository': REPOSITORY,
-            'repository_id': admission['repository_id'], 'candidate_sha': admission['expected']['candidate_sha'],
-            'candidate_tree': admission['expected']['candidate_tree'], 'receipt_sha256': receipt_hash,
-            'check_run_id': admission['check_run_id'], 'admission_id': admission['expected']['admission_id'],
-            'invocation': admission['expected']['invocation'], 'attempt_id': admission['expected']['attempt_id'],
-            'expires_at': admission['expected']['expires_at'], 'quality': copy.deepcopy(quality)}
+def verified_request(admission, receipt_hash, quality, evidence_bundle=None):
+    """Bind a quality result to the authenticated receipt and its evidence."""
+    expected = admission['expected']
+    request = {'repository': REPOSITORY, 'repository_id': admission['repository_id'],
+               'candidate_sha': expected['candidate_sha'], 'candidate_tree': expected['candidate_tree'],
+               'receipt_sha256': receipt_hash, 'check_run_id': admission['check_run_id'],
+               'admission_id': expected['admission_id'], 'invocation': expected['invocation'],
+               'attempt_id': expected['attempt_id'], 'expires_at': expected['expires_at']}
+    if evidence_bundle is None:
+        return dict(request, schema=SCHEMA, name=GATE, quality=copy.deepcopy(quality))
+    return dict(request, schema=PRIVATE_EVIDENCE_SCHEMA, name=PRIVATE_EVIDENCE_GATE,
+                artifact=copy.deepcopy(evidence_bundle[1]), quality_sha256=consumer.digest(quality))
 
 
 class UnsupportedCIEvent(ValueError):
@@ -465,6 +648,22 @@ def ci_premerge_event(environment):
     return event
 
 
+def validate_ci_evidence_reference(event, environment, binding):
+    release_policy.quality_results(json.loads(environment['QUALITY_RESULTS']))
+    native = {'repository': REPOSITORY, 'repository_id': event['repository']['id'],
+              'consumer_sha': environment['BOX_FORMAL_CONSUMER_SHA']}
+    if environment['GITHUB_EVENT_NAME'] == 'workflow_dispatch':
+        inputs = event['inputs']
+        native.update(pull_number=int(inputs['pull_number']), candidate_sha=inputs['sha'],
+                      base_sha=inputs['base_sha'])
+    else:
+        pull = event['pull_request']
+        native.update(pull_number=event['number'], candidate_sha=pull['head']['sha'],
+                      base_sha=pull['base']['sha'], head_repository_id=pull['head']['repo']['id'])
+    require(consumer.canonical(native) == consumer.canonical({key: binding.get(key) for key in native}),
+            'private evidence does not match native CI event')
+
+
 def resolve_ci_candidate(environment, reader=None):
     """Resolve public checkout coordinates through GETs, never grant quality.
 
@@ -497,7 +696,7 @@ def resolve_ci_candidate(environment, reader=None):
     return {'sha': head, 'repository': source['full_name']}
 
 
-def verify_ci_result(admission, environment, reader=None, *, clock=time.time):
+def verify_ci_result(admission, environment, reader=None, *, clock=time.time, evidence_bundle=None):
     """GET-only revalidation of a PRE-EXISTING App quality success for CI.
 
     Only premerge open-PR current-head/current-base validation is supported.
@@ -562,10 +761,9 @@ def verify_ci_result(admission, environment, reader=None, *, clock=time.time):
             'repository identity changed')
     verify_current_head(reader, admission)
     check = reader.check(admission['check_run_id'])
-    receipt = json.loads(check['output']['text'])
-    receipt_hash = consumer.validate_check(check, receipt, admission, int(clock()))
+    receipt, receipt_hash = consumer.validate_evidence_check(check, admission, int(clock()), evidence_bundle)
     quality = validate_quality(receipt, admission)
-    request = verified_request(admission, receipt_hash, quality)
+    request = verified_request(admission, receipt_hash, quality, evidence_bundle)
     gate = reader.check(gate_id)
     require(gate['id'] == gate_id, 'wrong quality check ID')
     validate_gate(gate, request, completed=True)
@@ -609,32 +807,38 @@ def verify_ci_result(admission, environment, reader=None, *, clock=time.time):
             consumer.canonical(reader.approvals(workflow['run_id'])) == consumer.canonical(approvals),
             'quality evidence changed during CI consumption')
     verify_current_head(reader, admission)
-    consumer.validate_check(check, receipt, admission, int(clock()))
+    consumer.validate_evidence_check(check, admission, int(clock()), evidence_bundle)
     return request
 
 
 def stage_publication(admission, environment, reader, publisher, journal, *, clock=time.time,
-                      execution_evidence=None):
+                      execution_evidence=None, evidence_bundle=None):
     """Stage a non-green check; exceptions burn the admission, never retry writes."""
+    require(environment['GITHUB_REF'] != consumer.evidence.CONTROL_REF,
+            'formal control branch requires post-terminal publication')
     admission = copy.deepcopy(admission)
     environment = dict(environment)
     execution_evidence = copy.deepcopy(execution_evidence)
-    verified = verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence)
+    evidence_bundle = copy.deepcopy(evidence_bundle)
+    verified = verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence,
+                      evidence_bundle=evidence_bundle)
     publisher.verify_installation(admission['repository_id'])
     journal.claim(verified)
-    require(verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence) == verified,
+    require(verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence,
+                      evidence_bundle=evidence_bundle) == verified,
             'evidence changed after claim')
     check_id = publisher.stage(copy.deepcopy(verified))
     # A concurrent head update or an uncertain POST leaves ONLY a pending check
     # on the old exact SHA; it cannot produce a green current-head result.
-    require(verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence) == verified,
+    require(verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence,
+                      evidence_bundle=evidence_bundle) == verified,
             'evidence changed while staging')
     journal.stage(verified, check_id)
     return {'state': 'pending', 'check_run_id': check_id, 'candidate_sha': verified['candidate_sha']}
 
 
 def collect_result(admission, environment, reader, publisher, journal, *, clock=time.time,
-                   execution_evidence=None):
+                   execution_evidence=None, evidence_bundle=None):
     """Return only a complete pre-existing App result, once, for the current head.
 
     There are no network writes here. A failure cannot publish a new green check.
@@ -644,13 +848,16 @@ def collect_result(admission, environment, reader, publisher, journal, *, clock=
     admission = copy.deepcopy(admission)
     environment = dict(environment)
     execution_evidence = copy.deepcopy(execution_evidence)
-    verified = verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence)
+    evidence_bundle = copy.deepcopy(evidence_bundle)
+    verified = verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence,
+                      evidence_bundle=evidence_bundle)
     publisher.verify_installation(admission['repository_id'])
     check_id = journal.pending(verified)
     check = reader.check(check_id)
     require(check['id'] == check_id, 'wrong published check')
     validate_gate(check, verified, completed=True)
-    require(verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence) == verified,
+    require(verify(admission, environment, reader, clock=clock, execution_evidence=execution_evidence,
+                      evidence_bundle=evidence_bundle) == verified,
             'evidence changed during collection')
     # Re-read the published object as well: incomplete/changed publication cannot
     # be substituted between receipt verification and final result consumption.
@@ -658,7 +865,7 @@ def collect_result(admission, environment, reader, publisher, journal, *, clock=
     require(consumer.canonical(published) == consumer.canonical(check),
             'publication changed during collection')
     verify_current_head(reader, admission)
-    consumer.validate_environment(environment, admission, int(clock()))
+    consumer.validate_environment(environment, admission, int(clock()), private=evidence_bundle is not None)
     journal.consume(verified, check_id)
     return {'state': 'verified', 'check_run_id': check_id, 'result': verified}
 
@@ -667,19 +874,36 @@ def main():
     # Quality reads use the protected consumer checkout; preflight reads only
     # public PR metadata on the hosted workflow checkout, without admission.
     # Publication is available solely through the trusted host's injected object.
-    require(sys.argv[1:] in ([], ['ci'], ['premerge']), 'unknown quality operation')
+    require(sys.argv[1:] in ([], ['ci'], ['premerge'], ['terminal'], ['public-terminal']), 'unknown quality operation')
     if sys.argv[1:] == ['premerge']:
         result = resolve_ci_candidate(os.environ)
         print(json.dumps(result, sort_keys=True))
         return
-    if sys.argv[1:] == ['ci']:
+    if sys.argv[1:] == ['terminal']:
+        now = int(time.time())
+        trusted_sha = consumer.trusted_consumer_context(os.environ, private=True)
+        require(os.environ['GITHUB_REF'] == consumer.evidence.CONTROL_REF, 'terminal must use the control branch')
+        admission, bundle = consumer.configured_evidence(os.environ, now)
+        require(bundle is not None, 'terminal requires complete private evidence')
+        hosted = {'run_id': int(os.environ['BOX_FORMAL_HOSTED_RUN_ID']),
+                  'attempt': int(os.environ['BOX_FORMAL_HOSTED_RUN_ATTEMPT']),
+                  'workflow_blob': os.environ['BOX_FORMAL_HOSTED_CI_BLOB']}
+        result = verify_terminal_evidence(admission, bundle, GitHubReader(os.environ['GITHUB_TOKEN']),
+                                          int(os.environ['GITHUB_RUN_ID']), hosted, trusted_sha, now, active=True)
+    elif sys.argv[1:] == ['public-terminal']:
         ci_premerge_event(os.environ)
-        admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'],
-                               object_pairs_hook=consumer.unique_json_fields)
-        result = verify_ci_result(admission, os.environ)
+        release_policy.quality_results(json.loads(os.environ['QUALITY_RESULTS']))
+        result = verify_public_terminal(os.environ, GitHubReader(os.environ['GITHUB_TOKEN']))
+    elif sys.argv[1:] == ['ci']:
+        event = ci_premerge_event(os.environ)
+        admission, bundle = consumer.configured_evidence(
+            os.environ, int(time.time()),
+            check_identity=lambda binding: validate_ci_evidence_reference(event, os.environ, binding))
+        result = (verify_ci_result(admission, os.environ) if bundle is None else
+                  verify_ci_result(admission, os.environ, evidence_bundle=bundle))
     else:
-        admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'])
-        result = verify(admission, os.environ, GitHubReader(os.environ['GITHUB_TOKEN']))
+        admission, bundle = consumer.configured_evidence(os.environ, int(time.time()))
+        result = verify(admission, os.environ, GitHubReader(os.environ['GITHUB_TOKEN']), evidence_bundle=bundle)
     print(json.dumps({key: result[key] for key in
                       ('schema', 'candidate_sha', 'candidate_tree', 'check_run_id', 'receipt_sha256')},
                      sort_keys=True))

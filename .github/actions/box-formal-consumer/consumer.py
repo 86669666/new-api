@@ -1,10 +1,17 @@
 """Validate an App-authenticated receipt against an operator-controlled admission."""
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import time
 import urllib.request
+from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location('_formal_evidence', Path(__file__).with_name('evidence.py'))
+evidence = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(evidence)
+
 
 APP = 5498942
 INSTALLATION = 175905031
@@ -81,9 +88,10 @@ def unique_json_fields(pairs):
     return result
 
 
-def validate_check(check, receipt, admission, now):
-    parsed = json.loads(check['output']['text'], object_pairs_hook=unique_json_fields)
-    require(canonical(parsed) == canonical(receipt), 'receipt differs from check output')
+def validate_check(check, receipt, admission, now, *, reference=None):
+    parsed = evidence.decode(check['output']['text'])
+    published = receipt if reference is None else reference
+    require(canonical(parsed) == canonical(published), 'receipt differs from check output')
     receipt_hash = validate_receipt(receipt, admission, now)
     require(check['app']['id'] == APP and check['app']['slug'] == 'new-api-box-formal', 'wrong App')
     require(type(admission['check_run_id']) is int and admission['check_run_id'] > 0
@@ -94,6 +102,14 @@ def validate_check(check, receipt, admission, now):
     require(check['status'] == 'completed' and check['conclusion'] == 'success', 'check not successful')
     require(check['external_id'] == receipt_hash == admission['receipt_sha256'], 'receipt hash mismatch')
     return receipt_hash
+
+
+def validate_evidence_check(check, admission, now, bundle=None):
+    if bundle is None:
+        receipt, reference = evidence.decode(check['output']['text']), None
+    else:
+        receipt, reference = bundle
+    return receipt, validate_check(check, receipt, admission, now, reference=reference)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -111,14 +127,63 @@ def api(path, token):
         return json.load(response)
 
 
-def validate_environment(environment, admission, now):
+def read_private_evidence(commit, token):
+    repository_path = '/repos/' + evidence.EVIDENCE_REPOSITORY
+    repo = api(repository_path, token)
+    require(repo.get('private') is True and repo.get('id') == evidence.EVIDENCE_REPOSITORY_ID and
+            repo.get('full_name') == evidence.EVIDENCE_REPOSITORY, 'untrusted evidence repository')
+    require(re.fullmatch('[0-9a-f]{40}', commit) is not None, 'invalid evidence revision')
+    request = urllib.request.Request(
+        'https://api.github.com' + repository_path + '/contents/' + evidence.EVIDENCE_PATH + '?ref=' + commit,
+        headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github.raw+json',
+                 'X-GitHub-Api-Version': '2022-11-28'})
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
+        return response.read(evidence.MAX_ARTIFACT_BYTES + 1)
+
+
+def configured_evidence(environment, now, *, check_identity=None):
+    record = json.loads(environment['BOX_FORMAL_ADMISSION'], object_pairs_hook=unique_json_fields,
+                        parse_constant=evidence.reject_constant)
+    require(type(record) is dict, 'invalid formal admission')
+    if record.get('schema') != evidence.CONFIG_SCHEMA:
+        return record, None
+    require(environment.get('GITHUB_REPOSITORY') == REPOSITORY, 'wrong repository')
+
+    def check_consumer_identity(binding):
+        trusted = trusted_consumer_context(environment, private=True)
+        native_id = environment['GITHUB_REPOSITORY_ID']
+        require(re.fullmatch('[1-9][0-9]*', native_id) is not None and
+                type(binding['repository_id']) is int and binding['repository_id'] == int(native_id) and
+                binding['repository'] == REPOSITORY and binding['consumer_sha'] == trusted and
+                environment['GITHUB_WORKFLOW_REF'] == REPOSITORY + '/' + evidence.WORKFLOW_PATH +
+                '@' + environment['GITHUB_REF'],
+                'private evidence does not match protected consumer context')
+
+    def fetch(commit):
+        token = environment.get('BOX_FORMAL_EVIDENCE_TOKEN')
+        require(token and token != environment.get('GITHUB_TOKEN'), 'private evidence read credential required')
+        return read_private_evidence(commit, token)
+
+    return evidence.resolve_configuration(record, fetch, now, check_identity or check_consumer_identity)
+
+
+def trusted_consumer_context(environment, *, private=False):
     require(environment['GITHUB_REPOSITORY'] == REPOSITORY, 'wrong repository')
     require(environment['GITHUB_EVENT_NAME'] == 'workflow_dispatch', 'manual admission only')
-    require(environment['GITHUB_REF'] == 'refs/heads/main', 'protected main required')
+    refs = ('refs/heads/main', evidence.CONTROL_REF) if private else ('refs/heads/main',)
+    require(environment['GITHUB_REF'] in refs, 'protected consumer ref required')
     trusted = environment['BOX_FORMAL_CONSUMER_SHA']
     require(re.fullmatch('[0-9a-f]{40}', trusted) is not None, 'immutable consumer SHA required')
-    require(trusted == environment['GITHUB_WORKFLOW_SHA'] == admission['expected']['consumer_sha'],
-            'unapproved workflow revision')
+    require(trusted == environment['GITHUB_WORKFLOW_SHA'], 'unapproved workflow revision')
+    if environment['GITHUB_REF'] == evidence.CONTROL_REF:
+        require(environment['GITHUB_SHA'] == trusted and environment['GITHUB_RUN_ATTEMPT'] == '1' and
+                environment['GITHUB_ACTOR_ID'] == str(evidence.TRIGGER_ID), 'wrong native dispatch identity')
+    return trusted
+
+
+def validate_environment(environment, admission, now, *, private=False):
+    trusted = trusted_consumer_context(environment, private=private)
+    require(trusted == admission['expected']['consumer_sha'], 'unapproved workflow revision')
     require(admission['active'] is True and admission['repository'] == REPOSITORY,
             'inactive or foreign admission')
     require(admission['app_id'] == APP and admission['installation_id'] == INSTALLATION,
@@ -132,16 +197,15 @@ def validate_environment(environment, admission, now):
 
 
 def main():
-    admission = json.loads(os.environ['BOX_FORMAL_ADMISSION'])
-    validate_environment(os.environ, admission, int(time.time()))
+    admission, bundle = configured_evidence(os.environ, int(time.time()))
+    validate_environment(os.environ, admission, int(time.time()), private=bundle is not None)
     token = os.environ['GITHUB_TOKEN']
     check_id = admission['check_run_id']
     require(type(check_id) is int and check_id > 0, 'invalid check ID')
     repo = api('/repos/' + REPOSITORY, token)
     require(repo['id'] == admission['repository_id'], 'repository ID mismatch')
     check = api('/repos/' + REPOSITORY + '/check-runs/' + str(check_id), token)
-    receipt = json.loads(check['output']['text'])
-    validate_check(check, receipt, admission, int(time.time()))
+    validate_evidence_check(check, admission, int(time.time()), bundle)
     commit = api('/repos/' + REPOSITORY + '/git/commits/' + admission['expected']['execution_sha'], token)
     require(commit['sha'] == admission['expected']['execution_sha'] and
             commit['tree']['sha'] == admission['expected']['candidate_tree'], 'remote commit or tree mismatch')
