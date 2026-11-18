@@ -11,7 +11,7 @@ ARTIFACT_SCHEMA = 'box-formal-evidence/v2'
 CONFIG_SCHEMA = 'box-formal-evidence-config/v2'
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 WORKFLOW_PATH = '.github/workflows/box-formal-receipt.yml'
-CONTROL_REF = 'refs/heads/codex/formal-quality'
+CONTROL_REF = 'refs/heads/codex/formal-quality-r2'
 TRIGGER_ID = 358061300
 
 

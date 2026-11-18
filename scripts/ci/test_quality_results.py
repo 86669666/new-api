@@ -671,6 +671,18 @@ class QualityWiringTests(unittest.TestCase):
     def test_private_evidence_keeps_large_full_receipt_and_enforces_app_binding(self):
         evidence = quality.consumer.evidence
         admission, receipt = copy.deepcopy(self.admission), copy.deepcopy(self.receipt)
+        images = {
+            'postgres': 'sha256:94bd3af0fdb294cd2c40005951b0b1ad62bd79e058983909628bec4f2b35b313',
+            'mysql': 'sha256:5022666e28e408728a872246e5b6478d9177a80e12b881d6f3983568891f1cb0',
+        }
+        admission['expected']['images'] = images
+        receipt['binding']['images'] = images
+        with self.assertRaisesRegex(ValueError, 'unapproved images'):
+            quality.consumer.validate_receipt(receipt, admission, 200)
+        images['mysql'] = self.admission['expected']['images']['mysql']
+        with self.assertRaisesRegex(ValueError, 'unapproved images'):
+            quality.consumer.validate_receipt(receipt, admission, 200, private=True)
+        images['mysql'] = 'sha256:5022666e28e408728a872246e5b6478d9177a80e12b881d6f3983568891f1cb0'
         # Exact transport boundary fixture: keep the real tier inventory and matching full leaf lists.
         leaves = [f'TestPrivateTransportFixture/leaf-{i:05d}' for i in range(2000)]
         admission['expected']['tiers']['sqlite']['required_leaves'] = leaves
@@ -765,7 +777,8 @@ class QualityWiringTests(unittest.TestCase):
                                        external_id=self.admission['receipt_sha256'])
         self.reader.pr['head']['repo']['full_name'] = 'fixture-fork/new-api'
         actor = {'id': 358061300}
-        runs = {n: dict(self.latest, id=n, workflow_id=402689897, head_branch='codex/formal-quality',
+        runs = {n: dict(self.latest, id=n, workflow_id=402689897,
+                       head_branch=evidence.CONTROL_REF.removeprefix('refs/heads/'),
                        actor=actor, triggering_actor=actor) for n in (100, 200)}
         approvals = {
             100: [dict(state='approved', user={'id': 3104616}, environments=[

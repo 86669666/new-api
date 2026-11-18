@@ -38,7 +38,7 @@ def seal(admission_bytes, capture_bytes, quality_bytes, release, *, policy, now)
     evidence.require(type(binding['repository_id']) is int and binding['repository_id'] > 0 and
                      evidence.canonical(binding) == evidence.canonical(release.get('identity')),
                      'reviewed formal publication identity changed')
-    receipt_digest = policy.consumer.validate_receipt(receipt, admission, now)
+    receipt_digest = policy.consumer.validate_receipt(receipt, admission, now, private=True)
     policy.validate_quality(receipt, admission)
     evidence.require(admission.get('receipt_sha256') in (None, receipt_digest),
                      'existing receipt digest conflicts with finalized evidence')

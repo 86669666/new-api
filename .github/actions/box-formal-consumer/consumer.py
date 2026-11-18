@@ -23,6 +23,10 @@ FORMAL_TIERS = frozenset(('postgres', 'postgres-redis', 'wallet-sqlite', 'wallet
                           'lifecycle-postgres', 'sqlite'))
 PINS = {'postgres': 'sha256:85b1ab67e7c7410b11da3f5b42913fc51b5b46f9cf5f07cc28a98e5f62083c5e',
         'mysql': 'sha256:d78bbb8f2cfdeb362aff7fcbea6b7954bef6429bef26b308f0e65ca5d9410482'}
+MIGRATED_PINS = {
+    'postgres': 'sha256:94bd3af0fdb294cd2c40005951b0b1ad62bd79e058983909628bec4f2b35b313',
+    'mysql': 'sha256:5022666e28e408728a872246e5b6478d9177a80e12b881d6f3983568891f1cb0',
+}
 
 
 def canonical(value):
@@ -38,7 +42,7 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def validate_receipt(receipt, admission, now):
+def validate_receipt(receipt, admission, now, *, private=False):
     expected = admission['expected']
     require(admission['active'] is True, 'inactive admission')
     require(admission['repository'] == REPOSITORY, 'repository mismatch')
@@ -51,7 +55,8 @@ def validate_receipt(receipt, admission, now):
                  'assets_sha256', 'toolchain_sha256', 'module_sha256', 'manifest_sha256'):
         require(re.fullmatch('[0-9a-f]{64}', expected[name]) is not None, 'invalid artifact identity')
     require(expected['candidate_sha'] == expected['execution_sha'], 'build and execution SHA differ')
-    require(expected['images'] == PINS, 'unapproved images')
+    require(expected['images'] == PINS or (private and expected['images'] == MIGRATED_PINS),
+            'unapproved images')
     require(expected['platform'] == 'linux/amd64', 'platform mismatch')
     require(expected['attempt_id'] and expected['admission_id'] and expected['invocation'], 'missing attempt')
     require(expected['test_binaries'] and all(re.fullmatch('[0-9a-f]{64}', v)
@@ -92,7 +97,7 @@ def validate_check(check, receipt, admission, now, *, reference=None):
     parsed = evidence.decode(check['output']['text'])
     published = receipt if reference is None else reference
     require(canonical(parsed) == canonical(published), 'receipt differs from check output')
-    receipt_hash = validate_receipt(receipt, admission, now)
+    receipt_hash = validate_receipt(receipt, admission, now, private=reference is not None)
     require(check['app']['id'] == APP and check['app']['slug'] == 'new-api-box-formal', 'wrong App')
     require(type(admission['check_run_id']) is int and admission['check_run_id'] > 0
             and type(check['id']) is int and check['id'] == admission['check_run_id'],

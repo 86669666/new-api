@@ -44,7 +44,7 @@ jobs:
           token: ${{ github.token }}
   consume:
     name: Verify authenticated box receipt
-    if: github.ref == 'refs/heads/codex/formal-quality' && (inputs.mode == 'consumer' || inputs.mode == 'preflight')
+    if: github.ref == 'refs/heads/codex/formal-quality-r2' && (inputs.mode == 'consumer' || inputs.mode == 'preflight')
     runs-on: ubuntu-latest
     environment: box-formal-consumer-v2
     timeout-minutes: 5
@@ -79,7 +79,7 @@ jobs:
           token: ${{ github.token }}
   terminal:
     name: Review formal quality evidence
-    if: github.ref == 'refs/heads/codex/formal-quality' && inputs.mode == 'terminal'
+    if: github.ref == 'refs/heads/codex/formal-quality-r2' && inputs.mode == 'terminal'
     runs-on: ubuntu-latest
     environment: box-formal-terminal
     timeout-minutes: 5
