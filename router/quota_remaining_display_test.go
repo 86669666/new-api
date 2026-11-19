@@ -338,7 +338,7 @@ func TestQuotaRemainingDisplayHTTP(t *testing.T) {
 		redisToken.AllowUserQuotaQuery = true
 		require.NoError(t, f.db.Create(&redisToken).Error)
 		key := fmt.Sprintf("user:%d", redisUser.Id)
-		keys := []string{key, fmt.Sprintf("auth:user:fence:%d", redisUser.Id), fmt.Sprintf("auth:user:version:%d", redisUser.Id)}
+		keys := []string{key, "auth:user:fence:{" + key + "}", "auth:user:version:{" + key + "}"}
 		existed, err := rdb.Exists(context.Background(), keys...).Result()
 		require.NoError(t, err)
 		require.Zero(t, existed, "fixture must not replace another owner's Redis key")
@@ -359,8 +359,9 @@ func TestQuotaRemainingDisplayHTTP(t *testing.T) {
 		_, host := service.NewBillingSession(c, info, 500)
 		require.NotNil(t, host)
 		message, display := service.WalletQuotaErrorPresentation(host)
-		assert.Contains(t, message, "0.000074")
-		assert.Equal(t, "$0.0001", display)
+		// The wallet error must display the committed balance despite stale Redis data.
+		assert.Contains(t, message, "0.000200")
+		assert.Equal(t, "$0.0002", display)
 		require.NoError(t, f.db.Model(&model.Token{}).Where("id = ?", redisToken.Id).Update("allow_user_quota_query", false).Error)
 		message, display = service.WalletQuotaErrorPresentation(host)
 		assert.Empty(t, display)
