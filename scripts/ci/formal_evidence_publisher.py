@@ -52,7 +52,7 @@ def seal(admission_bytes, capture_bytes, quality_bytes, release, *, policy, now)
 def complete_terminal_check(check_id, request, token, reader, *, policy, clock=time.time):
     """Update precisely one already-staged check using a supplied App token."""
     policy.require(type(check_id) is int and check_id > 0 and
-                   request['schema'] in (policy.TERMINAL_SCHEMA, policy.TERMINAL_SCHEMA_V4, policy.TERMINAL_SCHEMA_V5) and
+                   request['schema'] in (policy.TERMINAL_SCHEMA, policy.TERMINAL_SCHEMA_V4, policy.TERMINAL_SCHEMA_V5, policy.TERMINAL_SCHEMA_V6) and
                    request['name'] == policy.PRIVATE_EVIDENCE_GATE, 'invalid terminal completion')
     staged = reader.check(check_id)
     policy.require(staged['id'] == check_id, 'wrong staged check ID')
@@ -62,11 +62,11 @@ def complete_terminal_check(check_id, request, token, reader, *, policy, clock=t
         'summary': 'Complete formal evidence and both independent approvals were verified.',
         'text': policy.consumer.canonical(request).decode(),
     }}
-    timed = request['schema'] in (policy.TERMINAL_SCHEMA_V4, policy.TERMINAL_SCHEMA_V5)
+    timed = request['schema'] in (policy.TERMINAL_SCHEMA_V4, policy.TERMINAL_SCHEMA_V5, policy.TERMINAL_SCHEMA_V6)
     if timed:
         now = int(clock())
         reference = request['artifact']
-        policy.consumer.evidence.validate_reference(reference, now)
+        policy.validate_timed_artifact(request, now)
         policy.consumer.evidence.check_times(staged, reference['identity'], now, completed=False)
         payload['completed_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
     update = urllib.request.Request(f'https://api.github.com/repos/{policy.REPOSITORY}/check-runs/{check_id}',
@@ -115,5 +115,33 @@ def publish_terminal(admission, bundle, reader, publisher, journal, installation
         policy.consumer.evidence.check_times(current, bundle[1]['identity'], int(clock()))
         policy.require(policy.consumer.evidence.github_time(current, 'started_at') == staged_at,
                        'C2 start time changed on completion')
+    journal.consume(request, check_id)
+    return check_id
+
+
+
+def publish_delta(reference, reader, fetch, publication, journal, installation_token, terminal_run,
+                  *, policy, clock=time.time):
+    request = policy.delta.verify(policy, reference, reader, fetch, terminal_run, int(clock()))
+    publication.verify_installation(request['repository_id'])
+    journal.claim(request)
+    check_id = publication.stage(request)
+    journal.stage(request, check_id)
+    policy.require(journal.pending(request) == check_id, 'missing exact pending delta check')
+    staged = reader.check(check_id)
+    policy.require(staged['id'] == check_id, 'delta check identity changed')
+    policy.validate_gate(staged, request, completed=False)
+    binding = reference['identity']
+    staged_at = policy.consumer.evidence.check_times(staged, binding, int(clock()), completed=False)
+    policy.require(policy.delta.verify(policy, reference, reader, fetch, terminal_run, int(clock()),
+                                      staged_at=staged_at) == request,
+                   'delta evidence changed before signing')
+    published = complete_terminal_check(check_id, request, installation_token, reader, policy=policy, clock=clock)
+    policy.require(published['id'] == check_id, 'wrong signed delta check')
+    policy.validate_gate(published, request, completed=True)
+    current = reader.check(check_id)
+    policy.require(policy.consumer.canonical(current) == policy.consumer.canonical(published),
+                   'signed delta check changed on readback')
+    policy.consumer.evidence.check_times(current, binding, int(clock()))
     journal.consume(request, check_id)
     return check_id

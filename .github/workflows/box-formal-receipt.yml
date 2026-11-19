@@ -1,5 +1,5 @@
 name: Box formal receipt consumer
-run-name: ${{ inputs.mode == 'terminal' && format('Formal terminal {0}', inputs.intent) || inputs.mode == 'consumer' && github.ref == 'refs/heads/codex/formal-quality-r5' && format('Formal reuse {0}', inputs.intent) || 'Box formal receipt consumer' }}
+run-name: ${{ inputs.mode == 'terminal' && format('Formal terminal {0}', inputs.intent) || inputs.mode == 'consumer' && github.ref == 'refs/heads/codex/formal-quality-r6' && format('Formal delta {0}', inputs.intent) || 'Box formal receipt consumer' }}
 on:
   workflow_dispatch:
     inputs:
@@ -44,7 +44,7 @@ jobs:
           token: ${{ github.token }}
   consume:
     name: Verify authenticated box receipt
-    if: github.ref == 'refs/heads/codex/formal-quality-r5' && (inputs.mode == 'consumer' || inputs.mode == 'preflight')
+    if: github.ref == 'refs/heads/codex/formal-quality-r6' && (inputs.mode == 'consumer' || inputs.mode == 'preflight')
     runs-on: ubuntu-latest
     environment: box-formal-consumer-v2
     timeout-minutes: 5
@@ -81,10 +81,10 @@ jobs:
           BOX_FORMAL_ADMISSION: ${{ vars.BOX_FORMAL_ADMISSION }}
           BOX_FORMAL_EVIDENCE_TOKEN: ${{ secrets.BOX_FORMAL_EVIDENCE_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -I -B scripts/ci/quality_results.py reuse-consumer
+        run: python3 -I -B scripts/ci/quality_results.py delta-consumer
   terminal:
     name: Review formal quality evidence
-    if: github.ref == 'refs/heads/codex/formal-quality-r5' && inputs.mode == 'terminal'
+    if: github.ref == 'refs/heads/codex/formal-quality-r6' && inputs.mode == 'terminal'
     runs-on: ubuntu-latest
     environment: box-formal-terminal
     timeout-minutes: 5
@@ -121,4 +121,4 @@ jobs:
           BOX_FORMAL_HOSTED_CI_BLOB: ${{ vars.BOX_FORMAL_HOSTED_CI_BLOB }}
           BOX_FORMAL_EVIDENCE_TOKEN: ${{ secrets.BOX_FORMAL_EVIDENCE_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -I -B scripts/ci/quality_results.py reuse-terminal
+        run: python3 -I -B scripts/ci/quality_results.py delta-terminal

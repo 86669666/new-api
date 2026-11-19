@@ -44,6 +44,10 @@ _release_spec = importlib.util.spec_from_file_location(
     '_trusted_release_policy', Path(__file__).with_name('release_policy.py'))
 release_policy = importlib.util.module_from_spec(_release_spec)
 _release_spec.loader.exec_module(release_policy)
+_delta_spec = importlib.util.spec_from_file_location(
+    'newapi_reviewed_formal_delta', Path(__file__).with_name('formal_delta.py'))
+delta = importlib.util.module_from_spec(_delta_spec)
+_delta_spec.loader.exec_module(delta)
 require = consumer.require
 REPOSITORY = consumer.REPOSITORY
 GATE = 'Required quality gate'
@@ -53,6 +57,7 @@ PRIVATE_EVIDENCE_SCHEMA = 'box-quality-result/v2'
 TERMINAL_SCHEMA = 'box-quality-terminal/v2'
 TERMINAL_SCHEMA_V4 = 'box-quality-terminal/v4'
 TERMINAL_SCHEMA_V5 = 'box-quality-terminal/v5'
+TERMINAL_SCHEMA_V6 = 'box-quality-terminal/v6'
 REUSE_HOSTED = {'run_id': 44403089902, 'attempt': 1, 'workflow_blob': 'c123990e4a8c9fd981b721455a8edbc65b62dfc5'}
 FORMAL_WORKFLOW_ID = 402689897
 CI_WORKFLOW_ID = 389317795
@@ -188,14 +193,21 @@ class GitHubPublication:
                        'title': 'Awaiting authenticated quality publication',
                        'summary': 'Pending sanctioned publisher completion; this is not a quality success.',
                        'text': consumer.canonical(request).decode()}}
-        if request['schema'] in (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5):
+        if request['schema'] in (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5, TERMINAL_SCHEMA_V6):
             now = int(self._clock())
-            consumer.evidence.validate_reference(request['artifact'], now)
+            validate_timed_artifact(request, now)
             payload['started_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
         require(len(payload['output']['text']) <= 65535, 'quality publication exceeds API text limit')
         check = self._installation_request('POST', '/repos/' + REPOSITORY + '/check-runs', payload)
         validate_gate(check, request, completed=False)
         return check['id']
+
+
+def validate_timed_artifact(request, now):
+    if request['schema'] == TERMINAL_SCHEMA_V6:
+        delta.validate_reference(request['artifact'], now)
+    else:
+        consumer.evidence.validate_reference(request['artifact'], now)
 
 
 def validate_gate(check, request, *, completed):
@@ -210,7 +222,7 @@ def validate_gate(check, request, *, completed):
     require(consumer.canonical(json.loads(check['output']['text'],
             object_pairs_hook=consumer.unique_json_fields)) == consumer.canonical(request),
             'partial or substituted quality publication')
-    if request.get('schema') in (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5):
+    if request.get('schema') in (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5, TERMINAL_SCHEMA_V6):
         binding = request['artifact']['identity']
         consumer.evidence.check_times(check, binding, binding['release_expires_at'], completed=completed)
     if completed:
@@ -485,6 +497,8 @@ def verify_public_terminal(environment, reader, *, clock=time.time):
     sha = event['pull_request']['head']['sha']
     check = reader.formal_quality_check(sha)
     result = consumer.evidence.decode(check['output']['text'])
+    if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V6:
+        return delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
     fields = {'schema', 'name', 'artifact', 'quality_sha256', 'repository', 'repository_id', 'candidate_sha',
               'candidate_tree', 'receipt_sha256', 'check_run_id', 'admission_id', 'invocation', 'attempt_id',
               'expires_at', 'consumer_run', 'terminal_run', 'hosted'}
@@ -1066,13 +1080,16 @@ def main():
     # public PR metadata on the hosted workflow checkout, without admission.
     # Publication is available solely through the trusted host's injected object.
     require(sys.argv[1:] in ([], ['ci'], ['premerge'], ['terminal'], ['public-terminal'],
-                           ['reuse-consumer'], ['reuse-terminal']), 'unknown quality operation')
+                           ['reuse-consumer'], ['reuse-terminal'], ['delta-consumer'], ['delta-terminal']),
+            'unknown quality operation')
     if sys.argv[1:] == ['premerge']:
         result = resolve_ci_candidate(os.environ)
         print(json.dumps(result, sort_keys=True))
         return
     if sys.argv[1:] in (['reuse-consumer'], ['reuse-terminal']):
         result = verify_reuse_dispatch(os.environ, terminal=sys.argv[1] == 'reuse-terminal')
+    elif sys.argv[1:] in (['delta-consumer'], ['delta-terminal']):
+        result = delta.verify_dispatch(sys.modules[__name__], os.environ, terminal=sys.argv[1] == 'delta-terminal')
     elif sys.argv[1:] == ['terminal']:
         now = int(time.time())
         trusted_sha = consumer.trusted_consumer_context(os.environ, private=True)
