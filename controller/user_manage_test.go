@@ -799,7 +799,7 @@ func TestManageUserDemotePostCommitCacheFailures(t *testing.T) {
 			_, err = model.GetTokenByKey(key, false)
 			require.NoError(t, err)
 			cacheKey := "token:" + common.GenerateHMAC(key)
-			fenceKey := "token:fence:" + common.GenerateHMAC(key)
+			fenceKey := "token:fence:{" + cacheKey + "}"
 			require.EqualValues(t, 1, common.RDB.Exists(t.Context(), cacheKey).Val())
 			identity, proof := manageUserProof(t, db, service.VerificationOperation{Scope: service.VerificationScopeAdminUserManage, Context: []byte(fmt.Sprintf(`{"user_id":%d,"action":"demote"}`, user.Id))})
 			pending := scenario == "pending" || scenario == "pending_cache_failure"
