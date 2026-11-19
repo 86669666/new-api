@@ -527,7 +527,8 @@ class QualityResultsTests(unittest.TestCase):
     def test_concrete_http_adapter_only_stages_non_green_on_fixed_origin(self):
         transport = quality.GitHubStagingHTTP('FIXTURE-NOT-A-CREDENTIAL')
         payload = dict(name=quality.GATE, head_sha='a' * 40, status='in_progress',
-                       external_id='e' * 64, output={'title': 'pending', 'summary': 'pending'})
+                       external_id='e' * 64, output={'title': 'pending', 'summary': 'pending'},
+                       started_at='2026-11-19T06:00:00Z')
         with patch.object(quality.urllib.request, 'build_opener') as opener:
             opener.return_value.open.return_value = io.BytesIO(b'{"id":43}')
             self.assertEqual({'id': 43}, transport.request('POST',
@@ -535,9 +536,11 @@ class QualityResultsTests(unittest.TestCase):
             request = opener.return_value.open.call_args.args[0]
             self.assertEqual('https://api.github.com/repos/86669666/new-api/check-runs', request.full_url)
             self.assertEqual('in_progress', json.loads(request.data)['status'])
+            self.assertEqual(payload['started_at'], json.loads(request.data)['started_at'])
             for method, path, body in [
                 ('PATCH', '/repos/' + quality.REPOSITORY + '/check-runs/43', payload),
                 ('POST', '/repos/other/repo/check-runs', payload),
+                ('POST', '/repos/' + quality.REPOSITORY + '/check-runs', dict(payload, started_at='tomorrow')),
                 ('POST', '/repos/' + quality.REPOSITORY + '/check-runs',
                  dict(payload, status='completed', conclusion='success'))]:
                 with self.assertRaises(ValueError):
@@ -822,7 +825,10 @@ class QualityWiringTests(unittest.TestCase):
     def test_terminal_v3_binds_checks_and_native_approvals_to_root_completion(self):
         self.exercise_terminal_proof(quality.consumer.evidence.CONTROL_REF_V4)
 
-    def exercise_terminal_proof(self, control_ref):
+    def test_reuse_requires_historical_c1_and_two_fresh_ordered_approvals(self):
+        self.exercise_terminal_proof(quality.consumer.evidence.CONTROL_REF_V4, reuse=True)
+
+    def exercise_terminal_proof(self, control_ref, *, reuse=False):
         evidence = quality.consumer.evidence
         v4 = control_ref == evidence.CONTROL_REF_V4
 
@@ -889,6 +895,79 @@ class QualityWiringTests(unittest.TestCase):
             jobs[100][0]['completed_at'] = stamp(15)
             jobs[200][0]['completed_at'] = stamp(18)
         self.reader.jobs = lambda run_id, attempt: jobs[run_id]
+
+        if reuse:
+            # The old receipt really expires at 1990. Only the new dispatch review opens at 2000.
+            old = reference
+            raw = evidence.encode_artifact(stored, self.receipt)
+            with patch.object(evidence, 'REUSE_COMMIT', old['commit']), patch.object(
+                    evidence, 'REUSE_ARTIFACT_SHA256', old['sha256']):
+                reference = evidence.make_reuse_reference(old, 'f' * 40, 101, 2000, 'a' * 32)
+                a, b = 101, 201
+                hosted = quality.REUSE_HOSTED
+                self.reader.hosted_workflow_blob = lambda sha: hosted['workflow_blob']
+                old_hosted = self.reader.run(300, 1)
+                self.reader.run = lambda run_id, attempt: dict(old_hosted, id=hosted['run_id'])
+                jobs[hosted['run_id']] = jobs[300]
+                for new, previous, created, done in [(a,100,2000,2005),(b,200,2006,2010)]:
+                    runs[new] = dict(runs[previous], id=new, head_sha='f' * 40, status='completed', conclusion='success',
+                                     head_branch=evidence.CONTROL_REF_V5.removeprefix('refs/heads/'),
+                                     created_at=quality.time.strftime('%Y-%m-%dT%H:%M:%SZ',quality.time.gmtime(created)),
+                                     updated_at=quality.time.strftime('%Y-%m-%dT%H:%M:%SZ',quality.time.gmtime(done)))
+                    approvals[new] = copy.deepcopy(approvals[previous])
+                    jobs[new] = [dict(jobs[previous][0], head_sha='f'*40, completed_at=runs[new]['updated_at'])]
+                runs[a]['display_title'] = evidence.reuse_title(old, 'f'*40, reference['nonce'])
+                runs[b]['display_title'] = quality.terminal_run_title(reference,evidence.REUSE_CHECK_ID,a,hosted,
+                                                                       quality.consumer.digest(self.receipt['quality']))
+                self.reader.check_value['id'] = evidence.REUSE_CHECK_ID
+                admission, receipt = quality.load_reused_evidence(reference, self.reader, lambda commit: raw)
+                def derive_reuse():
+                    return quality.verify_terminal_evidence(admission, (receipt, reference), self.reader, b,
+                                                            hosted, 'f'*40, 2020, staged_at=2012)
+                request = derive_reuse()
+                self.assertEqual((quality.TERMINAL_SCHEMA_V5,2000,3800,10900),
+                                 tuple(request[k] for k in ('schema','release_not_before','release_expires_at','expires_at')))
+                self.assertEqual(self.admission['receipt_sha256'],request['receipt_sha256'])
+                self.environment.update(BOX_FORMAL_CONSUMER_SHA='f'*40,GITHUB_RUN_ID=str(hosted['run_id']))
+                self.reader.gate_value.update(name=quality.PRIVATE_EVIDENCE_GATE, output={'text':json.dumps(request)},
+                                              external_id=quality.consumer.digest(request),started_at='1970-01-01T00:33:32Z',
+                                              completed_at='1970-01-01T00:33:35Z')
+                self.reader.formal_quality_check = lambda sha: self.reader.gate_value
+                def public():
+                    return quality.verify_public_terminal(self.environment,self.reader,clock=lambda:2020)
+                self.assertEqual(request,public())
+                with patch.dict(self.environment,GITHUB_RUN_ID='300'), self.assertRaisesRegex(ValueError,'wrong native hosted gate'):
+                    public()
+                for obj, change in [(runs[a],{'created_at':'1970-01-01T00:33:21Z'}),
+                                    (runs[a],{'run_attempt':2}), (runs[a],{'display_title':'Box formal receipt consumer'}),
+                                    (runs[b],{'created_at':runs[a]['created_at']}),
+                                    (approvals[a][0],{'state':'rejected'}), (approvals[b][0],{'user':{'id':1}}),
+                                    (self.reader.check_value,{'completed_at':'1970-01-01T00:33:21Z'}),
+                                    (self.reader.check_value,{'id':42}), (self.reader.check_value,{'conclusion':'neutral'}),
+                                    (self.reader.check_value,{'output':{'text':json.dumps(reference)}})]:
+                    with self.subTest(change=change), patch.dict(obj,change):
+                        for verifier in (derive_reuse,public):
+                            with self.assertRaises(ValueError):
+                                verifier()
+                with self.assertRaises(ValueError):
+                    quality.load_reused_evidence(reference, self.reader, lambda commit: raw+b' ')
+                env = dict(self.environment,GITHUB_EVENT_NAME='workflow_dispatch',GITHUB_REF=evidence.CONTROL_REF_V5,
+                           GITHUB_SHA='f'*40,GITHUB_WORKFLOW_SHA='f'*40,GITHUB_RUN_ID=str(a),GITHUB_RUN_ATTEMPT='1',
+                           GITHUB_ACTOR_ID=str(evidence.TRIGGER_ID),GITHUB_TOKEN='public',BOX_FORMAL_EVIDENCE_TOKEN='private',
+                           GITHUB_WORKFLOW_REF=quality.REPOSITORY+'/'+evidence.WORKFLOW_PATH+'@'+evidence.CONTROL_REF_V5,
+                           BOX_FORMAL_ADMISSION=json.dumps(reference))
+                with patch.object(quality,'GitHubReader',return_value=self.reader), patch.object(
+                        quality.consumer,'read_private_evidence',return_value=raw) as fetch:
+                    with patch.dict(runs[a],status='in_progress',conclusion=None):
+                        result = quality.verify_reuse_dispatch(env,terminal=False,clock=lambda:2020)
+                        self.assertEqual(result['receipt_sha256'],request['receipt_sha256'])
+                    with patch.dict(env,GITHUB_RUN_ID=str(b)), patch.dict(runs[b],status='in_progress',conclusion=None):
+                        self.assertEqual(quality.verify_reuse_dispatch(env,terminal=True,clock=lambda:2020),request)
+                    fetch.reset_mock()
+                    with patch.dict(env,GITHUB_RUN_ID='100'), self.assertRaises(ValueError):
+                        quality.verify_reuse_dispatch(env,terminal=False,clock=lambda:2020)
+                    fetch.assert_not_called()
+            return
 
         def derive(terminal_run=200, *, active=False):
             return quality.verify_terminal_evidence(self.admission, bundle, self.reader, terminal_run,

@@ -1,5 +1,5 @@
 name: Box formal receipt consumer
-run-name: ${{ inputs.mode == 'terminal' && format('Formal terminal {0}', inputs.intent) || 'Box formal receipt consumer' }}
+run-name: ${{ inputs.mode == 'terminal' && format('Formal terminal {0}', inputs.intent) || inputs.mode == 'consumer' && github.ref == 'refs/heads/codex/formal-quality-r5' && format('Formal reuse {0}', inputs.intent) || 'Box formal receipt consumer' }}
 on:
   workflow_dispatch:
     inputs:
@@ -9,7 +9,7 @@ on:
         options: [consumer, terminal, preflight]
         default: consumer
       intent:
-        description: SHA-256 of the exact evidence and hosted run selected for terminal review
+        description: SHA-256 of the exact evidence selected for this approval
         type: string
         required: false
 permissions: {}
@@ -44,7 +44,7 @@ jobs:
           token: ${{ github.token }}
   consume:
     name: Verify authenticated box receipt
-    if: github.ref == 'refs/heads/codex/formal-quality-r4' && (inputs.mode == 'consumer' || inputs.mode == 'preflight')
+    if: github.ref == 'refs/heads/codex/formal-quality-r5' && (inputs.mode == 'consumer' || inputs.mode == 'preflight')
     runs-on: ubuntu-latest
     environment: box-formal-consumer-v2
     timeout-minutes: 5
@@ -63,6 +63,11 @@ jobs:
           test "$GITHUB_SHA" = "$TRUSTED_SHA"
           test "$GITHUB_ACTOR_ID" = 358061300
           test "$GITHUB_RUN_ATTEMPT" = 1
+      - name: Require evidence selection
+        if: inputs.mode == 'consumer'
+        env:
+          INTENT: ${{ inputs.intent }}
+        run: '[[ "$INTENT" =~ ^[0-9a-f]{64}$ ]]'
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         if: inputs.mode == 'consumer'
         with:
@@ -71,15 +76,15 @@ jobs:
           persist-credentials: false
       - name: Verify complete private evidence
         if: inputs.mode == 'consumer'
-        uses: ./.github/actions/box-formal-consumer
-        with:
-          trusted-sha: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
-          admission: ${{ vars.BOX_FORMAL_ADMISSION }}
-          evidence-token: ${{ secrets.BOX_FORMAL_EVIDENCE_TOKEN }}
-          token: ${{ github.token }}
+        env:
+          BOX_FORMAL_CONSUMER_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          BOX_FORMAL_ADMISSION: ${{ vars.BOX_FORMAL_ADMISSION }}
+          BOX_FORMAL_EVIDENCE_TOKEN: ${{ secrets.BOX_FORMAL_EVIDENCE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/ci/quality_results.py reuse-consumer
   terminal:
     name: Review formal quality evidence
-    if: github.ref == 'refs/heads/codex/formal-quality-r4' && inputs.mode == 'terminal'
+    if: github.ref == 'refs/heads/codex/formal-quality-r5' && inputs.mode == 'terminal'
     runs-on: ubuntu-latest
     environment: box-formal-terminal
     timeout-minutes: 5
@@ -116,4 +121,4 @@ jobs:
           BOX_FORMAL_HOSTED_CI_BLOB: ${{ vars.BOX_FORMAL_HOSTED_CI_BLOB }}
           BOX_FORMAL_EVIDENCE_TOKEN: ${{ secrets.BOX_FORMAL_EVIDENCE_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -I -B scripts/ci/quality_results.py terminal
+        run: python3 -I -B scripts/ci/quality_results.py reuse-terminal

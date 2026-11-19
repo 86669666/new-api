@@ -13,13 +13,18 @@ CONFIG_SCHEMA = 'box-formal-evidence-config/v2'
 REFERENCE_SCHEMA_V4 = 'box-formal-evidence-ref/v4'
 ARTIFACT_SCHEMA_V4 = 'box-formal-evidence/v4'
 CONFIG_SCHEMA_V4 = 'box-formal-evidence-config/v4'
+REFERENCE_SCHEMA_V5 = 'box-formal-reuse-ref/v5'
 EXECUTION_SECONDS = 10_800
 RELEASE_SECONDS = 1800
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 WORKFLOW_PATH = '.github/workflows/box-formal-receipt.yml'
 CONTROL_REF = 'refs/heads/codex/formal-quality-r2'
 CONTROL_REF_V4 = 'refs/heads/codex/formal-quality-r4'
+CONTROL_REF_V5 = 'refs/heads/codex/formal-quality-r5'
 TRIGGER_ID = 358061300
+REUSE_CHECK_ID = 135232975120
+REUSE_COMMIT = '468c7b0a274ce52a616548e2e95f07c5b9aedac2'
+REUSE_ARTIFACT_SHA256 = 'e3a1a46a1bdf3af7f1745888b0000592064b638a858a19a7ce673d020695819e'
 
 
 def canonical(value):
@@ -139,7 +144,48 @@ def make_reference(commit, artifact_bytes, admission):
     return reference
 
 
+def reuse_title(historical, control_sha, nonce):
+    intent = {'historical': historical, 'check_run_id': REUSE_CHECK_ID,
+              'control_sha': control_sha, 'nonce': nonce}
+    return 'Formal reuse ' + sha256(canonical(intent)).hexdigest()
+
+
+def make_reuse_reference(historical, control_sha, consumer_run, opened, nonce):
+    binding = dict(historical['identity'], consumer_sha=control_sha,
+                   release_not_before=opened, release_expires_at=opened + RELEASE_SECONDS)
+    reference = {'schema': REFERENCE_SCHEMA_V5, 'historical': historical, 'identity': binding,
+                 'consumer_run': consumer_run, 'nonce': nonce}
+    validate_reference(reference, opened)
+    return reference
+
+
+def validate_reuse_reference(reference, now):
+    require(set(reference) == {'schema', 'historical', 'identity', 'consumer_run', 'nonce'} and
+            type(reference['consumer_run']) is int and reference['consumer_run'] > 0 and
+            type(reference['nonce']) is str and re.fullmatch('[0-9a-f]{32}', reference['nonce']),
+            'invalid reuse reference')
+    old = reference['historical']
+    require(type(old) is dict and old['schema'] == REFERENCE_SCHEMA_V4 and
+            old['commit'] == REUSE_COMMIT and old['sha256'] == REUSE_ARTIFACT_SHA256,
+            'reuse requires the independently reviewed historical artifact')
+    historical = old['identity']
+    validate_reference(old, historical['release_not_before'])
+    current = reference['identity']
+    opened, expires = current['release_not_before'], current['release_expires_at']
+    sha = current['consumer_sha']
+    require(type(sha) is str and re.fullmatch('[0-9a-f]{40}', sha) and sha != historical['consumer_sha'],
+            'new protected revision required')
+    require(all(type(value) is int for value in (opened, expires, now)) and
+            historical['release_expires_at'] < opened <= now <= expires and
+            expires == opened + RELEASE_SECONDS and canonical(current) == canonical(
+                dict(historical, consumer_sha=sha, release_not_before=opened, release_expires_at=expires)),
+            'reuse reference outside its approval interval or mismatched')
+
+
 def validate_reference(reference, now):
+    if type(reference) is dict and reference.get('schema') == REFERENCE_SCHEMA_V5:
+        validate_reuse_reference(reference, now)
+        return
     require(type(reference) is dict and set(reference) == {'schema', 'commit', 'bytes', 'sha256', 'identity'}
             and reference['schema'] in (REFERENCE_SCHEMA, REFERENCE_SCHEMA_V4), 'invalid formal evidence reference')
     require(type(reference['commit']) is str and type(reference['sha256']) is str and
@@ -165,6 +211,8 @@ def validate_reference(reference, now):
 
 
 def resolve(reference, fetch, now, check_identity):
+    require(reference.get('schema') in (REFERENCE_SCHEMA, REFERENCE_SCHEMA_V4),
+            'resolve needs the original immutable artifact reference')
     validate_reference(reference, now)
     check_identity(reference['identity'])
     data = fetch(reference['commit'])
