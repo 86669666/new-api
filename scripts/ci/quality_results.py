@@ -48,6 +48,10 @@ _delta_spec = importlib.util.spec_from_file_location(
     'newapi_reviewed_formal_delta', Path(__file__).with_name('formal_delta.py'))
 delta = importlib.util.module_from_spec(_delta_spec)
 _delta_spec.loader.exec_module(delta)
+_static_delta_spec = importlib.util.spec_from_file_location(
+    'newapi_reviewed_static_delta', Path(__file__).with_name('formal_static_delta.py'))
+static_delta = importlib.util.module_from_spec(_static_delta_spec)
+_static_delta_spec.loader.exec_module(static_delta)
 require = consumer.require
 REPOSITORY = consumer.REPOSITORY
 GATE = 'Required quality gate'
@@ -58,6 +62,8 @@ TERMINAL_SCHEMA = 'box-quality-terminal/v2'
 TERMINAL_SCHEMA_V4 = 'box-quality-terminal/v4'
 TERMINAL_SCHEMA_V5 = 'box-quality-terminal/v5'
 TERMINAL_SCHEMA_V6 = 'box-quality-terminal/v6'
+TERMINAL_SCHEMA_V7 = static_delta.TERMINAL_SCHEMA
+TIMED_TERMINAL_SCHEMAS = (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5, TERMINAL_SCHEMA_V6, TERMINAL_SCHEMA_V7)
 REUSE_HOSTED = {'run_id': 44403089902, 'attempt': 1, 'workflow_blob': 'c123990e4a8c9fd981b721455a8edbc65b62dfc5'}
 FORMAL_WORKFLOW_ID = 402689897
 CI_WORKFLOW_ID = 389317795
@@ -193,7 +199,7 @@ class GitHubPublication:
                        'title': 'Awaiting authenticated quality publication',
                        'summary': 'Pending sanctioned publisher completion; this is not a quality success.',
                        'text': consumer.canonical(request).decode()}}
-        if request['schema'] in (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5, TERMINAL_SCHEMA_V6):
+        if request['schema'] in TIMED_TERMINAL_SCHEMAS:
             now = int(self._clock())
             validate_timed_artifact(request, now)
             payload['started_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
@@ -206,6 +212,8 @@ class GitHubPublication:
 def validate_timed_artifact(request, now):
     if request['schema'] == TERMINAL_SCHEMA_V6:
         delta.validate_reference(request['artifact'], now)
+    elif request['schema'] == TERMINAL_SCHEMA_V7:
+        static_delta.validate_reference(request['artifact'], now)
     else:
         consumer.evidence.validate_reference(request['artifact'], now)
 
@@ -222,7 +230,7 @@ def validate_gate(check, request, *, completed):
     require(consumer.canonical(json.loads(check['output']['text'],
             object_pairs_hook=consumer.unique_json_fields)) == consumer.canonical(request),
             'partial or substituted quality publication')
-    if request.get('schema') in (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5, TERMINAL_SCHEMA_V6):
+    if request.get('schema') in TIMED_TERMINAL_SCHEMAS:
         binding = request['artifact']['identity']
         consumer.evidence.check_times(check, binding, binding['release_expires_at'], completed=completed)
     if completed:
@@ -351,7 +359,11 @@ def verify_hosted_jobs(reader, hosted, identity):
                 for pull in run['pull_requests']), 'hosted run does not belong to the admitted PR')
     require(re.fullmatch('[0-9a-f]{40}', blob) is not None and
             reader.hosted_workflow_blob(identity['candidate_sha']) == blob, 'unreviewed hosted CI definition')
-    jobs = reader.jobs(run_id, attempt)
+    verify_hosted_job_steps(reader, hosted, identity['candidate_sha'])
+
+
+def verify_hosted_job_steps(reader, hosted, candidate_sha):
+    jobs = reader.jobs(hosted['run_id'], hosted['attempt'])
     for name, steps in (
         ('Require supported premerge event', ('Resolve supported current open PR through read-only API',)),
         ('Backend vet, build, and test', ('Vet root module', 'Vet relaykit independently', 'Vet tokenkit independently',
@@ -360,7 +372,7 @@ def verify_hosted_jobs(reader, hosted, identity):
         ('Frontend typecheck and test', ('Install dependencies', 'Typecheck', 'Test')),
         ('Required real database contracts', ('Required three-database suite (no skips)',)),
     ):
-        successful_job(jobs, name, identity['candidate_sha'], steps)
+        successful_job(jobs, name, candidate_sha, steps)
 
 
 def terminal_run_title(reference, receipt_check_id, consumer_run, hosted, quality_sha256):
@@ -499,6 +511,8 @@ def verify_public_terminal(environment, reader, *, clock=time.time):
     result = consumer.evidence.decode(check['output']['text'])
     if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V6:
         return delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
+    if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V7:
+        return static_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
     fields = {'schema', 'name', 'artifact', 'quality_sha256', 'repository', 'repository_id', 'candidate_sha',
               'candidate_tree', 'receipt_sha256', 'check_run_id', 'admission_id', 'invocation', 'attempt_id',
               'expires_at', 'consumer_run', 'terminal_run', 'hosted'}
@@ -1080,7 +1094,8 @@ def main():
     # public PR metadata on the hosted workflow checkout, without admission.
     # Publication is available solely through the trusted host's injected object.
     require(sys.argv[1:] in ([], ['ci'], ['premerge'], ['terminal'], ['public-terminal'],
-                           ['reuse-consumer'], ['reuse-terminal'], ['delta-consumer'], ['delta-terminal']),
+                           ['reuse-consumer'], ['reuse-terminal'], ['delta-consumer'], ['delta-terminal'],
+                           ['static-delta-consumer'], ['static-delta-terminal']),
             'unknown quality operation')
     if sys.argv[1:] == ['premerge']:
         result = resolve_ci_candidate(os.environ)
@@ -1090,6 +1105,9 @@ def main():
         result = verify_reuse_dispatch(os.environ, terminal=sys.argv[1] == 'reuse-terminal')
     elif sys.argv[1:] in (['delta-consumer'], ['delta-terminal']):
         result = delta.verify_dispatch(sys.modules[__name__], os.environ, terminal=sys.argv[1] == 'delta-terminal')
+    elif sys.argv[1:] in (['static-delta-consumer'], ['static-delta-terminal']):
+        result = static_delta.verify_dispatch(sys.modules[__name__], os.environ,
+                                              terminal=sys.argv[1] == 'static-delta-terminal', clock=time.time)
     elif sys.argv[1:] == ['terminal']:
         now = int(time.time())
         trusted_sha = consumer.trusted_consumer_context(os.environ, private=True)

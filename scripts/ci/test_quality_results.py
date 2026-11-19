@@ -1778,5 +1778,60 @@ class QualityWiringTests(unittest.TestCase):
             self.assertEqual([('index' if operation == 'index' else 'get', 'GITHUB_TOKEN')], trace)
 
 
+class StaticDeltaTests(unittest.TestCase):
+    def setUp(self):
+        self.delta = quality.static_delta
+        self.ref = self.delta.make_reference(self.delta.descriptor(), 'a' * 40, 123, 2000, 'b' * 32)
+
+    def test_reference_pins_candidate_and_window(self):
+        for now in (2000, 3800):
+            self.delta.validate_reference(self.ref, now)
+        for now in (1999, 3801, 2000.0):
+            with self.subTest(now=now), self.assertRaises(ValueError):
+                self.delta.validate_reference(self.ref, now)
+        for key, value in [('pull_number', 262), ('candidate_sha', 'c' * 40), ('base_sha', 'd' * 40),
+                           ('candidate_tree', 'e' * 40), ('release_expires_at', 3801)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                ref = copy.deepcopy(self.ref)
+                ref['identity'][key] = value
+                self.delta.validate_reference(ref, 2000)
+        with self.assertRaises(ValueError):
+            ref = copy.deepcopy(self.ref)
+            ref['artifact']['bytes'] = float(ref['artifact']['bytes'])
+            self.delta.validate_reference(ref, 2000)
+
+    def test_timed_publisher_uses_static_contract(self):
+        result = self.delta.result(self.ref, 456, {'receipt_sha256': 'e' * 64})
+        quality.validate_timed_artifact(result, 3800)
+        self.assertEqual(result['scope'], 'static-route-delta')
+        self.assertEqual(result['baseline']['pull_number'], 262)
+        with self.assertRaises(ValueError):
+            quality.validate_timed_artifact(result, 3801)
+        with self.assertRaises(ValueError):
+            self.delta.validate_package(quality, b'unpinned')
+
+    def test_current_subject_requires_both_reviewed_parents(self):
+        from unittest.mock import Mock
+
+        delta = self.delta
+        repo = {'id': 1423238398, 'full_name': '86669666/new-api'}
+        reader = Mock()
+        reader.repository.return_value = repo
+        reader.pull.return_value = {'number': 261, 'state': 'open', 'merged': False, 'changed_files': 3,
+            'head': {'repo': repo, 'ref': delta.BRANCH, 'sha': delta.HEAD},
+            'base': {'repo': repo, 'ref': 'main', 'sha': delta.BASE}}
+        parents = [{'sha': delta.PRIOR_HEAD}, {'sha': delta.BASE}]
+        reader.commit.return_value = {'sha': delta.HEAD, 'tree': {'sha': delta.TREE}, 'parents': parents}
+        with patch.object(quality, 'verify_hosted_jobs') as hosted:
+            delta.current_subject(quality, reader, self.ref['identity'])
+            hosted.assert_called_once_with(reader, delta.HOSTED, self.ref['identity'])
+            hosted.reset_mock()
+            for invalid in (parents[1:], parents[::-1]):
+                reader.commit.return_value['parents'] = invalid
+                with self.assertRaises(ValueError):
+                    delta.current_subject(quality, reader, self.ref['identity'])
+            hosted.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

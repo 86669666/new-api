@@ -52,7 +52,7 @@ def seal(admission_bytes, capture_bytes, quality_bytes, release, *, policy, now)
 def complete_terminal_check(check_id, request, token, reader, *, policy, clock=time.time):
     """Update precisely one already-staged check using a supplied App token."""
     policy.require(type(check_id) is int and check_id > 0 and
-                   request['schema'] in (policy.TERMINAL_SCHEMA, policy.TERMINAL_SCHEMA_V4, policy.TERMINAL_SCHEMA_V5, policy.TERMINAL_SCHEMA_V6) and
+                   request['schema'] in (policy.TERMINAL_SCHEMA, *policy.TIMED_TERMINAL_SCHEMAS) and
                    request['name'] == policy.PRIVATE_EVIDENCE_GATE, 'invalid terminal completion')
     staged = reader.check(check_id)
     policy.require(staged['id'] == check_id, 'wrong staged check ID')
@@ -62,7 +62,7 @@ def complete_terminal_check(check_id, request, token, reader, *, policy, clock=t
         'summary': 'Complete formal evidence and both independent approvals were verified.',
         'text': policy.consumer.canonical(request).decode(),
     }}
-    timed = request['schema'] in (policy.TERMINAL_SCHEMA_V4, policy.TERMINAL_SCHEMA_V5, policy.TERMINAL_SCHEMA_V6)
+    timed = request['schema'] in policy.TIMED_TERMINAL_SCHEMAS
     if timed:
         now = int(clock())
         reference = request['artifact']
@@ -122,7 +122,8 @@ def publish_terminal(admission, bundle, reader, publisher, journal, installation
 
 def publish_delta(reference, reader, fetch, publication, journal, installation_token, terminal_run,
                   *, policy, clock=time.time):
-    request = policy.delta.verify(policy, reference, reader, fetch, terminal_run, int(clock()))
+    delta = policy.static_delta if reference['schema'] == policy.static_delta.REFERENCE_SCHEMA else policy.delta
+    request = delta.verify(policy, reference, reader, fetch, terminal_run, int(clock()))
     publication.verify_installation(request['repository_id'])
     journal.claim(request)
     check_id = publication.stage(request)
@@ -133,7 +134,7 @@ def publish_delta(reference, reader, fetch, publication, journal, installation_t
     policy.validate_gate(staged, request, completed=False)
     binding = reference['identity']
     staged_at = policy.consumer.evidence.check_times(staged, binding, int(clock()), completed=False)
-    policy.require(policy.delta.verify(policy, reference, reader, fetch, terminal_run, int(clock()),
+    policy.require(delta.verify(policy, reference, reader, fetch, terminal_run, int(clock()),
                                       staged_at=staged_at) == request,
                    'delta evidence changed before signing')
     published = complete_terminal_check(check_id, request, installation_token, reader, policy=policy, clock=clock)
