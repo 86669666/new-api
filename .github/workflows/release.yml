@@ -27,10 +27,14 @@ jobs:
       - id: freeze
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+  # Premerge-only CI rejects this publication caller; postmerge/tag/release
+  # verification remains unsupported. Keep this required quality dependency.
   quality:
     needs: prepare
     permissions:
       contents: read
+      checks: read
+      actions: read
     uses: ./.github/workflows/ci.yml
     with:
       sha: ${{ needs.prepare.outputs.sha }}

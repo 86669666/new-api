@@ -1,15 +1,29 @@
 name: Box formal receipt consumer
+run-name: ${{ inputs.mode == 'terminal' && format('Formal terminal {0}', inputs.intent) || 'Box formal receipt consumer' }}
 on:
   workflow_dispatch:
-permissions:
-  contents: read
-  checks: read
+    inputs:
+      mode:
+        description: Select a protected formal workflow operation
+        type: choice
+        options: [consumer, terminal, preflight]
+        default: consumer
+      intent:
+        description: SHA-256 of the exact evidence and hosted run selected for terminal review
+        type: string
+        required: false
+permissions: {}
 jobs:
-  consume:
-    name: Verify authenticated box receipt
+  legacy:
+    if: github.ref == 'refs/heads/main' && inputs.mode == 'consumer'
+    name: Verify legacy box receipt
     runs-on: ubuntu-latest
     environment: box-formal-consumer
     timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+      actions: read
     steps:
       - name: Require approved immutable workflow revision
         env:
@@ -28,3 +42,78 @@ jobs:
           trusted-sha: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
           admission: ${{ vars.BOX_FORMAL_ADMISSION }}
           token: ${{ github.token }}
+  consume:
+    name: Verify authenticated box receipt
+    if: github.ref == 'refs/heads/codex/formal-quality' && (inputs.mode == 'consumer' || inputs.mode == 'preflight')
+    runs-on: ubuntu-latest
+    environment: box-formal-consumer-v2
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    steps:
+      - name: Require approved immutable workflow revision
+        env:
+          TRUSTED_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_SHA" = "$TRUSTED_SHA"
+          test "$GITHUB_SHA" = "$TRUSTED_SHA"
+          test "$GITHUB_ACTOR_ID" = 358061300
+          test "$GITHUB_RUN_ATTEMPT" = 1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        if: inputs.mode == 'consumer'
+        with:
+          repository: 86669666/new-api
+          ref: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          persist-credentials: false
+      - name: Verify complete private evidence
+        if: inputs.mode == 'consumer'
+        uses: ./.github/actions/box-formal-consumer
+        with:
+          trusted-sha: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          admission: ${{ vars.BOX_FORMAL_ADMISSION }}
+          evidence-token: ${{ secrets.BOX_FORMAL_EVIDENCE_TOKEN }}
+          token: ${{ github.token }}
+  terminal:
+    name: Review formal quality evidence
+    if: github.ref == 'refs/heads/codex/formal-quality' && inputs.mode == 'terminal'
+    runs-on: ubuntu-latest
+    environment: box-formal-terminal
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    steps:
+      - name: Require terminal proof selection
+        env:
+          INTENT: ${{ inputs.intent }}
+        run: '[[ "$INTENT" =~ ^[0-9a-f]{64}$ ]]'
+      - name: Require approved immutable workflow revision
+        env:
+          TRUSTED_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$WORKFLOW_SHA" = "$TRUSTED_SHA"
+          test "$GITHUB_SHA" = "$TRUSTED_SHA"
+          test "$GITHUB_ACTOR_ID" = 358061300
+          test "$GITHUB_RUN_ATTEMPT" = 1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: 86669666/new-api
+          ref: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          persist-credentials: false
+      - name: Verify reviewed execution
+        env:
+          BOX_FORMAL_CONSUMER_SHA: ${{ vars.BOX_FORMAL_CONSUMER_SHA }}
+          BOX_FORMAL_ADMISSION: ${{ vars.BOX_FORMAL_ADMISSION }}
+          BOX_FORMAL_HOSTED_RUN_ID: ${{ vars.BOX_FORMAL_HOSTED_RUN_ID }}
+          BOX_FORMAL_HOSTED_RUN_ATTEMPT: ${{ vars.BOX_FORMAL_HOSTED_RUN_ATTEMPT }}
+          BOX_FORMAL_HOSTED_CI_BLOB: ${{ vars.BOX_FORMAL_HOSTED_CI_BLOB }}
+          BOX_FORMAL_EVIDENCE_TOKEN: ${{ secrets.BOX_FORMAL_EVIDENCE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/ci/quality_results.py terminal

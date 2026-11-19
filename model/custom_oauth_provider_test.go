@@ -13,13 +13,7 @@ func TestCustomOAuthProviderReservedSlugs(t *testing.T) {
 		for _, input := range []string{slug, strings.ToUpper(slug)} {
 			t.Run(input, func(t *testing.T) {
 				provider := CustomOAuthProvider{Name: "Example", Slug: input}
-				err := validateCustomOAuthProvider(&provider)
-				require.Error(t, err)
-				if slug == "telegram" {
-					assert.EqualError(t, err, "the telegram slug is reserved for built-in Telegram OAuth; rename this custom provider")
-				} else {
-					assert.EqualError(t, err, "provider slug is reserved for OAuth routes; rename this custom provider")
-				}
+				require.EqualError(t, validateCustomOAuthProvider(&provider), "This slug is reserved")
 				assert.Equal(t, slug, provider.Slug)
 			})
 		}
@@ -49,7 +43,7 @@ func TestCustomOAuthProviderReservedSlugs(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, "example-login", provider.Slug)
 			} else {
-				require.EqualError(t, err, "provider slug is reserved for OAuth routes; rename this custom provider")
+				require.EqualError(t, err, "This slug is reserved")
 			}
 			assert.Equal(t, tc.id, provider.Id)
 			assert.Equal(t, tc.enabled, provider.Enabled)

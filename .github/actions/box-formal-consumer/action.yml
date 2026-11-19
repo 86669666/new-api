@@ -1,5 +1,5 @@
 name: Consume trusted box formal receipt
-description: Validate the exact App check against protected operator admission
+description: Validate complete exact-candidate quality against the protected App receipt admission
 inputs:
   admission:
     description: Protected environment admission JSON, never PR input
@@ -7,6 +7,9 @@ inputs:
   trusted-sha:
     description: Protected environment immutable consumer revision
     required: true
+  evidence-token:
+    description: Read-only credential for the private formal evidence repository
+    required: false
   token:
     description: Read-only GitHub token
     required: true
@@ -17,5 +20,6 @@ runs:
       env:
         BOX_FORMAL_CONSUMER_SHA: ${{ inputs.trusted-sha }}
         BOX_FORMAL_ADMISSION: ${{ inputs.admission }}
+        BOX_FORMAL_EVIDENCE_TOKEN: ${{ inputs.evidence-token }}
         GITHUB_TOKEN: ${{ inputs.token }}
-      run: python3 "$GITHUB_ACTION_PATH/consumer.py"
+      run: python3 -I -B "$GITHUB_ACTION_PATH/../../../scripts/ci/quality_results.py"
