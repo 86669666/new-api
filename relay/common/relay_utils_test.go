@@ -56,6 +56,28 @@ func TestSanitizeURLForLogKeepsURLWithoutSensitiveQuery(t *testing.T) {
 	assert.Equal(t, rawURL, got)
 }
 
+func TestSanitizeURLForLogRemovesUserinfoAndMasksRepeatedEncodedKeys(t *testing.T) {
+	rawURL := "https://fixture-user:fixture-password@example.test/v1?%61pi_key=fixture-a&api_key=fixture-b&model=a%20b&model=c"
+
+	got, err := url.Parse(SanitizeURLForLog(rawURL))
+	require.NoError(t, err)
+	assert.Nil(t, got.User)
+	assert.Equal(t, "/v1", got.Path)
+	assert.Equal(t, url.Values{"api_key": {"***masked***"}, "model": {"a b", "c"}}, got.Query())
+}
+
+func TestSanitizeURLForLogRejectsUnparseableCredentials(t *testing.T) {
+	for name, rawURL := range map[string]string{
+		"malformed URL": "https://example.test/%zz?token=fixture-secret",
+		"partial query": "https://example.test/path?model=test&t%6Fken=fixture-secret%zz",
+		"opaque URL":    "https:fixture-user:fixture-secret@example.test",
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, "[invalid URL]", SanitizeURLForLog(rawURL))
+		})
+	}
+}
+
 func TestValidateMultipartDirectNormalizesImageField(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := strings.NewReader(`{"model":"wan2.7-i2v","prompt":"animate","image":" https://example.com/first.png "}`)
