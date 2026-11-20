@@ -210,7 +210,7 @@ Proof 同时绑定用户、登录会话、用户鉴权版本、会话版本和 s
 - Hydra Admin 仅供私有管理边界访问，使用可信 TLS，不能发布到公开入口。系统密钥、数据库凭据和管理凭据由仓库外的密钥管理机制提供，限制读取权限；不得写入样例、日志、截图或版本库。
 - 公开客户端必须强制 S256 PKCE：部署要求 `OAUTH2_PKCE_ENFORCED_FOR_PUBLIC_CLIENTS=true`，并验证授权码兑换拒绝缺失或错误的 verifier。客户端使用精确注册的回调地址并验证 issuer、state/nonce；不能以公开客户端身份或 discovery 中出现 S256 代替服务端强制校验。
 - 部署要求 `STRATEGIES_ACCESS_TOKEN=opaque`。OAuth access token 与 OIDC ID token 用途不同；发现文档中的 ID token 签名算法不能证明 access token 是 opaque，也不能用 ID token 代替 API access token。
-- 操作人员必须依据固定 Hydra 版本的配置契约，显式选择并记录 access token 与 refresh token 的 TTL、单位、生效配置及该版本的刷新/过期语义。本文不提供未经验证的数值默认值；不得借用上文面板会话或 PAT 的 TTL。需要可运行配置时，先补齐该固定版本的配置依据，再核对实际生效值。
+- 操作人员必须依据固定 Hydra 版本的配置契约，显式选择并记录 access token 与 refresh token 的 TTL、单位、生效配置及该版本的刷新/过期语义。不得把 Hydra 配置模板里的默认时长当成网关已接受的值，也不得借用上文面板会话或 PAT 的 TTL。网关换票只接受整数 `expires_in`，且必须满足 `1 <= expires_in <= 900`（秒）；超出该闭区间时公开 token 端点返回 503 `temporarily_unavailable`，不发行本地可用的 access token。这是 [`OAuthPublic.Exchange`](../service/oauth_public.go) 的失败关闭上限，不是 Hydra 的默认值。Hydra v26.2.0 配置契约里 `ttl.access_token` 的模板默认是 `1h`。隔离 Hydra 在未改该项时直接换码的 `expires_in` 为 3599，同一网关桥接返回 503；只把该隔离实例的 access token 与 ID token TTL 设为 15 分钟后，`expires_in` 为 899/900，既有授权码、身份令牌、资源、scope、刷新轮换、重放、错误 PKCE、授权码族重用和跨客户端检查通过。部署必须把 `ttl.access_token` 设成使实际 `expires_in` 落在 1 到 900 秒内的值，并记下生效配置。refresh token 的 TTL 不由这一整数上限代表。
 
 拓扑、客户端及 discovery 校验由 [`service/oauth_public.go`](../service/oauth_public.go) 的 `NewOAuthPublic`、`ValidateTopology`、`CurrentOAuthDesktopStatus` 和 `metadata` 实现；环境变量装配见 [`service/oauth_provider.go`](../service/oauth_provider.go)。上述 Hydra 部署要求仍需部署者验证，不能从 gateway 配置校验推定全部已生效。
 
