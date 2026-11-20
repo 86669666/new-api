@@ -1919,5 +1919,60 @@ class InvitationDeltaTests(unittest.TestCase):
             invitation.validate_package(quality, b'unpinned')
 
 
+class OAuthDeltaTests(unittest.TestCase):
+    def test_public_oauth_gate_reads_exact_scope_and_both_approvals(self):
+        oauth = quality.oauth_delta
+        reference = oauth.make_reference(oauth.descriptor(), 'a' * 40, 123, 2000, 'b' * 32)
+        baseline = {'receipt_sha256': 'c' * 64}
+        result = oauth.result(reference, 456, baseline)
+        check = {'id': 789, 'started_at': '1970-01-01T00:42:00Z', 'output': {'text': json.dumps(result)}}
+        reader = Mock()
+        reader.formal_quality_check.return_value = check
+        event = {'number': 254, 'pull_request': {'head': {'sha': oauth.HEAD}}}
+        environment = {'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_RUN_ID': str(oauth.HOSTED['run_id'])}
+        with ExitStack() as stack:
+            for name in ('validate_ci_evidence_reference', 'validate_gate', 'resolve_ci_candidate'):
+                stack.enter_context(patch.object(quality, name))
+            stack.enter_context(patch.object(quality, 'ci_premerge_event', return_value=event))
+            stack.enter_context(patch.object(quality.consumer.evidence, 'check_times'))
+            stack.enter_context(patch.object(oauth, 'historical_baseline', return_value=baseline))
+            stack.enter_context(patch.object(oauth, 'current_subject'))
+            reviewed = stack.enter_context(patch.object(oauth, 'verify_approvals', return_value=2519))
+            self.assertEqual(quality.verify_public_terminal(environment, reader, clock=lambda: 2600), result)
+            reviewed.assert_called_once_with(quality, reader, reference, 456, 2600)
+            check['output']['text'] = json.dumps(dict(result, scope='personal-usage-series-delta'))
+            with self.assertRaisesRegex(ValueError, 'differs from exact scope'):
+                quality.verify_public_terminal(environment, reader, clock=lambda: 2600)
+
+    def test_oauth_reference_scope_timing_and_previous_schema(self):
+        oauth = quality.oauth_delta
+        reference = oauth.make_reference(oauth.descriptor(), 'a' * 40, 123, 2000, 'b' * 32)
+        proof = oauth.result(reference, 456, {'receipt_sha256': 'c' * 64})
+        quality.validate_timed_artifact(proof, 3800)
+        self.assertEqual(proof['scope'], 'oauth-application-revocation-readiness')
+        self.assertEqual(proof['baseline']['pull_number'], 257)
+        for invalid_schema in (quality.TERMINAL_SCHEMA_V9, quality.TERMINAL_SCHEMA_V8):
+            with self.subTest(invalid_schema=invalid_schema), self.assertRaises(ValueError):
+                quality.validate_timed_artifact(dict(proof, schema=invalid_schema), 3800)
+        with self.assertRaises(ValueError):
+            quality.validate_timed_artifact(proof, 3801)
+
+    def test_oauth_reference_rejects_mutated_candidate_artifact_and_approval_run(self):
+        oauth = quality.oauth_delta
+        reference = oauth.make_reference(oauth.descriptor(), 'a' * 40, 123, 2000, 'b' * 32)
+        for field, substitute in [('pull_number', 257), ('candidate_sha', 'd' * 40),
+                                  ('candidate_tree', 'e' * 40), ('base_sha', 'f' * 40)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                malformed = copy.deepcopy(reference)
+                malformed['identity'][field] = substitute
+                oauth.validate_reference(malformed, 2000)
+        with self.assertRaises(ValueError):
+            oauth.validate_reference(dict(reference, artifact=dict(reference['artifact'], bytes=9983.0)), 2000)
+        with self.assertRaises(ValueError):
+            oauth.validate_reference(dict(reference, consumer_run=True), 2000)
+        with self.assertRaises(ValueError):
+            oauth.validate_package(quality, b'unpinned')
+
+
 if __name__ == '__main__':
     unittest.main()
