@@ -1,9 +1,11 @@
 package channel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -496,8 +498,27 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	resp, err := relayClient.Do(req)
 	if err != nil {
-		logger.LogError(c, common2.LogText("do request failed: %s", err.Error()))
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
+		// Transport errors can carry credentials in the URL and nested messages.
+		cause := err
+		if requestErr, ok := err.(*url.Error); ok {
+			cause = requestErr.Err
+		}
+		reason := fmt.Sprintf("%T", cause)
+		var networkErr net.Error
+		var dnsErr *net.DNSError
+		switch {
+		case errors.Is(err, context.Canceled):
+			reason = "request canceled"
+		case errors.As(err, &networkErr) && networkErr.Timeout():
+			reason = "timeout"
+		case errors.As(err, &dnsErr):
+			reason = "DNS lookup failed"
+		}
+		detail := fmt.Sprintf("%s (%s)", common.SanitizeURLForLog(req.URL.String()), reason)
+		logger.LogError(c, common2.LogText("do request failed: %s", detail))
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, func(apiErr *types.NewAPIError) {
+			apiErr.SetMessage("upstream error: do request failed")
+		})
 	}
 	if resp == nil {
 		return nil, errors.New("resp is nil")

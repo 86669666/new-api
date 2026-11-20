@@ -1,16 +1,121 @@
 package channel
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type requestLogTransport func(*http.Request) (*http.Response, error)
+
+func (f requestLogTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestDoRequestTransportErrorLogRedaction(t *testing.T) {
+	var logs bytes.Buffer
+	common.LogWriterMu.Lock()
+	oldWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logs
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = oldWriter
+		common.LogWriterMu.Unlock()
+	})
+
+	debugLog, err := os.CreateTemp(t.TempDir(), "debug")
+	require.NoError(t, err)
+	oldStdout := os.Stdout
+	os.Stdout = debugLog
+	oldDebug := kitutil.Debug.Swap(true)
+	t.Cleanup(func() {
+		kitutil.Debug.Store(oldDebug)
+		os.Stdout = oldStdout
+		require.NoError(t, debugLog.Close())
+	})
+
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	client, err := service.GetHttpClientWithProxySettings("", info.ChannelSetting)
+	require.NoError(t, err)
+	oldTransport := client.Transport
+	t.Cleanup(func() { client.Transport = oldTransport })
+	const rawURL = "https://fixture-user:fixture-password@upstream.invalid/v1/chat?%61pi_key=fixture-a&api_key=fixture-b&mode=sse"
+	const privateDetail = "fixture-transport-detail"
+	typedError := types.NewError(errors.New(privateDetail), types.ErrorCodeInvalidRequest,
+		types.ErrOptionWithStatusCode(http.StatusBadRequest),
+		types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+
+	for _, tc := range []struct {
+		name       string
+		cause      error
+		diagnostic string
+	}{
+		{"DNS", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: privateDetail}}, "DNS lookup failed"},
+		{"timeout", context.DeadlineExceeded, "timeout"},
+		{"canceled", context.Canceled, "request canceled"},
+		{"structured error", typedError, "*types.NewAPIError"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs.Reset()
+			var sentURL string
+			client.Transport = requestLogTransport(func(req *http.Request) (*http.Response, error) {
+				sentURL = req.URL.String()
+				return nil, tc.cause
+			})
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
+			req, err := http.NewRequest(http.MethodPost, rawURL, nil)
+			require.NoError(t, err)
+			resp, err := DoRequest(c, req, info)
+
+			assert.Nil(t, resp)
+			var apiErr *types.NewAPIError
+			require.ErrorAs(t, err, &apiErr)
+			if tc.cause == typedError {
+				assert.Equal(t, types.ErrorCodeInvalidRequest, apiErr.GetErrorCode())
+				assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+				assert.False(t, types.IsRecordErrorLog(apiErr))
+			} else {
+				assert.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
+				assert.Equal(t, http.StatusInternalServerError, apiErr.StatusCode)
+			}
+			assert.EqualError(t, err, "upstream error: do request failed")
+			assert.Equal(t, rawURL, sentURL)
+			assert.Equal(t, rawURL, req.URL.String())
+
+			logged := logs.String()
+			assert.Contains(t, logged, "upstream.invalid/v1/chat")
+			assert.Contains(t, logged, "mode=sse")
+			assert.Contains(t, logged, tc.diagnostic)
+			for _, sensitive := range []string{"fixture-user", "fixture-password", "fixture-a", "fixture-b", privateDetail} {
+				assert.False(t, strings.Contains(logged, sensitive), "private data reached the server log")
+			}
+		})
+	}
+
+	debugOutput, err := os.ReadFile(debugLog.Name())
+	require.NoError(t, err)
+	for _, sensitive := range []string{"fixture-user", "fixture-password", "fixture-a", "fixture-b", privateDetail} {
+		assert.False(t, strings.Contains(string(debugOutput), sensitive), "private data reached debug output")
+	}
+}
 
 func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	recorder := httptest.NewRecorder()
