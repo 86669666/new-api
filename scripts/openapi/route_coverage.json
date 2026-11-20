@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "source": "router/task-router.go",
+  "function": "SetTaskRouter",
+  "documents": ["docs/openapi/api.json", "docs/openapi/relay.json"],
+  "scope": "Issue3 W5 first slice: static registrations in task-router.go only. Explicit deferrals are documentation debt, not documented coverage or runtime verification.",
+  "routes": [
+    {
+      "method": "POST",
+      "path": "/v1/tasks/:key",
+      "classification": "deferred",
+      "issue": "https://github.com/86669666/new-api/issues/3",
+      "reason": "SetTaskRouter taskSubmitRouter.POST registers generic plugin submission; neither existing api.json nor relay.json paths declares this operation. Defer its OpenAPI contract to issue3; organization-scoped task operations do not cover it."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/:key",
+      "classification": "deferred",
+      "issue": "https://github.com/86669666/new-api/issues/3",
+      "reason": "SetTaskRouter taskReadRouter.GET registers generic task lookup; neither existing OpenAPI document declares this operation. Defer to issue3; this :key is a task identifier, not an organization route alias."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/:key/artifacts",
+      "classification": "deferred",
+      "issue": "https://github.com/86669666/new-api/issues/3",
+      "reason": "SetTaskRouter taskReadRouter.GET registers generic artifact listing; the operation is absent from both existing OpenAPI documents. Defer to issue3 without treating organization task documentation as equivalent."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/:key/artifacts/:artifact_key/content",
+      "classification": "deferred",
+      "issue": "https://github.com/86669666/new-api/issues/3",
+      "reason": "SetTaskRouter taskContentRouter.GET registers generic artifact content access. Neither existing OpenAPI document declares it; its token-or-artifact-access and content contract remain documentation debt owned by issue3."
+    },
+    {
+      "method": "HEAD",
+      "path": "/v1/tasks/:key/artifacts/:artifact_key/content",
+      "classification": "deferred",
+      "issue": "https://github.com/86669666/new-api/issues/3",
+      "reason": "SetTaskRouter taskContentRouter.HEAD is a distinct registration. Neither existing OpenAPI document declares HEAD here; GET is not HEAD coverage. Defer its explicit contract to issue3."
+    }
+  ]
+}

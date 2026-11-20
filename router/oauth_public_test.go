@@ -1717,7 +1717,7 @@ func TestOAuthAuthorizedAppRevokeReadiness(t *testing.T) {
 	common.IsMasterNode = true
 	require.NoError(t, model.InitOAuthGrantStore(true))
 	common.IsMasterNode = false
-	require.NoError(t, f.db.AutoMigrate(&model.OAuthDerivedTokenSource{}))
+	require.NoError(t, f.db.AutoMigrate(&model.Token{}))
 	oldReady := model.OAuthCleanupReady()
 	t.Cleanup(func() { require.NoError(t, model.InitOAuthCleanupStore(oldReady)) })
 	userID := f.users["owner"].Id
@@ -1739,8 +1739,18 @@ func TestOAuthAuthorizedAppRevokeReadiness(t *testing.T) {
 	source := &model.OAuthDerivedTokenSource{GrantRef: target.GrantRef, UserID: userID, SchemaVersion: 1, QuotaLimit: 1000, ExpiresAt: now + 600,
 		PolicyHash: strings.Repeat("b", 64), BindingHash: strings.Repeat("c", 64), VerifiedAt: now - 10, ProofExpiresAt: now + 50, PermitDeadline: now + 40,
 		VerifiedMethod: "password", ProofFlowID: 1}
-	require.NoError(t, f.db.Create(source).Error)
 	require.NoError(t, model.InitOAuthCleanupStore(false))
+	if os.Getenv("NEWAPI_BOOTSTRAP_CLIENT") == "" {
+		t.Run("missing_source_store_refuses_local_revocation", func(t *testing.T) {
+			require.ErrorIs(t, model.RevokeAuthorizedOAuthApp(t.Context(), userID, target.ClientID), model.ErrOAuthDerivedTokenUnknown)
+			var stored model.OAuthGrant
+			require.NoError(t, f.db.Where("grant_ref = ?", target.GrantRef).First(&stored).Error)
+			assert.Zero(t, stored.RevokedAt)
+			assert.Equal(t, "approved", stored.State)
+		})
+		require.NoError(t, f.db.AutoMigrate(&model.OAuthDerivedTokenSource{}))
+	}
+	require.NoError(t, f.db.Create(source).Error)
 	require.ErrorIs(t, model.RevokeAuthorizedOAuthApp(t.Context(), userID, target.ClientID), model.ErrOAuthDerivedTokenUnknown)
 	var storedTarget, storedOther model.OAuthGrant
 	require.NoError(t, f.db.Where("grant_ref = ?", target.GrantRef).First(&storedTarget).Error)
@@ -4224,21 +4234,34 @@ func TestSessionRevocationS1RealRedis(t *testing.T) {
 			require.NotEmpty(t, physical, "observe the real cache key instead of duplicating its HMAC naming")
 			if scenario == "credential_rollback" {
 				require.NoError(t, model.PublishUserAuthCache(userID))
+				var versionKeys []string
+				hook.mu.Lock()
+				for key := range hook.keys {
+					if strings.HasPrefix(key, prefix+"auth:user:version:") {
+						versionKeys = append(versionKeys, key)
+					}
+				}
+				hook.mu.Unlock()
+				require.Len(t, versionKeys, 1, "observe the committed floor key written by the real cache")
+				versionKey := versionKeys[0]
+				floorBefore, err := control.Get(t.Context(), versionKey).Int64()
+				require.NoError(t, err)
+				require.EqualValues(t, 1, floorBefore)
 				forced := errors.New("S1 event create failed")
 				require.NoError(t, f.db.Callback().Create().Before("gorm:create").Register("s1:redis-intent", func(tx *gorm.DB) {
 					if _, ok := tx.Statement.Dest.(*model.SessionRevocationEvent); ok {
 						tx.AddError(forced)
 					}
 				}))
-				_, err := model.BumpUserAuthVersion(userID)
-				assert.ErrorIs(t, err, forced)
+				_, err = model.BumpUserAuthVersion(userID)
+				require.ErrorIs(t, err, forced)
 				require.NoError(t, f.db.Callback().Create().Remove("s1:redis-intent"))
 				var user model.User
 				require.NoError(t, f.db.First(&user, userID).Error)
 				assert.EqualValues(t, 1, user.AuthVersion)
-				floor, err := control.Get(t.Context(), prefix+fmt.Sprintf("auth:user:version:%d", userID)).Int64()
+				floor, err := control.Get(t.Context(), versionKey).Int64()
 				require.NoError(t, err)
-				assert.EqualValues(t, 1, floor, "a rolled back credential cannot publish committed version2")
+				assert.Equal(t, floorBefore, floor, "a rolled back credential cannot publish a new committed version")
 				var count int64
 				require.NoError(t, f.db.Model(&model.SessionRevocationEvent{}).Where("user_id = ?", userID).Count(&count).Error)
 				assert.Zero(t, count)
