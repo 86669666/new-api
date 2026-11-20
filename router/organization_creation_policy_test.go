@@ -70,7 +70,9 @@ func TestOrganizationCreationRatePolicy(t *testing.T) {
 						u := &model.User{Id: id, Username: "creation-" + common.NewRequestId(), Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: strconv.Itoa(id)}
 						require.NoError(t, f.db.Create(u).Error)
 						f.users[actor] = u
-						keys = append(keys, fmt.Sprintf("user:%d", id), fmt.Sprintf("auth:user:fence:%d", id), fmt.Sprintf("auth:user:version:%d", id), fmt.Sprintf("rateLimit:v2:user:UC:organization-create:%d", id), fmt.Sprintf("rateLimit:v2:user:UC:security-verification:%d", id))
+						cacheKey := fmt.Sprintf("user:%d", id)
+						keys = append(keys, cacheKey, "auth:user:fence:{"+cacheKey+"}", "auth:user:version:{"+cacheKey+"}",
+							fmt.Sprintf("rateLimit:v2:user:UC:organization-create:%d", id), fmt.Sprintf("rateLimit:v2:user:UC:security-verification:%d", id))
 						for _, suffix := range []string{"", "-second"} {
 							sid := "creation-" + common.NewRequestId()
 							require.NoError(t, model.CreateUserSession(&model.UserSession{SID: sid, UserID: id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("a", 64), LoginMethod: "password", ExpiresAt: time.Now().Unix() + 3600}))
@@ -972,7 +974,9 @@ func TestOrganizationCreationIdempotency(t *testing.T) {
 			if backend == "redis" {
 				client := redis.NewClient(&redis.Options{Addr: os.Getenv("NEWAPI_CREATION_REDIS_ADDR"), DB: 15, MaxRetries: -1})
 				require.NoError(t, client.Ping(t.Context()).Err())
-				keys := []string{fmt.Sprintf("user:%d", id), fmt.Sprintf("auth:user:fence:%d", id), fmt.Sprintf("auth:user:version:%d", id), fmt.Sprintf("rateLimit:v2:user:UC:organization-create:%d", id), "auth:session:" + common.GenerateHMACWithKey([]byte("user-session-cache-v1:"+common.SessionSecret), sid)}
+				cacheKey := fmt.Sprintf("user:%d", id)
+				keys := []string{cacheKey, "auth:user:fence:{" + cacheKey + "}", "auth:user:version:{" + cacheKey + "}",
+					fmt.Sprintf("rateLimit:v2:user:UC:organization-create:%d", id), "auth:session:" + common.GenerateHMACWithKey([]byte("user-session-cache-v1:"+common.SessionSecret), sid)}
 				count, err := client.Exists(t.Context(), keys...).Result()
 				require.NoError(t, err)
 				require.Zero(t, count)

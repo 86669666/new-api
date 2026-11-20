@@ -4301,8 +4301,8 @@ func TestOrganizationLifecycleRedisAuthorityFaults(t *testing.T) {
 			uid := c.users["owner"].Id
 			ctx := t.Context()
 			cacheKey := fmt.Sprintf("user:%d", uid)
-			fenceKey := fmt.Sprintf("auth:user:fence:%d", uid)
-			versionKey := fmt.Sprintf("auth:user:version:%d", uid)
+			fenceKey := "auth:user:fence:{" + cacheKey + "}"
+			versionKey := "auth:user:version:{" + cacheKey + "}"
 			t.Cleanup(func() { require.NoError(t, common.RDB.Del(context.Background(), cacheKey, fenceKey, versionKey).Err()) })
 			before, err := model.GetUserCache(uid)
 			require.NoError(t, err)
@@ -4325,15 +4325,21 @@ func TestOrganizationLifecycleRedisAuthorityFaults(t *testing.T) {
 				require.NoError(t, common.RDB.Del(ctx, versionKey).Err())
 				require.NoError(t, common.RDB.LPush(ctx, versionKey, "owned-wrong-type").Err())
 				next, err := model.BumpUserAuthVersion(uid)
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), "WRONGTYPE")
+				var pending *model.SessionRevocationPendingError
+				require.ErrorAs(t, err, &pending)
+				assert.True(t, pending.CredentialChangeCommitted)
 				assert.Equal(t, version+1, next)
 				var current model.User
 				require.NoError(t, c.db.First(&current, uid).Error)
 				assert.Equal(t, next, current.AuthVersion, "publication failure cannot undo an already committed authority change")
+				var revocation model.SessionRevocationEvent
+				require.NoError(t, c.db.Where("event_ref = ? AND user_id = ?", pending.EventRef, uid).First(&revocation).Error)
+				assert.Equal(t, "pending", revocation.State)
 				status, h, body := c.json(t, "GET", c.path()+"/self-state", "owner", nil, "")
 				organizationError(t, status, h, body, 401, "AUTH_SESSION_REVOKED")
 				require.NoError(t, common.RDB.Del(ctx, versionKey).Err())
+				require.NoError(t, model.CompleteSessionSecurityChange(&revocation, true))
+				assert.Equal(t, "local_complete", revocation.State)
 				require.NoError(t, model.PublishUserAuthCache(uid))
 				fresh, err := model.GetUserCache(uid)
 				require.NoError(t, err)

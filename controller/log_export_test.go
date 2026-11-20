@@ -462,8 +462,8 @@ func TestUserQuotaDataSeriesContract(t *testing.T) {
 	model.SaveQuotaDataCache()
 	var expected []any
 	require.NoError(t, common.UnmarshalJsonStr(fmt.Sprintf(`[
-		{"id":0,"user_id":1,"username":"alice","model_name":"owned-a","created_at":%d,"use_group":"","token_id":0,"channel_id":0,"node_name":"","token_used":8,"count":2,"quota":19},
-		{"id":0,"user_id":1,"username":"alice","model_name":"owned-b","created_at":%d,"use_group":"","token_id":0,"channel_id":0,"node_name":"","token_used":2,"count":1,"quota":6}
+		{"id":0,"user_id":1,"username":"alice","model_name":"owned-a","created_at":%d,"use_group":"","token_id":0,"channel_id":0,"node_name":"","token_used":8,"count":2,"quota":19,"cache_read_tokens":0,"cache_creation_tokens":0},
+		{"id":0,"user_id":1,"username":"alice","model_name":"owned-b","created_at":%d,"use_group":"","token_id":0,"channel_id":0,"node_name":"","token_used":2,"count":1,"quota":6,"cache_read_tokens":0,"cache_creation_tokens":0}
 	]`, bucket, bucket+3600), &expected))
 	for _, tc := range []struct {
 		name    string

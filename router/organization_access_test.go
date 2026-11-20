@@ -3998,7 +3998,7 @@ func TestOrganizationAccessHTTP(t *testing.T) {
 		for _, org := range []string{a, b, "0"} {
 			wg.Go(func() {
 				s, _, d := f.request(t, "GET", "/api/organization-context?org_id="+org, "member", "", nil)
-				if assert.Equal(t, 200, s) {
+				if assert.Equal(t, http.StatusOK, s, "tab selector=%s response_code=%v", org, d["code"]) {
 					ctx := d["data"].(map[string]any)
 					assert.Len(t, ctx, 4)
 					assert.Equal(t, org, ctx["org_id"])
