@@ -266,6 +266,16 @@ func CheckOAuthCleanupWithTx(tx *gorm.DB, issuer string, userID int, client, sid
 	return nil
 }
 
+// Without issuer cleanup, local revocation requires a readable source store
+// with no derived-token sources for this user.
+func requireNoOAuthDerivedTokenSources(tx *gorm.DB, userID int) error {
+	var sources int64
+	if err := tx.Model(&OAuthDerivedTokenSource{}).Where("user_id = ?", userID).Count(&sources).Error; err != nil || sources != 0 {
+		return ErrOAuthDerivedTokenUnknown
+	}
+	return nil
+}
+
 // RevokeOAuthWithTx joins an existing security transaction. The caller holds
 // the user lock and must use a fixed reason, never a token or caller error.
 // Scope values are trusted local IDs; they do not authenticate a caller.
@@ -280,11 +290,7 @@ func RevokeOAuthWithTx(tx *gorm.DB, userID int, scope, value, reason string, ses
 		if len(sessionEventRef) != 0 {
 			return ErrSessionRevocationStore
 		}
-		var sources int64
-		if err := tx.Model(&OAuthDerivedTokenSource{}).Where("user_id = ?", userID).Count(&sources).Error; err != nil || sources != 0 {
-			return ErrOAuthDerivedTokenUnknown
-		}
-		return nil
+		return requireNoOAuthDerivedTokenSources(tx, userID)
 	}
 	if !slices.Contains([]string{"user", "client", "sid", "others", "grant"}, scope) || scope != "user" && value == "" {
 		return ErrOAuthGrantInvalid

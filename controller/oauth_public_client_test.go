@@ -42,7 +42,7 @@ import (
 
 func TestOAuthPublicClientManagementAndAuthorizedApps(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.OAuthPublicClient{}, &model.OAuthGrant{}, &model.CustomOAuthProvider{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.OAuthPublicClient{}, &model.OAuthGrant{}, &model.OAuthDerivedTokenSource{}, &model.CustomOAuthProvider{}))
 	require.NoError(t, model.DB.AutoMigrate(&model.OAuthPublicClient{}))
 	require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
 	user.Role = common.RoleRootUser
