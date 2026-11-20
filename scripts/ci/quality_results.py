@@ -64,6 +64,10 @@ _oauth_delta_spec = importlib.util.spec_from_file_location(
     'newapi_reviewed_oauth_delta', Path(__file__).with_name('formal_oauth_delta.py'))
 oauth_delta = importlib.util.module_from_spec(_oauth_delta_spec)
 _oauth_delta_spec.loader.exec_module(oauth_delta)
+_client_events_delta_spec = importlib.util.spec_from_file_location(
+    'newapi_reviewed_client_events_delta', Path(__file__).with_name('formal_client_events_delta.py'))
+client_events_delta = importlib.util.module_from_spec(_client_events_delta_spec)
+_client_events_delta_spec.loader.exec_module(client_events_delta)
 
 require = consumer.require
 REPOSITORY = consumer.REPOSITORY
@@ -79,8 +83,10 @@ TERMINAL_SCHEMA_V7 = static_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V8 = usage_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V9 = invitation_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V10 = oauth_delta.TERMINAL_SCHEMA
+TERMINAL_SCHEMA_V11 = client_events_delta.TERMINAL_SCHEMA
 TIMED_TERMINAL_SCHEMAS = (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5, TERMINAL_SCHEMA_V6,
-                          TERMINAL_SCHEMA_V7, TERMINAL_SCHEMA_V8, TERMINAL_SCHEMA_V9, TERMINAL_SCHEMA_V10)
+                          TERMINAL_SCHEMA_V7, TERMINAL_SCHEMA_V8, TERMINAL_SCHEMA_V9,
+                          TERMINAL_SCHEMA_V10, TERMINAL_SCHEMA_V11)
 REUSE_HOSTED = {'run_id': 44403089902, 'attempt': 1, 'workflow_blob': 'c123990e4a8c9fd981b721455a8edbc65b62dfc5'}
 FORMAL_WORKFLOW_ID = 402689897
 CI_WORKFLOW_ID = 389317795
@@ -237,6 +243,8 @@ def validate_timed_artifact(request, now):
         invitation_delta.validate_reference(request['artifact'], now)
     elif request['schema'] == TERMINAL_SCHEMA_V10:
         oauth_delta.validate_reference(request['artifact'], now)
+    elif request['schema'] == TERMINAL_SCHEMA_V11:
+        client_events_delta.validate_reference(request['artifact'], now)
     else:
         consumer.evidence.validate_reference(request['artifact'], now)
 
@@ -542,6 +550,8 @@ def verify_public_terminal(environment, reader, *, clock=time.time):
         return invitation_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
     if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V10:
         return oauth_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
+    if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V11:
+        return client_events_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
     fields = {'schema', 'name', 'artifact', 'quality_sha256', 'repository', 'repository_id', 'candidate_sha',
               'candidate_tree', 'receipt_sha256', 'check_run_id', 'admission_id', 'invocation', 'attempt_id',
               'expires_at', 'consumer_run', 'terminal_run', 'hosted'}
@@ -1126,7 +1136,8 @@ def main():
                            ['reuse-consumer'], ['reuse-terminal'], ['delta-consumer'], ['delta-terminal'],
                            ['static-delta-consumer'], ['static-delta-terminal'], ['usage-delta-consumer'], ['usage-delta-terminal'],
                            ['invitation-delta-consumer'], ['invitation-delta-terminal'],
-                           ['oauth-delta-consumer'], ['oauth-delta-terminal']),
+                           ['oauth-delta-consumer'], ['oauth-delta-terminal'],
+                           ['client-events-delta-consumer'], ['client-events-delta-terminal']),
             'unknown quality operation')
     if sys.argv[1:] == ['premerge']:
         result = resolve_ci_candidate(os.environ)
@@ -1148,6 +1159,9 @@ def main():
     elif sys.argv[1:] in (['oauth-delta-consumer'], ['oauth-delta-terminal']):
         result = oauth_delta.verify_dispatch(sys.modules[__name__], os.environ,
                                               terminal=sys.argv[1] == 'oauth-delta-terminal', clock=time.time)
+    elif sys.argv[1:] in (['client-events-delta-consumer'], ['client-events-delta-terminal']):
+        result = client_events_delta.verify_dispatch(
+            sys.modules[__name__], os.environ, terminal=sys.argv[1] == 'client-events-delta-terminal', clock=time.time)
     elif sys.argv[1:] == ['terminal']:
         now = int(time.time())
         trusted_sha = consumer.trusted_consumer_context(os.environ, private=True)
