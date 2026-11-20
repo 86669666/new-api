@@ -940,20 +940,28 @@ func UpdateClientEventsConfigOption(value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var matches []Option
-		if err := tx.Where("LOWER(TRIM("+commonKeyCol+")) = LOWER(?)", operation_setting.ClientEventsConfigKey).Find(&matches).Error; err != nil {
+		// Establish a canonical lock target without a racy FirstOrCreate read.
+		option := Option{Key: operation_setting.ClientEventsConfigKey, Value: value}
+		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&option)
+		if created.Error != nil {
+			return created.Error
+		}
+		current, err := lockClientEventsOption(tx)
+		if err != nil {
 			return err
 		}
-		if len(matches) > 1 || len(matches) == 1 && matches[0].Key != operation_setting.ClientEventsConfigKey {
+		old, oldErr := operation_setting.ParseClientEventsConfig(current.Value)
+		fields, _ := common.DecodeRawJSONObject([]byte(value))
+		if _, explicit := fields["allow_anonymous"]; !explicit && (oldErr != nil || old.AllowAnonymous) {
 			return operation_setting.ErrClientEventsConfig
 		}
-		option := Option{Key: operation_setting.ClientEventsConfigKey}
-		if err := tx.FirstOrCreate(&option, Option{Key: option.Key}).Error; err != nil {
-			return err
+		next, _ := operation_setting.ParseClientEventsConfig(value)
+		if next.AllowAnonymous && (created.RowsAffected > 0 || oldErr != nil || !old.AllowAnonymous) {
+			if err := validateAnonymousClientEventStore(tx); err != nil {
+				return err
+			}
 		}
-		if option.Key != operation_setting.ClientEventsConfigKey {
-			return operation_setting.ErrClientEventsConfig
-		}
+		option = current
 		option.Value = value
 		return tx.Save(&option).Error
 	})
