@@ -350,11 +350,14 @@ export function compilePersonalLogPagination() {
 `);
 await writeFile(consumer, await readFile(consumer, 'utf8') + `
 export async function compilePersonalQuotaSeries() {
-  const result = await client.${dataService}.getApiDataSelf({ startTimestamp: '1700000000', endTimestamp: '1700003600' });
+  const result = await client.${dataService}.getApiDataSelf({ startTimestamp: '1700000000', endTimestamp: '1700003600', granularity: 'day' });
   // The pinned generator widens boolean enums; also narrow by the success data property.
   if (result.success !== true || !('data' in result)) return null;
   const rows: client.PersonalQuotaDataPoint[] | null = result.data;
   const quota: number | undefined = rows?.[0]?.quota;
+  const granularity: 'hour' | 'day' = result.granularity;
+  // @ts-expect-error only supported aggregation values are accepted
+  client.${dataService}.getApiDataSelf({ granularity: 'week' });
   const timestamp: number | undefined = rows?.[0]?.created_at;
   const status = await client.${statusService}.getApiStatus({});
   const enabled: boolean | undefined = status.data.enable_data_export;
@@ -1048,6 +1051,18 @@ try {
     assert.equal(new Headers(request.init.headers).get('Authorization'), 'Bearer fixture-series-dashboard');
     assert.equal(new Headers(request.init.headers).has('X-Security-Proof'), false);
   }
+  responseBody = { success: true, message: '', data: [row], granularity: 'day', quota_per_unit: 500000, data_complete: false, enable_data_export: false };
+  const dailyResult = await api[dataService].getApiDataSelf({ startTimestamp: '1700000000', endTimestamp: '1700003600', granularity: 'day' });
+  assert.deepEqual(dailyResult, responseBody);
+  assert.equal(new URL(calls.at(-1).url).searchParams.get('granularity'), 'day');
+  responseStatus = 400;
+  responseBody = { success: false, code: 'INVALID_GRANULARITY', message: 'Invalid parameters', message_key: 'Invalid parameters' };
+  await assert.rejects(api[dataService].getApiDataSelf({ granularity: 'week' }), error => {
+    assert.equal(error.status, 400);
+    assert.deepEqual(error.body, responseBody);
+    return true;
+  });
+  responseStatus = 200;
   personalSeriesStubbedRequests = calls.length - beforeSeriesRequests;
   api.OpenAPI.TOKEN = undefined;
   const beforeCollectionStatusRequests = calls.length;

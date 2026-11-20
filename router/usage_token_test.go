@@ -339,7 +339,7 @@ func TestTokenUsageReadOnlyHTTP(t *testing.T) {
 					status, _, body := f.request(t, "GET", "/api/status", "", "", nil)
 					require.Equal(t, http.StatusOK, status)
 					data := body["data"].(map[string]any)
-					assert.Equal(t, map[string]any{"token_usage_logs": consume, "oauth": false, "model_metadata": false}, data["client_features"])
+					assert.Equal(t, map[string]any{"token_usage_logs": consume, "oauth": false, "model_metadata": true}, data["client_features"])
 					assert.Equal(t, map[string]any{"enabled": false}, data["oauth"])
 					request := httptest.NewRequest(http.MethodGet, "/api/status", nil)
 					request.Host = "untrusted-discovery.invalid"

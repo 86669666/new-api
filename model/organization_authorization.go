@@ -224,7 +224,10 @@ func withOrganizationWithContext(parent context.Context, identity AuthSessionIde
 	slices.Sort(ids)
 	ids = slices.Compact(ids)
 	return db.Transaction(func(tx *gorm.DB) error {
-		if mutate && common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		if identity.UserID > 0 && common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+			// Session validation takes the SQLite write lock even for reads.
+			// Take it before reading participants so a concurrent request
+			// cannot force this transaction to upgrade a stale read snapshot.
 			if err := tx.Model(&User{}).Where("id = ?", identity.UserID).UpdateColumn("auth_version", gorm.Expr("auth_version")).Error; err != nil {
 				return err
 			}

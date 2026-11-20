@@ -83,7 +83,7 @@ async function renderLogs(props: {
         all_subscriptions: [{ subscription: { status: 'expired' } }],
       }
     } else if (
-      url.startsWith('/api/log?') ||
+      url.startsWith('/api/log/?') ||
       url.startsWith('/api/log/self?')
     ) {
       data = { items: records, total: records.length }
@@ -118,6 +118,11 @@ async function renderLogs(props: {
   )
   await screen.findAllByText('$0.01')
   await waitFor(() => expect(client.isFetching()).toBe(0))
+  expect(api.get).toHaveBeenCalledWith(
+    expect.stringMatching(
+      props.role === ROLE.ADMIN ? /^\/api\/log\/\?/ : /^\/api\/log\/self\?/
+    )
+  )
   return client
 }
 
@@ -188,6 +193,9 @@ test('uses personal subscriptions when an admin switches to only-self view', asy
 
   await user.click(screen.getByRole('button', { name: 'Switch scope' }))
   await waitFor(() => expect(client.isFetching()).toBe(0))
+  expect(api.get).toHaveBeenCalledWith(
+    expect.stringMatching(/^\/api\/log\/self\?/)
+  )
   expect(screen.queryByRole('img', { name: 'Wallet' })).not.toBeInTheDocument()
   expect(screen.getByRole('img', { name: 'Subscription' })).toBeVisible()
 
