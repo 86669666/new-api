@@ -122,7 +122,11 @@ def publish_terminal(admission, bundle, reader, publisher, journal, installation
 
 def publish_delta(reference, reader, fetch, publication, journal, installation_token, terminal_run,
                   *, policy, clock=time.time):
-    delta = policy.static_delta if reference['schema'] == policy.static_delta.REFERENCE_SCHEMA else policy.delta
+    for delta in (policy.delta, policy.static_delta, policy.usage_delta):
+        if reference['schema'] == delta.REFERENCE_SCHEMA:
+            break
+    else:
+        raise ValueError('unknown formal delta reference schema')
     request = delta.verify(policy, reference, reader, fetch, terminal_run, int(clock()))
     publication.verify_installation(request['repository_id'])
     journal.claim(request)

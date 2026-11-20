@@ -1833,5 +1833,36 @@ class StaticDeltaTests(unittest.TestCase):
             hosted.assert_not_called()
 
 
+class UsageDeltaTests(unittest.TestCase):
+    def test_usage_reference_scope_timing_and_previous_schema(self):
+        usage = quality.usage_delta
+        reference = usage.make_reference(usage.descriptor(), 'a' * 40, 123, 2000, 'b' * 32)
+        proof = usage.result(reference, 456, {'receipt_sha256': 'c' * 64})
+        quality.validate_timed_artifact(proof, 3800)
+        self.assertEqual(proof['scope'], 'personal-usage-series-delta')
+        self.assertEqual(proof['baseline']['pull_number'], 261)
+        for invalid_schema in (quality.TERMINAL_SCHEMA_V7, quality.TERMINAL_SCHEMA_V6):
+            with self.subTest(invalid_schema=invalid_schema), self.assertRaises(ValueError):
+                quality.validate_timed_artifact(dict(proof, schema=invalid_schema), 3800)
+        with self.assertRaises(ValueError):
+            quality.validate_timed_artifact(proof, 3801)
+
+    def test_usage_reference_rejects_mutated_candidate_artifact_and_approval_run(self):
+        usage = quality.usage_delta
+        reference = usage.make_reference(usage.descriptor(), 'a' * 40, 123, 2000, 'b' * 32)
+        for field, substitute in [('pull_number', 257), ('candidate_sha', 'd' * 40),
+                                  ('candidate_tree', 'e' * 40), ('base_sha', 'f' * 40)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                malformed = copy.deepcopy(reference)
+                malformed['identity'][field] = substitute
+                usage.validate_reference(malformed, 2000)
+        with self.assertRaises(ValueError):
+            usage.validate_reference(dict(reference, artifact=dict(reference['artifact'], bytes=16476.0)), 2000)
+        with self.assertRaises(ValueError):
+            usage.validate_reference(dict(reference, consumer_run=True), 2000)
+        with self.assertRaises(ValueError):
+            usage.validate_package(quality, b'unpinned')
+
+
 if __name__ == '__main__':
     unittest.main()
