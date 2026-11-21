@@ -123,7 +123,8 @@ def publish_terminal(admission, bundle, reader, publisher, journal, installation
 def publish_delta(reference, reader, fetch, publication, journal, installation_token, terminal_run,
                   *, policy, clock=time.time):
     for delta in (policy.delta, policy.static_delta, policy.usage_delta,
-                  policy.invitation_delta, policy.oauth_delta, policy.client_events_delta, policy.relay_log_delta):
+                  policy.invitation_delta, policy.oauth_delta, policy.client_events_delta, policy.relay_log_delta,
+                  policy.upstream_errors_delta):
         if reference['schema'] == delta.REFERENCE_SCHEMA:
             break
     else:
