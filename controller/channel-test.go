@@ -455,7 +455,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 				testModel,
 				endpointType,
 				httpResp.StatusCode,
-				err,
+				err.GetErrorType(),
 			))
 			return testResult{
 				context:     c,

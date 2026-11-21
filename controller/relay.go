@@ -145,7 +145,8 @@ func relayRequest(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			service.RecordRequestPolicyTermination(c, newAPIError)
-			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			upstreamURLs := common.UpstreamAddresses(c)
+			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(service.RelayErrorLogMessage(newAPIError, upstreamURLs...))))
 			message, remainingDisplay := newAPIError.Error(), ""
 			if !c.Writer.Written() {
 				switch relayFormat {
@@ -156,7 +157,6 @@ func relayRequest(c *gin.Context, relayFormat types.RelayFormat) {
 				}
 			}
 			newAPIError.SetMessage(common.MessageWithRequestId(message, requestId))
-			upstreamURLs := common.UpstreamAddresses(c)
 			if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() &&
 				strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
 				writeRelayStreamError(c, relayFormat, newAPIError)

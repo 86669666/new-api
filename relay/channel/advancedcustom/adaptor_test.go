@@ -2,8 +2,11 @@ package advancedcustom
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -20,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -65,14 +69,24 @@ func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
 	upstreamURL, err := url.Parse(upstream.URL)
 	require.NoError(t, err)
 	for _, tc := range []struct {
-		name   string
-		proxy  string
-		hidden string
+		name       string
+		proxy      string
+		wantStatus int
 	}{
-		{name: "absolute route host", hidden: "localhost"},
-		{name: "channel proxy host", proxy: "http://egress.private.invalid:8080", hidden: "egress.private.invalid"},
+		{name: "absolute route host", wantStatus: http.StatusForbidden},
+		{name: "channel proxy failure", proxy: "http://proxy.invalid:8080", wantStatus: http.StatusInternalServerError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.proxy != "" {
+				oldDialer := websocket.DefaultDialer
+				dialer := *oldDialer
+				dialer.NetDialContext = func(_ context.Context, _, address string) (net.Conn, error) {
+					assert.Equal(t, "proxy.invalid:8080", address)
+					return nil, errors.New("fixture-private-dial-detail " + address)
+				}
+				websocket.DefaultDialer = &dialer
+				t.Cleanup(func() { websocket.DefaultDialer = oldDialer })
+			}
 			info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
 				Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/realtime", UpstreamPath: "http://localhost:" + upstreamURL.Port() + "/v1/realtime", Converter: relayconvert.ConverterNone}},
 			})
@@ -87,10 +101,20 @@ func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
 
 			var apiErr *types.NewAPIError
 			require.ErrorAs(t, err, &apiErr)
-			require.Contains(t, apiErr.Error(), tc.hidden)
+			assert.Equal(t, tc.wantStatus, apiErr.StatusCode)
+			assert.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
+			if tc.proxy == "" {
+				assert.ErrorIs(t, apiErr, websocket.ErrBadHandshake)
+			}
+			internal, ok := apiErr.RelayError.(types.OpenAIError)
+			require.True(t, ok)
+			for _, detail := range []string{"proxy.invalid", "fixture-private-dial-detail"} {
+				assert.NotContains(t, apiErr.Error(), detail)
+				assert.NotContains(t, internal.Message, detail)
+			}
 			message := apiErr.ToOpenAIError(common.UpstreamAddresses(c)...).Message
 			assert.Contains(t, message, "dial failed to ws://***:"+upstreamURL.Port()+"/***/***")
-			assert.NotContains(t, message, tc.hidden)
+			assert.NotContains(t, message, "localhost")
 		})
 	}
 }

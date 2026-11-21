@@ -130,6 +130,49 @@ func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	require.ErrorIs(t, upstream.Context().Err(), context.Canceled)
 }
 
+type requestURLAdaptor struct {
+	Adaptor
+	target string
+}
+
+func (a requestURLAdaptor) GetRequestURL(*relaycommon.RelayInfo) (string, error) {
+	return a.target, nil
+}
+
+type taskRequestURLAdaptor struct {
+	TaskAdaptor
+	target string
+}
+
+func (a taskRequestURLAdaptor) BuildRequestURL(*relaycommon.RelayInfo) (string, error) {
+	return a.target, nil
+}
+
+func TestUpstreamRequestConstructionErrorOmitsInvalidURL(t *testing.T) {
+	// Construction rejects this URL before any HTTP transport is used.
+	const target = "https://fixture-user:fixture-password@provider.invalid/%zz"
+	adaptor := requestURLAdaptor{target: target}
+	taskAdaptor := taskRequestURLAdaptor{target: target}
+	for _, path := range []string{"api", "form", "task"} {
+		t.Run(path, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			info := &relaycommon.RelayInfo{}
+			var err error
+			switch path {
+			case "api":
+				_, err = DoApiRequest(adaptor, c, info, nil)
+			case "form":
+				_, err = DoFormRequest(adaptor, c, info, nil)
+			case "task":
+				_, err = DoTaskApiRequest(taskAdaptor, c, info, nil)
+			}
+			require.Error(t, err)
+			assert.EqualError(t, err, "new request failed: invalid upstream URL")
+		})
+	}
+}
+
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 	t.Parallel()
 
