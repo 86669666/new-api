@@ -13,6 +13,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -253,20 +254,20 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 			if websocket.IsCloseError(recvErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				break
 			}
-			return nil, types.NewErrorWithStatusCode(
+			return nil, service.MarkUpstreamResponseError(types.NewErrorWithStatusCode(
 				fmt.Errorf("failed to receive message: %w", recvErr),
 				types.ErrorCodeBadResponse,
 				http.StatusInternalServerError,
-			)
+			))
 		}
 
 		switch msg.MsgType {
 		case MsgTypeError:
-			return nil, types.NewErrorWithStatusCode(
+			return nil, service.MarkUpstreamResponseError(types.NewErrorWithStatusCode(
 				fmt.Errorf("received error from server: code=%d, %s", msg.ErrorCode, string(msg.Payload)),
 				types.ErrorCodeBadResponse,
 				http.StatusBadRequest,
-			)
+			))
 		case MsgTypeFrontEndResultServer:
 			continue
 		case MsgTypeAudioOnlyServer:

@@ -41,7 +41,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			if service.SundaySearch(data, "usage") {
 				var simpleResponse dto.SimpleResponse
 				if err := common.Unmarshal([]byte(data), &simpleResponse); err != nil {
-					logger.LogError(c, err.Error())
+					logger.LogError(c, common.LogText("failed to decode TTS stream usage (%T)", err))
 					sr.Error(err)
 				} else if simpleResponse.Usage.TotalTokens != 0 {
 					usage.PromptTokens = simpleResponse.Usage.InputTokens
@@ -58,7 +58,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		// 读取响应体到缓冲区
 		bodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
-			logger.LogError(c, common.LogText("failed to read TTS response body: %v", err))
+			logger.LogError(c, common.LogText("failed to read TTS response body (%T)", err))
 			c.Writer.WriteHeaderNow()
 			return usage
 		}
@@ -67,7 +67,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		c.Writer.WriteHeaderNow()
 		_, err = c.Writer.Write(bodyBytes)
 		if err != nil {
-			logger.LogError(c, common.LogText("failed to write TTS response: %v", err))
+			logger.LogError(c, common.LogText("failed to write TTS response (%T)", err))
 		}
 
 		// 计算音频时长并更新 usage

@@ -817,3 +817,31 @@ func TestGeminiEmbeddingHandlersUsageMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestGeminiNativeStreamRecordsOnlyRecognizedBlockReasons(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, test := range []struct{ name, reason, diagnostic string }{
+		{"known", "SAFETY", "SAFETY"},
+		{"extension", "sample provider category", "UNKNOWN"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini:streamGenerateContent", nil)
+			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatGemini, IsStream: true, DisablePing: true,
+				ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-fixture"}}
+			body := `{"promptFeedback":{"blockReason":"` + test.reason + `"},"usageMetadata":{"promptTokenCount":2,"totalTokenCount":2}}`
+			resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("data: " + body + "\n\n"))}
+			usage, apiErr := GeminiTextGenerationStreamHandler(c, info, resp)
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			assert.True(t, info.PerformanceBusinessRejection)
+			assert.Equal(t, 2, usage.PromptTokens)
+			assert.Equal(t, "gemini_block_reason="+test.diagnostic, common.GetContextKeyString(c, constant.ContextKeyAdminRejectReason))
+			assert.Contains(t, recorder.Body.String(), test.reason)
+		})
+	}
+}

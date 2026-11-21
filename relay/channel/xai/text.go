@@ -46,7 +46,7 @@ func xAIStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var xAIResp *dto.ChatCompletionsStreamResponse
 		if err := common.UnmarshalJsonStr(data, &xAIResp); err != nil {
-			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
+			common.SysLog(common.LogText("error unmarshalling stream response (%T)", err))
 			sr.Error(err)
 			return
 		}
@@ -64,7 +64,7 @@ func xAIStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		openaiResponse := streamResponseXAI2OpenAI(xAIResp, usage)
 		_ = openai.ProcessStreamResponse(*openaiResponse, &responseTextBuilder, &toolCount)
 		if err := helper.ObjectData(c, openaiResponse); err != nil {
-			common.SysLog(err.Error())
+			common.SysLog(common.LogText("failed to write stream response (%T)", err))
 			sr.Error(err)
 		}
 	})

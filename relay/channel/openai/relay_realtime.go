@@ -38,7 +38,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	gopool.Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
-				errChan <- fmt.Errorf("panic in client reader: %v", r)
+				errChan <- fmt.Errorf("panic in client reader (%T)", r)
 			}
 		}()
 		for {
@@ -49,7 +49,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				_, message, err := clientConn.ReadMessage()
 				if err != nil {
 					if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-						errChan <- fmt.Errorf("error reading from client: %v", err)
+						errChan <- fmt.Errorf("error reading from client (%T)", err)
 					}
 					close(clientClosed)
 					return
@@ -58,7 +58,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				realtimeEvent := &dto.RealtimeEvent{}
 				err = common.Unmarshal(message, realtimeEvent)
 				if err != nil {
-					errChan <- fmt.Errorf("error unmarshalling message: %v", err)
+					errChan <- fmt.Errorf("error unmarshalling realtime message (%T)", err)
 					return
 				}
 
@@ -72,10 +72,10 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 
 				textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 				if err != nil {
-					errChan <- fmt.Errorf("error counting text token: %v", err)
+					errChan <- fmt.Errorf("error counting realtime tokens (%T)", err)
 					return
 				}
-				logger.LogInfo(c, common.LogText("type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
+				logger.LogInfo(c, common.LogText("realtime client event tokens: text=%d, audio=%d", textToken, audioToken))
 				localUsage.TotalTokens += textToken + audioToken
 				localUsage.InputTokens += textToken + audioToken
 				localUsage.InputTokenDetails.TextTokens += textToken
@@ -83,7 +83,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 
 				err = helper.WssString(c, targetConn, string(message))
 				if err != nil {
-					errChan <- fmt.Errorf("error writing to target: %v", err)
+					errChan <- fmt.Errorf("error writing to upstream (%T)", err)
 					return
 				}
 
@@ -98,7 +98,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	gopool.Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
-				errChan <- fmt.Errorf("panic in target reader: %v", r)
+				errChan <- fmt.Errorf("panic in upstream reader (%T)", r)
 			}
 		}()
 		for {
@@ -109,7 +109,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				_, message, err := targetConn.ReadMessage()
 				if err != nil {
 					if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-						errChan <- fmt.Errorf("error reading from target: %v", err)
+						errChan <- fmt.Errorf("error reading from upstream (%T)", err)
 					}
 					close(targetClosed)
 					return
@@ -118,7 +118,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				realtimeEvent := &dto.RealtimeEvent{}
 				err = common.Unmarshal(message, realtimeEvent)
 				if err != nil {
-					errChan <- fmt.Errorf("error unmarshalling message: %v", err)
+					errChan <- fmt.Errorf("error unmarshalling realtime message (%T)", err)
 					return
 				}
 
@@ -135,7 +135,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						usage.OutputTokenDetails.TextTokens += realtimeUsage.OutputTokenDetails.TextTokens
 						err := preConsumeUsage(c, info, usage, sumUsage)
 						if err != nil {
-							errChan <- fmt.Errorf("error consume usage: %v", err)
+							errChan <- fmt.Errorf("error consuming realtime usage (%T)", err)
 							return
 						}
 						// 本次计费完成，清除
@@ -145,10 +145,10 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					} else {
 						textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 						if err != nil {
-							errChan <- fmt.Errorf("error counting text token: %v", err)
+							errChan <- fmt.Errorf("error counting realtime tokens (%T)", err)
 							return
 						}
-						logger.LogInfo(c, common.LogText("type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
+						logger.LogInfo(c, common.LogText("realtime upstream event tokens: text=%d, audio=%d", textToken, audioToken))
 						localUsage.TotalTokens += textToken + audioToken
 						info.IsFirstRequest = false
 						localUsage.InputTokens += textToken + audioToken
@@ -156,7 +156,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						localUsage.InputTokenDetails.AudioTokens += audioToken
 						err = preConsumeUsage(c, info, localUsage, sumUsage)
 						if err != nil {
-							errChan <- fmt.Errorf("error consume usage: %v", err)
+							errChan <- fmt.Errorf("error consuming realtime usage (%T)", err)
 							return
 						}
 						// 本次计费完成，清除
@@ -164,7 +164,6 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						// print now usage
 					}
 					logger.LogInfo(c, common.LogText("realtime streaming sumUsage: %v", sumUsage))
-					logger.LogInfo(c, common.LogText("realtime streaming localUsage: %v", localUsage))
 					logger.LogInfo(c, common.LogText("realtime streaming localUsage: %v", localUsage))
 
 				} else if realtimeEvent.Type == dto.RealtimeEventTypeSessionUpdated || realtimeEvent.Type == dto.RealtimeEventTypeSessionCreated {
@@ -177,10 +176,10 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				} else {
 					textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 					if err != nil {
-						errChan <- fmt.Errorf("error counting text token: %v", err)
+						errChan <- fmt.Errorf("error counting realtime tokens (%T)", err)
 						return
 					}
-					logger.LogInfo(c, common.LogText("type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
+					logger.LogInfo(c, common.LogText("realtime upstream event tokens: text=%d, audio=%d", textToken, audioToken))
 					localUsage.TotalTokens += textToken + audioToken
 					localUsage.OutputTokens += textToken + audioToken
 					localUsage.OutputTokenDetails.TextTokens += textToken
@@ -189,7 +188,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 
 				err = helper.WssString(c, clientConn, string(message))
 				if err != nil {
-					errChan <- fmt.Errorf("error writing to client: %v", err)
+					errChan <- fmt.Errorf("error writing to client (%T)", err)
 					return
 				}
 

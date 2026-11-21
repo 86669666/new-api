@@ -54,7 +54,7 @@ func cfStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 		var response dto.ChatCompletionsStreamResponse
 		err := json.Unmarshal([]byte(data), &response)
 		if err != nil {
-			logger.LogError(c, common.LogText("error_unmarshalling_stream_response: %s", err.Error()))
+			logger.LogError(c, common.LogText("error_unmarshalling_stream_response (%T)", err))
 			continue
 		}
 		for _, choice := range response.Choices {
@@ -69,12 +69,12 @@ func cfStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 			info.FirstResponseTime = time.Now()
 		}
 		if err != nil {
-			logger.LogError(c, common.LogText("error_rendering_stream_response: %s", err.Error()))
+			logger.LogError(c, common.LogText("error_rendering_stream_response (%T)", err))
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		logger.LogError(c, common.LogText("error_scanning_stream_response: %s", err.Error()))
+		logger.LogError(c, common.LogText("error_scanning_stream_response (%T)", err))
 	}
 	usage := service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
 	if info.ShouldIncludeUsage {

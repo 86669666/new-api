@@ -107,7 +107,7 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		var tencentResponse TencentChatResponse
 		err := common.Unmarshal([]byte(data), &tencentResponse)
 		if err != nil {
-			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
+			common.SysLog(common.LogText("error unmarshalling stream response (%T)", err))
 			continue
 		}
 
@@ -118,12 +118,12 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 
 		err = helper.ObjectData(c, response)
 		if err != nil {
-			common.SysLog(err.Error())
+			common.SysLog(common.LogText("failed to write stream response (%T)", err))
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		common.SysLog(common.LogText("error reading stream: %s", err.Error()))
+		common.SysLog(common.LogText("error reading stream (%T)", err))
 	}
 
 	helper.Done(c)

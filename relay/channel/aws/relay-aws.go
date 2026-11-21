@@ -268,7 +268,7 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 
 	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput))
 	if err != nil {
-		return newAwsInvokeError(requestContext, err, "InvokeModelWithResponseStream"), nil
+		return service.MarkUpstreamResponseError(newAwsInvokeError(requestContext, err, "InvokeModelWithResponseStream")), nil
 	}
 	stream := awsResp.GetStream()
 	defer stream.Close()
@@ -303,7 +303,7 @@ streamLoop:
 					return respErr, nil
 				}
 			case *bedrockruntimeTypes.UnknownUnionMember:
-				fmt.Println(common.LogText("unknown tag: %v", v.Tag))
+				common.SysLog(common.LogText("unknown AWS stream event tag"))
 				return types.NewError(errors.New("unknown response type"), types.ErrorCodeInvalidRequest), nil
 			default:
 				fmt.Println(common.LogText("union is nil or unknown type"))

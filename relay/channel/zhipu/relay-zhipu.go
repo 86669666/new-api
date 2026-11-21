@@ -41,7 +41,7 @@ func getZhipuToken(apikey string) string {
 
 	split := strings.Split(apikey, ".")
 	if len(split) != 2 {
-		common.SysLog(common.LogText("invalid zhipu key: %s", apikey))
+		common.SysLog(common.LogText("invalid zhipu key format"))
 		return ""
 	}
 
@@ -181,7 +181,7 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			common.SysLog(common.LogText("error reading stream: %s", err.Error()))
+			common.SysLog(common.LogText("error reading stream (%T)", err))
 		}
 		stopChan <- true
 	}()
@@ -192,7 +192,7 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			response := streamResponseZhipu2OpenAI(data)
 			jsonResponse, err := json.Marshal(response)
 			if err != nil {
-				common.SysLog(common.LogText("error marshalling stream response: %s", err.Error()))
+				common.SysLog(common.LogText("error marshalling stream response (%T)", err))
 				return true
 			}
 			c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonResponse)})
@@ -201,13 +201,13 @@ func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			var zhipuResponse ZhipuStreamMetaResponse
 			err := json.Unmarshal([]byte(data), &zhipuResponse)
 			if err != nil {
-				common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
+				common.SysLog(common.LogText("error unmarshalling stream response (%T)", err))
 				return true
 			}
 			response, zhipuUsage := streamMetaResponseZhipu2OpenAI(&zhipuResponse)
 			jsonResponse, err := json.Marshal(response)
 			if err != nil {
-				common.SysLog(common.LogText("error marshalling stream response: %s", err.Error()))
+				common.SysLog(common.LogText("error marshalling stream response (%T)", err))
 				return true
 			}
 			usage = zhipuUsage

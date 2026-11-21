@@ -290,10 +290,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 	}
 
-	//// 创建一个用于日志的 info 副本，移除 ApiKey
-	//logInfo := info
-	//logInfo.ApiKey = ""
-	common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+	common.SysLog(common.LogText("testing channel #%d with model %q (relay mode=%d, stream=%t)", channel.Id, testModel, info.RelayMode, isStream))
 
 	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
 	if err != nil {
@@ -469,7 +466,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		return testResult{
 			context:     c,
 			localErr:    respErr,
-			newAPIError: respErr,
+			newAPIError: service.MarkUpstreamResponseError(respErr),
 		}
 	}
 	usage, usageErr := coerceTestUsage(usageA, isStream, info.GetEstimatePromptTokens())
@@ -493,7 +490,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		return testResult{
 			context:     c,
 			localErr:    bodyErr,
-			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			newAPIError: service.MarkUpstreamResponseError(types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)),
 		}
 	}
 	info.SetEstimatePromptTokens(usage.PromptTokens)
@@ -516,7 +513,8 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		Group:            info.UsingGroup,
 		Other:            other,
 	})
-	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	common.SysLog(common.LogText("channel #%d test response (status=%d, stream=%t, inspected bytes=%d)",
+		channel.Id, result.StatusCode, isStream, len(respBody)))
 	return testResult{
 		context:     c,
 		localErr:    nil,
@@ -598,9 +596,9 @@ func coerceTestUsage(usageAny any, isStream bool, estimatePromptTokens int) (*dt
 
 func readTestResponseBody(body io.ReadCloser, isStream bool) ([]byte, error) {
 	defer func() { _ = body.Close() }()
-	const maxStreamLogBytes = 8 << 10
+	const maxStreamCheckBytes = 8 << 10
 	if isStream {
-		return io.ReadAll(io.LimitReader(body, maxStreamLogBytes))
+		return io.ReadAll(io.LimitReader(body, maxStreamCheckBytes))
 	}
 	return io.ReadAll(body)
 }

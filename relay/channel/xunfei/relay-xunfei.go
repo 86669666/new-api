@@ -145,7 +145,7 @@ func xunfeiStreamHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, a
 			response := streamResponseXunfei2OpenAI(&xunfeiResponse)
 			jsonResponse, err := json.Marshal(response)
 			if err != nil {
-				common.SysLog(common.LogText("error marshalling stream response: %s", err.Error()))
+				common.SysLog(common.LogText("error marshalling stream response (%T)", err))
 				return true
 			}
 			c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonResponse)})
@@ -224,19 +224,19 @@ func xunfeiMakeRequest(textRequest dto.GeneralOpenAIRequest, domain, authUrl, ap
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				common.SysLog(common.LogText("error reading stream response: %s", err.Error()))
+				common.SysLog(common.LogText("error reading stream response (%T)", err))
 				break
 			}
 			var response XunfeiChatResponse
 			err = json.Unmarshal(msg, &response)
 			if err != nil {
-				common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
+				common.SysLog(common.LogText("error unmarshalling stream response (%T)", err))
 				break
 			}
 			dataChan <- response
 			if response.Payload.Choices.Status == 2 {
 				if err != nil {
-					common.SysLog(common.LogText("error closing websocket connection: %s", err.Error()))
+					common.SysLog(common.LogText("error closing websocket connection (%T)", err))
 				}
 				break
 			}
