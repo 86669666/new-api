@@ -251,7 +251,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	gopool.Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
-				logger.LogError(c, common.LogText("data handler goroutine panic: %v", r))
+				logger.LogError(c, common.LogText("data handler goroutine panic (%T)", r))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("handler panic: %v", r))
 			}
 			stop()
@@ -276,7 +276,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		defer func() {
 			close(dataChan)
 			if r := recover(); r != nil {
-				logger.LogError(c, common.LogText("scanner goroutine panic: %v", r))
+				logger.LogError(c, common.LogText("scanner goroutine panic (%T)", r))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("scanner panic: %v", r))
 			}
 			stop()
@@ -296,7 +296,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 			ticker.Reset(streamingTimeout)
 			data := scanner.Text()
-			logger.LogDebug(c, "stream scanner data: %s", data)
+			logger.LogDebug(c, "stream scanner line bytes=%d", len(data))
 
 			data, hasDataPrefix := strings.CutPrefix(data, "data:")
 			data = strings.TrimSpace(data)
@@ -331,7 +331,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}
 		if err := scanner.Err(); err != nil {
 			if err != io.EOF {
-				logger.LogError(c, common.LogText("scanner error: %s", err.Error()))
+				logger.LogError(c, common.LogText("scanner error (%T)", err))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 			}
 		}

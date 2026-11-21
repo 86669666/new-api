@@ -95,10 +95,16 @@ func isUpstreamResponseError(err error) bool {
 	return errors.As(err, &upstreamErr)
 }
 
+// MarkUpstreamResponseError keeps client diagnostics out of shared error logs.
+func MarkUpstreamResponseError(err *types.NewAPIError) *types.NewAPIError {
+	err.Err = upstreamResponseError{err.Err}
+	return err
+}
+
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 	defer func() {
-		newApiErr.Err = upstreamResponseError{newApiErr.Err}
+		MarkUpstreamResponseError(newApiErr)
 	}()
 
 	responseBody, err := io.ReadAll(resp.Body)

@@ -1,6 +1,7 @@
 package ollama
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -184,6 +187,31 @@ func TestBuildOllamaStreamDelta(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOllamaStreamDecodeErrorLogsOnlyDiagnostics(t *testing.T) {
+	var logs bytes.Buffer
+	common.LogWriterMu.Lock()
+	writer := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logs
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = writer
+		common.LogWriterMu.Unlock()
+	})
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	const frame = "{\"message\":\"fixture-private-ndjson\""
+	resp := &http.Response{Header: make(http.Header), Body: io.NopCloser(strings.NewReader(frame))}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "fixture-model"}}
+	usage, err := ollamaStreamHandler(c, info, resp)
+	require.NotNil(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, http.StatusInternalServerError, err.StatusCode)
+	assert.Equal(t, types.ErrorCodeBadResponseBody, err.GetErrorCode())
+	assert.Equal(t, "status_code=500, upstream returned an error", service.RelayErrorLogMessage(err))
+	assert.Contains(t, logs.String(), "line bytes=")
+	assert.NotContains(t, logs.String(), "fixture-private-ndjson")
 }
 
 func TestOllamaStreamHandlerDoneToolCalls(t *testing.T) {

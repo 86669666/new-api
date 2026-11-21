@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -37,7 +38,7 @@ func GetFullRequestURL(baseURL string, requestURL string, channelType int) strin
 	return fullRequestURL
 }
 
-func SanitizeURLForLog(rawURL string) string {
+func SanitizeURLForLog(rawURL string, sensitiveQueryKeys ...string) string {
 	if rawURL == "" {
 		return rawURL
 	}
@@ -55,7 +56,7 @@ func SanitizeURLForLog(rawURL string) string {
 
 	changed := false
 	for key := range query {
-		if isSensitiveURLQueryKey(key) {
+		if isSensitiveURLQueryKey(key) || slices.Contains(sensitiveQueryKeys, key) {
 			query.Set(key, "***masked***")
 			changed = true
 		}

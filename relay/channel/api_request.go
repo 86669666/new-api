@@ -331,12 +331,20 @@ func redactUpstreamURLError(err error) error {
 	return err
 }
 
+func upstreamAuthQueryName(a Adaptor) string {
+	if auth, ok := a.(interface{ UpstreamAuthQueryName() string }); ok {
+		return auth.UpstreamAuthQueryName()
+	}
+	return ""
+}
+
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", redactUpstreamURLError(err))
 	}
-	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
+	queryAuthName := upstreamAuthQueryName(a)
+	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL, queryAuthName))
 	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", redactUpstreamURLError(err))
@@ -360,7 +368,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
 	}
-	resp, err := doRequest(c, req, info)
+	resp, err := doRequest(c, req, info, queryAuthName)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
@@ -372,7 +380,8 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", redactUpstreamURLError(err))
 	}
-	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
+	queryAuthName := upstreamAuthQueryName(a)
+	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL, queryAuthName))
 	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", redactUpstreamURLError(err))
@@ -390,7 +399,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
 	}
-	resp, err := doRequest(c, req, info)
+	resp, err := doRequest(c, req, info, queryAuthName)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
@@ -445,7 +454,7 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 				_ = resp.Body.Close()
 			}
 		}
-		target := common.SanitizeURLForLog(fullRequestURL)
+		target := common.SanitizeURLForLog(fullRequestURL, upstreamAuthQueryName(a))
 		dialErr := fmt.Errorf("dial failed to %s: %s", target, upstreamTransportErrorReason(err))
 		if errors.Is(err, websocket.ErrBadHandshake) {
 			dialErr = fmt.Errorf("dial failed to %s: %w", target, websocket.ErrBadHandshake)
@@ -497,7 +506,7 @@ func upstreamTransportErrorReason(err error) string {
 	return fmt.Sprintf("%T", err)
 }
 
-func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo, sensitiveQueryKeys ...string) (*http.Response, error) {
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 	if err != nil {
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)
@@ -531,7 +540,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	resp, err := relayClient.Do(req)
 	if err != nil {
-		detail := fmt.Sprintf("%s (%s)", common.SanitizeURLForLog(req.URL.String()), upstreamTransportErrorReason(err))
+		detail := fmt.Sprintf("%s (%s)", common.SanitizeURLForLog(req.URL.String(), sensitiveQueryKeys...), upstreamTransportErrorReason(err))
 		logger.LogError(c, common2.LogText("do request failed: %s", detail))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, func(apiErr *types.NewAPIError) {
 			apiErr.SetMessage("upstream error: do request failed")

@@ -2,6 +2,7 @@ package helper
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -291,6 +293,39 @@ func TestStreamScannerHandler_SkipsNonDataLines(t *testing.T) {
 	})
 
 	assert.Equal(t, int64(100), count.Load())
+}
+
+func TestStreamScannerHandlerKeepsFramesAndErrorsOutOfDiagnostics(t *testing.T) {
+	const payload = "fixture-forwarded-payload"
+	const comment = "fixture-private-comment"
+	const detail = "fixture-private-error"
+	var logs bytes.Buffer
+	common.LogWriterMu.Lock()
+	writer := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logs
+	common.LogWriterMu.Unlock()
+	debug := common.DebugEnabled
+	common.DebugEnabled = true
+	t.Cleanup(func() {
+		common.DebugEnabled = debug
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = writer
+		common.LogWriterMu.Unlock()
+	})
+	c, resp, info := setupStreamTest(t, strings.NewReader(": "+comment+"\ndata: "+payload+"\ndata: [DONE]\n"))
+	var forwarded []string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		forwarded = append(forwarded, data)
+		sr.Error(fmt.Errorf("%s", detail))
+	})
+	assert.Equal(t, []string{payload}, forwarded)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	require.Len(t, info.StreamStatus.Errors, 1)
+	assert.NotContains(t, info.StreamStatus.Errors[0].Message, detail)
+	assert.Contains(t, logs.String(), "stream scanner line bytes=")
+	for _, marker := range []string{payload, comment, detail} {
+		assert.NotContains(t, logs.String(), marker)
+	}
 }
 
 func TestStreamScannerHandler_DataWithExtraSpaces(t *testing.T) {

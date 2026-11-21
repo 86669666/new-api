@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -173,6 +175,21 @@ func TestRelayErrorHandlerKeepsStructuredErrorMessage(t *testing.T) {
 
 	require.NotNil(t, newAPIError)
 	require.Equal(t, message, newAPIError.Error())
+}
+
+func TestStreamEndErrorDoesNotExposeDiagnosticInPublicLog(t *testing.T) {
+	status := relaycommon.NewStreamStatus()
+	detail := fmt.Errorf("fixture-private-stream-error")
+	status.SetEndReason(relaycommon.StreamEndReasonScannerErr, detail)
+	other := model.NewLogOther()
+	appendStreamStatus(&relaycommon.RelayInfo{IsStream: true, StreamStatus: status}, other)
+	info, ok := other.Snapshot()["stream_status"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "error", info["status"])
+	assert.Equal(t, string(relaycommon.StreamEndReasonScannerErr), info["end_reason"])
+	assert.Equal(t, fmt.Sprintf("%T", detail), info["end_error"])
+	assert.NotContains(t, status.Summary(), detail.Error())
+	assert.ErrorIs(t, status.EndError, detail)
 }
 
 func TestRelayErrorHandlerKeepsOpenAIErrorMessage(t *testing.T) {

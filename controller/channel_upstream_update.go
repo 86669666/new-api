@@ -496,7 +496,7 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string)
 
 	body, err := getFetchModelsResponseBody(http.MethodGet, url, channel, headers)
 	if err != nil {
-		return nil, sanitizeFetchModelsError(err, key)
+		return nil, sanitizeAdvancedCustomRequestError(err, key, url)
 	}
 	return parseOpenAIModelIDs(body)
 }

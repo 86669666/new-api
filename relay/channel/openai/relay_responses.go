@@ -81,7 +81,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
-			logger.LogError(c, common.LogText("failed to unmarshal stream response: %s", err.Error()))
+			logger.LogError(c, common.LogText("failed to unmarshal stream response (%T)", err))
 			sr.Error(err)
 			return
 		}

@@ -173,6 +173,14 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	return a.routeURL(info)
 }
 
+// UpstreamAuthQueryName returns the credential field of the resolved route for logging.
+func (a *Adaptor) UpstreamAuthQueryName() string {
+	if auth := a.route.Auth; auth != nil && strings.TrimSpace(auth.Type) == dto.AdvancedCustomAuthTypeQuery {
+		return strings.TrimSpace(auth.Name)
+	}
+	return ""
+}
+
 func (a *Adaptor) BuildModelListRequest(info *relaycommon.RelayInfo) (string, http.Header, error) {
 	return a.buildManagementRequest(info, dto.AdvancedCustomModelListPath)
 }
