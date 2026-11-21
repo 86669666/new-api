@@ -111,7 +111,7 @@ func RecordPolicyFailure(c *gin.Context, channelID int, err *types.NewAPIError, 
 		source = "local"
 	}
 	state := RequestPolicy(c)
-	event := PolicyEvent{ChannelID: channelID, Status: err.StatusCode, ErrorCode: string(err.GetErrorCode()), ErrorSource: source, Decision: PolicyDecision{Action: "failure", Reason: "upstream_failure", Source: source}}
+	event := PolicyEvent{ChannelID: channelID, Status: err.StatusCode, ErrorCode: string(relayErrorLogCode(err)), ErrorSource: source, Decision: PolicyDecision{Action: "failure", Reason: "upstream_failure", Source: source}}
 	if source == "local" {
 		event.Decision.Reason = "local_rejection"
 	}
@@ -177,6 +177,6 @@ func RecordRequestPolicyTermination(c *gin.Context, apiErr *types.NewAPIError) {
 	state.FinalLogged = true
 	events := state.Events()
 	if len(events) == 0 || events[len(events)-1].Decision.Action != "stop" {
-		state.AddEvent(PolicyEvent{ChannelID: c.GetInt("channel_id"), Status: apiErr.StatusCode, ErrorCode: string(apiErr.GetErrorCode()), Decision: PolicyDecision{Action: "stop", Reason: "request_failed", Source: "system"}, Health: "unchanged"})
+		state.AddEvent(PolicyEvent{ChannelID: c.GetInt("channel_id"), Status: apiErr.StatusCode, ErrorCode: string(relayErrorLogCode(apiErr)), Decision: PolicyDecision{Action: "stop", Reason: "request_failed", Source: "system"}, Health: "unchanged"})
 	}
 }

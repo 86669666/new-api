@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,15 +65,60 @@ func TestResetStatusCode(t *testing.T) {
 	}
 }
 
-func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {
-	withDebugEnabled(t, false)
+func TestRelayErrorHandlerOmitsProviderBodiesFromLogs(t *testing.T) {
+	const diagnostic = "fixture-provider-detail"
+	for _, tc := range []struct {
+		name           string
+		body           string
+		debug          bool
+		showDiagnostic bool
+	}{
+		{name: "invalid JSON", body: diagnostic},
+		{name: "empty error message in debug mode", body: `{"diagnostic":"` + diagnostic + `"}`, debug: true},
+		{name: "channel test returns diagnostics", body: diagnostic, debug: true, showDiagnostic: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withDebugEnabled(t, tc.debug)
+			var logBuffer bytes.Buffer
+			common.LogWriterMu.Lock()
+			oldWriter := gin.DefaultErrorWriter
+			gin.DefaultErrorWriter = &logBuffer
+			common.LogWriterMu.Unlock()
+			t.Cleanup(func() {
+				common.LogWriterMu.Lock()
+				gin.DefaultErrorWriter = oldWriter
+				common.LogWriterMu.Unlock()
+			})
 
-	body := strings.Repeat("b", common.LocalLogContentLimit+256)
-	var logBuffer bytes.Buffer
+			resp := &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Body:       io.NopCloser(strings.NewReader(tc.body)),
+			}
+			err := RelayErrorHandler(context.Background(), resp, tc.showDiagnostic)
 
+			require.NotNil(t, err)
+			assert.Equal(t, http.StatusBadGateway, err.StatusCode)
+			assert.Equal(t, types.ErrorCodeBadResponseStatusCode, err.GetErrorCode())
+			assert.NotContains(t, logBuffer.String(), diagnostic)
+			if tc.showDiagnostic {
+				assert.Contains(t, err.Error(), diagnostic)
+				assert.Equal(t, "status_code=502, upstream returned an error", RelayErrorLogMessage(err))
+			} else {
+				assert.Contains(t, logBuffer.String(), fmt.Sprintf("[omitted, %d bytes]", len(tc.body)))
+				assert.NotContains(t, err.Error(), diagnostic)
+			}
+		})
+	}
+}
+
+func TestProviderErrorDiagnosticsAreSafeInChannelAndPolicyLogs(t *testing.T) {
+	const detail = "fixture-private-provider-detail"
+	const code = "fixture-private-provider-code"
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	var logs bytes.Buffer
 	common.LogWriterMu.Lock()
 	oldWriter := gin.DefaultErrorWriter
-	gin.DefaultErrorWriter = &logBuffer
+	gin.DefaultErrorWriter = &logs
 	common.LogWriterMu.Unlock()
 	t.Cleanup(func() {
 		common.LogWriterMu.Lock()
@@ -80,17 +127,38 @@ func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {
 	})
 
 	resp := &http.Response{
-		StatusCode: http.StatusInternalServerError,
-		Body:       io.NopCloser(strings.NewReader(body)),
+		StatusCode: http.StatusBadGateway,
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"` + detail + `","code":"` + code + `"}}`)),
 	}
+	err := RelayErrorHandler(c, resp, false)
+	require.NotNil(t, err)
+	types.ErrOptionWithNoRecordErrorLog()(err)
+	ProcessChannelError(c, types.ChannelError{}, err, nil)
+	RecordPolicyFailure(c, 1, err, PolicyDecision{Action: "retry"})
+	RecordRequestPolicyTermination(c, err)
+	assert.Contains(t, logs.String(), "status_code=502, upstream returned an error")
+	assert.NotContains(t, logs.String(), detail)
+	assert.NotContains(t, logs.String(), code)
+	for _, event := range RequestPolicy(c).Events() {
+		assert.Equal(t, string(types.ErrorCodeBadResponseStatusCode), event.ErrorCode)
+	}
+	assert.Equal(t, detail, err.ToOpenAIError().Message)
+	assert.Equal(t, types.ErrorCode(code), err.GetErrorCode())
 
-	newAPIError := RelayErrorHandler(context.Background(), resp, false)
-
-	require.NotNil(t, newAPIError)
-	require.Equal(t, "bad response status code 500", newAPIError.Error())
-	require.Contains(t, logBuffer.String(), "[truncated")
-	require.Contains(t, logBuffer.String(), fmt.Sprintf("original_length=%d", len(body)))
-	require.NotContains(t, logBuffer.String(), strings.Repeat("b", common.LocalLogContentLimit+1))
+	// Rewrapping a provider error for violation handling preserves its log policy.
+	const providerType = "fixture-private-provider-type"
+	resp.Body = io.NopCloser(strings.NewReader(fmt.Sprintf(
+		`{"error":{"message":%q,"type":%q,"code":%q}}`, detail, providerType, types.ErrorCodeViolationFeeGrokCSAM)))
+	normalized := NormalizeViolationFeeError(RelayErrorHandler(c, resp, false))
+	assert.Equal(t, "status_code=502, upstream returned an error", RelayErrorLogMessage(normalized))
+	assert.Equal(t, types.ErrorCodeViolationFeeGrokCSAM, relayErrorLogCode(normalized))
+	logType, logCode := violationFeeLogClassification(normalized)
+	assert.Equal(t, "upstream_error", logType)
+	assert.Equal(t, string(types.ErrorCodeViolationFeeGrokCSAM), logCode)
+	clientError := normalized.ToOpenAIError()
+	assert.Equal(t, detail, clientError.Message)
+	assert.Equal(t, providerType, clientError.Type)
+	assert.True(t, types.IsSkipRetryError(normalized))
 }
 
 func TestRelayErrorHandlerKeepsStructuredErrorMessage(t *testing.T) {
@@ -119,34 +187,6 @@ func TestRelayErrorHandlerKeepsOpenAIErrorMessage(t *testing.T) {
 
 	require.NotNil(t, newAPIError)
 	require.Equal(t, message, newAPIError.Error())
-}
-
-func TestRelayErrorHandlerKeepsInvalidJSONBodyInDebugLog(t *testing.T) {
-	withDebugEnabled(t, true)
-
-	body := strings.Repeat("e", common.LocalLogContentLimit+256)
-	var logBuffer bytes.Buffer
-
-	common.LogWriterMu.Lock()
-	oldWriter := gin.DefaultErrorWriter
-	gin.DefaultErrorWriter = &logBuffer
-	common.LogWriterMu.Unlock()
-	t.Cleanup(func() {
-		common.LogWriterMu.Lock()
-		gin.DefaultErrorWriter = oldWriter
-		common.LogWriterMu.Unlock()
-	})
-
-	resp := &http.Response{
-		StatusCode: http.StatusInternalServerError,
-		Body:       io.NopCloser(strings.NewReader(body)),
-	}
-
-	newAPIError := RelayErrorHandler(context.Background(), resp, false)
-
-	require.NotNil(t, newAPIError)
-	require.NotContains(t, logBuffer.String(), "[truncated")
-	require.Contains(t, logBuffer.String(), body)
 }
 
 func withDebugEnabled(t *testing.T, enabled bool) {

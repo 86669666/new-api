@@ -45,7 +45,15 @@ func WrapAsViolationFeeGrokCSAM(err *types.NewAPIError) *types.NewAPIError {
 	oai := err.ToOpenAIError()
 	oai.Type = string(types.ErrorCodeViolationFeeGrokCSAM)
 	oai.Code = string(types.ErrorCodeViolationFeeGrokCSAM)
-	return types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+	return violationFeeErrorWithCode(err, oai)
+}
+
+func violationFeeErrorWithCode(err *types.NewAPIError, oai types.OpenAIError) *types.NewAPIError {
+	result := types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+	if isUpstreamResponseError(err) {
+		result.Err = upstreamResponseError{result.Err}
+	}
+	return result
 }
 
 // NormalizeViolationFeeError ensures:
@@ -63,8 +71,7 @@ func NormalizeViolationFeeError(err *types.NewAPIError) *types.NewAPIError {
 	}
 
 	if IsViolationFeeCode(err.GetErrorCode()) {
-		oai := err.ToOpenAIError()
-		return types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+		return violationFeeErrorWithCode(err, err.ToOpenAIError())
 	}
 
 	return err
@@ -96,6 +103,14 @@ func calcViolationFeeQuota(amount, groupRatio float64) int {
 		return 0
 	}
 	return quota
+}
+
+func violationFeeLogClassification(err *types.NewAPIError) (string, string) {
+	if isUpstreamResponseError(err) {
+		return "upstream_error", string(relayErrorLogCode(err))
+	}
+	oai := err.ToOpenAIError()
+	return oai.Type, fmt.Sprintf("%v", oai.Code)
 }
 
 // ChargeViolationFeeIfNeeded charges an additional fee after the normal flow finishes (including refund).
@@ -132,7 +147,7 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 
 	useTimeSeconds := time.Now().Unix() - relayInfo.StartTime.Unix()
 	tokenName := ctx.GetString("token_name")
-	oai := apiErr.ToOpenAIError(common.UpstreamAddresses(ctx)...)
+	errorType, errorCode := violationFeeLogClassification(apiErr)
 
 	other := model.NewLogOther()
 	other.MergePublic(map[string]any{
@@ -142,8 +157,8 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 		"base_amount":          settings.ViolationDeductionAmount,
 		"group_ratio":          groupRatio,
 		"status_code":          apiErr.StatusCode,
-		"upstream_error_type":  oai.Type,
-		"upstream_error_code":  fmt.Sprintf("%v", oai.Code),
+		"upstream_error_type":  errorType,
+		"upstream_error_code":  errorCode,
 		"violation_fee_marker": CSAMViolationMarker,
 	})
 

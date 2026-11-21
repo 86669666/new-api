@@ -84,8 +84,22 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 	return claudeErr
 }
 
+// upstreamResponseError retains the client error while identifying provider text
+// that must stay out of server diagnostics and stored error records.
+type upstreamResponseError struct{ error }
+
+func (e upstreamResponseError) Unwrap() error { return e.error }
+
+func isUpstreamResponseError(err error) bool {
+	var upstreamErr upstreamResponseError
+	return errors.As(err, &upstreamErr)
+}
+
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
+	defer func() {
+		newApiErr.Err = upstreamResponseError{newApiErr.Err}
+	}()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -94,7 +108,8 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
-	responseBodyPreview := common.LocalLogPreview(responseBodyText)
+	// Provider bodies may contain arbitrary sensitive text, even in debug mode.
+	bodySummary := fmt.Sprintf("[omitted, %d bytes]", len(responseBody))
 	buildErrWithBody := func(message string) error {
 		if message == "" {
 			return fmt.Errorf("bad response status code %d, body: %s", resp.StatusCode, responseBodyText)
@@ -107,7 +122,7 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		if showBodyWhenFail {
 			newApiErr.Err = buildErrWithBody("")
 		} else {
-			logger.LogError(ctx, common.LogText("bad response status code %d, body: %s", resp.StatusCode, responseBodyPreview))
+			logger.LogError(ctx, common.LogText("bad response status code %d, body: %s", resp.StatusCode, bodySummary))
 			newApiErr.Err = fmt.Errorf("bad response status code %d", resp.StatusCode)
 		}
 		return
@@ -126,9 +141,7 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	}
 	message := errResponse.ToMessage()
 	if message == "" {
-		// The body parsed as JSON but carried no usable error message; log the
-		// raw body so the upstream failure remains diagnosable.
-		logger.LogError(ctx, common.LogText("bad response status code %d with empty error message, body: %s", resp.StatusCode, responseBodyPreview))
+		logger.LogError(ctx, common.LogText("bad response status code %d with empty error message, body: %s", resp.StatusCode, bodySummary))
 	}
 	newApiErr = types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 	if showBodyWhenFail {

@@ -322,15 +322,24 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 	}
 }
 
+func redactUpstreamURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		// The URL parser can include credentials in both the URL and the cause.
+		return errors.New("invalid upstream URL")
+	}
+	return err
+}
+
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
-		return nil, fmt.Errorf("get request url failed: %w", err)
+		return nil, fmt.Errorf("get request url failed: %w", redactUpstreamURLError(err))
 	}
 	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
 	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("new request failed: %w", err)
+		return nil, fmt.Errorf("new request failed: %w", redactUpstreamURLError(err))
 	}
 	if info.RelayMode == constant.RelayModeToolsSearch {
 		req = req.WithContext(c.Request.Context())
@@ -361,12 +370,12 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
-		return nil, fmt.Errorf("get request url failed: %w", err)
+		return nil, fmt.Errorf("get request url failed: %w", redactUpstreamURLError(err))
 	}
 	logger.LogDebug(c, "fullRequestURL: %s", common.SanitizeURLForLog(fullRequestURL))
 	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("new request failed: %w", err)
+		return nil, fmt.Errorf("new request failed: %w", redactUpstreamURLError(err))
 	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
 	// set form data
@@ -395,7 +404,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
-		return nil, fmt.Errorf("get request url failed: %w", err)
+		return nil, fmt.Errorf("get request url failed: %w", redactUpstreamURLError(err))
 	}
 	fullRequestURL = toWebSocketURL(fullRequestURL)
 	if targetURL, parseErr := url.Parse(fullRequestURL); parseErr == nil {
@@ -436,7 +445,12 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 				_ = resp.Body.Close()
 			}
 		}
-		return nil, types.NewErrorWithStatusCode(fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(fullRequestURL), err), types.ErrorCodeDoRequestFailed, statusCode)
+		target := common.SanitizeURLForLog(fullRequestURL)
+		dialErr := fmt.Errorf("dial failed to %s: %s", target, upstreamTransportErrorReason(err))
+		if errors.Is(err, websocket.ErrBadHandshake) {
+			dialErr = fmt.Errorf("dial failed to %s: %w", target, websocket.ErrBadHandshake)
+		}
+		return nil, types.NewErrorWithStatusCode(dialErr, types.ErrorCodeDoRequestFailed, statusCode)
 	}
 	return targetConn, nil
 }
@@ -462,6 +476,25 @@ func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 // returning the upstream 3xx response to the relay without an extra error.
 func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 	return http.ErrUseLastResponse
+}
+
+// upstreamTransportErrorReason describes failures without formatting the raw
+// error, which may contain URLs, proxy details, or credentials.
+func upstreamTransportErrorReason(err error) string {
+	var networkErr net.Error
+	var dnsErr *net.DNSError
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "request canceled"
+	case errors.As(err, &networkErr) && networkErr.Timeout():
+		return "timeout"
+	case errors.As(err, &dnsErr):
+		return "DNS lookup failed"
+	}
+	if requestErr, ok := err.(*url.Error); ok {
+		err = requestErr.Err
+	}
+	return fmt.Sprintf("%T", err)
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
@@ -498,23 +531,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	resp, err := relayClient.Do(req)
 	if err != nil {
-		// Transport errors can carry credentials in the URL and nested messages.
-		cause := err
-		if requestErr, ok := err.(*url.Error); ok {
-			cause = requestErr.Err
-		}
-		reason := fmt.Sprintf("%T", cause)
-		var networkErr net.Error
-		var dnsErr *net.DNSError
-		switch {
-		case errors.Is(err, context.Canceled):
-			reason = "request canceled"
-		case errors.As(err, &networkErr) && networkErr.Timeout():
-			reason = "timeout"
-		case errors.As(err, &dnsErr):
-			reason = "DNS lookup failed"
-		}
-		detail := fmt.Sprintf("%s (%s)", common.SanitizeURLForLog(req.URL.String()), reason)
+		detail := fmt.Sprintf("%s (%s)", common.SanitizeURLForLog(req.URL.String()), upstreamTransportErrorReason(err))
 		logger.LogError(c, common2.LogText("do request failed: %s", detail))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, func(apiErr *types.NewAPIError) {
 			apiErr.SetMessage("upstream error: do request failed")
@@ -545,11 +562,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.BuildRequestURL(info)
 	if err != nil {
-		return nil, err
+		return nil, redactUpstreamURLError(err)
 	}
 	req, err := newTaskAPIRequest(c, fullRequestURL, requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("new request failed: %w", err)
+		return nil, fmt.Errorf("new request failed: %w", redactUpstreamURLError(err))
 	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
 	// Do NOT wrap requestBody in a GetBody closure here: returning the same

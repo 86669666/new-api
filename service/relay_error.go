@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -60,14 +61,30 @@ func ShouldRetryRelayError(c *gin.Context, openaiErr *types.NewAPIError, retryTi
 	return DecideRelayRetry(c, openaiErr, retryTimes).Action == "retry"
 }
 
+// RelayErrorLogMessage is safe to use for server logs, stored errors and channel
+// health notices. Provider messages remain available to the client and policy.
+func RelayErrorLogMessage(err *types.NewAPIError, upstreamURLs ...string) string {
+	if isUpstreamResponseError(err) {
+		return fmt.Sprintf("status_code=%d, upstream returned an error", err.StatusCode)
+	}
+	return err.MaskSensitiveErrorWithStatusCode(upstreamURLs...)
+}
+
+func relayErrorLogCode(err *types.NewAPIError) types.ErrorCode {
+	code := err.GetErrorCode()
+	if isUpstreamResponseError(err) && code != types.ErrorCodeViolationFeeGrokCSAM {
+		return types.ErrorCodeBadResponseStatusCode
+	}
+	return code
+}
+
 func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 	if err == nil {
 		return
 	}
-	upstreamURLs := common.UpstreamAddresses(c)
-	logger.LogError(c, common.LogText("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.MaskSensitiveErrorWithStatusCode(upstreamURLs...))))
+	reason := RelayErrorLogMessage(err, common.UpstreamAddresses(c)...)
+	logger.LogError(c, common.LogText("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(reason)))
 	if ShouldDisableChannel(err) && channelError.AutoBan {
-		reason := err.MaskSensitiveErrorWithStatusCode(upstreamURLs...)
 		gopool.Go(func() {
 			DisableChannel(channelError, reason)
 		})
@@ -84,7 +101,7 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			other.SetPublic("request_path", c.Request.URL.Path)
 		}
 		other.SetPublic("error_type", err.GetErrorType())
-		other.SetPublic("error_code", err.GetErrorCode())
+		other.SetPublic("error_code", relayErrorLogCode(err))
 		other.SetPublic("status_code", err.StatusCode)
 		AppendRelayLogAdminInfo(c, relayInfo, other)
 		AppendResponseModelLogInfo(relayInfo, other)
@@ -94,6 +111,6 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(upstreamURLs...), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, reason, tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
 }
