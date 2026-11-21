@@ -85,8 +85,8 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
-			logger.LogError(c, common.LogText("failed to unmarshal buffered responses stream event: %s", err.Error()))
-			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+			logger.LogError(c, common.LogText("failed to unmarshal buffered responses stream event (%T)", err))
+			streamErr = service.MarkUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError))
 			break
 		}
 		if streamResp.Response != nil {
@@ -108,7 +108,7 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 		case "response.failed", "response.error":
 			if streamResp.Response != nil {
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
-					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)
+					streamErr = service.MarkUpstreamResponseError(types.WithOpenAIError(*oaiErr, http.StatusInternalServerError))
 					break
 				}
 			}
@@ -122,7 +122,7 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 		return nil, streamErr
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+		return nil, service.MarkUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError))
 	}
 	if finalResponse == nil {
 		finalResponse = &dto.OpenAIResponsesResponse{
@@ -136,7 +136,7 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 
 	responseValue, usage, err := convertResponsesResponseForClient(c, info, finalResponse)
 	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		return nil, service.MarkUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError))
 	}
 	responseBody, err := common.Marshal(responseValue)
 	if err != nil {
@@ -271,7 +271,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
-			logger.LogError(c, common.LogText("failed to unmarshal responses stream event: %s", err.Error()))
+			logger.LogError(c, common.LogText("failed to unmarshal responses stream event (%T)", err))
 			sr.Error(err)
 			return
 		}
@@ -284,7 +284,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			if streamResp.Response != nil {
 				failedUsage = streamResp.Response.Usage
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
-					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)
+					streamErr = service.MarkUpstreamResponseError(types.WithOpenAIError(*oaiErr, http.StatusInternalServerError))
 					stopStream(sr, streamErr)
 					return
 				}
@@ -338,7 +338,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
 			}
 		}
-		logger.LogError(c, common.LogText("responses stream failed after output was delivered, billing the delivered output: %s", streamErr.Error()))
+		logger.LogError(c, common.LogText("responses stream failed after output was delivered, billing the delivered output: %s", service.RelayErrorLogMessage(streamErr)))
 		streamErr.SetMessage(common.MessageWithRequestId(streamErr.Error(), c.GetString(common.RequestIdKey)))
 		if info.RelayFormat == types.RelayFormatClaude {
 			c.JSON(streamErr.StatusCode, gin.H{"type": "error", "error": streamErr.ToClaudeError(common.UpstreamAddresses(c)...)})

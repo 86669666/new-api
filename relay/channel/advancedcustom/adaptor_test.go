@@ -62,7 +62,10 @@ func TestAdaptorUsesExactRouteAndQueryAuth(t *testing.T) {
 // URL, and a channel proxy is dialed before the upstream; a failed handshake
 // must hide both.
 func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	const fixtureCredential = "fixture-query-credential"
+	received := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.URL.Query().Get("ClientId")
 		w.WriteHeader(http.StatusForbidden)
 	}))
 	defer upstream.Close()
@@ -88,8 +91,14 @@ func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
 				t.Cleanup(func() { websocket.DefaultDialer = oldDialer })
 			}
 			info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
-				Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/realtime", UpstreamPath: "http://localhost:" + upstreamURL.Port() + "/v1/realtime", Converter: relayconvert.ConverterNone}},
+				Routes: []dto.AdvancedCustomRoute{{
+					IncomingPath: "/v1/realtime",
+					UpstreamPath: "http://localhost:" + upstreamURL.Port() + "/v1/realtime?mode=realtime",
+					Converter:    relayconvert.ConverterNone,
+					Auth:         &dto.AdvancedCustomRouteAuth{Type: dto.AdvancedCustomAuthTypeQuery, Name: "ClientId", Value: "{api_key}"},
+				}},
 			})
+			info.ApiKey = fixtureCredential
 			info.RelayMode = relayconstant.RelayModeRealtime
 			info.RequestURLPath = "/v1/realtime"
 			info.ChannelSetting.Proxy = tc.proxy
@@ -105,10 +114,16 @@ func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
 			assert.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
 			if tc.proxy == "" {
 				assert.ErrorIs(t, apiErr, websocket.ErrBadHandshake)
+				select {
+				case value := <-received:
+					assert.Equal(t, fixtureCredential, value)
+				default:
+					t.Error("upstream handshake did not see the request")
+				}
 			}
 			internal, ok := apiErr.RelayError.(types.OpenAIError)
 			require.True(t, ok)
-			for _, detail := range []string{"proxy.invalid", "fixture-private-dial-detail"} {
+			for _, detail := range []string{"proxy.invalid", "fixture-private-dial-detail", fixtureCredential} {
 				assert.NotContains(t, apiErr.Error(), detail)
 				assert.NotContains(t, internal.Message, detail)
 			}
@@ -117,6 +132,59 @@ func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
 			assert.NotContains(t, message, "localhost")
 		})
 	}
+}
+
+func TestAdaptorMasksCustomQueryAuthInHTTPRelayLogs(t *testing.T) {
+	var logs bytes.Buffer
+	common.LogWriterMu.Lock()
+	oldWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logs
+	common.LogWriterMu.Unlock()
+	oldDebug := common.DebugEnabled
+	common.DebugEnabled = true
+	t.Cleanup(func() {
+		common.DebugEnabled = oldDebug
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = oldWriter
+		common.LogWriterMu.Unlock()
+	})
+
+	const credential = "fixture-query-credential"
+	sent := make(chan url.Values, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent <- r.URL.Query()
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if assert.NoError(t, err) {
+			_ = conn.Close()
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
+		Routes: []dto.AdvancedCustomRoute{{
+			IncomingPath: "/v1/chat/completions",
+			UpstreamPath: upstream.URL + "/v1/chat/completions?mode=fixture",
+			Converter:    relayconvert.ConverterNone,
+			Auth:         &dto.AdvancedCustomRouteAuth{Type: dto.AdvancedCustomAuthTypeQuery, Name: "ClientId", Value: "prefix-{api_key}"},
+		}},
+	})
+	info.ApiKey = credential
+	info.RequestURLPath = "/v1/chat/completions"
+	c := advancedCustomGinContext("/v1/chat/completions")
+
+	_, err := (&Adaptor{}).DoRequest(c, info, strings.NewReader("{}"))
+	require.Error(t, err)
+	select {
+	case query := <-sent:
+		assert.Equal(t, "prefix-"+credential, query.Get("ClientId"))
+		assert.Equal(t, "fixture", query.Get("mode"))
+	default:
+		t.Fatal("upstream did not receive the request")
+	}
+	logged := logs.String()
+	assert.Contains(t, logged, "fullRequestURL")
+	assert.Contains(t, logged, "do request failed")
+	assert.Contains(t, logged, "mode=fixture")
+	assert.NotContains(t, logged, credential)
 }
 
 func TestAdaptorJoinsUpstreamPathWithChannelBaseURL(t *testing.T) {

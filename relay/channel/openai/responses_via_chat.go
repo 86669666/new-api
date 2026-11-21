@@ -132,11 +132,11 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				if failResponsesStream(fmt.Errorf("%s", oaiError.Message)) {
 					// The client got response.failed, so the request is never
 					// retried; the recorded error keeps the stream failed.
-					upstreamFailure = types.WithOpenAIError(*oaiError, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+					upstreamFailure = service.MarkUpstreamResponseError(types.WithOpenAIError(*oaiError, http.StatusInternalServerError, types.ErrOptionWithSkipRetry()))
 					sr.Stop(upstreamFailure)
 					return
 				}
-				streamErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
+				streamErr = service.MarkUpstreamResponseError(types.WithOpenAIError(*oaiError, resp.StatusCode))
 				stopStream(sr, streamErr)
 				return
 			}
@@ -144,13 +144,13 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 		var chunk dto.ChatCompletionsStreamResponse
 		if err := common.UnmarshalJsonStr(data, &chunk); err != nil {
-			logger.LogError(c, common.LogText("failed to unmarshal chat stream response: %s", err.Error()))
+			logger.LogError(c, common.LogText("failed to unmarshal chat stream response (%T)", err))
 			if failResponsesStream(err) {
-				upstreamFailure = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+				upstreamFailure = service.MarkUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError, types.ErrOptionWithSkipRetry()))
 				sr.Stop(upstreamFailure)
 				return
 			}
-			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+			streamErr = service.MarkUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError))
 			stopStream(sr, streamErr)
 			return
 		}

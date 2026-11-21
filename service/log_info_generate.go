@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/base64"
+	"fmt"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -169,7 +170,7 @@ func appendStreamStatus(relayInfo *relaycommon.RelayInfo, other *model.LogOther)
 		streamInfo["response_status"] = outcome
 	}
 	if ss.EndError != nil {
-		streamInfo["end_error"] = ss.EndError.Error()
+		streamInfo["end_error"] = fmt.Sprintf("%T", ss.EndError)
 	}
 	if ss.ErrorCount > 0 {
 		streamInfo["error_count"] = ss.ErrorCount

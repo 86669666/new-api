@@ -173,7 +173,7 @@ func TestFetchAdvancedCustomModelsRedactsQueryKeyFromTransportErrors(t *testing.
 	queryValue := "prefix-" + secret
 	queryError := sanitizeAdvancedCustomRequestError(
 		errors.New("dial "+queryValue+": connection refused"),
-		queryValue,
+		"fixture-unrelated-channel-key",
 		baseURL+"/v1/models?custom-token="+url.QueryEscape(queryValue),
 	)
 	require.NotContains(t, queryError.Error(), queryValue)

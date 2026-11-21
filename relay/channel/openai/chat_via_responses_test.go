@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -40,6 +41,78 @@ func newResponsesChatTestContext(t *testing.T, body string, isStream bool) (*gin
 		DisablePing:        true,
 	}
 	return c, recorder, resp, info
+}
+
+func captureProviderStreamLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	common.LogWriterMu.Lock()
+	writer, errorWriter := gin.DefaultWriter, gin.DefaultErrorWriter
+	gin.DefaultWriter = &logs
+	gin.DefaultErrorWriter = &logs
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter = writer
+		gin.DefaultErrorWriter = errorWriter
+		common.LogWriterMu.Unlock()
+	})
+	return &logs
+}
+
+func TestOaiStreamHandlerDoesNotLogRawFinalFrame(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	t.Run("OpenAI", func(t *testing.T) {
+		logs := captureProviderStreamLogs(t)
+		c, _, resp, info := newResponsesChatTestContext(t,
+			`data: {"id":"fixture-chat","model":"gpt-test","choices":[{"index":0,"delta":{"content":"hello"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`+
+				"\ndata: fixture-private-final-frame\ndata: [DONE]\n", true)
+		usage, err := OaiStreamHandler(c, info, resp)
+		require.Nil(t, err)
+		require.NotNil(t, usage)
+		assert.Equal(t, 5, usage.TotalTokens, "the valid penultimate usage still applies")
+		assert.Contains(t, logs.String(), "error handling last response")
+		assert.NotContains(t, logs.String(), "fixture-private-final-frame")
+	})
+
+	for _, format := range []types.RelayFormat{types.RelayFormatClaude, types.RelayFormatGemini} {
+		t.Run(string(format), func(t *testing.T) {
+			logs := captureProviderStreamLogs(t)
+			const malformedTime = "123456789012345678901234567890"
+			c, _, resp, info := newResponsesChatTestContext(t, `data: {"created":`+malformedTime+"}\ndata: [DONE]\n", true)
+			info.RelayFormat = format
+			usage, err := OaiStreamHandler(c, info, resp)
+			require.Nil(t, err)
+			require.NotNil(t, usage)
+			assert.Contains(t, logs.String(), "error unmarshalling stream response")
+			assert.NotContains(t, logs.String(), malformedTime)
+		})
+	}
+}
+
+func TestOaiResponsesToChatStreamFailureKeepsClientMessageOutOfLogs(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	logs := captureProviderStreamLogs(t)
+	c, recorder, resp, info := newResponsesChatTestContext(t, strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_fixture","model":"gpt-test"}}`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: {"type":"response.failed","response":{"status":"failed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5},"error":{"type":"provider_rejection","message":"fixture-private-provider-message"}}}`,
+		"",
+	}, "\n"), true)
+	usage, err := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, 5, usage.TotalTokens)
+	assert.Contains(t, recorder.Body.String(), "hello")
+	assert.Contains(t, recorder.Body.String(), "fixture-private-provider-message")
+	assert.Contains(t, logs.String(), "upstream returned an error")
+	assert.NotContains(t, logs.String(), "fixture-private-provider-message")
+	require.NotEmpty(t, info.StreamStatus.Errors)
+	assert.NotContains(t, info.StreamStatus.Errors[0].Message, "fixture-private-provider-message")
 }
 
 func TestOaiResponsesToChatStreamHandlerConvertsSSEOrderAndUsage(t *testing.T) {
@@ -172,6 +245,63 @@ func TestOaiResponsesToChatBufferedStreamHandlerReturnsJSONFromSSE(t *testing.T)
 	require.Contains(t, got, `"name":"lookup"`)
 	require.Contains(t, got, `"arguments":"{\"q\":\"x\"}"`)
 	require.Contains(t, got, `"finish_reason":"tool_calls"`)
+}
+
+func TestOpenAIResponsesStreamErrorsKeepProviderDiagnosticsOutOfLogs(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	const privateMessage = "fixture-provider-diagnostic"
+	const privateCode = "fixture-provider-code"
+	const invalidResponse = `data: {"type":"response.created","response":{"created_at":"` + privateMessage + `"}}` + "\n"
+	const responsesFailure = `data: {"type":"response.failed","response":{"status":"failed","error":{"type":"upstream","code":"` +
+		privateCode + `","message":"` + privateMessage + `"}}}` + "\n"
+	const chatFailure = `data: {"error":{"type":"upstream","code":"` + privateCode + `","message":"` + privateMessage + `"}}` + "\n"
+
+	for _, tc := range []struct {
+		name       string
+		handler    func(*gin.Context, *relaycommon.RelayInfo, *http.Response) (*dto.Usage, *types.NewAPIError)
+		input      string
+		isStream   bool
+		wantStatus int
+		wantLog    string
+	}{
+		{"buffered decode failure", OaiResponsesToChatBufferedStreamHandler, invalidResponse, false, http.StatusInternalServerError, "failed to unmarshal buffered responses stream event"},
+		{"buffered provider failure", OaiResponsesToChatBufferedStreamHandler, responsesFailure, false, http.StatusInternalServerError, ""},
+		{"chat-backed provider failure", OaiChatToResponsesStreamHandler, chatFailure, true, http.StatusInternalServerError, ""},
+		{"native Responses decode failure", OaiResponsesStreamHandler, invalidResponse, true, 0, "failed to unmarshal stream response"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureProviderStreamLogs(t)
+			c, recorder, resp, info := newResponsesChatTestContext(t, tc.input+"data: [DONE]\n", tc.isStream)
+			usage, apiErr := tc.handler(c, info, resp)
+			if tc.wantStatus == 0 {
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				require.Equal(t, 1, info.StreamStatus.TotalErrorCount())
+				assert.NotContains(t, recorder.Body.String(), privateMessage)
+			} else {
+				require.Nil(t, usage)
+				require.NotNil(t, apiErr)
+				assert.Equal(t, tc.wantStatus, apiErr.StatusCode)
+				assert.Contains(t, apiErr.ToOpenAIError().Message, privateMessage)
+				if tc.isStream {
+					assert.Contains(t, recorder.Body.String(), "event: response.failed")
+					assert.Contains(t, recorder.Body.String(), privateMessage)
+					assert.True(t, types.IsSkipRetryError(apiErr))
+				}
+				assert.Contains(t, service.RelayErrorLogMessage(apiErr), "upstream returned an error")
+				assert.NotContains(t, service.RelayErrorLogMessage(apiErr), privateMessage)
+				assert.NotContains(t, service.RelayErrorLogMessage(apiErr), privateCode)
+			}
+			if tc.wantLog != "" {
+				assert.Contains(t, logs.String(), tc.wantLog)
+			}
+			assert.NotContains(t, logs.String(), privateMessage)
+			assert.NotContains(t, logs.String(), privateCode)
+		})
+	}
 }
 
 func TestOaiResponsesToChatBufferedStreamHandlerPreservesInterleavedClaudeContent(t *testing.T) {

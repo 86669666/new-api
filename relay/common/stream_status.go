@@ -222,7 +222,7 @@ func (s *StreamStatus) Summary() string {
 	b := &strings.Builder{}
 	fmt.Fprintf(b, "reason=%s", s.EndReason)
 	if s.EndError != nil {
-		fmt.Fprintf(b, " end_error=%q", s.EndError.Error())
+		fmt.Fprintf(b, " end_error=%T", s.EndError)
 	}
 	s.mu.Lock()
 	if s.ErrorCount > 0 {

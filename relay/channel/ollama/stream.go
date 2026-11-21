@@ -166,8 +166,8 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		}
 		var chunk ollamaChatStreamChunk
 		if err := common.Unmarshal([]byte(line), &chunk); err != nil {
-			logger.LogError(c, common.LogText("ollama stream json decode error: %s line=%s", err.Error(), line))
-			return usage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+			logger.LogError(c, common.LogText("ollama stream json decode error (%T, line bytes=%d)", err, len(line)))
+			return usage, service.MarkUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError))
 		}
 		if chunk.Model != "" {
 			model = chunk.Model
@@ -215,7 +215,7 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		break
 	}
 	if err := scanner.Err(); err != nil && err != io.EOF {
-		logger.LogError(c, common.LogText("ollama stream scan error: %s", err.Error()))
+		logger.LogError(c, common.LogText("ollama stream scan error (%T)", err))
 	}
 	return usage, nil
 }

@@ -2,6 +2,7 @@ package helper
 
 import (
 	"errors"
+	"fmt"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -26,7 +27,7 @@ func (r *StreamResult) Error(err error) {
 	if err == nil {
 		return
 	}
-	r.status.RecordError(err.Error())
+	r.status.RecordError(fmt.Sprintf("stream error (%T)", err))
 	var apiErr *types.NewAPIError
 	if errors.As(err, &apiErr) {
 		r.status.MarkFailed(string(apiErr.GetErrorCode()), apiErr.ToOpenAIError().Type, apiErr.StatusCode)
