@@ -105,6 +105,12 @@ func CurrentOAuthUserInfoResource() *OAuthUserInfoResource {
 	return currentOAuthUserInfo.Load()
 }
 
+// SetCurrentOAuthUserInfoResource installs a resource that already carries its
+// CA pool. Production startup still uses InitOAuthUserInfoResource.
+func SetCurrentOAuthUserInfoResource(resource *OAuthUserInfoResource) *OAuthUserInfoResource {
+	return currentOAuthUserInfo.Swap(resource)
+}
+
 // roots optionally supplies trusted certificate authorities, including an
 // isolated test issuer's CA. Certificate and hostname verification stay enabled;
 // there is no plaintext or InsecureSkipVerify configuration path.
