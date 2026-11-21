@@ -90,11 +90,11 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	var claudeResponse dto.ClaudeResponse
 	err := common.UnmarshalJsonStr(data, &claudeResponse)
 	if err != nil {
-		common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
-		return types.NewError(err, types.ErrorCodeBadResponseBody)
+		common.SysLog(common.LogText("error unmarshalling stream response (%T)", err))
+		return service.MarkUpstreamResponseError(types.NewError(err, types.ErrorCodeBadResponseBody))
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		return service.MarkUpstreamResponseError(types.WithClaudeError(*claudeError, http.StatusInternalServerError))
 	}
 	if claudeResponse.Type == "message_start" && claudeResponse.Message != nil {
 		info.ObserveResponseModel(claudeResponse.Message.Model)
@@ -128,11 +128,11 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	} else if info.RelayFormat == types.RelayFormatOpenAI {
 		state, err := claudeToChatStreamState(info)
 		if err != nil {
-			return types.NewError(err, types.ErrorCodeBadResponseBody)
+			return service.MarkUpstreamResponseError(types.NewError(err, types.ErrorCodeBadResponseBody))
 		}
 		response, err := state.ConvertChunk(&claudeResponse)
 		if err != nil {
-			return types.NewError(err, types.ErrorCodeBadResponseBody)
+			return service.MarkUpstreamResponseError(types.NewError(err, types.ErrorCodeBadResponseBody))
 		}
 
 		if !FormatClaudeResponseInfo(&claudeResponse, response, claudeInfo) {
@@ -146,16 +146,16 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		}
 		err = helper.ObjectData(c, response)
 		if err != nil {
-			logger.LogError(c, common.LogText("send_stream_response_failed: %s", err.Error()))
+			logger.LogError(c, common.LogText("failed to send Claude stream response (%T)", err))
 		}
 	} else if info.RelayFormat == types.RelayFormatGemini {
 		state, err := claudeToGeminiStreamState(info)
 		if err != nil {
-			return types.NewError(err, types.ErrorCodeBadResponseBody)
+			return service.MarkUpstreamResponseError(types.NewError(err, types.ErrorCodeBadResponseBody))
 		}
 		results, err := service.ConvertStreamResponseChunk(c, info, state, &claudeResponse)
 		if err != nil {
-			return types.NewError(err, types.ErrorCodeBadResponseBody)
+			return service.MarkUpstreamResponseError(types.NewError(err, types.ErrorCodeBadResponseBody))
 		}
 		if !FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo) {
 			return nil
@@ -294,23 +294,23 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 			response := helper.GenerateFinalUsageResponse(claudeInfo.ResponseId, claudeInfo.Created, info.UpstreamModelName, openAIUsage)
 			err := helper.ObjectData(c, response)
 			if err != nil {
-				common.SysLog(common.LogText("send final response failed: %s", err.Error()))
+				common.SysLog(common.LogText("send final response failed (%T)", err))
 			}
 		}
 		helper.Done(c)
 	} else if info.RelayFormat == types.RelayFormatGemini {
 		state, err := claudeToGeminiStreamState(info)
 		if err != nil {
-			common.SysLog(common.LogText("error creating Gemini stream state: %s", err.Error()))
+			common.SysLog(common.LogText("error creating Gemini stream state (%T)", err))
 			return
 		}
 		results, err := service.FinalizeStreamResponse(c, info, state)
 		if err != nil {
-			common.SysLog(common.LogText("error finalizing Gemini stream response: %s", err.Error()))
+			common.SysLog(common.LogText("error finalizing Gemini stream response (%T)", err))
 			return
 		}
 		if sendErr := sendGeminiStreamResults(c, results); sendErr != nil {
-			common.SysLog(common.LogText("send final Gemini stream response failed: %s", sendErr.Error()))
+			common.SysLog(common.LogText("send final Gemini stream response failed (%T)", sendErr))
 		}
 	}
 }
@@ -439,7 +439,7 @@ func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayI
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
-	logger.LogDebug(c, "responseBody: %s", responseBody)
+	logger.LogDebug(c, "Claude response body bytes: %d", len(responseBody))
 	handleErr := HandleClaudeResponseData(c, info, claudeInfo, resp, responseBody)
 	if handleErr != nil {
 		return nil, handleErr

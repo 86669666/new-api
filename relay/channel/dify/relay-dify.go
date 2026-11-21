@@ -231,7 +231,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var difyResponse DifyChunkChatCompletionResponse
 		if err := json.Unmarshal([]byte(data), &difyResponse); err != nil {
-			common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
+			common.SysLog(common.LogText("error unmarshalling stream response (%T)", err))
 			sr.Error(err)
 			return
 		}
@@ -251,7 +251,7 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			}
 		}
 		if err := helper.ObjectData(c, openaiResponse); err != nil {
-			common.SysLog(err.Error())
+			common.SysLog(common.LogText("failed to write stream response (%T)", err))
 			sr.Error(err)
 		}
 	})

@@ -2,6 +2,7 @@ package claude
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -501,4 +503,45 @@ func TestClaudeResponsePassesInputTransformationsThrough(t *testing.T) {
 		transformations + `,"usage":{"input_tokens":5,"output_tokens":1}}}`
 	require.Nil(t, HandleStreamResponseData(c, info, &ClaudeResponseInfo{Usage: &dto.Usage{}}, event))
 	assert.Contains(t, w.Body.String(), "data: "+event+"\n")
+}
+
+func TestClaudeStreamProviderErrorKeepsClientMessageOutOfDiagnostics(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	const detail = "sample provider rejection"
+	for _, test := range []struct {
+		name    string
+		handler func(*gin.Context, *http.Response, *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError)
+		format  types.RelayFormat
+	}{
+		{"native", ClaudeStreamHandler, types.RelayFormatClaude},
+		{"converted Responses", ClaudeResponsesStreamHandler, types.RelayFormatOpenAIResponses},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(
+				`data: {"type":"error","error":{"type":"overloaded_error","message":"` + detail + `"}}` + "\n\n"))}
+			info := &relaycommon.RelayInfo{RelayFormat: test.format, IsStream: true, DisablePing: true,
+				ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-fixture"}}
+			usage, apiErr := test.handler(c, resp, info)
+			if test.format == types.RelayFormatOpenAIResponses {
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				assert.Zero(t, usage.TotalTokens)
+				assert.Contains(t, recorder.Body.String(), "event: response.failed")
+				assert.Contains(t, recorder.Body.String(), detail)
+				return
+			}
+			require.Nil(t, usage)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusInternalServerError, apiErr.StatusCode)
+			assert.Equal(t, types.ErrorCode("overloaded_error"), apiErr.GetErrorCode())
+			assert.Equal(t, detail, apiErr.ToClaudeError().Message)
+			assert.Equal(t, "status_code=500, upstream returned an error", service.RelayErrorLogMessage(apiErr))
+		})
+	}
 }

@@ -1,14 +1,12 @@
 package aws
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
@@ -54,7 +52,6 @@ func formatRequest(requestBody io.Reader, requestHeader http.Header) (*AwsClaude
 		}
 		awsClaudeRequest.AnthropicBeta = betaJson
 	}
-	logger.LogJson(context.Background(), "json", awsClaudeRequest)
 	return &awsClaudeRequest, nil
 }
 

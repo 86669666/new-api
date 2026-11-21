@@ -201,6 +201,16 @@ func handleFinalStream(c *gin.Context, info *relaycommon.RelayInfo, resp *dto.Ch
 	return nil
 }
 
+func recordGeminiBlockReason(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
+	switch reason {
+	case "BLOCK_REASON_UNSPECIFIED", "SAFETY", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY":
+	default:
+		reason = "UNKNOWN"
+	}
+	info.PerformanceBusinessRejection = true
+	common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "gemini_block_reason="+reason)
+}
+
 func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, callback func(data string, geminiResponse *dto.GeminiChatResponse) bool) (*dto.Usage, *types.NewAPIError) {
 	var usage = &dto.Usage{}
 	var imageCount int
@@ -219,8 +229,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		}
 
 		if len(geminiResponse.Candidates) == 0 && geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
-			info.PerformanceBusinessRejection = true
-			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", *geminiResponse.PromptFeedback.BlockReason))
+			recordGeminiBlockReason(c, info, *geminiResponse.PromptFeedback.BlockReason)
 		}
 		info.ObserveResponseModel(ojson.Get(data, "modelVersion").Str)
 		for _, candidate := range geminiResponse.Candidates {
@@ -285,7 +294,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 
 	if streamErr != nil {
-		return usage, types.NewOpenAIError(streamErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		return usage, service.MarkUpstreamResponseError(types.NewOpenAIError(streamErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError))
 	}
 	if info.StreamStatus != nil && !info.StreamStatus.IsNormalEnd() {
 		logger.LogWarn(c, common.LogText("Gemini stream ended unexpectedly: %s", info.StreamStatus.Summary()))
@@ -366,7 +375,7 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 				finishReason = constant.FinishReasonToolCalls
 				err := handleStream(c, info, emptyResponse)
 				if err != nil {
-					logger.LogError(c, err.Error())
+					logger.LogError(c, common.LogText("failed to send Gemini stream response (%T)", err))
 				}
 
 				response.ClearToolCalls()
@@ -376,14 +385,14 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 			} else {
 				err := handleStream(c, info, emptyResponse)
 				if err != nil {
-					logger.LogError(c, err.Error())
+					logger.LogError(c, common.LogText("failed to send Gemini stream response (%T)", err))
 				}
 			}
 		}
 
 		err := handleStream(c, info, response)
 		if err != nil {
-			logger.LogError(c, err.Error())
+			logger.LogError(c, common.LogText("failed to send Gemini stream response (%T)", err))
 		}
 		if isStop {
 			if info.RelayFormat != types.RelayFormatClaude {
@@ -404,7 +413,7 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 	}
 	handleErr := handleFinalStream(c, info, response)
 	if handleErr != nil {
-		common.SysLog(common.LogText("send final response failed: %s", handleErr.Error()))
+		common.SysLog(common.LogText("send final response failed (%T)", handleErr))
 	}
 	return usage, nil
 }
@@ -415,7 +424,7 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	service.CloseResponseBodyGracefully(resp)
-	logger.LogDebug(c, "Gemini response body: %s", responseBody)
+	logger.LogDebug(c, "Gemini response body bytes: %d", len(responseBody))
 	var geminiResponse dto.GeminiChatResponse
 	err = common.Unmarshal(responseBody, &geminiResponse)
 	if err != nil {
@@ -431,8 +440,7 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 
 		var newAPIError *types.NewAPIError
 		if geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
-			info.PerformanceBusinessRejection = true
-			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", *geminiResponse.PromptFeedback.BlockReason))
+			recordGeminiBlockReason(c, info, *geminiResponse.PromptFeedback.BlockReason)
 			newAPIError = types.NewOpenAIError(
 				errors.New("request blocked by Gemini API: "+*geminiResponse.PromptFeedback.BlockReason),
 				types.ErrorCodePromptBlocked,

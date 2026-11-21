@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
@@ -307,6 +310,88 @@ func TestCloudflareEmbeddingResponseCompatibility(t *testing.T) {
 			assert.Equal(t, http.StatusOK, w.Code)
 			assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
 			assert.JSONEq(t, tt.body, w.Body.String())
+		})
+	}
+}
+
+func TestChannelTestResponseLogOmitsProviderContent(t *testing.T) {
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	oldRedis, oldDebug, oldConsume := common.RedisEnabled, common.DebugEnabled, common.LogConsumeEnabled
+	oldTimeout, oldMode := constant.StreamingTimeout, gin.Mode()
+	db := setupModelListControllerTestDB(t)
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLogDB
+		common.SetDatabaseTypes(oldMainType, oldLogType)
+		common.RedisEnabled, common.DebugEnabled, common.LogConsumeEnabled = oldRedis, oldDebug, oldConsume
+		constant.StreamingTimeout = oldTimeout
+		gin.SetMode(oldMode)
+	})
+	common.DebugEnabled, common.LogConsumeEnabled = true, false
+	constant.StreamingTimeout = 30
+	service.InitHttpClient()
+	user := model.User{Username: "channel-test-fixture", Group: "default"}
+	user.SetSetting(dto.UserSetting{AcceptUnsetRatioModel: true})
+	require.NoError(t, db.Create(&user).Error)
+
+	const reply = "sample channel response"
+	const errorCode = "fixture_provider_error"
+	for _, test := range []struct {
+		name        string
+		contentType string
+		body        string
+		stream      bool
+		model       string
+		endpoint    constant.EndpointType
+		channelType int
+		wantError   bool
+	}{
+		{name: "JSON", contentType: "application/json",
+			body: `{"id":"fixture","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"` + reply + `"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`},
+		{name: "SSE", contentType: "text/event-stream", stream: true,
+			body: `data: {"id":"fixture","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"` + reply + `"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}` + "\n\ndata: [DONE]\n\n"},
+		{name: "JSON provider error", contentType: "application/json", wantError: true,
+			body: `{"error":{"type":"provider_error","message":"` + reply + `","code":"` + errorCode + `"}}`},
+		{name: "Rerank", contentType: "application/json", model: "jina-reranker-v2-base-multilingual",
+			endpoint: constant.EndpointTypeJinaRerank, channelType: constant.ChannelTypeJina,
+			body: `{"results":[{"index":0,"document":{"text":"` + reply + `"},"relevance_score":1}],"usage":{"total_tokens":2}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", test.contentType)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+			var logs bytes.Buffer
+			common.LogWriterMu.Lock()
+			writer, errWriter := gin.DefaultWriter, gin.DefaultErrorWriter
+			gin.DefaultWriter, gin.DefaultErrorWriter = &logs, &logs
+			common.LogWriterMu.Unlock()
+			t.Cleanup(func() {
+				common.LogWriterMu.Lock()
+				defer common.LogWriterMu.Unlock()
+				gin.DefaultWriter, gin.DefaultErrorWriter = writer, errWriter
+			})
+
+			channelType, endpoint, modelName := test.channelType, test.endpoint, test.model
+			if channelType == 0 {
+				channelType, endpoint, modelName = constant.ChannelTypeOpenAI, constant.EndpointTypeOpenAI, "gpt-4o-mini"
+			}
+			channel := &model.Channel{Id: 42, Type: channelType, Key: "fixture-channel-key", BaseURL: &server.URL}
+			result := testChannel(context.Background(), channel, user.Id, modelName, string(endpoint), test.stream)
+			assert.NotContains(t, logs.String(), reply)
+			assert.NotContains(t, logs.String(), channel.Key)
+			if test.wantError {
+				require.ErrorContains(t, result.localErr, reply)
+				require.NotNil(t, result.newAPIError)
+				assert.Equal(t, types.ErrorCode(errorCode), result.newAPIError.GetErrorCode())
+				assert.Equal(t, "status_code=200, upstream returned an error", service.RelayErrorLogMessage(result.newAPIError))
+				return
+			}
+			require.NoError(t, result.localErr)
+			require.Nil(t, result.newAPIError)
+			assert.Contains(t, logs.String(), "channel #42 test response (status=200")
+			assert.Contains(t, logs.String(), "inspected bytes=")
 		})
 	}
 }
