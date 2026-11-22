@@ -42,6 +42,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
@@ -7150,13 +7151,15 @@ func TestTokenAuthStaleExpiryDeniesHTTP(t *testing.T) {
 
 func TestPersonalHistoricalMediaReading(t *testing.T) {
 	f := newOrganizationHTTPFixture(t)
-	require.NoError(t, f.db.AutoMigrate(&model.Midjourney{}, &model.Channel{}, &model.MidjourneyImageVersion{}, &model.MidjourneyImageShare{}))
+	require.NoError(t, f.db.AutoMigrate(&model.Midjourney{}, &model.Channel{}, &model.MidjourneyImageVersion{}, &model.MidjourneyImageShare{}, &model.PersonalTaskImage{}))
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	pinStarted := make(chan struct{})
 	pinRelease := make(chan struct{})
 	var pinOnce sync.Once
+	taskImageStarted, taskImageRelease := make(chan struct{}), make(chan struct{})
+	var taskImageReleaseOnce sync.Once
 	var upstreamRequests atomic.Int64
 	raster := image.NewRGBA(image.Rect(0, 0, 1, 1))
 	raster.Set(0, 0, color.RGBA{R: 11, G: 22, B: 33, A: 255})
@@ -7178,6 +7181,18 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 			}
 		}
 		switch r.URL.Path {
+		case "/task-image-pin-paused":
+			close(taskImageStarted)
+			select {
+			case <-taskImageRelease:
+				_, _ = w.Write(originalImage.Bytes())
+			case <-r.Context().Done():
+			}
+			return
+		case "/truncated-image":
+			w.Header().Set("Content-Length", strconv.Itoa(originalImage.Len()+9))
+			_, _ = w.Write(originalImage.Bytes())
+			return
 		case "/pin-paused":
 			close(pinStarted)
 			select {
@@ -7215,6 +7230,7 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 	}))
 	defer upstream.Close()
 	defer releaseOnce.Do(func() { close(release) })
+	defer taskImageReleaseOnce.Do(func() { close(taskImageRelease) })
 	defer pinOnce.Do(func() { close(pinRelease) })
 	address, err := url.Parse(upstream.URL)
 	require.NoError(t, err)
@@ -7421,6 +7437,178 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 		status, _, _ = send(http.MethodGet, path, "", native)
 		require.Equal(t, http.StatusNotFound, status)
 		assert.Equal(t, before, upstreamRequests.Load())
+	})
+
+	t.Run("retained_dashscope_artifact_can_be_fixed_and_read_privately", func(t *testing.T) {
+		source, err := plugins.Source("alibaba")
+		require.NoError(t, err)
+		plugin, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "alibaba"})
+		require.NoError(t, err)
+		oldAddress, oldSecret := system_setting.ServerAddress, common.CryptoSecret
+		system_setting.ServerAddress, common.CryptoSecret = f.server.URL, "isolated-generic-media-fixture"
+		t.Cleanup(func() { system_setting.ServerAddress, common.CryptoSecret = oldAddress, oldSecret })
+		task := model.Task{
+			TaskID: "dashscope-stored-image", UserId: owner, Platform: "alibaba", ChannelId: channel.Id,
+			SubmitTime: 1919, Status: model.TaskStatusInProgress, Action: "image",
+			PrivateData: model.TaskPrivateData{
+				UpstreamTaskID: "dashscope-fixture-upstream",
+				Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "alibaba",
+					Version: plugin.Meta.Version, APIVersion: plugin.Meta.APIVersion}},
+			},
+		}
+		require.NoError(t, task.Insert())
+		polled := map[string]any{"output": map[string]any{
+			"task_id": task.PrivateData.UpstreamTaskID, "task_status": "SUCCEEDED",
+			"results": []map[string]any{{"url": upstream.URL + "/original"}},
+		}}
+		fromPlugin, err := plugin.Engine.Call(t.Context(), "parseTaskResult", map[string]any{"model": "wanx-v1"}, polled)
+		require.NoError(t, err)
+		require.IsType(t, map[string]any{}, fromPlugin)
+		require.Equal(t, "SUCCESS", fromPlugin.(map[string]any)["status"])
+		task.Status = model.TaskStatusSuccess
+		task.SetData(polled)
+		updated, err := task.UpdateWithStatus(model.TaskStatusInProgress)
+		require.NoError(t, err)
+		require.True(t, updated)
+
+		projection := "/api/task/" + task.TaskID + "/artifacts"
+		person := request(http.MethodGet, projection, f.bearer["owner"], nil)
+		require.NoError(t, person.err)
+		require.Equal(t, http.StatusOK, person.status)
+		assert.Contains(t, person.body, `"personal_fixed_image":true`)
+		path := fmt.Sprintf("/api/task/media/%d/artifacts/image-1/versions", task.ID)
+		before := upstreamRequests.Load()
+		for _, actor := range []string{"foreign", "relay"} {
+			denied := request(http.MethodPost, path, f.bearer[actor], nil)
+			require.NoError(t, denied.err)
+			assert.Contains(t, []int{http.StatusNotFound, http.StatusUnauthorized}, denied.status)
+		}
+		missingVersion := request(http.MethodGet, path+"/1", f.bearer["owner"], nil)
+		require.NoError(t, missingVersion.err)
+		assert.Equal(t, http.StatusNotFound, missingVersion.status)
+		assert.Equal(t, before, upstreamRequests.Load())
+		pinned := request(http.MethodPost, path, f.bearer["owner"], nil)
+		require.NoError(t, pinned.err)
+		require.Equal(t, http.StatusCreated, pinned.status, pinned.body)
+		assert.Contains(t, pinned.body, fmt.Sprintf("%x", sha256.Sum256(originalImage.Bytes())))
+		assert.NotContains(t, pinned.body, upstream.URL)
+		assert.Equal(t, before+1, upstreamRequests.Load())
+
+		polled["output"].(map[string]any)["results"] = []map[string]any{{"url": upstream.URL + "/changed"}}
+		task.SetData(polled)
+		require.NoError(t, f.db.Model(&task).Select("Data").Updates(&task).Error)
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			readBack := request(method, path+"/1", f.bearer["owner"], http.Header{"Accept-Encoding": {"gzip"}})
+			require.NoError(t, readBack.err)
+			require.Equal(t, http.StatusOK, readBack.status)
+			assert.Equal(t, "image/png", readBack.header.Get("Content-Type"))
+			assert.Equal(t, "private, no-store", readBack.header.Get("Cache-Control"))
+			assert.Equal(t, strconv.Itoa(originalImage.Len()), readBack.header.Get("Content-Length"))
+			assert.Equal(t, strconv.Quote(fmt.Sprintf("%x", sha256.Sum256(originalImage.Bytes()))), readBack.header.Get("ETag"))
+			assert.Empty(t, readBack.header.Get("Content-Encoding"))
+			if method == http.MethodGet {
+				assert.Equal(t, originalImage.String(), readBack.body)
+			} else {
+				assert.Empty(t, readBack.body)
+			}
+		}
+		retry := request(http.MethodPost, path, f.bearer["owner"], nil)
+		require.NoError(t, retry.err)
+		assert.Equal(t, http.StatusOK, retry.status)
+		assert.JSONEq(t, pinned.body, retry.body)
+		// Both version reads and idempotent pin retries obey current
+		// eligibility even when the fixed bytes still exist.
+		task.PrivateData.ResultDiscarded = true
+		require.NoError(t, f.db.Model(&task).Select("PrivateData").Updates(&task).Error)
+		for _, call := range []struct{ method, target string }{{http.MethodGet, path + "/1"}, {http.MethodPost, path}} {
+			unavailable := request(call.method, call.target, f.bearer["owner"], nil)
+			require.NoError(t, unavailable.err)
+			assert.Equal(t, http.StatusNotFound, unavailable.status)
+		}
+		task.PrivateData.ResultDiscarded = false
+		require.NoError(t, f.db.Model(&task).Select("PrivateData").Updates(&task).Error)
+		require.NoError(t, f.db.Model(&task).Update("organization_id", f.orgA).Error)
+		transferred := request(http.MethodGet, path+"/1", f.bearer["owner"], nil)
+		require.NoError(t, transferred.err)
+		assert.Equal(t, http.StatusNotFound, transferred.status)
+		assert.Equal(t, before+1, upstreamRequests.Load())
+
+		newTask := func(taskID, source string) (int64, string) {
+			t.Helper()
+			other := task
+			other.ID, other.TaskID, other.OrganizationID = 0, taskID, 0
+			other.PrivateData.UpstreamTaskID = taskID + "-upstream"
+			polled["output"].(map[string]any)["task_id"] = other.PrivateData.UpstreamTaskID
+			polled["output"].(map[string]any)["results"] = []map[string]any{{"url": upstream.URL + source}}
+			other.SetData(polled)
+			require.NoError(t, other.Insert())
+			return other.ID, fmt.Sprintf("/api/task/media/%d/artifacts/image-1/versions", other.ID)
+		}
+		badSource := task
+		badSource.ID, badSource.TaskID, badSource.OrganizationID = 0, "dashscope-source-id-mismatch", 0
+		badSource.PrivateData.UpstreamTaskID = "expected-source-id"
+		polled["output"].(map[string]any)["results"] = []map[string]any{{"url": upstream.URL + "/original"}}
+		badSource.SetData(polled)
+		require.NoError(t, badSource.Insert())
+		beforeMismatch := upstreamRequests.Load()
+		wrongSource := request(http.MethodGet, "/api/task/"+badSource.TaskID+"/artifacts", f.bearer["owner"], nil)
+		require.NoError(t, wrongSource.err)
+		require.Equal(t, http.StatusOK, wrongSource.status)
+		assert.NotContains(t, wrongSource.body, "personal_fixed_image")
+		rejected := request(http.MethodPost,
+			fmt.Sprintf("/api/task/media/%d/artifacts/image-1/versions", badSource.ID), f.bearer["owner"], nil)
+		require.NoError(t, rejected.err)
+		assert.Equal(t, http.StatusNotFound, rejected.status)
+		assert.Equal(t, beforeMismatch, upstreamRequests.Load())
+		for _, suffix := range []string{"/truncated-image", "/oversize"} {
+			rowID, candidate := newTask("dashscope-fixture-"+suffix, suffix)
+			rejected := request(http.MethodPost, candidate, f.bearer["owner"], nil)
+			require.NoError(t, rejected.err)
+			assert.Equal(t, http.StatusBadGateway, rejected.status)
+			var count int64
+			require.NoError(t, f.db.Model(&model.PersonalTaskImage{}).Where("task_row_id = ?", rowID).Count(&count).Error)
+			assert.Zero(t, count)
+		}
+
+		// Start two fresh captures for one row. One commit wins and both callers
+		// observe that one stored version, regardless of which fetch finished first.
+		rowID, candidate := newTask("dashscope-fixture-race", "/original")
+		results := make(chan result, 2)
+		start := make(chan struct{})
+		for range 2 {
+			go func() {
+				<-start
+				results <- request(http.MethodPost, candidate, f.bearer["owner"], nil)
+			}()
+		}
+		close(start)
+		first, second := <-results, <-results
+		require.NoError(t, first.err)
+		require.NoError(t, second.err)
+		assert.ElementsMatch(t, []int{http.StatusCreated, http.StatusOK}, []int{first.status, second.status})
+		assert.JSONEq(t, first.body, second.body)
+		var count int64
+		require.NoError(t, f.db.Model(&model.PersonalTaskImage{}).Where("task_row_id = ?", rowID).Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+
+		rowID, candidate = newTask("dashscope-fixture-revoked", "/task-image-pin-paused")
+		go func() { results <- request(http.MethodPost, candidate, f.bearer["owner"], nil) }()
+		defer taskImageReleaseOnce.Do(func() { close(taskImageRelease) })
+		select {
+		case <-taskImageStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("fixture did not reach source read")
+		}
+		require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).Update("revoked_at", time.Now().Unix()).Error)
+		t.Cleanup(func() {
+			require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).Update("revoked_at", 0).Error)
+		})
+		taskImageReleaseOnce.Do(func() { close(taskImageRelease) })
+		revoked := <-results
+		require.NoError(t, revoked.err)
+		assert.Equal(t, http.StatusNotFound, revoked.status)
+		require.NoError(t, f.db.Model(&model.PersonalTaskImage{}).Where("task_row_id = ?", rowID).Count(&count).Error)
+		assert.Zero(t, count)
 	})
 
 	t.Run("fixed_images_read_back_without_the_source", func(t *testing.T) {

@@ -308,29 +308,27 @@ func PersonalMidjourneyImage(c *gin.Context) {
 	}
 }
 
-func capturePersonalMidjourneyImage(c *gin.Context, task *model.Midjourney) ([]byte, string, error) {
+func capturePersonalImage(c *gin.Context, channelID int, taskID string, descriptor *relaychannel.TaskContentRequest, maxBytes int64) ([]byte, string, error) {
 	fetchContext, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 	request := c.Request
 	c.Request = request.WithContext(fetchContext)
 	defer func() { c.Request = request }()
-	rawURL := strings.TrimSpace(task.ImageUrl)
-	response, err := requestTaskMedia(c, task.ChannelId, "", rawURL, &relaychannel.TaskContentRequest{
-		URL: rawURL, Method: http.MethodGet, Credentialless: true,
-	}, nil)
+	rawURL := strings.TrimSpace(descriptor.URL)
+	response, err := requestTaskMedia(c, channelID, taskID, rawURL, descriptor, nil)
 	if err != nil {
 		return nil, "", err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Range") != "" ||
-		response.ContentLength > model.PersonalMidjourneyImageMaxBytes {
+		response.ContentLength > maxBytes {
 		return nil, "", errTaskMediaRequestRejected
 	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, model.PersonalMidjourneyImageMaxBytes+1))
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
 	if err != nil {
 		return nil, "", err
 	}
-	if len(data) == 0 || int64(len(data)) > model.PersonalMidjourneyImageMaxBytes ||
+	if len(data) == 0 || int64(len(data)) > maxBytes ||
 		response.ContentLength >= 0 && response.ContentLength != int64(len(data)) {
 		return nil, "", errTaskMediaRequestRejected
 	}
@@ -383,7 +381,9 @@ func PinPersonalMidjourneyImage(c *gin.Context) {
 		writePersonalMediaError(c, model.ErrMidjourneyImageNotReady)
 		return
 	}
-	data, mimeType, err := capturePersonalMidjourneyImage(c, task)
+	data, mimeType, err := capturePersonalImage(c, task.ChannelId, "", &relaychannel.TaskContentRequest{
+		URL: task.ImageUrl, Method: http.MethodGet, Credentialless: true,
+	}, model.PersonalMidjourneyImageMaxBytes)
 	if err != nil {
 		writeTaskMediaProxyError(c, &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_upstream_error", message: "Failed to fetch complete image", err: err})
 		return

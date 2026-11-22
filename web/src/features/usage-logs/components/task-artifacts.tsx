@@ -69,6 +69,8 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import { getTaskArtifacts } from '../api'
 import {
+  getPersonalTaskArtifactVersionCreatePath,
+  getPersonalTaskArtifactVersionPath,
   resolveTaskPreviewMode,
   shouldLoadTaskArtifacts,
 } from '../lib/task-artifacts'
@@ -79,6 +81,7 @@ import type {
   TaskLog,
 } from '../types'
 import { AudioPreviewDialog } from './dialogs/audio-preview-dialog'
+import { ImageDialog } from './dialogs/image-dialog'
 
 function artifactIcon(type: TaskArtifactType) {
   switch (type) {
@@ -215,13 +218,63 @@ function MediaFailure(props: { onRetry: () => void }) {
   )
 }
 
-function TaskArtifactCard(props: { artifact: TaskArtifact }) {
+function PersonalTaskImageMedia(props: { rowId: number; artifactKey: string }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const privateImagePath = getPersonalTaskArtifactVersionPath(
+    props.rowId,
+    props.artifactKey
+  )
+  const pinPath = getPersonalTaskArtifactVersionCreatePath(
+    props.rowId,
+    props.artifactKey
+  )
+  const privateImageFallbackPath = `/api/task/media/${props.rowId}/artifacts/${encodeURIComponent(props.artifactKey)}/content`
+
+  if (!privateImagePath || !pinPath) return null
+
+  return (
+    <>
+      <Button type='button' variant='outline' onClick={() => setOpen(true)}>
+        <HugeiconsIcon
+          icon={Image01Icon}
+          strokeWidth={2}
+          data-icon='inline-start'
+        />
+        {t('Preview')}
+      </Button>
+      <ImageDialog
+        isAdmin={false}
+        imageUrl=''
+        rowId={props.rowId}
+        open={open}
+        onOpenChange={setOpen}
+        privateImagePath={privateImagePath}
+        privateImageFallbackPath={privateImageFallbackPath}
+        fixedImage
+        pinPath={pinPath}
+        maxBytes={2 * 1024 * 1024}
+      />
+    </>
+  )
+}
+
+function TaskArtifactCard(props: {
+  artifact: TaskArtifact
+  isPersonal: boolean
+  rowId: number
+}) {
   const { t } = useTranslation()
   const [mediaFailed, setMediaFailed] = useState(false)
   const [mediaRevision, setMediaRevision] = useState(0)
   const icon = artifactIcon(props.artifact.type)
   const isVisualArtifact =
     props.artifact.type === 'image' || props.artifact.type === 'video'
+  const isPrivateFixedImage =
+    props.isPersonal &&
+    props.artifact.key === 'image-1' &&
+    props.artifact.type === 'image' &&
+    props.artifact.personal_fixed_image === true
 
   let cardContent = (
     <div
@@ -240,6 +293,13 @@ function TaskArtifactCard(props: { artifact: TaskArtifact }) {
           setMediaFailed(false)
           setMediaRevision((revision) => revision + 1)
         }}
+      />
+    )
+  } else if (isPrivateFixedImage) {
+    cardContent = (
+      <PersonalTaskImageMedia
+        rowId={props.rowId}
+        artifactKey={props.artifact.key}
       />
     )
   } else if (props.artifact.type !== 'file') {
@@ -279,34 +339,38 @@ function TaskArtifactCard(props: { artifact: TaskArtifact }) {
         </CardDescription>
       </CardHeader>
       <CardContent>{cardContent}</CardContent>
-      <CardFooter>
-        <Button
-          variant='outline'
-          size='sm'
-          nativeButton={false}
-          render={
-            <a
-              href={props.artifact.content_url}
-              download={props.artifact.key}
-              target='_blank'
-              rel='noopener noreferrer'
+      {!isPrivateFixedImage ? (
+        <CardFooter>
+          <Button
+            variant='outline'
+            size='sm'
+            nativeButton={false}
+            render={
+              <a
+                href={props.artifact.content_url}
+                download={props.artifact.key}
+                target='_blank'
+                rel='noopener noreferrer'
+              />
+            }
+          >
+            <HugeiconsIcon
+              icon={Download01Icon}
+              strokeWidth={2}
+              data-icon='inline-start'
             />
-          }
-        >
-          <HugeiconsIcon
-            icon={Download01Icon}
-            strokeWidth={2}
-            data-icon='inline-start'
-          />
-          {t('Download')}
-        </Button>
-      </CardFooter>
+            {t('Download')}
+          </Button>
+        </CardFooter>
+      ) : null}
     </Card>
   )
 }
 
 interface TaskArtifactsProps {
   taskId: string
+  rowId: number
+  isAdmin: boolean
   enabled: boolean
   emptyContent?: (projection: TaskArtifactProjection) => React.ReactNode
 }
@@ -375,7 +439,12 @@ function TaskArtifacts(props: TaskArtifactsProps) {
       )}
     >
       {artifactsQuery.data.artifacts.map((artifact) => (
-        <TaskArtifactCard key={artifact.key} artifact={artifact} />
+        <TaskArtifactCard
+          key={artifact.key}
+          artifact={artifact}
+          isPersonal={!props.isAdmin}
+          rowId={props.rowId}
+        />
       ))}
     </div>
   )
@@ -505,6 +574,8 @@ export function TaskArtifactsCell(props: { log: TaskLog; isAdmin?: boolean }) {
       >
         <TaskArtifacts
           taskId={props.log.task_id}
+          rowId={props.log.id}
+          isAdmin={props.isAdmin ?? false}
           enabled={shouldLoadTaskArtifacts(props.log, open)}
           emptyContent={(projection) => (
             <LegacyTaskArtifacts

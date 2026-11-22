@@ -531,6 +531,16 @@ func (r *Registry) Get(platform string) (*LoadedPlugin, bool) {
 	return r.Generation().Get(platform)
 }
 
+// IsFactoryPlugin reports whether the supplied, already pinned plugin is the embedded implementation.
+func (r *Registry) IsFactoryPlugin(plugin *LoadedPlugin) bool {
+	if plugin == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.factory[plugin.Meta.Key] == plugin
+}
+
 func (r *Registry) GetByChannelType(channelType int) (*LoadedPlugin, bool) {
 	return r.Generation().GetByChannelType(channelType)
 }

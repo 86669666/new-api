@@ -22,7 +22,7 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter.Use(middleware.RouteTag("api"))
 	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPathsRegexs([]string{
 		`^/api/organizations/[0-9]+/tasks/[0-9]+/artifacts/[^/]+/content$`,
-		`^/api/task/media/[0-9]+/artifacts/[^/]+/content$`,
+		`^/api/task/media/[0-9]+/artifacts/[^/]+/(content|versions/[0-9]+)$`,
 		`^/api/mj/media/[0-9]+/(image|versions/[0-9]+)$`,
 		`^/api/media-shares/mj/image$`,
 	})))
@@ -463,6 +463,9 @@ func SetApiRouter(router *gin.Engine) {
 			taskRoute.GET("", middleware.AdminAuth(), controller.GetAllTask)
 			taskRoute.GET("/media/:row_id/artifacts/:artifact_key/content", middleware.DisableCache(), middleware.PersonalTaskMediaAuth(), controller.PersonalTaskArtifactContent)
 			taskRoute.HEAD("/media/:row_id/artifacts/:artifact_key/content", middleware.DisableCache(), middleware.PersonalTaskMediaAuth(), controller.PersonalTaskArtifactContent)
+			taskRoute.POST("/media/:row_id/artifacts/:artifact_key/versions", middleware.DisableCache(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-task-image-pin"), controller.PinPersonalTaskImage)
+			taskRoute.GET("/media/:row_id/artifacts/:artifact_key/versions/:version", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalTaskImageVersion)
+			taskRoute.HEAD("/media/:row_id/artifacts/:artifact_key/versions/:version", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalTaskImageVersion)
 			taskRoute.GET("/:task_id/artifacts", middleware.UserAuth(), controller.GetDashboardTaskArtifacts)
 			taskRoute.POST("/media/:row_id/artifacts/:artifact_key/content/context", middleware.SessionCookieOriginGuard(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-media-context"), controller.PersonalTaskArtifactContext)
 		}
