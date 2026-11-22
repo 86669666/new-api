@@ -1218,7 +1218,8 @@ def main():
                            ['independent-stream-delta-consumer'], ['independent-stream-delta-terminal'],
                            ['request-plugin-delta-consumer'], ['request-plugin-delta-terminal'],
                            ['sql-midjourney-delta-consumer'], ['sql-midjourney-delta-terminal'],
-                           ['authz-policy-reload-delta-consumer'], ['authz-policy-reload-delta-terminal']),
+                           ['authz-policy-reload-delta-consumer'], ['authz-policy-reload-delta-terminal'],
+                           ['legacy-media-delta-consumer'], ['legacy-media-delta-terminal']),
             'unknown quality operation')
     if sys.argv[1:] == ['premerge']:
         result = resolve_ci_candidate(os.environ)
