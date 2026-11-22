@@ -439,17 +439,20 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	assert.Contains(t, logA, "plugin-console-request-a")
 	assert.NotContains(t, logA, "plugin-console-request-b")
 	assert.Contains(t, logA, "task_plugin subsystem=runtime event=console")
-	assert.Contains(t, logA, "[plugin:console-debug@1.2.3] checkpoint context-a")
+	assert.Contains(t, logA, `plugin="console-debug" version="1.2.3" message_bytes=`)
+	assert.NotContains(t, logA, "checkpoint context-a")
 	assert.NotContains(t, logA, "disabled")
 
 	assert.Contains(t, logB, "plugin-console-request-b")
 	assert.NotContains(t, logB, "plugin-console-request-a")
-	assert.Contains(t, logB, "[plugin:console-debug@1.2.3] checkpoint context-b")
+	assert.Contains(t, logB, `plugin="console-debug" version="1.2.3" message_bytes=`)
+	assert.NotContains(t, logB, "checkpoint context-b")
 
 	assert.Contains(t, logBackground, "| SYSTEM |")
 	assert.NotContains(t, logBackground, "plugin-console-request-a")
 	assert.NotContains(t, logBackground, "plugin-console-request-b")
-	assert.Contains(t, logBackground, "[plugin:console-debug@1.2.3] checkpoint background")
+	assert.Contains(t, logBackground, `plugin="console-debug" version="1.2.3" message_bytes=`)
+	assert.NotContains(t, logBackground, "checkpoint background")
 }
 
 func TestCompileRejectsAsynchronousAndImportedPlugins(t *testing.T) {

@@ -470,17 +470,12 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 			return nil, fmt.Errorf("error parsing multipart form: %w", err2)
 		}
 
-		// 打印类似 curl 命令格式的信息
-		logger.LogDebug(c.Request.Context(), "--form 'model=\"%s\"'", request.Model)
-
-		// 遍历表单字段并打印输出
 		for key, values := range formData.Value {
 			if key == "model" {
 				continue
 			}
 			for _, value := range values {
 				writer.WriteField(key, value)
-				logger.LogDebug(c.Request.Context(), "--form '%s=\"%s\"'", key, value)
 			}
 		}
 
@@ -492,9 +487,6 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 
 		// 使用 formData 中的第一个文件
 		fileHeader := fileHeaders[0]
-		logger.LogDebug(c.Request.Context(), "--form 'file=@\"%s\"' (size: %d bytes, content-type: %s)",
-			fileHeader.Filename, fileHeader.Size, fileHeader.Header.Get("Content-Type"))
-
 		file, err := fileHeader.Open()
 		if err != nil {
 			return nil, fmt.Errorf("error opening audio file: %v", err)
@@ -512,7 +504,7 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 		// 关闭 multipart 编写器以设置分界线
 		writer.Close()
 		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
-		logger.LogDebug(c.Request.Context(), "--header 'Content-Type: %s'", writer.FormDataContentType())
+		logger.LogDebug(c, "audio multipart request body bytes: %d", requestBody.Len())
 		return &requestBody, nil
 	}
 }

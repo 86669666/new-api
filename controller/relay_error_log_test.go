@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/types"
 
@@ -67,13 +68,18 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 		ChannelName: "snapshot-channel",
 		AutoBan:     false,
 	}
-	apiErr := types.NewOpenAIError(errors.New("upstream failed"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway)
+	const providerMessage = "fixture-only provider failure"
+	taskErr := &taskdto.TaskError{Error: errors.New(providerMessage), Message: providerMessage, StatusCode: http.StatusBadGateway}
+	apiErr := taskSubmissionAPIError(taskErr)
+	assert.Equal(t, providerMessage, apiErr.Error())
 
 	processChannelError(ctx, channelSnapshot, apiErr, nil)
 
 	var stored model.Log
 	require.NoError(t, database.First(&stored).Error)
 	assert.Equal(t, channelSnapshot.ChannelId, stored.ChannelId)
+	assert.NotContains(t, stored.Content, providerMessage)
+	assert.NotContains(t, stored.Other, providerMessage)
 	storedOther, err := common.StrToMap(stored.Other)
 	require.NoError(t, err)
 	assert.Equal(t, float64(http.StatusBadGateway), storedOther["status_code"])

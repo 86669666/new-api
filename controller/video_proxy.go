@@ -103,7 +103,7 @@ func VideoProxy(c *gin.Context) {
 					}
 				}
 				if adaptorErr != nil {
-					logger.LogWarn(c.Request.Context(), common.LogText("Failed to resolve plugin video content for task %s: %v", taskID, adaptorErr))
+					logger.LogWarn(c.Request.Context(), common.LogText("Failed to resolve plugin video content for task %s", taskID))
 					descriptor = nil
 				}
 				break
@@ -308,7 +308,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 			return nil
 		}
 		if _, err := io.Copy(c.Writer, resp.Body); err != nil {
-			logger.LogError(c.Request.Context(), common.LogText("Failed to stream task media: %v", err))
+			logger.LogError(c.Request.Context(), common.LogText("Failed to stream task media"))
 		}
 		return nil
 	case http.StatusUnauthorized, http.StatusForbidden:
@@ -648,7 +648,7 @@ func setTaskMediaResponseSecurityHeaders(header http.Header) {
 
 func writeTaskMediaProxyError(c *gin.Context, err error) {
 	if c.Writer.Written() {
-		logger.LogError(c.Request.Context(), err.Error())
+		logger.LogError(c.Request.Context(), common.LogText("Task media proxy failed after writing the response"))
 		return
 	}
 	var proxyErr *taskMediaProxyError

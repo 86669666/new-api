@@ -347,7 +347,7 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 	defer cancel()
 	resp, err := GetHttpClient().Do(req)
 	if err != nil {
-		common.SysLog(common.LogText("do request failed: %s", err.Error()))
+		common.SysLog(common.LogText("Midjourney upstream request failed"))
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "do_request_failed", http.StatusInternalServerError), nullBytes, err
 	}
 	statusCode := resp.StatusCode
@@ -369,7 +369,7 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "read_response_body_failed", statusCode), nullBytes, err
 	}
 	CloseResponseBodyGracefully(resp)
-	logger.LogDebug(c, "midjourney response body: %s", responseBody)
+	logger.LogDebug(c, "Midjourney upstream response: http=%d body_bytes=%d", statusCode, len(responseBody))
 	if len(responseBody) == 0 {
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "empty_response_body", statusCode), responseBody, nil
 	} else {

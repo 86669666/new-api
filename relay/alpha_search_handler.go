@@ -61,7 +61,7 @@ func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError
 		}
 	}
 
-	logger.LogDebug(c, "requestBody: %s", jsonData)
+	logger.LogDebug(c, "search request body bytes: %d", len(jsonData))
 	body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())

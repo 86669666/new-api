@@ -638,7 +638,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			// The client already holds the vendor's events, so the task
 			// completes at the reserved quota instead of failing and refunding
 			// the vendor's work.
-			logger.LogWarn(c, common.LogText("task plugin %s could not read the result of a relayed submit stream; settling at the reserved quota: %s", a.plugin.Meta.Key, taskErr.Message))
+			logger.LogWarn(c, common.LogText("task plugin %s could not read the result of a relayed submit stream; settling at the reserved quota (http=%d)", a.plugin.Meta.Key, taskErr.StatusCode))
 			a.keepReservation = true
 			submitted = &channel.TaskSubmitResponse{UpstreamTaskID: info.PublicTaskID, Immediate: &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: taskcommon.ProgressComplete}}
 			taskErr = nil
@@ -767,16 +767,16 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	task.PrivateData.PluginState = pluginState
 	ctx, err := a.queryContext(task, info.ApiKey, info.ChannelBaseUrl, info.ChannelSetting.Proxy)
 	if err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion context failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
+		logger.LogWarn(c, common.LogText("task plugin %s completion context failed; retaining reserved quota", a.plugin.Meta.Key))
 		return response, nil
 	}
 	facts, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsageOnComplete", ctx, jsonValue(immediate), parsed.TaskData)
 	if err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
+		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; retaining reserved quota", a.plugin.Meta.Key))
 		return response, nil
 	}
 	if err := a.applyCompletionUsageFacts(immediate, facts, info.UpstreamModelName, info.OriginModelName); err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; retaining reserved quota: %v", a.plugin.Meta.Key, err))
+		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; retaining reserved quota", a.plugin.Meta.Key))
 	}
 	return response, nil
 }
@@ -1007,9 +1007,8 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor r
 	if err != nil {
 		logger.LogDebug(
 			context.Background(),
-			"task_plugin subsystem=adaptor event=query_request_failed plugin=%q method=%q reason=transport_error elapsed_ms=%d",
+			"task_plugin subsystem=adaptor event=query_request_failed plugin=%q reason=transport_error elapsed_ms=%d",
 			a.plugin.Meta.Key,
-			method,
 			time.Since(started).Milliseconds(),
 		)
 		if redirectPolicyErr != nil {
@@ -1021,9 +1020,8 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor r
 	}
 	logger.LogDebug(
 		context.Background(),
-		"task_plugin subsystem=adaptor event=query_response_received plugin=%q method=%q status=%d elapsed_ms=%d",
+		"task_plugin subsystem=adaptor event=query_response_received plugin=%q status=%d elapsed_ms=%d",
 		a.plugin.Meta.Key,
-		method,
 		resp.StatusCode,
 		time.Since(started).Milliseconds(),
 	)
@@ -1759,18 +1757,12 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 		info.UpstreamModelName = descriptor.RewriteModel
 	}
 	a.submit = &descriptor
-	method := strings.ToUpper(strings.TrimSpace(descriptor.Method))
-	if method == "" {
-		method = http.MethodPost
-	}
 	logger.LogDebug(
 		c,
-		"task_plugin subsystem=adaptor event=build_submit_complete plugin=%q method=%q body_type=%q parts=%d model=%q action_present=%t rewrite_model=%t elapsed_ms=%d",
+		"task_plugin subsystem=adaptor event=build_submit_complete plugin=%q multipart=%t parts=%d action_present=%t rewrite_model=%t elapsed_ms=%d",
 		a.plugin.Meta.Key,
-		method,
-		descriptor.BodyType,
+		descriptor.BodyType == "multipart",
 		len(descriptor.Parts),
-		info.OriginModelName,
 		info.Action != "",
 		descriptor.RewriteModel != "",
 		time.Since(started).Milliseconds(),

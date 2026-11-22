@@ -1686,6 +1686,17 @@ export function parseSubmitResponse() { return {taskId: "one"}; }
 export function buildQueryRequest() { return {url: "https://example.com"}; }
 export function parseTaskResult() { return {status: "SUCCESS"}; }
 `)
+	var logs bytes.Buffer
+	common.LogWriterMu.Lock()
+	oldWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logs
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultErrorWriter = oldWriter
+		common.LogWriterMu.Unlock()
+	})
+
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set(common.RequestIdKey, "native-error-req")
@@ -1700,6 +1711,8 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 
 	router.ServeHTTP(recorder, request)
 
+	assert.Contains(t, logs.String(), "stage=resolve_request")
+	assert.NotContains(t, logs.String(), "model is required")
 	assert.Equal(t, http.StatusBadRequest, recorder.Code)
 	assert.JSONEq(t, `{"code":"invalid_request","message":"model is required","requestId":"native-error-req"}`, recorder.Body.String())
 }

@@ -809,7 +809,7 @@ func (e *Engine) newRuntime(ctx context.Context) (*runtimeInstance, error) {
 	logOutput := e.log
 	if logOutput == nil {
 		logOutput = func(message string) {
-			logger.LogDebug(logContext.context, "task_plugin subsystem=runtime event=console message=%q", message)
+			logger.LogDebug(logContext.context, "task_plugin subsystem=runtime event=console plugin=%q version=%q message_bytes=%d", e.key, e.version, len(message))
 		}
 	}
 	if err := injectGlobals(runtime, func() string {

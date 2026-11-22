@@ -127,7 +127,7 @@ func serveTaskPluginImageProtocol(c *gin.Context, pinned pluginruntime.PinnedEnd
 	}
 	payload, err := pinned.Plugin.Engine.CallPathWithAdmissionTimeout(c.Request.Context(), deps.admissionTimeout, "protocols", []string{pinned.Protocol, "render"}, protocolRequest.JSValue(), viewValue)
 	if err != nil {
-		logger.LogError(c, common.LogText("task protocol image render hook failed: %s", err.Error()))
+		logger.LogError(c, common.LogText("task protocol image render hook failed (plugin=%s)", pinned.Plugin.Meta.Key))
 		respondPluginProtocolError(c, http.StatusInternalServerError, "task_protocol_error", "Task protocol request failed")
 		return
 	}
@@ -159,7 +159,7 @@ func serveTaskPluginImageProtocol(c *gin.Context, pinned pluginruntime.PinnedEnd
 			}
 			_, encoded, downloadErr := deps.downloadImage(url)
 			if downloadErr != nil {
-				logger.LogWarn(c, common.LogText("task protocol image download failed; returning the upstream URL instead of b64_json: %s", common.MaskSensitiveInfo(downloadErr.Error(), common.UpstreamAddresses(c)...)))
+				logger.LogWarn(c, common.LogText("task protocol image download failed; returning the upstream URL instead of b64_json"))
 				continue
 			}
 			item["b64_json"] = encoded
@@ -188,7 +188,7 @@ func waitTaskPluginImageTask(c *gin.Context, task *model.Task, deps pluginProtoc
 		case <-timer.C:
 		}
 		if err := deps.pollTask(ctx, task); err != nil {
-			logger.LogWarn(c, common.LogText("task protocol image poll failed for task %s: %s", task.TaskID, common.MaskSensitiveInfo(err.Error(), common.UpstreamAddresses(c)...)))
+			logger.LogWarn(c, common.LogText("task protocol image poll failed for task %s", task.TaskID))
 			continue
 		}
 		if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {

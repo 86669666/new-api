@@ -139,10 +139,9 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		if err != nil {
 			logger.LogWarn(
 				c,
-				common.LogText("task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=request_decode reason=invalid_request err=%q",
+				common.LogText("task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=request_decode reason=invalid_request",
 					generation,
-					pinned.Plugin.Meta.Key,
-					err.Error()),
+					pinned.Plugin.Meta.Key),
 			)
 			status := invalidRequestStatus(err)
 			if errors.Is(err, errTaskPluginUnsupportedMediaType) {
@@ -276,11 +275,10 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				}
 				logger.LogWarn(
 					c,
-					common.LogText("task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=%s err=%q elapsed_ms=%d",
+					common.LogText("task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=%s elapsed_ms=%d",
 						generation,
 						candidate.Plugin.Meta.Key,
 						reason,
-						detail,
 						time.Since(hookStarted).Milliseconds()),
 				)
 				if _, seen := rejectedPlugins[detail]; !seen {
@@ -841,8 +839,8 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 				detail = fmt.Sprintf("model %q is not served by this plugin", model)
 			}
 			if detail != "" {
-				logger.LogWarn(c, common.LogText("task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=%s err=%q elapsed_ms=%d",
-					pinned.Generation.Number, candidate.Plugin.Meta.Key, reason, detail, time.Since(hookStarted).Milliseconds()))
+				logger.LogWarn(c, common.LogText("task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=%s elapsed_ms=%d",
+					pinned.Generation.Number, candidate.Plugin.Meta.Key, reason, time.Since(hookStarted).Milliseconds()))
 				if _, seen := rejectedPlugins[detail]; !seen {
 					failures = append(failures, detail)
 				}
@@ -1400,7 +1398,7 @@ func renderTaskPluginQuery(
 	if !multiple {
 		projected, projectErr := taskjsplugin.RendererArtifacts(pinned.Plugin, tasksByID[taskIDs[0]], service.BuildTaskArtifactContentURL)
 		if projectErr != nil {
-			logger.LogWarn(c, common.LogText("task_plugin subsystem=query event=artifacts_unavailable generation=%d plugin=%q err=%q", generation, pinned.Plugin.Meta.Key, projectErr.Error()))
+			logger.LogWarn(c, common.LogText("task_plugin subsystem=query event=artifacts_unavailable generation=%d plugin=%q", generation, pinned.Plugin.Meta.Key))
 		} else {
 			artifacts = projected
 		}
@@ -1437,7 +1435,7 @@ func renderTaskPluginQuery(
 	)
 	c.Abort()
 	if replyErr := WriteNativeReply(c, http.StatusOK, result); replyErr != nil {
-		logger.LogWarn(c, common.LogText("task_plugin subsystem=query event=render_failed generation=%d plugin=%q renderer=%q err=%q", generation, pinned.Plugin.Meta.Key, renderer, replyErr.Error()))
+		logger.LogWarn(c, common.LogText("task_plugin subsystem=query event=render_failed generation=%d plugin=%q renderer=%q reason=invalid_reply", generation, pinned.Plugin.Meta.Key, renderer))
 		abortTaskPluginRouteError(c, http.StatusInternalServerError)
 	}
 }
@@ -1552,10 +1550,9 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 		}
 		logger.LogWarn(
 			c,
-			common.LogText("task_plugin subsystem=route event=error_renderer_failed plugin=%q reason=hook_failed status=%d err=%q",
+			common.LogText("task_plugin subsystem=route event=error_renderer_failed plugin=%q reason=hook_failed status=%d",
 				pinned.Plugin.Meta.Key,
-				sanitized.HTTPStatus,
-				callErr.Error()),
+				sanitized.HTTPStatus),
 		)
 	}
 	logger.LogWarn(

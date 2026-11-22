@@ -49,9 +49,9 @@ func DoWorkerRequest(req *WorkerRequest) (*http.Response, error) {
 	return GetHttpClient().Post(workerUrl, "application/json", bytes.NewBuffer(workerPayload))
 }
 
-func DoDownloadRequest(originUrl string, reason ...string) (resp *http.Response, err error) {
+func DoDownloadRequest(originUrl string, _ ...string) (resp *http.Response, err error) {
 	if system_setting.EnableWorker() {
-		common.SysLog(common.LogText("downloading file from worker: %s, reason: %s", originUrl, strings.Join(reason, ", ")))
+		common.SysLog(common.LogText("downloading file via worker"))
 		req := &WorkerRequest{
 			URL: originUrl,
 			Key: system_setting.WorkerValidKey,
@@ -63,7 +63,7 @@ func DoDownloadRequest(originUrl string, reason ...string) (resp *http.Response,
 			return nil, fmt.Errorf("request reject: %v", err)
 		}
 
-		common.SysLog(common.LogText("downloading from origin: %s, reason: %s", common.MaskSensitiveInfo(originUrl), strings.Join(reason, ", ")))
+		common.SysLog(common.LogText("downloading file from origin"))
 		return GetSSRFProtectedHTTPClient().Get(originUrl)
 	}
 }

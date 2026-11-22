@@ -119,7 +119,7 @@ func GetImageFromUrl(url string) (mimeType string, data string, err error) {
 func DecodeUrlImageData(imageUrl string) (image.Config, string, error) {
 	response, err := DoDownloadRequest(imageUrl)
 	if err != nil {
-		common.SysLog(common.LogText("fail to get image from url: %s", err.Error()))
+		common.SysLog(common.LogText("image config download request failed"))
 		return image.Config{}, "", err
 	}
 	defer response.Body.Close()
