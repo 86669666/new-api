@@ -123,6 +123,12 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 			return
 		}
 		response["legacy_content_url"] = legacyContentURL
+		if dashboard && task.OrganizationID == 0 && personalNativeVideoConfigured() && personalNativeVideoAvailable(c, task) {
+			identity, session := middleware.GetSessionAuthIdentity(c)
+			if session && identity.UserID == task.UserId {
+				response["personal_video_context"] = true
+			}
+		}
 	}
 	if dashboard {
 		common.ApiSuccess(c, response)

@@ -255,7 +255,11 @@ export function useTaskLogsColumns(
         id: 'artifacts',
         header: t('Artifacts'),
         cell: ({ row }) => (
-          <TaskArtifactsCell key={row.original.task_id} log={row.original} />
+          <TaskArtifactsCell
+            key={row.original.task_id}
+            log={row.original}
+            isAdmin={isAdmin}
+          />
         ),
         size: 120,
         maxSize: 140,

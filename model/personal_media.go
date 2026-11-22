@@ -29,6 +29,36 @@ func ReadPersonalTaskArtifact(ctx context.Context, identity AuthSessionIdentity,
 	return &task, err
 }
 
+// TaskMediaResultFingerprint binds a native-media ticket to the exact
+// retrievable result observed when the ticket was minted.
+func TaskMediaResultFingerprint(task *Task) string {
+	if task == nil {
+		return ""
+	}
+	payload, err := common.Marshal(struct {
+		TaskID     string
+		Status     TaskStatus
+		Platform   any
+		ChannelID  int
+		UserID     int
+		Action     string
+		CreatedAt  int64
+		UpdatedAt  int64
+		ResultURL  string
+		Properties Properties
+		Data       any
+		Private    TaskPrivateData
+	}{
+		TaskID: task.TaskID, Status: task.Status, Platform: task.Platform, ChannelID: task.ChannelId,
+		UserID: task.UserId, Action: task.Action, CreatedAt: task.CreatedAt, UpdatedAt: task.UpdatedAt,
+		ResultURL: task.GetResultURL(), Properties: task.Properties, Data: task.Data, Private: task.PrivateData,
+	})
+	if err != nil {
+		return ""
+	}
+	return common.GenerateHMACWithKey([]byte("task-media-result-v1:"+common.CryptoSecret), string(payload))
+}
+
 func ReadPersonalMidjourneyImage(ctx context.Context, identity AuthSessionIdentity, rowID int64) (*Midjourney, error) {
 	var task Midjourney
 	err := personalMediaOwner(ctx, identity).Where("id = ?", rowID).First(&task).Error

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -175,6 +176,13 @@ func proxyTaskMediaFromChannel(c *gin.Context, channelID int, taskID string, des
 		return err
 	}
 	defer resp.Body.Close()
+	nativeVideo := c.GetBool("require_video_media")
+	if nativeVideo && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+		mediaType, _, parseErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		if parseErr != nil || !strings.HasPrefix(strings.ToLower(mediaType), "video/") {
+			return &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_media_type_rejected", message: "Artifact content type was rejected"}
+		}
+	}
 	// This is the response's authorization point, after all upstream waits and
 	// before publishing even HEAD, 304 or 416 response metadata. The body is
 	// closed before a failed guard can return to the organization handler.
@@ -182,6 +190,13 @@ func proxyTaskMediaFromChannel(c *gin.Context, channelID int, taskID string, des
 		if err := beforePublish[0](); err != nil {
 			return err
 		}
+	}
+
+	if nativeVideo && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		c.Header("Content-Range", resp.Header.Get("Content-Range"))
+		c.Header("Accept-Ranges", resp.Header.Get("Accept-Ranges"))
+		c.Status(http.StatusRequestedRangeNotSatisfiable)
+		return nil
 	}
 
 	if len(descriptor.ContentPath) > 0 && resp.StatusCode == http.StatusOK {

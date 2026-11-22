@@ -21,9 +21,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -169,6 +171,16 @@ func PersonalTaskArtifactContent(c *gin.Context) {
 		writePersonalMediaError(c, err)
 		return
 	}
+	ticket, hasTicket := middleware.GetTaskMediaTicket(c)
+	if hasTicket && (!personalNativeVideoAvailable(c, task) ||
+		!ticket.Matches(identity, rowID, c.Param("artifact_key"), model.TaskMediaResultFingerprint(task))) {
+		writePersonalMediaError(c, gorm.ErrRecordNotFound)
+		return
+	}
+	if hasTicket {
+		c.Set("require_video_media", true)
+		c.Header("Cross-Origin-Resource-Policy", "same-origin")
+	}
 	beforePublish := func() error {
 		current, err := model.ReadPersonalTaskArtifact(ctx, identity, rowID)
 		if err != nil {
@@ -182,11 +194,75 @@ func PersonalTaskArtifactContent(c *gin.Context) {
 			!bytes.Equal(current.Data, task.Data) || !reflect.DeepEqual(current.PrivateData, task.PrivateData) {
 			return gorm.ErrRecordNotFound
 		}
+		if hasTicket && !ticket.Matches(identity, rowID, c.Param("artifact_key"), model.TaskMediaResultFingerprint(current)) {
+			return gorm.ErrRecordNotFound
+		}
 		return nil
 	}
 	if err := writeTaskArtifactContent(c, task, beforePublish); err != nil {
 		writePersonalMediaError(c, err)
 	}
+}
+
+// PersonalTaskArtifactContext mints the cookie used by a native personal
+// legacy-video element. The cookie deliberately omits Path: the browser's
+// default-path rule scopes it to the /content path, including the deployment
+// prefix. Only the registered GET/HEAD endpoints interpret the cookie.
+func PersonalTaskArtifactContext(c *gin.Context) {
+	if !singleTrustedHTTPSOrigin(c) {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "code": "AUTH_ORIGIN_FORBIDDEN", "message": "request origin is not allowed"})
+		return
+	}
+	identity, rowID, ok := personalMediaRequest(c)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(c.Param("artifact_key")) != "video" {
+		writePersonalMediaError(c, gorm.ErrRecordNotFound)
+		return
+	}
+	task, err := model.ReadPersonalTaskArtifact(c.Request.Context(), identity, rowID)
+	if err != nil || !personalNativeVideoAvailable(c, task) {
+		writePersonalMediaError(c, gorm.ErrRecordNotFound)
+		return
+	}
+	rawTicket, ticket, err := service.IssueTaskMediaTicket(identity, rowID, "video", model.TaskMediaResultFingerprint(task))
+	if err != nil {
+		writePersonalMediaError(c, err)
+		return
+	}
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name: service.TaskMediaCookieName, Value: rawTicket,
+		MaxAge: int(service.TaskMediaTicketTTL / time.Second), Expires: time.Unix(ticket.ExpiresAt, 0),
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+	})
+	c.Status(http.StatusNoContent)
+}
+
+func personalNativeVideoAvailable(c *gin.Context, task *model.Task) bool {
+	if !legacyVideoAvailable(task) || !task.ResultRetrievable() {
+		return false
+	}
+	rawURL := strings.TrimSpace(task.GetResultURL())
+	source, err := url.Parse(rawURL)
+	return err == nil && source.Host != "" && (source.Scheme == "http" || source.Scheme == "https") &&
+		!isTaskMediaFallbackLoop(rawURL, task.TaskID) && !isSelfTaskMediaURL(c, source)
+}
+
+func personalNativeVideoConfigured() bool {
+	return common.SessionCookieSecure && len(common.SessionCookieTrustedURLs) == 1
+}
+
+func singleTrustedHTTPSOrigin(c *gin.Context) bool {
+	if !personalNativeVideoConfigured() {
+		return false
+	}
+	values := c.Request.Header.Values("Origin")
+	if len(values) != 1 || strings.Contains(values[0], ",") {
+		return false
+	}
+	origin, err := common.NormalizeOrigin(values[0])
+	return err == nil && origin == common.SessionCookieTrustedURLs[0]
 }
 
 func PersonalMidjourneyImage(c *gin.Context) {

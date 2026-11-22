@@ -408,6 +408,7 @@ export interface AudioClip {
 export interface TaskArtifactProjection {
   artifacts: TaskArtifact[]
   legacyContentUrl?: string
+  personalVideoContext?: true
   legacyAudioClips?: AudioClip[]
 }
 
@@ -418,6 +419,7 @@ export interface TaskArtifactsResponse {
   data?: {
     artifacts?: unknown
     legacy_content_url?: unknown
+    personal_video_context?: unknown
     legacy_audio_clips?: unknown
   }
 }

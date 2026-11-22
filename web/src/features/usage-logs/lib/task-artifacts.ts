@@ -205,6 +205,9 @@ export function parseTaskArtifactsResponse(
       response.data.legacy_content_url
     )
   }
+  if (response.data?.personal_video_context === true) {
+    projection.personalVideoContext = true
+  }
   if (response.data?.legacy_audio_clips != null) {
     projection.legacyAudioClips = parseLegacyAudioClips(
       response.data.legacy_audio_clips

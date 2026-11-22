@@ -19,6 +19,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -7192,6 +7193,10 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 			w.Header().Set("Content-Type", "image/gif")
 			_, _ = w.Write(gifImage.Bytes())
 			return
+		case "/native-video":
+			w.Header().Set("Content-Type", "video/mp4")
+			http.ServeContent(w, r, "fixture.mp4", time.Time{}, strings.NewReader("abcdefgh"))
+			return
 		case "/oversize":
 			w.Header().Set("Content-Length", strconv.FormatInt(model.PersonalMidjourneyImageMaxBytes+1, 10))
 			w.WriteHeader(http.StatusOK)
@@ -7302,6 +7307,119 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 			assert.Equal(t, tc.status, response.status, "path=%s actor=%s", tc.path, tc.actor)
 			assert.Empty(t, response.header.Get("ETag"))
 		}
+		assert.Equal(t, before, upstreamRequests.Load())
+	})
+
+	t.Run("native_video_cookie_is_limited_to_live_personal_media", func(t *testing.T) {
+		const prefix = "/gateway"
+		tls := httptest.NewTLSServer(http.StripPrefix(prefix, f.engine))
+		t.Cleanup(tls.Close)
+		secure, trusted, secret := common.SessionCookieSecure, common.SessionCookieTrustedURLs, common.CryptoSecret
+		t.Cleanup(func() {
+			common.SessionCookieSecure, common.SessionCookieTrustedURLs, common.CryptoSecret = secure, trusted, secret
+		})
+		common.SessionCookieSecure, common.SessionCookieTrustedURLs = true, []string{tls.URL}
+		common.CryptoSecret = "isolated-video-cookie-test"
+		video := model.Task{TaskID: "native-legacy-video", UserId: owner, ChannelId: channel.Id,
+			Platform: "document", Status: model.TaskStatusSuccess, Action: constant.TaskActionTextToVideo,
+			FailReason: upstream.URL + "/native-video"}
+		require.NoError(t, f.db.Create(&video).Error)
+		path := fmt.Sprintf("%s/api/task/media/%d/artifacts/video/content", prefix, video.ID)
+		jar, err := cookiejar.New(nil)
+		require.NoError(t, err)
+		client := tls.Client()
+		client.Jar = jar
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		send := func(method, target, bearer string, headers http.Header) (int, http.Header, string) {
+			t.Helper()
+			req, err := http.NewRequest(method, tls.URL+target, nil)
+			require.NoError(t, err)
+			req.Header = headers.Clone()
+			if bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+bearer)
+			}
+			res, err := client.Do(req)
+			require.NoError(t, err)
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			require.NoError(t, err)
+			return res.StatusCode, res.Header, string(body)
+		}
+		oldAddress := system_setting.ServerAddress
+		system_setting.ServerAddress = tls.URL
+		t.Cleanup(func() { system_setting.ServerAddress = oldAddress })
+		projection := prefix + "/api/task/" + video.TaskID + "/artifacts"
+		status, _, body := send(http.MethodGet, projection, f.bearer["owner"], http.Header{})
+		require.Equal(t, http.StatusOK, status)
+		assert.Contains(t, body, `"personal_video_context":true`)
+		assert.Contains(t, body, `"legacy_content_url"`)
+		common.SessionCookieSecure = false
+		status, _, body = send(http.MethodGet, projection, f.bearer["owner"], http.Header{})
+		require.Equal(t, http.StatusOK, status)
+		assert.NotContains(t, body, `"personal_video_context"`)
+		assert.Contains(t, body, `"legacy_content_url"`)
+		common.SessionCookieSecure = true
+		wrongOrigin := http.Header{"Origin": {"https://wrong.example.invalid"}}
+		status, _, _ = send(http.MethodPost, path+"/context", f.bearer["owner"], wrongOrigin)
+		require.Equal(t, http.StatusForbidden, status)
+		origin := http.Header{"Origin": {tls.URL}}
+		discarded := video
+		discarded.ID = 0
+		discarded.TaskID = "discarded-native-video"
+		discarded.PrivateData.ResultDiscarded = true
+		require.NoError(t, f.db.Create(&discarded).Error)
+		for _, suppressed := range []model.Task{task, discarded} {
+			status, _, body = send(http.MethodGet, prefix+"/api/task/"+suppressed.TaskID+"/artifacts", f.bearer["owner"], http.Header{})
+			require.Equal(t, http.StatusOK, status)
+			assert.NotContains(t, body, `"personal_video_context"`)
+			contextPath := fmt.Sprintf("%s/api/task/media/%d/artifacts/video/content/context", prefix, suppressed.ID)
+			status, headers, _ := send(http.MethodPost, contextPath, f.bearer["owner"], origin)
+			assert.Equal(t, http.StatusNotFound, status)
+			assert.Empty(t, headers.Get("Set-Cookie"))
+		}
+
+		status, _, _ = send(http.MethodPost, path+"/context", "", origin)
+		require.Equal(t, http.StatusUnauthorized, status)
+		status, headers, _ := send(http.MethodPost, path+"/context", f.bearer["owner"], origin)
+		require.Equal(t, http.StatusNoContent, status)
+		rawCookie := headers.Get("Set-Cookie")
+		assert.True(t, strings.HasPrefix(rawCookie, service.TaskMediaCookieName+"="))
+		for _, attr := range []string{"Secure", "HttpOnly", "SameSite=Strict", "Max-Age=300"} {
+			assert.Contains(t, rawCookie, attr)
+		}
+		assert.NotContains(t, rawCookie, "Domain=")
+		assert.NotContains(t, rawCookie, "Path=")
+		otherPath, err := url.Parse(tls.URL + prefix + "/api/status")
+		require.NoError(t, err)
+		assert.Empty(t, jar.Cookies(otherPath))
+
+		status, _, _ = send(http.MethodGet, path, "", http.Header{"Sec-Fetch-Site": {"same-origin"}, "Sec-Fetch-Dest": {"empty"}})
+		require.Equal(t, http.StatusNotFound, status)
+		native := http.Header{"Sec-Fetch-Site": {"same-origin"}, "Sec-Fetch-Dest": {"video"}, "Range": {"bytes=0-1"}}
+		status, headers, body = send(http.MethodGet, path, "", native)
+		require.Equal(t, http.StatusPartialContent, status)
+		assert.Equal(t, "bytes 0-1/8", headers.Get("Content-Range"))
+		assert.Equal(t, "video/mp4", headers.Get("Content-Type"))
+		assert.Equal(t, "same-origin", headers.Get("Cross-Origin-Resource-Policy"))
+		assert.Equal(t, "private, no-store", headers.Get("Cache-Control"))
+		assert.Equal(t, "ab", body)
+		native.Set("Range", "bytes=10-")
+		status, headers, body = send(http.MethodGet, path, "", native)
+		require.Equal(t, http.StatusRequestedRangeNotSatisfiable, status)
+		assert.Equal(t, "bytes */8", headers.Get("Content-Range"))
+		assert.Empty(t, body)
+		native.Del("Range")
+		status, headers, body = send(http.MethodHead, path, "", native)
+		require.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "8", headers.Get("Content-Length"))
+		assert.Empty(t, body)
+		before := upstreamRequests.Load()
+		require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).Update("revoked_at", time.Now().Unix()).Error)
+		t.Cleanup(func() {
+			require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.sids["owner"]).Update("revoked_at", 0).Error)
+		})
+		status, _, _ = send(http.MethodGet, path, "", native)
+		require.Equal(t, http.StatusNotFound, status)
 		assert.Equal(t, before, upstreamRequests.Load())
 	})
 
