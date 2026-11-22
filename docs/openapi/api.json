@@ -14765,10 +14765,13 @@
         "tags": [
           "任务"
         ],
-        "description": "Requires the current owner's dashboard Bearer JWT session. The numeric row identifies a personal resource. The response uses private, no-store and returns no source URL or share credential.",
+        "description": "Requires the current owner's dashboard Bearer JWT session, or the short-lived media cookie for a same-origin native video request to its bound legacy video. The response uses private, no-store and returns no source URL or share credential.",
         "security": [
           {
             "DashboardJWT": []
+          },
+          {
+            "PersonalVideoCookie": []
           }
         ],
         "parameters": [
@@ -14905,10 +14908,13 @@
         "tags": [
           "任务"
         ],
-        "description": "Requires the current owner's dashboard Bearer JWT session. The numeric row identifies a personal resource. The response uses private, no-store and returns no source URL or share credential.",
+        "description": "Requires the current owner's dashboard Bearer JWT session, or the short-lived media cookie for a same-origin native video request to its bound legacy video. The response uses private, no-store and returns no source URL or share credential.",
         "security": [
           {
             "DashboardJWT": []
+          },
+          {
+            "PersonalVideoCookie": []
           }
         ],
         "parameters": [
@@ -14976,6 +14982,78 @@
         }
       }
     },
+      "/api/task/media/{row_id}/artifacts/{artifact_key}/content/context": {
+        "post": {
+          "summary": "Authorize native playback of a personal legacy video",
+          "operationId": "createPersonalTaskVideoContext",
+          "tags": [
+            "任务"
+          ],
+          "description": "Issues a five-minute, Secure, HttpOnly, SameSite=Strict media cookie from the current owner's DashboardJWT and one trusted HTTPS Origin. Requires secure session cookie configuration with one trusted origin. The default browser cookie path follows the mounted content path. The cookie is only used on same-origin native video GET/HEAD and rechecks current ownership and login session.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "parameters": [
+            {
+              "name": "row_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*$"
+              }
+            },
+            {
+              "name": "artifact_key",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "enum": [
+                  "video"
+                ]
+              }
+            },
+            {
+              "name": "Origin",
+              "in": "header",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "204": {
+              "description": "Media cookie issued",
+              "headers": {
+                "Set-Cookie": {
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "401": {
+              "description": "Current dashboard Bearer JWT required"
+            },
+            "403": {
+              "description": "Untrusted Origin or unsupported credential/scope"
+            },
+            "404": {
+              "description": "Eligible owned personal legacy video not found"
+            },
+            "429": {
+              "description": "API rate limit reached"
+            },
+            "500": {
+              "description": "Media authorization could not be created"
+            }
+          }
+        }
+      },
     "/api/task/{task_id}/artifacts": {
       "get": {
         "summary": "获取任务产物预览",
@@ -27530,6 +27608,10 @@
                   }
                 }
               },
+              "personal_video_context": {
+                "type": "boolean",
+                "description": "Dashboard-only indication that this retrievable personal legacy video supports direct HTTP(S) proxying with a native playback cookie."
+              },
               "legacy_content_url": {
                 "type": "string",
                 "description": "Optional signed legacy video capability"
@@ -38635,6 +38717,12 @@
       }
     },
     "securitySchemes": {
+      "PersonalVideoCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Secure-new_api_task_media",
+        "description": "Short-lived cookie limited to the bound personal legacy video, current dashboard session, and same-origin native playback."
+      },
       "DashboardJWT": {
         "type": "http",
         "scheme": "bearer",

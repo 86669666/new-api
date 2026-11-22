@@ -457,9 +457,10 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			taskRoute.GET("/self", middleware.UserAuth(), controller.GetUserTask)
 			taskRoute.GET("", middleware.AdminAuth(), controller.GetAllTask)
-			taskRoute.GET("/media/:row_id/artifacts/:artifact_key/content", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalTaskArtifactContent)
-			taskRoute.HEAD("/media/:row_id/artifacts/:artifact_key/content", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalTaskArtifactContent)
+			taskRoute.GET("/media/:row_id/artifacts/:artifact_key/content", middleware.DisableCache(), middleware.PersonalTaskMediaAuth(), controller.PersonalTaskArtifactContent)
+			taskRoute.HEAD("/media/:row_id/artifacts/:artifact_key/content", middleware.DisableCache(), middleware.PersonalTaskMediaAuth(), controller.PersonalTaskArtifactContent)
 			taskRoute.GET("/:task_id/artifacts", middleware.UserAuth(), controller.GetDashboardTaskArtifacts)
+			taskRoute.POST("/media/:row_id/artifacts/:artifact_key/content/context", middleware.SessionCookieOriginGuard(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-media-context"), controller.PersonalTaskArtifactContext)
 		}
 
 		vendorRoute := apiRouter.Group("/vendors")

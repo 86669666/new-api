@@ -27,7 +27,7 @@ import {
 } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
@@ -61,15 +61,23 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { api } from '@/lib/api'
+import { appPath } from '@/lib/deployment-path'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getTaskArtifacts } from '../api'
 import {
   resolveTaskPreviewMode,
   shouldLoadTaskArtifacts,
 } from '../lib/task-artifacts'
-import type { TaskArtifact, TaskArtifactType, TaskLog } from '../types'
+import type {
+  TaskArtifact,
+  TaskArtifactType,
+  TaskArtifactProjection,
+  TaskLog,
+} from '../types'
 import { AudioPreviewDialog } from './dialogs/audio-preview-dialog'
 
 function artifactIcon(type: TaskArtifactType) {
@@ -103,8 +111,9 @@ function artifactTypeLabel(type: TaskArtifactType): string {
 function LegacyAudioPreview(props: { taskId: string }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
+  const sessionSid = useAuthStore((state) => state.auth.session?.sid ?? '')
   const artifactsQuery = useQuery({
-    queryKey: ['usage-logs', 'task-artifacts', props.taskId],
+    queryKey: ['usage-logs', 'task-artifacts', props.taskId, sessionSid],
     queryFn: async () =>
       requireServerSuccess(await getTaskArtifacts(props.taskId)),
     enabled: open,
@@ -299,13 +308,14 @@ function TaskArtifactCard(props: { artifact: TaskArtifact }) {
 interface TaskArtifactsProps {
   taskId: string
   enabled: boolean
-  emptyContent?: (legacyContentUrl?: string) => React.ReactNode
+  emptyContent?: (projection: TaskArtifactProjection) => React.ReactNode
 }
 
 function TaskArtifacts(props: TaskArtifactsProps) {
   const { t } = useTranslation()
+  const sessionSid = useAuthStore((state) => state.auth.session?.sid ?? '')
   const artifactsQuery = useQuery({
-    queryKey: ['usage-logs', 'task-artifacts', props.taskId],
+    queryKey: ['usage-logs', 'task-artifacts', props.taskId, sessionSid],
     queryFn: async () =>
       requireServerSuccess(await getTaskArtifacts(props.taskId)),
     enabled: props.enabled,
@@ -354,11 +364,7 @@ function TaskArtifacts(props: TaskArtifactsProps) {
   }
 
   if (artifactsQuery.data.artifacts.length === 0) {
-    return (
-      props.emptyContent?.(artifactsQuery.data.legacyContentUrl) ?? (
-        <EmptyTaskArtifacts />
-      )
-    )
+    return props.emptyContent?.(artifactsQuery.data) ?? <EmptyTaskArtifacts />
   }
 
   return (
@@ -390,16 +396,35 @@ function EmptyTaskArtifacts() {
   )
 }
 
-function LegacyTaskArtifacts(props: { legacyContentUrl?: string }) {
+function LegacyTaskArtifacts(props: {
+  legacyContentUrl?: string
+  personalVideoContext?: true
+  rowId: number
+  isAdmin: boolean
+}) {
+  const sessionSid = useAuthStore((state) => state.auth.session?.sid ?? '')
+  if (!props.isAdmin && props.personalVideoContext) {
+    if (!sessionSid) return <EmptyTaskArtifacts />
+    if (window.location.protocol === 'https:') {
+      return (
+        <LegacyVideoMedia
+          key={`${sessionSid}:${props.rowId}`}
+          rowId={props.rowId}
+          sessionSid={sessionSid}
+        />
+      )
+    }
+  }
   if (props.legacyContentUrl) {
     return <LegacyVideoMedia contentUrl={props.legacyContentUrl} />
   }
   return <EmptyTaskArtifacts />
 }
 
-export function TaskArtifactsCell(props: { log: TaskLog }) {
+export function TaskArtifactsCell(props: { log: TaskLog; isAdmin?: boolean }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
+  const isAdmin = props.isAdmin ?? false
   const previewMode = resolveTaskPreviewMode(props.log)
 
   if (previewMode === 'discarded') {
@@ -481,8 +506,13 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
         <TaskArtifacts
           taskId={props.log.task_id}
           enabled={shouldLoadTaskArtifacts(props.log, open)}
-          emptyContent={(legacyContentUrl) => (
-            <LegacyTaskArtifacts legacyContentUrl={legacyContentUrl} />
+          emptyContent={(projection) => (
+            <LegacyTaskArtifacts
+              legacyContentUrl={projection.legacyContentUrl}
+              personalVideoContext={projection.personalVideoContext}
+              rowId={props.log.id}
+              isAdmin={isAdmin}
+            />
           )}
         />
       </Dialog>
@@ -491,12 +521,55 @@ export function TaskArtifactsCell(props: { log: TaskLog }) {
 }
 
 interface LegacyVideoMediaProps {
-  contentUrl: string
+  contentUrl?: string
+  rowId?: number
+  sessionSid?: string
 }
 
 function LegacyVideoMedia(props: LegacyVideoMediaProps) {
+  const { t } = useTranslation()
   const [mediaFailed, setMediaFailed] = useState(false)
   const [mediaRevision, setMediaRevision] = useState(0)
+  const [contextReady, setContextReady] = useState(Boolean(props.contentUrl))
+
+  useEffect(() => {
+    if (props.contentUrl || props.rowId == null) return
+    const controller = new AbortController()
+    setContextReady(false)
+    setMediaFailed(false)
+    void api
+      .post(
+        `/api/task/media/${props.rowId}/artifacts/video/content/context`,
+        undefined,
+        {
+          signal: controller.signal,
+          singleUseAuthorization: true,
+          skipErrorHandler: true,
+          skipBusinessError: true,
+          disableDuplicate: true,
+        }
+      )
+      .then(() => {
+        if (
+          !controller.signal.aborted &&
+          useAuthStore.getState().auth.session?.sid === props.sessionSid
+        ) {
+          setContextReady(true)
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setMediaFailed(true)
+      })
+    return () => controller.abort()
+  }, [mediaRevision, props.contentUrl, props.rowId, props.sessionSid])
+
+  if (!props.contentUrl && !contextReady && !mediaFailed) {
+    return (
+      <div aria-label={t('Loading...')}>
+        <Skeleton className='aspect-video min-h-48 w-full rounded-xl' />
+      </div>
+    )
+  }
 
   return mediaFailed ? (
     <MediaFailure
@@ -508,7 +581,10 @@ function LegacyVideoMedia(props: LegacyVideoMediaProps) {
   ) : (
     <video
       key={mediaRevision}
-      src={props.contentUrl}
+      src={
+        props.contentUrl ??
+        appPath(`/api/task/media/${props.rowId}/artifacts/video/content`)
+      }
       controls
       preload='metadata'
       className='max-h-[60vh] w-full rounded-md bg-black'
