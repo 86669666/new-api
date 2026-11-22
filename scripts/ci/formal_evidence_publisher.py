@@ -126,7 +126,7 @@ def publish_delta(reference, reader, fetch, publication, journal, installation_t
                   policy.invitation_delta, policy.oauth_delta, policy.client_events_delta, policy.relay_log_delta,
                   policy.upstream_errors_delta, policy.provider_logs_delta,
                   policy.independent_stream_delta, policy.request_plugin_delta, policy.sql_midjourney_delta,
-                  policy.authz_policy_reload_delta, policy.legacy_media_delta, policy.personal_media_delta):
+                  policy.authz_policy_reload_delta, policy.legacy_media_delta, policy.personal_media_delta, policy.personal_media_share_delta):
         if reference['schema'] == delta.REFERENCE_SCHEMA:
             break
     else:
