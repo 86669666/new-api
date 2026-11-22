@@ -4590,12 +4590,12 @@ func TestOrganizationRateLimitContract(t *testing.T) {
 func TestOrganizationLegacyCapabilityCompatibility(t *testing.T) {
 	f := newOrganizationHTTPFixture(t)
 	oldSecret := common.CryptoSecret
-	common.CryptoSecret = common.SessionSecret
+	common.CryptoSecret = "w04-synthetic-archive-fixture-key"
 	t.Cleanup(func() { common.CryptoSecret = oldSecret })
 	task := &model.Task{TaskID: "s2-legacy-video", UserId: f.users["member"].Id, Platform: "document", Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess, FailReason: "data:video/mp4;base64,YWJj"}
 	require.NoError(t, f.db.Create(task).Error)
-	capability, err := service.IssueTaskArtifactAccess(task.TaskID, "video")
-	require.NoError(t, err)
+	// An archived synthetic v1 capability, independent of the current issuer.
+	const capability = "o1FvBvzcfejacV6FPmRwecnp72w9s9sbTKGI70pA1Qo"
 	path := "/v1/tasks/" + task.TaskID + "/artifacts/video/content?access=" + url.QueryEscape(capability)
 	for _, removed := range []bool{false, true} {
 		if removed {
