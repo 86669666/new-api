@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,28 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMidjourneyShareAccessIsCanonicalAndRedacted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	secret := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	router := gin.New()
+	router.Use(redactTaskArtifactAccessQuery())
+	router.GET("/api/media-shares/mj/image", MidjourneyShareAccessAuth(), func(c *gin.Context) {
+		assert.NotContains(t, c.Request.URL.RawQuery, "access")
+		assert.NotContains(t, c.Request.RequestURI, secret)
+		assert.Len(t, MidjourneyShareAccess(c), 64)
+		c.Status(http.StatusNoContent)
+	})
+	for _, query := range []string{"?access=" + secret, "?access=" + secret + "&extra=1", "?access=" + secret + "&access=" + secret} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/media-shares/mj/image"+query, nil))
+		if strings.Contains(query, "extra") || strings.Count(query, "access=") != 1 {
+			assert.Equal(t, http.StatusNotFound, recorder.Code)
+		} else {
+			assert.Equal(t, http.StatusNoContent, recorder.Code)
+		}
+	}
+}
 
 func TestTaskArtifactAccessIsRedactedAndVerifiedBeforeHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)

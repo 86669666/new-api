@@ -23,6 +23,10 @@ import (
 // accessTokenExemptRoutes are /api routes that never reach dashboard
 // authentication, so a personal access token has no rule to satisfy there.
 var accessTokenExemptRoutes = []string{
+	"GET /api/media-shares/mj/image",
+	"HEAD /api/media-shares/mj/image",
+	"GET /api/media-shares/mj/image/*trailing",
+	"HEAD /api/media-shares/mj/image/*trailing",
 	// Anonymous pages and setup.
 	"GET /api/setup",
 	"POST /api/setup",
