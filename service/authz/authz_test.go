@@ -1,7 +1,18 @@
 package authz
 
 import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -232,6 +243,103 @@ func TestSetUserPermissionsInTxDoesNotMutateEnforcerBeforeReload(t *testing.T) {
 	assert.False(t, Can(42, common.RoleAdminUser, ChannelSensitiveWrite))
 	require.NoError(t, ReloadPolicy())
 	assert.True(t, Can(42, common.RoleAdminUser, ChannelSensitiveWrite))
+}
+
+func TestReloadPolicyFailsClosedAndRecoversWithRevocation(t *testing.T) {
+	const adminID = 42
+	const readerArg = "--authz-policy-reader"
+	args := os.Args
+	if len(args) >= 2 && args[len(args)-2] == readerArg {
+		checkReloadPolicyOnReader(t, args[len(args)-1], adminID)
+		return
+	}
+
+	path := filepath.Join(t.TempDir(), "policy.db")
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
+	require.NoError(t, db.AutoMigrate(&model.CasbinRule{}, &model.AuthzRole{}))
+	wasMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() { common.IsMasterNode = wasMaster })
+	require.NoError(t, Init(db))
+	require.NoError(t, SetUserPermissions(adminID, PermissionsMap{ResourceChannel: {
+		ActionSensitiveWrite: true,
+	}}))
+
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable,
+		"-test.run=^TestReloadPolicyFailsClosedAndRecoversWithRevocation$", "--", readerArg, path)
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			cancel()
+			_ = cmd.Wait()
+		}
+	})
+
+	reader := bufio.NewReader(stdout)
+	line, err := reader.ReadString('\n')
+	require.NoError(t, err, "reader output: %s", line)
+	require.Equal(t, "policy reader ready", strings.TrimSpace(line))
+
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return SetUserPermissionsInTx(tx, adminID, PermissionsMap{ResourceChannel: {
+			ActionSensitiveWrite: false,
+		}})
+	}))
+	require.NoError(t, ReloadPolicy())
+	require.False(t, Can(adminID, common.RoleAdminUser, ChannelSensitiveWrite))
+	require.NoError(t, stdin.Close())
+
+	output, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, cmd.Wait(), "reader output:\n%s", output)
+}
+
+func checkReloadPolicyOnReader(t *testing.T, path string, adminID int) {
+	t.Helper()
+	source := url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}
+	db, err := gorm.Open(sqlite.Open(source.String()), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
+	common.IsMasterNode = false
+	require.NoError(t, Init(db))
+	require.True(t, Can(adminID, common.RoleAdminUser, ChannelRead))
+	require.True(t, Can(adminID, common.RoleAdminUser, ChannelSensitiveWrite))
+	_, err = fmt.Fprintln(os.Stdout, "policy reader ready")
+	require.NoError(t, err)
+	// The writer closes the pipe only after the transaction commits and reloads.
+	var signal [1]byte
+	_, err = os.Stdin.Read(signal[:])
+	require.ErrorIs(t, err, io.EOF)
+
+	readFailure := errors.New("test policy store unavailable")
+	query := db.Callback().Query()
+	const failPolicyRead = "test:fail_policy_read"
+	require.NoError(t, query.Before("gorm:query").Register(failPolicyRead, func(tx *gorm.DB) {
+		tx.AddError(readFailure)
+	}))
+	assert.ErrorIs(t, ReloadPolicy(), readFailure)
+	assert.False(t, Can(adminID, common.RoleAdminUser, ChannelRead))
+	assert.False(t, Can(adminID, common.RoleAdminUser, ChannelSensitiveWrite))
+
+	require.NoError(t, query.Remove(failPolicyRead))
+	require.NoError(t, ReloadPolicy())
+	assert.True(t, Can(adminID, common.RoleAdminUser, ChannelRead))
+	assert.False(t, Can(adminID, common.RoleAdminUser, ChannelSensitiveWrite))
 }
 
 func TestSetUserPermissionsInTxRollbackLeavesNoPolicy(t *testing.T) {
