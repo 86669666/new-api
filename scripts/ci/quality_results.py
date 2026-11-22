@@ -116,6 +116,10 @@ _personal_task_image_delta_spec = importlib.util.spec_from_file_location(
     'newapi_reviewed_personal_task_image_delta', Path(__file__).with_name('formal_personal_task_image_delta.py'))
 personal_task_image_delta = importlib.util.module_from_spec(_personal_task_image_delta_spec)
 _personal_task_image_delta_spec.loader.exec_module(personal_task_image_delta)
+_legacy_media_preparation_delta_spec = importlib.util.spec_from_file_location(
+    'newapi_reviewed_legacy_media_preparation_delta', Path(__file__).with_name('formal_legacy_media_preparation_delta.py'))
+legacy_media_preparation_delta = importlib.util.module_from_spec(_legacy_media_preparation_delta_spec)
+_legacy_media_preparation_delta_spec.loader.exec_module(legacy_media_preparation_delta)
 
 require = consumer.require
 REPOSITORY = consumer.REPOSITORY
@@ -144,11 +148,12 @@ TERMINAL_SCHEMA_V20 = personal_media_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V21 = personal_media_share_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V22 = personal_media_video_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V23 = personal_task_image_delta.TERMINAL_SCHEMA
+TERMINAL_SCHEMA_V24 = legacy_media_preparation_delta.TERMINAL_SCHEMA
 TIMED_TERMINAL_SCHEMAS = (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5, TERMINAL_SCHEMA_V6,
                           TERMINAL_SCHEMA_V7, TERMINAL_SCHEMA_V8, TERMINAL_SCHEMA_V9,
                           TERMINAL_SCHEMA_V10, TERMINAL_SCHEMA_V11, TERMINAL_SCHEMA_V12,
                           TERMINAL_SCHEMA_V13, TERMINAL_SCHEMA_V14, TERMINAL_SCHEMA_V15,
-                          TERMINAL_SCHEMA_V16, TERMINAL_SCHEMA_V17, TERMINAL_SCHEMA_V18, TERMINAL_SCHEMA_V19, TERMINAL_SCHEMA_V20, TERMINAL_SCHEMA_V21, TERMINAL_SCHEMA_V22, TERMINAL_SCHEMA_V23)
+                          TERMINAL_SCHEMA_V16, TERMINAL_SCHEMA_V17, TERMINAL_SCHEMA_V18, TERMINAL_SCHEMA_V19, TERMINAL_SCHEMA_V20, TERMINAL_SCHEMA_V21, TERMINAL_SCHEMA_V22, TERMINAL_SCHEMA_V23, TERMINAL_SCHEMA_V24)
 REUSE_HOSTED = {'run_id': 44403089902, 'attempt': 1, 'workflow_blob': 'c123990e4a8c9fd981b721455a8edbc65b62dfc5'}
 FORMAL_WORKFLOW_ID = 402689897
 CI_WORKFLOW_ID = 389317795
@@ -331,6 +336,8 @@ def validate_timed_artifact(request, now):
         personal_media_video_delta.validate_reference(request['artifact'], now)
     elif request['schema'] == TERMINAL_SCHEMA_V23:
         personal_task_image_delta.validate_reference(request['artifact'], now)
+    elif request['schema'] == TERMINAL_SCHEMA_V24:
+        legacy_media_preparation_delta.validate_reference(request['artifact'], now)
     else:
         consumer.evidence.validate_reference(request['artifact'], now)
 
@@ -662,6 +669,8 @@ def verify_public_terminal(environment, reader, *, clock=time.time):
         return personal_media_video_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
     if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V23:
         return personal_task_image_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
+    if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V24:
+        return legacy_media_preparation_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
     fields = {'schema', 'name', 'artifact', 'quality_sha256', 'repository', 'repository_id', 'candidate_sha',
               'candidate_tree', 'receipt_sha256', 'check_run_id', 'admission_id', 'invocation', 'attempt_id',
               'expires_at', 'consumer_run', 'terminal_run', 'hosted'}
@@ -1259,7 +1268,8 @@ def main():
                            ['personal-media-delta-consumer'], ['personal-media-delta-terminal'],
                            ['personal-media-share-delta-consumer'], ['personal-media-share-delta-terminal'],
                            ['personal-media-video-delta-consumer'], ['personal-media-video-delta-terminal'],
-                           ['personal-task-image-delta-consumer'], ['personal-task-image-delta-terminal']),
+                           ['personal-task-image-delta-consumer'], ['personal-task-image-delta-terminal'],
+                           ['legacy-media-preparation-delta-consumer'], ['legacy-media-preparation-delta-terminal']),
             'unknown quality operation')
     if sys.argv[1:] == ['premerge']:
         result = resolve_ci_candidate(os.environ)
@@ -1320,6 +1330,9 @@ def main():
     elif sys.argv[1:] in (['personal-task-image-delta-consumer'], ['personal-task-image-delta-terminal']):
         result = personal_task_image_delta.verify_dispatch(
             sys.modules[__name__], os.environ, terminal=sys.argv[1] == 'personal-task-image-delta-terminal', clock=time.time)
+    elif sys.argv[1:] in (['legacy-media-preparation-delta-consumer'], ['legacy-media-preparation-delta-terminal']):
+        result = legacy_media_preparation_delta.verify_dispatch(
+            sys.modules[__name__], os.environ, terminal=sys.argv[1] == 'legacy-media-preparation-delta-terminal', clock=time.time)
     elif sys.argv[1:] == ['terminal']:
         now = int(time.time())
         trusted_sha = consumer.trusted_consumer_context(os.environ, private=True)
