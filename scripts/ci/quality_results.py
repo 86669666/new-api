@@ -84,6 +84,10 @@ _independent_stream_delta_spec = importlib.util.spec_from_file_location(
     'newapi_reviewed_independent_stream_delta', Path(__file__).with_name('formal_independent_stream_delta.py'))
 independent_stream_delta = importlib.util.module_from_spec(_independent_stream_delta_spec)
 _independent_stream_delta_spec.loader.exec_module(independent_stream_delta)
+_request_plugin_delta_spec = importlib.util.spec_from_file_location(
+    'newapi_reviewed_request_plugin_delta', Path(__file__).with_name('formal_request_plugin_delta.py'))
+request_plugin_delta = importlib.util.module_from_spec(_request_plugin_delta_spec)
+_request_plugin_delta_spec.loader.exec_module(request_plugin_delta)
 
 require = consumer.require
 REPOSITORY = consumer.REPOSITORY
@@ -104,10 +108,12 @@ TERMINAL_SCHEMA_V12 = relay_log_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V13 = upstream_errors_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V14 = provider_logs_delta.TERMINAL_SCHEMA
 TERMINAL_SCHEMA_V15 = independent_stream_delta.TERMINAL_SCHEMA
+TERMINAL_SCHEMA_V16 = request_plugin_delta.TERMINAL_SCHEMA
 TIMED_TERMINAL_SCHEMAS = (TERMINAL_SCHEMA_V4, TERMINAL_SCHEMA_V5, TERMINAL_SCHEMA_V6,
                           TERMINAL_SCHEMA_V7, TERMINAL_SCHEMA_V8, TERMINAL_SCHEMA_V9,
                           TERMINAL_SCHEMA_V10, TERMINAL_SCHEMA_V11, TERMINAL_SCHEMA_V12,
-                          TERMINAL_SCHEMA_V13, TERMINAL_SCHEMA_V14, TERMINAL_SCHEMA_V15)
+                          TERMINAL_SCHEMA_V13, TERMINAL_SCHEMA_V14, TERMINAL_SCHEMA_V15,
+                          TERMINAL_SCHEMA_V16)
 REUSE_HOSTED = {'run_id': 44403089902, 'attempt': 1, 'workflow_blob': 'c123990e4a8c9fd981b721455a8edbc65b62dfc5'}
 FORMAL_WORKFLOW_ID = 402689897
 CI_WORKFLOW_ID = 389317795
@@ -274,6 +280,8 @@ def validate_timed_artifact(request, now):
         provider_logs_delta.validate_reference(request['artifact'], now)
     elif request['schema'] == TERMINAL_SCHEMA_V15:
         independent_stream_delta.validate_reference(request['artifact'], now)
+    elif request['schema'] == TERMINAL_SCHEMA_V16:
+        request_plugin_delta.validate_reference(request['artifact'], now)
     else:
         consumer.evidence.validate_reference(request['artifact'], now)
 
@@ -589,6 +597,8 @@ def verify_public_terminal(environment, reader, *, clock=time.time):
         return provider_logs_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
     if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V15:
         return independent_stream_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
+    if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V16:
+        return request_plugin_delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
     fields = {'schema', 'name', 'artifact', 'quality_sha256', 'repository', 'repository_id', 'candidate_sha',
               'candidate_tree', 'receipt_sha256', 'check_run_id', 'admission_id', 'invocation', 'attempt_id',
               'expires_at', 'consumer_run', 'terminal_run', 'hosted'}
@@ -1178,7 +1188,8 @@ def main():
                            ['relay-log-delta-consumer'], ['relay-log-delta-terminal'],
                            ['upstream-errors-delta-consumer'], ['upstream-errors-delta-terminal'],
                            ['provider-logs-delta-consumer'], ['provider-logs-delta-terminal'],
-                           ['independent-stream-delta-consumer'], ['independent-stream-delta-terminal']),
+                           ['independent-stream-delta-consumer'], ['independent-stream-delta-terminal'],
+                           ['request-plugin-delta-consumer'], ['request-plugin-delta-terminal']),
             'unknown quality operation')
     if sys.argv[1:] == ['premerge']:
         result = resolve_ci_candidate(os.environ)
@@ -1215,6 +1226,9 @@ def main():
     elif sys.argv[1:] in (['independent-stream-delta-consumer'], ['independent-stream-delta-terminal']):
         result = independent_stream_delta.verify_dispatch(
             sys.modules[__name__], os.environ, terminal=sys.argv[1] == 'independent-stream-delta-terminal', clock=time.time)
+    elif sys.argv[1:] in (['request-plugin-delta-consumer'], ['request-plugin-delta-terminal']):
+        result = request_plugin_delta.verify_dispatch(
+            sys.modules[__name__], os.environ, terminal=sys.argv[1] == 'request-plugin-delta-terminal', clock=time.time)
     elif sys.argv[1:] == ['terminal']:
         now = int(time.time())
         trusted_sha = consumer.trusted_consumer_context(os.environ, private=True)
