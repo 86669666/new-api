@@ -1071,6 +1071,9 @@ func (user *User) HardDelete() (int64, error) {
 		if err := deleteUserAuthenticationData(tx, user.Id); err != nil {
 			return err
 		}
+		if err := tx.Unscoped().Where("user_id = ?", user.Id).Delete(&MidjourneyImageShare{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Unscoped().Where("user_id = ?", user.Id).Delete(&MidjourneyImageVersion{}).Error; err != nil {
 			return err
 		}

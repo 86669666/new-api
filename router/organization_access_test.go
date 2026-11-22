@@ -7149,7 +7149,7 @@ func TestTokenAuthStaleExpiryDeniesHTTP(t *testing.T) {
 
 func TestPersonalHistoricalMediaReading(t *testing.T) {
 	f := newOrganizationHTTPFixture(t)
-	require.NoError(t, f.db.AutoMigrate(&model.Midjourney{}, &model.Channel{}, &model.MidjourneyImageVersion{}))
+	require.NoError(t, f.db.AutoMigrate(&model.Midjourney{}, &model.Channel{}, &model.MidjourneyImageVersion{}, &model.MidjourneyImageShare{}))
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
@@ -7340,12 +7340,130 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 				assert.Empty(t, media.body)
 			}
 		}
+		sharesPath := path + "/1/shares"
+		rejected := request(http.MethodPost, sharesPath, f.bearer["member"], nil)
+		require.NoError(t, rejected.err)
+		require.Equal(t, http.StatusNotFound, rejected.status)
+		type shareLink struct {
+			ID        int64  `json:"id"`
+			Access    string `json:"access"`
+			AccessURL string `json:"access_url"`
+			ExpiresAt int64  `json:"expires_at"`
+			CreatedAt int64  `json:"created_at"`
+		}
+		mint := func() shareLink {
+			t.Helper()
+			issued := request(http.MethodPost, sharesPath, ownerBearer, nil)
+			require.NoError(t, issued.err)
+			require.Equal(t, http.StatusCreated, issued.status)
+			var link shareLink
+			require.NoError(t, common.Unmarshal([]byte(issued.body), &link))
+			require.Positive(t, link.ID)
+			require.Len(t, link.Access, 43)
+			assert.EqualValues(t, 15*60, link.ExpiresAt-link.CreatedAt)
+			assert.Contains(t, issued.header.Get("Cache-Control"), "no-store")
+			return link
+		}
+		first, second := mint(), mint()
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			shared := request(method, second.AccessURL, "", http.Header{"Accept-Encoding": {"gzip"}})
+			require.NoError(t, shared.err)
+			require.Equal(t, http.StatusOK, shared.status)
+			assert.Equal(t, "image/png", shared.header.Get("Content-Type"))
+			assert.Empty(t, shared.header.Get("Content-Encoding"))
+			assert.Equal(t, strconv.Itoa(originalImage.Len()), shared.header.Get("Content-Length"))
+			assert.Equal(t, strconv.Quote(fmt.Sprintf("%x", sha256.Sum256(originalImage.Bytes()))), shared.header.Get("ETag"))
+			assert.Equal(t, "no-referrer", shared.header.Get("Referrer-Policy"))
+			assert.Contains(t, shared.header.Get("Cache-Control"), "no-store")
+			switch method {
+			case http.MethodGet:
+				assert.Equal(t, originalImage.String(), shared.body)
+			case http.MethodHead:
+				assert.Empty(t, shared.body)
+			}
+		}
+		firstManagement := sharesPath + "/" + strconv.FormatInt(first.ID, 10)
+		revoked := request(http.MethodDelete, firstManagement, ownerBearer, nil)
+		require.NoError(t, revoked.err)
+		require.Equal(t, http.StatusNoContent, revoked.status)
+		third := mint()
+		revokedAgain := request(http.MethodDelete, firstManagement, ownerBearer, nil)
+		require.NoError(t, revokedAgain.err)
+		assert.Equal(t, http.StatusNoContent, revokedAgain.status)
+		denied := request(http.MethodGet, first.AccessURL, "", nil)
+		require.NoError(t, denied.err)
+		assert.Equal(t, http.StatusNotFound, denied.status)
+		require.NoError(t, f.db.Model(&model.MidjourneyImageShare{}).Where("id = ?", third.ID).Update("expires_at", time.Now().Unix()).Error)
+		expired := request(http.MethodGet, third.AccessURL, "", nil)
+		require.NoError(t, expired.err)
+		assert.Equal(t, http.StatusNotFound, expired.status)
+		listed := request(http.MethodGet, sharesPath, ownerBearer, nil)
+		require.NoError(t, listed.err)
+		require.Equal(t, http.StatusOK, listed.status)
+		var list struct {
+			Shares []model.MidjourneyImageShare `json:"shares"`
+		}
+		require.NoError(t, common.Unmarshal([]byte(listed.body), &list))
+		require.Len(t, list.Shares, 1)
+		assert.Equal(t, second.ID, list.Shares[0].ID)
+		assert.NotContains(t, listed.body, second.Access)
+		var activeGrant model.MidjourneyImageShare
+		require.NoError(t, f.db.First(&activeGrant, second.ID).Error)
+		var seeded []model.MidjourneyImageShare
+		for n := range 6 {
+			grant := activeGrant
+			grant.ID = 0
+			grant.AccessHash = fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("fixture-share-%d", n))))
+			seeded = append(seeded, grant)
+		}
+		require.NoError(t, f.db.Create(&seeded).Error)
+		startIssuing := make(chan struct{})
+		issuedResponses := make(chan result, 2)
+		for range 2 {
+			go func() {
+				<-startIssuing
+				issuedResponses <- request(http.MethodPost, sharesPath, ownerBearer, nil)
+			}()
+		}
+		close(startIssuing)
+		var statuses []int
+		for range 2 {
+			response := <-issuedResponses
+			require.NoError(t, response.err)
+			statuses = append(statuses, response.status)
+		}
+		assert.ElementsMatch(t, []int{http.StatusCreated, http.StatusConflict}, statuses)
+
+		// A non-master deployment normally sends unmatched paths to its configured frontend.
+		t.Setenv("FRONTEND_BASE_URL", "https://frontend.example.invalid")
+		withExternalFrontend := gin.New()
+		middleware.SetUpLogger(withExternalFrontend)
+		SetRouter(withExternalFrontend, WebAssets{})
+		ordinary := httptest.NewRecorder()
+		withExternalFrontend.ServeHTTP(ordinary, httptest.NewRequest(http.MethodGet, "/ordinary-missing", nil))
+		require.Equal(t, http.StatusMovedPermanently, ordinary.Code)
+		invalidPath, _, _ := strings.Cut(second.AccessURL, "?")
+		for _, invalid := range []string{invalidPath + "//?access=" + second.Access,
+			"/api/media-shares/unmatched?ignored=" + second.Access,
+			"/api//media-shares/mj/image?access=" + second.Access} {
+			res := httptest.NewRecorder()
+			withExternalFrontend.ServeHTTP(res, httptest.NewRequest(http.MethodGet, invalid, nil))
+			assert.Equal(t, http.StatusNotFound, res.Code)
+			assert.Empty(t, res.Header().Get("Location"))
+		}
+		assert.NotContains(t, f.logs.snapshot(), first.Access)
+		assert.NotContains(t, f.logs.snapshot(), second.Access)
+		assert.NotContains(t, f.logs.snapshot(), third.Access)
+
 		require.NoError(t, f.db.Model(&pinned).Update("user_id", f.users["member"].Id).Error)
 		for _, actor := range []string{"owner", "member"} {
 			response := request(http.MethodGet, path+"/1", f.bearer[actor], nil)
 			require.NoError(t, response.err)
 			assert.Equal(t, http.StatusNotFound, response.status)
 		}
+		transferred := request(http.MethodGet, second.AccessURL, "", nil)
+		require.NoError(t, transferred.err)
+		assert.Equal(t, http.StatusNotFound, transferred.status)
 		assert.Equal(t, before+1, upstreamRequests.Load())
 	})
 
