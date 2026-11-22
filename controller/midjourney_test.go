@@ -13,10 +13,70 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMidjourneyHistoryPreservesLegacyImageLinks(t *testing.T) {
+	database, _ := openTaskDialectDatabase(t, &model.Midjourney{})
+	oldDB, oldForward, oldAddress := model.DB, setting.MjForwardUrlEnabled, system_setting.ServerAddress
+	model.DB = database
+	system_setting.ServerAddress = "https://gateway.example/tenant"
+	t.Cleanup(func() {
+		model.DB = oldDB
+		setting.MjForwardUrlEnabled = oldForward
+		system_setting.ServerAddress = oldAddress
+	})
+
+	const ownerID = 42
+	const upstream = "https://images.example/history.png"
+	require.NoError(t, database.Create(&model.Midjourney{
+		UserId: ownerID, MjId: "migration-fixture", ImageUrl: upstream, Status: "SUCCESS",
+	}).Error)
+	for _, history := range []struct {
+		name    string
+		path    string
+		handler gin.HandlerFunc
+	}{
+		{"personal", "/api/mj/self", GetUserMidjourney},
+		{"admin", "/api/mj/", GetAllMidjourney},
+	} {
+		t.Run(history.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name    string
+				forward bool
+				want    string
+			}{
+				{"gateway link", true, "https://gateway.example/tenant/mj/image/migration-fixture"},
+				{"upstream link", false, upstream},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					setting.MjForwardUrlEnabled = tc.forward
+					response := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(response)
+					c.Set("id", ownerID)
+					c.Request = httptest.NewRequest(http.MethodGet, history.path, nil)
+					history.handler(c)
+
+					require.Equal(t, http.StatusOK, response.Code)
+					var result struct {
+						Success bool `json:"success"`
+						Data    struct {
+							Items []model.Midjourney `json:"items"`
+						} `json:"data"`
+					}
+					require.NoError(t, common.DecodeJson(response.Body, &result))
+					require.True(t, result.Success)
+					require.Len(t, result.Data.Items, 1)
+					assert.Equal(t, tc.want, result.Data.Items[0].ImageUrl)
+				})
+			}
+		})
+	}
+}
 
 func TestMidjourneyPollKeepsProviderDataOutOfLogs(t *testing.T) {
 	database, _ := openTaskDialectDatabase(t, &model.Channel{}, &model.Midjourney{})
