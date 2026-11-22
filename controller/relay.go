@@ -900,10 +900,10 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 							diagnostics.present(outcome.Task, "native_presenter")
 							return
 						} else {
-							logger.LogError(c, common.LogText("task plugin native submit presenter failed: %s", replyErr.Error()))
+							logger.LogError(c, common.LogText("write task plugin native submit reply failed (plugin=%s)", pinned.Plugin.Meta.Key))
 						}
 					} else {
-						logger.LogError(c, common.LogText("task plugin native submit presenter failed: %s", callErr.Error()))
+						logger.LogError(c, common.LogText("task plugin native submit render hook failed (plugin=%s)", pinned.Plugin.Meta.Key))
 					}
 				} else {
 					logger.LogError(c, common.LogText("encode task plugin native submit view failed: %s", valueErr.Error()))
@@ -963,7 +963,7 @@ func taskSubmissionAPIError(taskErr *taskdto.TaskError) *types.NewAPIError {
 	if err == nil {
 		err = errors.New(taskErr.Message)
 	}
-	return types.NewOpenAIError(err, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode)
+	return service.MarkUpstreamResponseError(types.NewOpenAIError(err, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
 }
 
 // decideTaskRetry is the single retry decision for task submissions. The

@@ -18,6 +18,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -471,6 +472,17 @@ func TestUpdateBatchTasksRefundsFailedTieredTask(t *testing.T) {
 
 func TestUpdateBatchTasksRefundsFailedTaskWithoutUsageSettlement(t *testing.T) {
 	truncate(t)
+	const providerReason = "fixture-private-task-failure"
+	var output bytes.Buffer
+	common.LogWriterMu.Lock()
+	oldWriter := gin.DefaultWriter
+	gin.DefaultWriter = &output
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter = oldWriter
+		common.LogWriterMu.Unlock()
+	})
 
 	const userID, tokenID, channelID = 42, 42, 142
 	const initialQuota, preConsumedQuota, tokenRemain = 10_000, 4_000, 7_000
@@ -488,7 +500,7 @@ func TestUpdateBatchTasksRefundsFailedTaskWithoutUsageSettlement(t *testing.T) {
 
 	upstreamID := task.GetUpstreamTaskID()
 	adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{
-		upstreamID: {TaskInfo: relaycommon.TaskInfo{TaskID: upstreamID, Status: model.TaskStatusFailure, Reason: "upstream failed", TotalTokens: 123}},
+		upstreamID: {TaskInfo: relaycommon.TaskInfo{TaskID: upstreamID, Status: model.TaskStatusFailure, Reason: providerReason, TotalTokens: 123}},
 	}}
 	require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, map[int][]string{channelID: {upstreamID}}, map[string]*model.Task{upstreamID: task}))
 
@@ -497,6 +509,16 @@ func TestUpdateBatchTasksRefundsFailedTaskWithoutUsageSettlement(t *testing.T) {
 	log := getLastLog(t)
 	require.NotNil(t, log)
 	assert.Equal(t, model.LogTypeRefund, log.Type)
+	assert.NotContains(t, log.Other, providerReason)
+	other, err := common.StrToMap(log.Other)
+	require.NoError(t, err)
+	assert.Equal(t, "Upstream task failed", other["reason"])
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, providerReason, persisted.FailReason)
+	assert.Contains(t, output.String(), task.TaskID)
+	assert.NotContains(t, output.String(), providerReason)
+	assert.NotContains(t, output.String(), upstreamID)
 }
 
 func TestUpdateVideoTasksCanSkipPollingSleepPerChannel(t *testing.T) {

@@ -431,7 +431,7 @@ func writeTaskArtifactContent(c *gin.Context, task *model.Task, beforePublish fu
 	}
 	if err != nil || descriptor == nil {
 		if err != nil {
-			logger.LogWarn(c.Request.Context(), fmt.Sprintf("Failed to resolve plugin %s content for task %s: %v", artifactKey, task.TaskID, err))
+			logger.LogWarn(c.Request.Context(), common.LogText("Failed to resolve plugin artifact content for task %s", task.TaskID))
 		}
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_plugin_error", "Artifact content plugin failed")
 		return nil

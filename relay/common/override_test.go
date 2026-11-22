@@ -2553,8 +2553,8 @@ func TestApplyParamOverrideWithRelayInfoRecordsOperationAuditInDebugMode(t *test
 
 	expected := []string{
 		"copy metadata.target_model -> model",
-		"set service_tier = flex",
-		"set temperature = 0.1",
+		"set service_tier",
+		"set temperature",
 	}
 	if !reflect.DeepEqual(info.ParamOverrideAudit, expected) {
 		t.Fatalf("unexpected param override audit, got %#v", info.ParamOverrideAudit)
@@ -2623,7 +2623,7 @@ func TestApplyParamOverrideWithRelayInfoRecordsConversationBodyOperationsWhenDeb
 					},
 					map[string]any{
 						"mode":  "set",
-						"path":  "input.0.content.0.text",
+						"path":  "input.0.content.0.*",
 						"value": "rewritten response input",
 					},
 					map[string]any{
@@ -2653,7 +2653,7 @@ func TestApplyParamOverrideWithRelayInfoRecordsConversationBodyOperationsWhenDeb
 
 	out, err := ApplyParamOverrideWithRelayInfo([]byte(`{
 		"messages":[{"role":"user","content":"hello world"}],
-		"input":[{"role":"user","content":[{"type":"input_text","text":"original response input"}]}],
+		"input":[{"role":"user","content":[{"fixture-private-key":"original response input"}]}],
 		"instructions":"old instruction",
 		"system":"old system",
 		"contents":[{"role":"user","parts":[{"text":"hello gemini"}]}],
@@ -2662,7 +2662,7 @@ func TestApplyParamOverrideWithRelayInfoRecordsConversationBodyOperationsWhenDeb
 	require.NoError(t, err)
 	assertJSONEqual(t, `{
 		"messages":[{"role":"user","content":"hi world"}],
-		"input":[{"role":"user","content":[{"type":"input_text","text":"rewritten response input"}]}],
+		"input":[{"role":"user","content":[{"fixture-private-key":"rewritten response input"}]}],
 		"instructions":"new instruction",
 		"system":"old system",
 		"contents":[{"role":"user","parts":[{"text":"hello gemini"},{"text":"new gemini part"}]}],
@@ -2671,10 +2671,10 @@ func TestApplyParamOverrideWithRelayInfoRecordsConversationBodyOperationsWhenDeb
 	}`, string(out))
 
 	require.Equal(t, []string{
-		"replace messages.0.content from hello to hi",
-		"set input.0.content.0.text = rewritten response input",
-		"set instructions = new instruction",
-		"append contents.0.parts with {\"text\":\"new gemini part\"}",
+		"replace messages.0.content",
+		"set input.0.content.0.*",
+		"set instructions",
+		"append contents.0.parts",
 		"copy system -> metadata.system_copy",
 	}, info.ParamOverrideAudit)
 }
@@ -2818,5 +2818,5 @@ func TestReasoningEffortOverrideIsAuditedWithoutDebugMode(t *testing.T) {
 
 	_, err := ApplyParamOverrideWithRelayInfo([]byte(`{"reasoning":{"effort":"high"}}`), info)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"set reasoning.effort = max"}, info.ParamOverrideAudit)
+	assert.Equal(t, []string{"set reasoning.effort"}, info.ParamOverrideAudit)
 }

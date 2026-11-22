@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net/http"
@@ -44,13 +45,14 @@ func (*imageReservation) NeedsRefund() bool          { return false }
 
 func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 	service.InitHttpClient()
+	const fixturePrompt = "a fixture-only private prompt"
 	for _, tc := range []struct {
 		name, body                                    string
 		tiered, passThrough, insufficient, retryReset bool
 		override                                      any
 		count, status                                 int
 	}{
-		{name: "top-level count", body: `{"model":"gpt-image-2","n":2,"parameters":{}}`, count: 2},
+		{name: "top-level count", body: `{"model":"gpt-image-2","n":2,"parameters":{},"prompt":"` + fixturePrompt + `"}`, count: 2},
 		{name: "legacy channel quantity override", body: `{"model":"gpt-image-2","n":1}`, override: 4, count: 4},
 		{name: "expression channel quantity override", body: `{"model":"gpt-image-2","n":1}`, override: 4, count: 4, tiered: true},
 		{name: "pass-through quantity", body: `{"model":"gpt-image-2","n":2,"parameters":{}}`, count: 2, passThrough: true},
@@ -59,6 +61,21 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 		{name: "retry drops the previous attempt's quantity", body: `{"model":"gpt-image-2","n":1}`, count: 1, retryReset: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			if tc.name == "top-level count" {
+				oldDebug := common.DebugEnabled
+				common.DebugEnabled = true
+				common.LogWriterMu.Lock()
+				oldErrorWriter := gin.DefaultErrorWriter
+				gin.DefaultErrorWriter = &logs
+				common.LogWriterMu.Unlock()
+				t.Cleanup(func() {
+					common.DebugEnabled = oldDebug
+					common.LogWriterMu.Lock()
+					gin.DefaultErrorWriter = oldErrorWriter
+					common.LogWriterMu.Unlock()
+				})
+			}
 			received := make(chan []byte, 1)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, err := io.ReadAll(r.Body)
@@ -111,6 +128,11 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 			require.Len(t, received, 1)
 			body := <-received
 			assert.Equal(t, int64(tc.count), ojson.GetBytes(body, "n").Int())
+			if tc.name == "top-level count" {
+				assert.Equal(t, fixturePrompt, ojson.GetBytes(body, "prompt").String())
+				assert.Contains(t, logs.String(), "image request body bytes:")
+				assert.NotContains(t, logs.String(), fixturePrompt)
+			}
 			assert.Equal(t, tc.count*20000, info.PriceData.QuotaToPreConsume)
 			assert.GreaterOrEqual(t, reservation.held, info.PriceData.QuotaToPreConsume)
 			assert.Nil(t, info.BillingImageCount)

@@ -1,16 +1,21 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -314,4 +319,72 @@ func TestProtectedFetchRoundTripperReusesTransportPerProxy(t *testing.T) {
 	require.NotSame(t, direct, proxied)
 	require.True(t, direct.ForceAttemptHTTP2)
 	require.False(t, direct.DisableKeepAlives)
+}
+
+func TestDownloadRequestKeepsOriginalURLWithoutLoggingIt(t *testing.T) {
+	const targetPath = "/fixture-private-file?field%2Bonename=one%2Btwo&field%2Bonename=second"
+	const reason = "fixture-private-download-reason"
+	received := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var request WorkerRequest
+			if err := common.DecodeJson(r.Body, &request); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			received <- request.URL
+		} else {
+			received <- r.URL.RequestURI()
+		}
+		_, _ = io.WriteString(w, "fixture content")
+	}))
+	t.Cleanup(upstream.Close)
+
+	configureSSRFTestFetchSetting(t)
+	setting := system_setting.GetFetchSetting()
+	setting.AllowPrivateIp = true
+	setting.AllowedPorts = []string{mustParseURL(t, upstream.URL).Port()}
+	oldWorkerURL, oldAllowHTTP := system_setting.WorkerUrl, system_setting.WorkerAllowHttpImageRequestEnabled
+	oldHTTPClient, oldProtectedClient := httpClient, ssrfProtectedHTTPClient
+	system_setting.WorkerAllowHttpImageRequestEnabled = true
+	httpClient, ssrfProtectedHTTPClient = upstream.Client(), newProtectedFetchHTTPClient()
+	t.Cleanup(func() {
+		system_setting.WorkerUrl, system_setting.WorkerAllowHttpImageRequestEnabled = oldWorkerURL, oldAllowHTTP
+		ssrfProtectedHTTPClient.CloseIdleConnections()
+		httpClient, ssrfProtectedHTTPClient = oldHTTPClient, oldProtectedClient
+	})
+
+	var output bytes.Buffer
+	common.LogWriterMu.Lock()
+	oldWriter := gin.DefaultWriter
+	gin.DefaultWriter = &output
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter = oldWriter
+		common.LogWriterMu.Unlock()
+	})
+
+	target := upstream.URL + targetPath
+	for _, tc := range []struct {
+		name, workerURL, wantRequest, wantLog string
+	}{
+		{name: "origin", wantRequest: targetPath, wantLog: "downloading file from origin"},
+		{name: "worker", workerURL: upstream.URL, wantRequest: target, wantLog: "downloading file via worker"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			system_setting.WorkerUrl = tc.workerURL
+			output.Reset()
+			resp, err := DoDownloadRequest(target, reason)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Len(t, received, 1)
+			assert.Equal(t, tc.wantRequest, <-received)
+			assert.Contains(t, output.String(), tc.wantLog)
+			for _, value := range []string{"fixture-private-file", "field%2Bonename", "one%2Btwo", reason} {
+				assert.NotContains(t, output.String(), value)
+			}
+		})
+	}
 }

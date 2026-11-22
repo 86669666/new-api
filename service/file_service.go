@@ -49,9 +49,7 @@ func LoadFileSource(c *gin.Context, source types.FileSource, reason ...string) (
 		return nil, fmt.Errorf("file source is nil")
 	}
 
-	if common.DebugEnabled {
-		logger.LogDebug(c, "LoadFileSource starting for: %s", source.GetIdentifier())
-	}
+	logger.LogDebug(c, "LoadFileSource starting: remote=%t", source.IsURL())
 
 	// 1. 快速检查内部缓存
 	if source.HasCache() {
