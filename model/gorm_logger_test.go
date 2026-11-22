@@ -2,17 +2,24 @@ package model
 
 import (
 	"bytes"
+	"context"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/proto"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // 保护契约:数据库驱动错误消息可能内联数据值,非 DEBUG 下日志只保留错误码。
@@ -34,6 +41,12 @@ func TestSanitizeDBErrorStripsDriverMessage(t *testing.T) {
 			err:    &pgconn.PgError{Code: "23505", Message: "duplicate key value", Detail: "Key (k)=(secret-value) already exists."},
 			want:   "postgres error SQLSTATE 23505",
 			leaked: "secret-value",
+		},
+		{
+			name:   "invalid postgres state is kept out of logs",
+			err:    &pgconn.PgError{Code: "fixture-private-data", Message: "invalid diagnostic"},
+			want:   "postgres error",
+			leaked: "fixture-private-data",
 		},
 		{
 			name:   "postgres pooler prepared statement conflict gets remediation hint",
@@ -75,34 +88,129 @@ func TestSanitizeDBErrorSQLiteDriver(t *testing.T) {
 	assert.NotContains(t, got.Error(), "secret-value")
 }
 
-func TestSanitizeDBErrorKeepsNonDriverErrors(t *testing.T) {
-	err := fmt.Errorf("dial tcp 127.0.0.1:3306: connect: connection refused")
-	assert.Equal(t, err, sanitizeDBError(err))
+func TestSanitizeDBErrorClassifiesNonDriverErrors(t *testing.T) {
+	const marker = "fixture-private-diagnostic"
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"scan", fmt.Errorf("cannot scan value %q into column", marker), "database operation failed"},
+		{"network", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New(marker)}, "database network error"},
+		{"timeout", fmt.Errorf("%s: %w", marker, context.DeadlineExceeded), "context deadline exceeded"},
+		{"canceled", fmt.Errorf("%s: %w", marker, context.Canceled), "context canceled"},
+		{"bad connection", fmt.Errorf("%s: %w", marker, driver.ErrBadConn), "driver: bad connection"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.ErrorContains(t, tc.err, marker)
+			assert.EqualError(t, sanitizeDBError(tc.err), tc.want)
+		})
+	}
 }
 
-// 保护契约:经 gorm 真实链路,错误日志同时满足 SQL 参数化、驱动错误脱敏、
-// 调用点归因到业务代码;DEBUG=true 恢复参数值与错误原文。
+// Exercise the two logging modes through GORM and SQLite. The SQL engine
+// still receives its arguments and the caller still receives driver errors.
 func TestGormLoggerEndToEndSanitizedOutput(t *testing.T) {
+	t.Setenv("SQL_SLOW_THRESHOLD_MS", "0")
 	previousDebug := common.DebugEnabled
 	t.Cleanup(func() { common.DebugEnabled = previousDebug })
 
-	execQuery := func() string {
-		var buf bytes.Buffer
-		db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: newGormLogger(&buf)})
-		require.NoError(t, err)
-		db.Exec("SELECT * FROM missing_table WHERE k = ?", "secret-value")
-		return buf.String()
+	for _, tc := range []struct {
+		name  string
+		debug bool
+	}{{"default", false}, {"debug", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			const value = "fixture-sql-binding-%2B"
+			common.DebugEnabled = tc.debug
+			var logs bytes.Buffer
+			db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: newGormLogger(&logs)})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			if tc.debug {
+				db = db.Debug()
+			}
+
+			var actual string
+			require.NoError(t, db.Raw("SELECT ? AS value", value).Scan(&actual).Error)
+			assert.Equal(t, value, actual)
+			if tc.debug {
+				assert.Contains(t, logs.String(), "operation=SELECT")
+				assert.Contains(t, logs.String(), "[rows:1]")
+			} else {
+				assert.Empty(t, logs.String())
+			}
+			assert.NotContains(t, logs.String(), value)
+
+			logs.Reset()
+			queryErr := db.Exec("SELECT * FROM missing_table WHERE k = ?", value).Error
+			require.ErrorContains(t, queryErr, "no such table")
+			assert.Contains(t, logs.String(), "operation=SELECT")
+			assert.Contains(t, logs.String(), "sqlite error")
+			assert.Contains(t, logs.String(), "gorm_logger_test.go")
+			assert.NotContains(t, logs.String(), value)
+			assert.NotContains(t, logs.String(), "no such table")
+			assert.NotContains(t, logs.String(), "missing_table")
+		})
 	}
 
-	common.DebugEnabled = false
-	out := execQuery()
-	assert.Contains(t, out, "k = ?")
-	assert.NotContains(t, out, "secret-value")
-	assert.Contains(t, out, "sqlite error")
-	assert.Contains(t, out, "gorm_logger_test.go")
+	t.Run("slow trace", func(t *testing.T) {
+		t.Setenv("SQL_SLOW_THRESHOLD_MS", "1")
+		var logs bytes.Buffer
+		newGormLogger(&logs).Trace(t.Context(), time.Now().Add(-time.Second), func() (string, int64) {
+			return "/* fixture-private-sql-comment */ select 'fixture-private-binding'", -1
+		}, nil)
+		assert.Contains(t, logs.String(), "SLOW SQL")
+		assert.Contains(t, logs.String(), "[rows:-]")
+		assert.Contains(t, logs.String(), "operation=OTHER")
+		assert.NotContains(t, logs.String(), "fixture-private-sql-comment")
+		assert.NotContains(t, logs.String(), "fixture-private-binding")
+	})
+}
 
-	common.DebugEnabled = true
-	debugOut := execQuery()
-	assert.Contains(t, debugOut, "secret-value")
-	assert.Contains(t, debugOut, "no such table")
+func TestTaskAccountingDoesNotRepeatDatabaseErrorDetails(t *testing.T) {
+	const fixture = "fixture-private-billing-error"
+	var output bytes.Buffer
+	common.LogWriterMu.Lock()
+	oldWriter := gin.DefaultWriter
+	gin.DefaultWriter = &output
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter = oldWriter
+		common.LogWriterMu.Unlock()
+	})
+
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: logger.Discard})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	require.NoError(t, db.AutoMigrate(&User{}, &Channel{}, &Log{}))
+
+	oldDB, oldLogDB, oldRedis := DB, LOG_DB, common.RedisEnabled
+	oldBatch := common.BatchUpdateEnabled
+	DB, LOG_DB, common.RedisEnabled = db, db, false
+	common.BatchUpdateEnabled = false
+	t.Cleanup(func() {
+		DB, LOG_DB, common.RedisEnabled = oldDB, oldLogDB, oldRedis
+		common.BatchUpdateEnabled = oldBatch
+	})
+	failWrite := func(tx *gorm.DB) {
+		tx.AddError(&mysql.MySQLError{Number: 1062, Message: fixture})
+	}
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("fixture:log_write", failWrite))
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("fixture:usage_write", failWrite))
+
+	RecordTaskBillingLog(RecordTaskBillingLogParams{LogType: LogTypeRefund, Quota: 1})
+	UpdateUserUsedQuota(1, -1)
+	updateUserUsedQuotaAndRequestCount(1, -1, 0)
+	UpdateChannelUsedQuota(1, -1)
+
+	assert.Contains(t, output.String(), "failed to record task billing log: mysql error 1062")
+	assert.Contains(t, output.String(), "failed to update user used quota: mysql error 1062")
+	assert.Contains(t, output.String(), "failed to update user used quota and request count: mysql error 1062")
+	assert.Contains(t, output.String(), "delta_quota=-1, error=mysql error 1062")
+	assert.NotContains(t, output.String(), fixture)
 }
