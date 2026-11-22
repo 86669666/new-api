@@ -20,7 +20,11 @@ func SetApiRouter(router *gin.Engine) {
 	events.POST("/events/", controller.ReceiveClientEvents)
 	apiRouter := router.Group("/api")
 	apiRouter.Use(middleware.RouteTag("api"))
-	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPathsRegexs([]string{`^/api/organizations/[0-9]+/tasks/[0-9]+/artifacts/[^/]+/content$`})))
+	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPathsRegexs([]string{
+		`^/api/organizations/[0-9]+/tasks/[0-9]+/artifacts/[^/]+/content$`,
+		`^/api/task/media/[0-9]+/artifacts/[^/]+/content$`,
+		`^/api/mj/media/[0-9]+/(image|versions/[0-9]+)$`,
+	})))
 	apiRouter.Use(middleware.AccessTokenAudit())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
@@ -441,6 +445,11 @@ func SetApiRouter(router *gin.Engine) {
 		}
 
 		mjRoute := apiRouter.Group("/mj")
+		mjRoute.GET("/media/:row_id/image", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalMidjourneyImage)
+		mjRoute.HEAD("/media/:row_id/image", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalMidjourneyImage)
+		mjRoute.POST("/media/:row_id/versions", middleware.DisableCache(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-media-pin"), controller.PinPersonalMidjourneyImage)
+		mjRoute.GET("/media/:row_id/versions/:version", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalMidjourneyImageVersion)
+		mjRoute.HEAD("/media/:row_id/versions/:version", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalMidjourneyImageVersion)
 		mjRoute.GET("/self", middleware.UserAuth(), controller.GetUserMidjourney)
 		mjRoute.GET("/", middleware.AdminAuth(), controller.GetAllMidjourney)
 
@@ -448,6 +457,8 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			taskRoute.GET("/self", middleware.UserAuth(), controller.GetUserTask)
 			taskRoute.GET("", middleware.AdminAuth(), controller.GetAllTask)
+			taskRoute.GET("/media/:row_id/artifacts/:artifact_key/content", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalTaskArtifactContent)
+			taskRoute.HEAD("/media/:row_id/artifacts/:artifact_key/content", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalTaskArtifactContent)
 			taskRoute.GET("/:task_id/artifacts", middleware.UserAuth(), controller.GetDashboardTaskArtifacts)
 		}
 

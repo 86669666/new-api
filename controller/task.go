@@ -398,7 +398,7 @@ func writeTaskArtifactContent(c *gin.Context, task *model.Task, beforePublish fu
 		return nil
 	}
 	artifactStore := service.GetTaskArtifactStore()
-	if task.OrganizationID != 0 {
+	if beforePublish != nil {
 		// No enabled backend currently provides a session-bound serving contract.
 		if artifactStore.Enabled() {
 			writeTaskArtifactError(c, http.StatusServiceUnavailable, "artifact_plugin_unavailable", "Artifact content plugin is unavailable")

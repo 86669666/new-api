@@ -11,6 +11,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/gif"
+	"image/png"
 	"io"
 	"maps"
 	"net"
@@ -7141,4 +7145,272 @@ func TestTokenAuthStaleExpiryDeniesHTTP(t *testing.T) {
 			assert.NotContains(t, f.logs.snapshot(), token.Key)
 		})
 	}
+}
+
+func TestPersonalHistoricalMediaReading(t *testing.T) {
+	f := newOrganizationHTTPFixture(t)
+	require.NoError(t, f.db.AutoMigrate(&model.Midjourney{}, &model.Channel{}, &model.MidjourneyImageVersion{}))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	pinStarted := make(chan struct{})
+	pinRelease := make(chan struct{})
+	var pinOnce sync.Once
+	var upstreamRequests atomic.Int64
+	raster := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	raster.Set(0, 0, color.RGBA{R: 11, G: 22, B: 33, A: 255})
+	var originalImage bytes.Buffer
+	require.NoError(t, png.Encode(&originalImage, raster))
+	var gifImage bytes.Buffer
+	require.NoError(t, gif.Encode(&gifImage, raster, nil))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("ETag", `"fixture-media"`)
+		w.Header().Set("Set-Cookie", "provider=fixture")
+		if r.URL.Path == "/paused" {
+			close(started)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		switch r.URL.Path {
+		case "/pin-paused":
+			close(pinStarted)
+			select {
+			case <-pinRelease:
+			case <-r.Context().Done():
+				return
+			}
+			fallthrough
+		case "/original":
+			_, _ = w.Write(originalImage.Bytes())
+			return
+		case "/gif":
+			w.Header().Set("Content-Type", "image/gif")
+			_, _ = w.Write(gifImage.Bytes())
+			return
+		case "/oversize":
+			w.Header().Set("Content-Length", strconv.FormatInt(model.PersonalMidjourneyImageMaxBytes+1, 10))
+			w.WriteHeader(http.StatusOK)
+			return
+		case "/changed":
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Range") == "bytes=0-1" {
+			w.Header().Set("Content-Range", "bytes 0-1/3")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, "ab")
+			return
+		}
+		_, _ = io.WriteString(w, "abc")
+	}))
+	defer upstream.Close()
+	defer releaseOnce.Do(func() { close(release) })
+	defer pinOnce.Do(func() { close(pinRelease) })
+	address, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	fetchSetting := system_setting.GetFetchSetting()
+	oldFetch := *fetchSetting
+	t.Cleanup(func() { *fetchSetting = oldFetch })
+	*fetchSetting = system_setting.FetchSetting{
+		EnableSSRFProtection: true, AllowPrivateIp: true,
+		IpFilterMode: true, IpList: []string{"127.0.0.1/32"}, AllowedPorts: []string{address.Port()},
+	}
+
+	channel := model.Channel{Name: "w04-private-media", Status: common.ChannelStatusEnabled, Key: "fixture-provider-key"}
+	require.NoError(t, f.db.Create(&channel).Error)
+	owner := f.users["owner"].Id
+	mj := model.Midjourney{MjId: "fixture-mj", UserId: owner, ChannelId: channel.Id, ImageUrl: upstream.URL + "/image"}
+	require.NoError(t, f.db.Create(&mj).Error)
+	task := model.Task{TaskID: "fixture-task", UserId: owner, Platform: "document", ChannelId: channel.Id,
+		Status: model.TaskStatusSuccess, Action: constant.TaskActionTextToVideo, FailReason: "data:video/mp4;base64,YWJj"}
+	require.NoError(t, f.db.Create(&task).Error)
+	orgTask := task
+	orgTask.ID, orgTask.TaskID, orgTask.OrganizationID = 0, "organization-fixture-task", f.orgA
+	require.NoError(t, f.db.Create(&orgTask).Error)
+	mjPath := fmt.Sprintf("/api/mj/media/%d/image", mj.Id)
+	taskPath := fmt.Sprintf("/api/task/media/%d/artifacts/video/content", task.ID)
+	orgPath := fmt.Sprintf("/api/task/media/%d/artifacts/video/content", orgTask.ID)
+	type result struct {
+		status int
+		header http.Header
+		body   string
+		err    error
+	}
+	request := func(method, path, bearer string, headers http.Header) result {
+		req, err := http.NewRequest(method, f.server.URL+path, nil)
+		if err != nil {
+			return result{err: err}
+		}
+		if headers != nil {
+			req.Header = headers.Clone()
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := f.client.Do(req)
+		if err != nil {
+			return result{err: err}
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		return result{resp.StatusCode, resp.Header, string(body), err}
+	}
+
+	t.Run("session_owner_get_head_and_range", func(t *testing.T) {
+		for _, path := range []string{mjPath, taskPath} {
+			for _, method := range []string{http.MethodGet, http.MethodHead} {
+				response := request(method, path, f.bearer["owner"], nil)
+				require.NoError(t, response.err)
+				require.Equal(t, http.StatusOK, response.status)
+				assert.Equal(t, "private, no-store", response.header.Get("Cache-Control"))
+				assert.Equal(t, "no-referrer", response.header.Get("Referrer-Policy"))
+				assert.Empty(t, response.header.Get("Set-Cookie"))
+				if method == http.MethodGet {
+					assert.Equal(t, "abc", response.body)
+				} else {
+					assert.Empty(t, response.body)
+				}
+			}
+		}
+		response := request(http.MethodGet, mjPath, f.bearer["owner"], http.Header{"Range": {"bytes=0-1"}})
+		require.NoError(t, response.err)
+		assert.Equal(t, http.StatusPartialContent, response.status)
+		assert.Equal(t, "bytes 0-1/3", response.header.Get("Content-Range"))
+		assert.Equal(t, "ab", response.body)
+	})
+
+	t.Run("other_credentials_and_organization_stay_separate", func(t *testing.T) {
+		before := upstreamRequests.Load()
+		for _, tc := range []struct {
+			path, actor string
+			status      int
+		}{
+			{mjPath, "", http.StatusUnauthorized},
+			{taskPath, "relay", http.StatusUnauthorized},
+			{mjPath, "foreign", http.StatusNotFound},
+			{taskPath, "admin", http.StatusNotFound},
+			{orgPath, "owner", http.StatusNotFound},
+			{fmt.Sprintf("%s?org_id=%d", mjPath, f.orgA), "owner", http.StatusForbidden},
+		} {
+			response := request(http.MethodGet, tc.path, f.bearer[tc.actor], nil)
+			require.NoError(t, response.err)
+			assert.Equal(t, tc.status, response.status, "path=%s actor=%s", tc.path, tc.actor)
+			assert.Empty(t, response.header.Get("ETag"))
+		}
+		assert.Equal(t, before, upstreamRequests.Load())
+	})
+
+	t.Run("fixed_images_read_back_without_the_source", func(t *testing.T) {
+		pinned := model.Midjourney{MjId: "pinned-image", UserId: owner, ChannelId: channel.Id,
+			SubmitTime: 123, ImageUrl: upstream.URL + "/original", Status: "SUCCESS", Progress: "100%"}
+		require.NoError(t, f.db.Create(&pinned).Error)
+		path := fmt.Sprintf("/api/mj/media/%d/versions", pinned.Id)
+		ownerBearer := f.bearer["owner"]
+		before := upstreamRequests.Load()
+		unowned := request(http.MethodPost, path, f.bearer["member"], nil)
+		require.NoError(t, unowned.err)
+		require.Equal(t, http.StatusNotFound, unowned.status)
+		assert.Equal(t, before, upstreamRequests.Load())
+		created := request(http.MethodPost, path, ownerBearer, nil)
+		require.NoError(t, created.err)
+		require.Equal(t, http.StatusCreated, created.status, created.body)
+		assert.Equal(t, before+1, upstreamRequests.Load())
+		require.NoError(t, f.db.Model(&pinned).Update("image_url", upstream.URL+"/changed").Error)
+
+		retry := request(http.MethodPost, path, ownerBearer, nil)
+		require.NoError(t, retry.err)
+		require.Equal(t, http.StatusOK, retry.status, retry.body)
+		assert.JSONEq(t, created.body, retry.body)
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			media := request(method, path+"/1", ownerBearer, nil)
+			require.NoError(t, media.err)
+			require.Equal(t, http.StatusOK, media.status, media.body)
+			assert.Equal(t, "image/png", media.header.Get("Content-Type"))
+			assert.Equal(t, "private, no-store", media.header.Get("Cache-Control"))
+			assert.Equal(t, strconv.Itoa(originalImage.Len()), media.header.Get("Content-Length"))
+			assert.Equal(t, strconv.Quote(fmt.Sprintf("%x", sha256.Sum256(originalImage.Bytes()))), media.header.Get("ETag"))
+			if method == http.MethodGet {
+				assert.Equal(t, originalImage.String(), media.body)
+			} else {
+				assert.Empty(t, media.body)
+			}
+		}
+		require.NoError(t, f.db.Model(&pinned).Update("user_id", f.users["member"].Id).Error)
+		for _, actor := range []string{"owner", "member"} {
+			response := request(http.MethodGet, path+"/1", f.bearer[actor], nil)
+			require.NoError(t, response.err)
+			assert.Equal(t, http.StatusNotFound, response.status)
+		}
+		assert.Equal(t, before+1, upstreamRequests.Load())
+	})
+
+	t.Run("unsupported_or_oversize_sources_do_not_publish_a_version", func(t *testing.T) {
+		for _, source := range []string{"/gif", "/oversize"} {
+			row := model.Midjourney{MjId: "rejected" + source, UserId: owner, ChannelId: channel.Id,
+				ImageUrl: upstream.URL + source, Status: "SUCCESS", Progress: "100%"}
+			require.NoError(t, f.db.Create(&row).Error)
+			path := fmt.Sprintf("/api/mj/media/%d/versions", row.Id)
+			failed := request(http.MethodPost, path, f.bearer["owner"], nil)
+			require.NoError(t, failed.err)
+			require.Equal(t, http.StatusBadGateway, failed.status, failed.body)
+			var count int64
+			require.NoError(t, f.db.Model(&model.MidjourneyImageVersion{}).Where("midjourney_id = ?", row.Id).Count(&count).Error)
+			assert.Zero(t, count)
+		}
+	})
+
+	t.Run("revocation_while_pinning_does_not_save_bytes", func(t *testing.T) {
+		actor := f.users["foreign"]
+		task := model.Midjourney{MjId: "paused-image", UserId: actor.Id, ChannelId: channel.Id,
+			ImageUrl: upstream.URL + "/pin-paused", Status: "SUCCESS", Progress: "100%"}
+		require.NoError(t, f.db.Create(&task).Error)
+		path := fmt.Sprintf("/api/mj/media/%d/versions", task.Id)
+		done := make(chan result, 1)
+		go func() { done <- request(http.MethodPost, path, f.bearer["foreign"], nil) }()
+		select {
+		case <-pinStarted:
+		case response := <-done:
+			t.Fatalf("pin source was not reached: status=%d err=%v", response.status, response.err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("pin source was not reached")
+		}
+		revoked, err := model.RevokeUserSession(actor.Id, f.sids["foreign"], "fixture-pin-revocation")
+		require.NoError(t, err)
+		require.True(t, revoked)
+		pinOnce.Do(func() { close(pinRelease) })
+		response := <-done
+		require.NoError(t, response.err)
+		assert.Equal(t, http.StatusNotFound, response.status)
+		var count int64
+		require.NoError(t, f.db.Model(&model.MidjourneyImageVersion{}).Where("midjourney_id = ?", task.Id).Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("revocation_while_waiting_for_upstream", func(t *testing.T) {
+		require.NoError(t, f.db.Model(&mj).Update("image_url", upstream.URL+"/paused").Error)
+		done := make(chan result, 1)
+		go func() { done <- request(http.MethodGet, mjPath, f.bearer["owner"], nil) }()
+		select {
+		case <-started:
+		case response := <-done:
+			t.Fatalf("upstream was not reached: status=%d err=%v", response.status, response.err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("upstream was not reached")
+		}
+		revoked, err := model.RevokeUserSession(owner, f.sids["owner"], "fixture-manual-revocation")
+		require.NoError(t, err)
+		require.True(t, revoked)
+		releaseOnce.Do(func() { close(release) })
+		response := <-done
+		require.NoError(t, response.err)
+		assert.Equal(t, http.StatusNotFound, response.status)
+		assert.Empty(t, response.header.Get("ETag"))
+		assert.Empty(t, response.header.Get("Content-Range"))
+		assert.Contains(t, response.body, "artifact_not_found")
+	})
 }

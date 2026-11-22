@@ -14294,6 +14294,688 @@
         "x-organization-selection": "personal-only; explicit positive selection is rejected before authentication/resource access"
       }
     },
+    "/api/mj/media/{row_id}/image": {
+      "get": {
+        "summary": "Read personal Midjourney image",
+        "operationId": "getPersonalMidjourneyImage",
+        "tags": [
+          "任务"
+        ],
+        "description": "Requires the current owner's dashboard Bearer JWT session. The numeric row identifies a personal resource. The response uses private, no-store and returns no source URL or share credential.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authorized media. Content-Type reflects the media source or the known type of inline media.",
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "video/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "audio/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "Requested range when supported by the source. Content-Type reflects the media source or the known type of inline media.",
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "video/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "audio/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Media matches the request validator"
+          },
+          "401": {
+            "description": "A dashboard Bearer JWT session is required"
+          },
+          "403": {
+            "description": "An access token or organization selection cannot authorize this personal route"
+          },
+          "404": {
+            "description": "Resource is missing or unavailable to the current caller"
+          },
+          "410": {
+            "description": "Artifact content is no longer available"
+          },
+          "416": {
+            "description": "Source cannot satisfy the requested range"
+          },
+          "429": {
+            "description": "API rate limit reached"
+          },
+          "500": {
+            "description": "Failed to read personal media or resolve its source"
+          },
+          "502": {
+            "description": "Upstream media fetch, validation, or decoding failed"
+          },
+          "503": {
+            "description": "Artifact channel, plugin or authenticated storage delivery is unavailable"
+          },
+          "504": {
+            "description": "Upstream media request timed out"
+          }
+        }
+      },
+      "head": {
+        "summary": "Read personal Midjourney image headers",
+        "operationId": "headPersonalMidjourneyImage",
+        "tags": [
+          "任务"
+        ],
+        "description": "Requires the current owner's dashboard Bearer JWT session. The numeric row identifies a personal resource. The response uses private, no-store and returns no source URL or share credential.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authorized media headers. Content-Type reflects the media source or the known type of inline media."
+          },
+          "206": {
+            "description": "Requested range when supported by the source. Content-Type reflects the media source or the known type of inline media."
+          },
+          "304": {
+            "description": "Media matches the request validator"
+          },
+          "401": {
+            "description": "A dashboard Bearer JWT session is required"
+          },
+          "403": {
+            "description": "An access token or organization selection cannot authorize this personal route"
+          },
+          "404": {
+            "description": "Resource is missing or unavailable to the current caller"
+          },
+          "410": {
+            "description": "Artifact content is no longer available"
+          },
+          "416": {
+            "description": "Source cannot satisfy the requested range"
+          },
+          "429": {
+            "description": "API rate limit reached"
+          },
+          "500": {
+            "description": "Failed to read personal media or resolve its source"
+          },
+          "502": {
+            "description": "Upstream media fetch, validation, or decoding failed"
+          },
+          "503": {
+            "description": "Artifact channel, plugin or authenticated storage delivery is unavailable"
+          },
+          "504": {
+            "description": "Upstream media request timed out"
+          }
+        }
+      }
+    },
+    "/api/mj/media/{row_id}/versions": {
+      "post": {
+        "summary": "Fix a completed personal Midjourney image as an immutable version",
+        "operationId": "pinPersonalMidjourneyImageVersion",
+        "tags": [
+          "任务"
+        ],
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          }
+        ],
+        "description": "The current owner must explicitly request version 1. Existing versions are returned without contacting the source. Images are limited to 2 MiB, dimensions at most 4096 by 4096, and a 16 MiB owner storage budget. The first request reads a complete PNG or JPEG response with a decodable default image and verifies the owner and source record again before saving. A successful response is private and not cacheable.",
+        "responses": {
+          "200": {
+            "description": "The existing fixed version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "digest",
+                    "length",
+                    "mime",
+                    "created_at"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "digest": {
+                      "type": "string",
+                      "pattern": "^[a-f0-9]{64}$"
+                    },
+                    "length": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2097152
+                    },
+                    "mime": {
+                      "type": "string",
+                      "enum": [
+                        "image/png",
+                        "image/jpeg"
+                      ]
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "New fixed version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "digest",
+                    "length",
+                    "mime",
+                    "created_at"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "digest": {
+                      "type": "string",
+                      "pattern": "^[a-f0-9]{64}$"
+                    },
+                    "length": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2097152
+                    },
+                    "mime": {
+                      "type": "string",
+                      "enum": [
+                        "image/png",
+                        "image/jpeg"
+                      ]
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "A current dashboard Bearer JWT session is required"
+          },
+          "403": {
+            "description": "Personal access tokens and organization-selected requests cannot authorize this operation"
+          },
+          "404": {
+            "description": "The personal resource or fixed version is unavailable to the caller"
+          },
+          "409": {
+            "description": "The source image is not ready or changed before commit"
+          },
+          "413": {
+            "description": "The owner storage budget has been reached"
+          },
+          "429": {
+            "description": "Request rate limit reached"
+          },
+          "500": {
+            "description": "The database read, write, or stored version check failed"
+          },
+          "502": {
+            "description": "The source did not return a complete accepted image"
+          }
+        }
+      }
+    },
+    "/api/mj/media/{row_id}/versions/{version}": {
+      "get": {
+        "summary": "Read a fixed personal Midjourney image",
+        "operationId": "getPersonalMidjourneyImageVersion",
+        "tags": [
+          "任务"
+        ],
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1"
+              ]
+            }
+          }
+        ],
+        "description": "Requires the current owner's dashboard Bearer JWT session and the original owned task. The response is private and not cacheable. The gateway reads the fixed version from storage.",
+        "responses": {
+          "200": {
+            "description": "Version bytes or HEAD metadata from storage. Content-Length and ETag match the fixed version.",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "A current dashboard Bearer JWT session is required"
+          },
+          "403": {
+            "description": "Personal access tokens and organization-selected requests cannot authorize this operation"
+          },
+          "404": {
+            "description": "The personal resource or fixed version is unavailable to the caller"
+          },
+          "429": {
+            "description": "Request rate limit reached"
+          },
+          "500": {
+            "description": "The database read, write, or stored version check failed"
+          }
+        }
+      },
+      "head": {
+        "summary": "Read fixed personal Midjourney image headers",
+        "operationId": "headPersonalMidjourneyImageVersion",
+        "tags": [
+          "任务"
+        ],
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1"
+              ]
+            }
+          }
+        ],
+        "description": "Requires the current owner's dashboard Bearer JWT session and the original owned task. The response is private and not cacheable. The gateway reads the fixed version from storage.",
+        "responses": {
+          "200": {
+            "description": "Version bytes or HEAD metadata from storage. Content-Length and ETag match the fixed version."
+          },
+          "401": {
+            "description": "A current dashboard Bearer JWT session is required"
+          },
+          "403": {
+            "description": "Personal access tokens and organization-selected requests cannot authorize this operation"
+          },
+          "404": {
+            "description": "The personal resource or fixed version is unavailable to the caller"
+          },
+          "429": {
+            "description": "Request rate limit reached"
+          },
+          "500": {
+            "description": "The database read, write, or stored version check failed"
+          }
+        }
+      }
+    },
+    "/api/task/media/{row_id}/artifacts/{artifact_key}/content": {
+      "get": {
+        "summary": "Read personal task artifact",
+        "operationId": "getPersonalTaskArtifact",
+        "tags": [
+          "任务"
+        ],
+        "description": "Requires the current owner's dashboard Bearer JWT session. The numeric row identifies a personal resource. The response uses private, no-store and returns no source URL or share credential.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "artifact_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authorized media. Content-Type reflects the media source or the known type of inline media.",
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "video/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "audio/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "Requested range when supported by the source. Content-Type reflects the media source or the known type of inline media.",
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "video/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "audio/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Media matches the request validator"
+          },
+          "401": {
+            "description": "A dashboard Bearer JWT session is required"
+          },
+          "403": {
+            "description": "An access token or organization selection cannot authorize this personal route"
+          },
+          "404": {
+            "description": "Resource is missing or unavailable to the current caller"
+          },
+          "409": {
+            "description": "Task artifacts are not ready"
+          },
+          "410": {
+            "description": "Artifact content is no longer available"
+          },
+          "416": {
+            "description": "Source cannot satisfy the requested range"
+          },
+          "429": {
+            "description": "API rate limit reached"
+          },
+          "500": {
+            "description": "Failed to read personal media or resolve its source"
+          },
+          "502": {
+            "description": "Upstream media fetch, validation, or decoding failed"
+          },
+          "503": {
+            "description": "Artifact channel, plugin or authenticated storage delivery is unavailable"
+          },
+          "504": {
+            "description": "Upstream media request timed out"
+          }
+        }
+      },
+      "head": {
+        "summary": "Read personal task artifact headers",
+        "operationId": "headPersonalTaskArtifact",
+        "tags": [
+          "任务"
+        ],
+        "description": "Requires the current owner's dashboard Bearer JWT session. The numeric row identifies a personal resource. The response uses private, no-store and returns no source URL or share credential.",
+        "security": [
+          {
+            "DashboardJWT": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "artifact_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authorized media headers. Content-Type reflects the media source or the known type of inline media."
+          },
+          "206": {
+            "description": "Requested range when supported by the source. Content-Type reflects the media source or the known type of inline media."
+          },
+          "304": {
+            "description": "Media matches the request validator"
+          },
+          "401": {
+            "description": "A dashboard Bearer JWT session is required"
+          },
+          "403": {
+            "description": "An access token or organization selection cannot authorize this personal route"
+          },
+          "404": {
+            "description": "Resource is missing or unavailable to the current caller"
+          },
+          "409": {
+            "description": "Task artifacts are not ready"
+          },
+          "410": {
+            "description": "Artifact content is no longer available"
+          },
+          "416": {
+            "description": "Source cannot satisfy the requested range"
+          },
+          "429": {
+            "description": "API rate limit reached"
+          },
+          "500": {
+            "description": "Failed to read personal media or resolve its source"
+          },
+          "502": {
+            "description": "Upstream media fetch, validation, or decoding failed"
+          },
+          "503": {
+            "description": "Artifact channel, plugin or authenticated storage delivery is unavailable"
+          },
+          "504": {
+            "description": "Upstream media request timed out"
+          }
+        }
+      }
+    },
     "/api/task/{task_id}/artifacts": {
       "get": {
         "summary": "获取任务产物预览",
