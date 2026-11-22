@@ -22,6 +22,8 @@ import { describe, test } from 'vitest'
 
 import {
   getPersonalMidjourneyImagePath,
+  getPersonalTaskArtifactVersionCreatePath,
+  getPersonalTaskArtifactVersionPath,
   getSafePluginAuthorUrl,
   parseLegacyAudioClips,
   parseTaskArtifactsResponse,
@@ -67,6 +69,15 @@ describe('task artifact projection', () => {
   test('builds same-origin personal media paths from log row identities', () => {
     assert.equal(getPersonalMidjourneyImagePath(42), '/api/mj/media/42/image')
     assert.equal(getPersonalMidjourneyImagePath(0), undefined)
+    assert.equal(
+      getPersonalTaskArtifactVersionPath(42, 'image-1'),
+      '/api/task/media/42/artifacts/image-1/versions/1'
+    )
+    assert.equal(
+      getPersonalTaskArtifactVersionCreatePath(42, 'image-1'),
+      '/api/task/media/42/artifacts/image-1/versions'
+    )
+    assert.equal(getPersonalTaskArtifactVersionPath(42, 'bad/key'), undefined)
   })
 
   test('enables projection only after a successful artifact viewer opens', () => {
@@ -162,6 +173,29 @@ describe('task artifact projection', () => {
         ),
       }
     )
+  })
+
+  test('preserves the personal fixed-image marker without changing ordinary artifacts', () => {
+    const projection = parseTaskArtifactsResponse({
+      success: true,
+      data: {
+        artifacts: [
+          {
+            key: 'image-1',
+            type: 'image',
+            content_url: artifactContentUrl('image-1'),
+            personal_fixed_image: true,
+          },
+          {
+            key: 'image-2',
+            type: 'image',
+            content_url: artifactContentUrl('image-2'),
+          },
+        ],
+      },
+    })
+    assert.equal(projection.artifacts[0]?.personal_fixed_image, true)
+    assert.equal(projection.artifacts[1]?.personal_fixed_image, undefined)
   })
 
   test('rejects failed, malformed, or duplicate artifact results', () => {

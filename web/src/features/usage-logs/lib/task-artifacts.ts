@@ -53,12 +53,40 @@ function isMediaRowId(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0
 }
 
+function isArtifactKey(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$/.test(value)
+}
+
 /** Build the logical authenticated path used by the dashboard MJ viewer. */
 export function getPersonalMidjourneyImagePath(
   rowId: number
 ): string | undefined {
   if (!isMediaRowId(rowId)) return undefined
   return `/api/mj/media/${rowId}/image`
+}
+
+export function getPersonalTaskArtifactVersionPath(
+  rowId: number,
+  artifactKey: string,
+  version = 1
+): string | undefined {
+  if (
+    !isMediaRowId(rowId) ||
+    !isArtifactKey(artifactKey) ||
+    !Number.isSafeInteger(version) ||
+    version <= 0
+  ) {
+    return undefined
+  }
+  return `/api/task/media/${rowId}/artifacts/${encodeURIComponent(artifactKey)}/versions/${version}`
+}
+
+export function getPersonalTaskArtifactVersionCreatePath(
+  rowId: number,
+  artifactKey: string
+): string | undefined {
+  if (!isMediaRowId(rowId) || !isArtifactKey(artifactKey)) return undefined
+  return `/api/task/media/${rowId}/artifacts/${encodeURIComponent(artifactKey)}/versions`
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -139,6 +167,14 @@ function parseTaskArtifact(value: unknown): TaskArtifact {
     key,
     type: type as TaskArtifact['type'],
     content_url: parseContentUrl(value.content_url),
+  }
+  if (value.personal_fixed_image === true) {
+    artifact.personal_fixed_image = true
+  } else if (
+    value.personal_fixed_image !== undefined &&
+    value.personal_fixed_image !== false
+  ) {
+    throw new TaskArtifactApiError('invalid_artifact')
   }
   if (typeof value.mime_type === 'string' && value.mime_type.trim()) {
     const mimeType = value.mime_type.trim()

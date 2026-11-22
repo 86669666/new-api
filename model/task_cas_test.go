@@ -44,6 +44,7 @@ func TestMain(m *testing.M) {
 		&Task{},
 		&MidjourneyImageVersion{},
 		&MidjourneyImageShare{},
+		&PersonalTaskImage{},
 		&User{},
 		&Organization{},
 		&OrganizationMember{},
@@ -84,6 +85,7 @@ func truncateTables(t *testing.T) {
 	t.Cleanup(func() {
 		DB.Exec("DELETE FROM tasks")
 		DB.Exec("DELETE FROM midjourney_image_shares")
+		DB.Exec("DELETE FROM personal_task_images")
 		DB.Exec("DELETE FROM midjourney_image_versions")
 		DB.Exec("DELETE FROM auth_flows")
 		DB.Exec("DELETE FROM external_identity_claims")

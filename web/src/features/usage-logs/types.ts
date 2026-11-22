@@ -388,6 +388,7 @@ export interface TaskArtifact {
   type: TaskArtifactType
   mime_type?: string
   content_url: string
+  personal_fixed_image?: boolean
 }
 
 export interface AudioClip {

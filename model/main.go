@@ -388,6 +388,7 @@ func migrateDB() error {
 		&Midjourney{},
 		&MidjourneyImageVersion{},
 		&MidjourneyImageShare{},
+		&PersonalTaskImage{},
 		&TopUp{},
 		&QuotaData{},
 		&Task{},

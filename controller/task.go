@@ -24,10 +24,11 @@ import (
 )
 
 type taskArtifactResponse struct {
-	Key        string `json:"key"`
-	Type       string `json:"type"`
-	MimeType   string `json:"mime_type,omitempty"`
-	ContentURL string `json:"content_url"`
+	Key                string `json:"key"`
+	Type               string `json:"type"`
+	MimeType           string `json:"mime_type,omitempty"`
+	ContentURL         string `json:"content_url"`
+	PersonalFixedImage bool   `json:"personal_fixed_image,omitempty"`
 }
 
 var (
@@ -99,6 +100,8 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 		return
 	}
 	items := make([]taskArtifactResponse, 0, len(artifacts))
+	identity, session := middleware.GetSessionAuthIdentity(c)
+	personalImage := dashboard && session && identity.UserID == task.UserId && personalTaskImagePlugin(task) != nil
 	for _, artifact := range artifacts {
 		contentURL, buildErr := service.BuildTaskArtifactContentURL(task.TaskID, artifact.Key)
 		if buildErr != nil {
@@ -106,10 +109,11 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 			return
 		}
 		items = append(items, taskArtifactResponse{
-			Key:        artifact.Key,
-			Type:       artifact.Type,
-			MimeType:   artifact.MimeType,
-			ContentURL: contentURL,
+			Key:                artifact.Key,
+			Type:               artifact.Type,
+			MimeType:           artifact.MimeType,
+			ContentURL:         contentURL,
+			PersonalFixedImage: personalImage && artifact.Key == model.PersonalTaskImageKey && artifact.Type == "image",
 		})
 	}
 	response := gin.H{"task_id": task.TaskID, "artifacts": items}
@@ -222,13 +226,17 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	if task == nil || !taskHasPluginExecution(task) {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	channelModel, err := model.CacheGetChannel(task.ChannelId)
-	if err != nil {
-		return nil, fmt.Errorf("%w: channel unavailable", errTaskArtifactPluginUnavailable)
-	}
 	adaptor := relay.GetTaskAdaptor(task.Platform)
 	if adaptor == nil {
 		return nil, errTaskArtifactPluginUnavailable
+	}
+	return configureTaskArtifactAdaptor(task, adaptor)
+}
+
+func configureTaskArtifactAdaptor(task *model.Task, adaptor relaychannel.TaskAdaptor) (relaychannel.TaskAdaptor, error) {
+	channelModel, err := model.CacheGetChannel(task.ChannelId)
+	if err != nil {
+		return nil, fmt.Errorf("%w: channel unavailable", errTaskArtifactPluginUnavailable)
 	}
 	pluginKey := task.PrivateData.Key
 	if pluginKey == "" {

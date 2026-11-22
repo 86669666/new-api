@@ -15295,6 +15295,274 @@
         }
       }
     },
+      "/api/task/media/{row_id}/artifacts/{artifact_key}/versions": {
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "artifact_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "image-1"
+              ]
+            }
+          }
+        ],
+        "post": {
+          "summary": "Fix a personal task image version",
+          "operationId": "pinPersonalTaskImage",
+          "tags": [
+            "任务"
+          ],
+          "description": "The current owner explicitly stores image-1 of an eligible completed asynchronous DashScope task. Accepts PNG or JPEG up to 2 MiB. Returning the existing version does not contact the source.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Existing first fixed image",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "version",
+                      "digest",
+                      "length",
+                      "mime",
+                      "created_at"
+                    ],
+                    "properties": {
+                      "version": {
+                        "type": "integer",
+                        "enum": [
+                          1
+                        ]
+                      },
+                      "digest": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      },
+                      "length": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2097152
+                      },
+                      "mime": {
+                        "type": "string",
+                        "enum": [
+                          "image/png",
+                          "image/jpeg"
+                        ]
+                      },
+                      "created_at": {
+                        "type": "integer",
+                        "format": "int64"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "201": {
+              "description": "First fixed image stored",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "version",
+                      "digest",
+                      "length",
+                      "mime",
+                      "created_at"
+                    ],
+                    "properties": {
+                      "version": {
+                        "type": "integer",
+                        "enum": [
+                          1
+                        ]
+                      },
+                      "digest": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      },
+                      "length": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2097152
+                      },
+                      "mime": {
+                        "type": "string",
+                        "enum": [
+                          "image/png",
+                          "image/jpeg"
+                        ]
+                      },
+                      "created_at": {
+                        "type": "integer",
+                        "format": "int64"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "401": {
+              "description": "Current dashboard Bearer JWT session required"
+            },
+            "403": {
+              "description": "Personal access tokens and organization-selected requests cannot authorize this operation"
+            },
+            "404": {
+              "description": "Eligible owned task or fixed image version unavailable"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            },
+            "500": {
+              "description": "Fixed image storage or integrity check failed"
+            },
+            "409": {
+              "description": "Task or source changed while the image was being pinned"
+            },
+            "413": {
+              "description": "Personal task image storage budget exceeded"
+            },
+            "502": {
+              "description": "Source did not return a complete accepted image"
+            }
+          }
+        }
+      },
+      "/api/task/media/{row_id}/artifacts/{artifact_key}/versions/{version}": {
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "artifact_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "image-1"
+              ]
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1"
+              ]
+            }
+          }
+        ],
+        "get": {
+          "summary": "Read a fixed personal task image",
+          "operationId": "getPersonalTaskImageVersion",
+          "tags": [
+            "任务"
+          ],
+          "description": "Reads the stored immutable version using the current personal owner's dashboard session. The source is not contacted. The response is private and not cacheable.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Stored bytes and integrity metadata",
+              "content": {
+                "image/png": {
+                  "schema": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                },
+                "image/jpeg": {
+                  "schema": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                }
+              }
+            },
+            "401": {
+              "description": "Current dashboard Bearer JWT session required"
+            },
+            "403": {
+              "description": "Personal access tokens and organization-selected requests cannot authorize this operation"
+            },
+            "404": {
+              "description": "Eligible owned task or fixed image version unavailable"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            },
+            "500": {
+              "description": "Fixed image storage or integrity check failed"
+            }
+          }
+        },
+        "head": {
+          "summary": "Read a fixed personal task image's headers",
+          "operationId": "headPersonalTaskImageVersion",
+          "tags": [
+            "任务"
+          ],
+          "description": "Reads the stored immutable version using the current personal owner's dashboard session. The source is not contacted. The response is private and not cacheable.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Stored image headers"
+            },
+            "401": {
+              "description": "Current dashboard Bearer JWT session required"
+            },
+            "403": {
+              "description": "Personal access tokens and organization-selected requests cannot authorize this operation"
+            },
+            "404": {
+              "description": "Eligible owned task or fixed image version unavailable"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            },
+            "500": {
+              "description": "Fixed image storage or integrity check failed"
+            }
+          }
+        }
+      },
       "/api/task/media/{row_id}/artifacts/{artifact_key}/content/context": {
         "post": {
           "summary": "Authorize native playback of a personal legacy video",
@@ -27913,6 +28181,10 @@
                     },
                     "mime_type": {
                       "type": "string"
+                    },
+                    "personal_fixed_image": {
+                      "type": "boolean",
+                      "description": "Present for an eligible image-1 in the current owner's dashboard projection."
                     },
                     "content_url": {
                       "type": "string",

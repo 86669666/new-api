@@ -18,14 +18,15 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { Download01Icon } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
-import { getFreshAuthHeaders } from '@/lib/api'
+import { Spinner } from '@/components/ui/spinner'
+import { api, getFreshAuthHeaders } from '@/lib/api'
 import { appPath } from '@/lib/deployment-path'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -38,12 +39,18 @@ const privateImageTypes = new Set([
   'image/gif',
   'image/avif',
 ])
+const fixedImageTypes = new Set(['image/png', 'image/jpeg'])
 
 interface ImageDialogProps {
   isAdmin: boolean
   imageUrl: string
   rowId: number
   taskId?: string
+  privateImagePath?: string
+  privateImageFallbackPath?: string
+  fixedImage?: boolean
+  pinPath?: string
+  maxBytes?: number
   open: boolean
   onOpenChange: (open: boolean) => void
 }
@@ -53,34 +60,59 @@ export function ImageDialog({
   imageUrl,
   rowId,
   taskId,
+  privateImagePath: providedPrivateImagePath,
+  privateImageFallbackPath,
+  fixedImage = false,
+  pinPath,
+  maxBytes,
   open,
   onOpenChange,
 }: ImageDialogProps) {
   const { t } = useTranslation()
   const [isLoading, setIsLoading] = useState(true)
   const [hasError, setHasError] = useState(false)
+  const [needsPin, setNeedsPin] = useState(false)
+  const [isPinning, setIsPinning] = useState(false)
+  const [loadRevision, setLoadRevision] = useState(0)
   const [loadedImage, setLoadedImage] = useState<{
     url: string
     source: string
     sid: string
   } | null>(null)
   const sessionSid = useAuthStore((state) => state.auth.session?.sid ?? '')
+  const userId = useAuthStore((state) => state.auth.user?.id ?? 0)
+  const pinRequest = useRef<AbortController | null>(null)
   const privateImagePath =
-    !isAdmin && rowId ? getPersonalMidjourneyImagePath(rowId) : undefined
+    providedPrivateImagePath ??
+    (!isAdmin && rowId ? getPersonalMidjourneyImagePath(rowId) : undefined)
   const privateImageUrl = privateImagePath
     ? appPath(privateImagePath)
+    : undefined
+  const privateImageFallbackUrl = privateImageFallbackPath
+    ? appPath(privateImageFallbackPath)
     : undefined
 
   const objectUrl =
     open &&
-    loadedImage?.source === privateImageUrl &&
+    (loadedImage?.source === privateImageUrl ||
+      loadedImage?.source === privateImageFallbackUrl) &&
     loadedImage?.sid === sessionSid
       ? loadedImage.url
       : null
 
   const handleOpenChange = (newOpen: boolean) => {
+    if (!newOpen) pinRequest.current?.abort()
     onOpenChange(newOpen)
   }
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setIsPinning(false)
+    return () => {
+      pinRequest.current?.abort()
+      pinRequest.current = null
+    }
+  }, [open, pinPath, privateImageUrl, sessionSid, userId])
 
   useEffect(() => {
     let disposed = false
@@ -92,6 +124,7 @@ export function ImageDialog({
     setIsLoading(open)
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setHasError(false)
+    setNeedsPin(false)
     if (!open || isAdmin) {
       return () => {
         disposed = true
@@ -109,23 +142,44 @@ export function ImageDialog({
 
     const controller = new AbortController()
     const loadImage = async () => {
-      const url = new URL(privateImageUrl, window.location.origin)
-      if (url.origin !== window.location.origin) {
-        throw new Error('invalid private image origin')
+      const fetchPrivateImage = async (imageUrl: string) => {
+        const url = new URL(imageUrl, window.location.origin)
+        if (url.origin !== window.location.origin) {
+          throw new Error('invalid private image origin')
+        }
+        const headers = await getFreshAuthHeaders()
+        if (
+          !headers.Authorization ||
+          useAuthStore.getState().auth.session?.sid !== sessionSid
+        ) {
+          throw new Error('private image session changed')
+        }
+        return fetch(url, {
+          credentials: 'same-origin',
+          headers,
+          redirect: 'error',
+          signal: controller.signal,
+        })
       }
-      const headers = await getFreshAuthHeaders()
+
+      let responseUrl = privateImageUrl
+      let response = await fetchPrivateImage(responseUrl)
+      let allowedImageTypes = fixedImage ? fixedImageTypes : privateImageTypes
+      let imageMaxBytes = fixedImage
+        ? Math.min(maxBytes ?? 2 * 1024 * 1024, 2 * 1024 * 1024)
+        : (maxBytes ?? 16 * 1024 * 1024)
       if (
-        !headers.Authorization ||
-        useAuthStore.getState().auth.session?.sid !== sessionSid
+        response.status === 404 &&
+        fixedImage &&
+        privateImageFallbackUrl &&
+        !disposed
       ) {
-        throw new Error('private image session changed')
+        setNeedsPin(true)
+        responseUrl = privateImageFallbackUrl
+        response = await fetchPrivateImage(responseUrl)
+        allowedImageTypes = privateImageTypes
+        imageMaxBytes = 16 * 1024 * 1024
       }
-      const response = await fetch(url, {
-        credentials: 'same-origin',
-        headers,
-        redirect: 'error',
-        signal: controller.signal,
-      })
       if (!response.ok) {
         throw new Error(`image request failed: ${response.status}`)
       }
@@ -134,12 +188,11 @@ export function ImageDialog({
         ?.split(';', 1)[0]
         .trim()
         .toLowerCase()
-      const maxBytes = 16 * 1024 * 1024
       const contentLength = Number(response.headers.get('content-length'))
       if (
         !contentType ||
-        !privateImageTypes.has(contentType) ||
-        (Number.isFinite(contentLength) && contentLength > maxBytes)
+        !allowedImageTypes.has(contentType) ||
+        (Number.isFinite(contentLength) && contentLength > imageMaxBytes)
       ) {
         throw new Error('image response is not a bounded image')
       }
@@ -152,7 +205,7 @@ export function ImageDialog({
         const { done, value } = await reader.read()
         if (done) break
         totalBytes += value.byteLength
-        if (totalBytes > maxBytes) {
+        if (totalBytes > imageMaxBytes) {
           controller.abort()
           throw new Error('image response exceeds the size limit')
         }
@@ -165,7 +218,7 @@ export function ImageDialog({
       nextObjectUrl = URL.createObjectURL(blob)
       setLoadedImage({
         url: nextObjectUrl,
-        source: privateImageUrl,
+        source: responseUrl,
         sid: sessionSid,
       })
     }
@@ -182,7 +235,56 @@ export function ImageDialog({
       controller.abort()
       if (nextObjectUrl) URL.revokeObjectURL(nextObjectUrl)
     }
-  }, [isAdmin, open, privateImageUrl, sessionSid])
+  }, [
+    isAdmin,
+    loadRevision,
+    maxBytes,
+    open,
+    pinPath,
+    privateImageFallbackUrl,
+    privateImageUrl,
+    sessionSid,
+    fixedImage,
+  ])
+
+  const handlePin = async () => {
+    if (!open || !pinPath || pinRequest.current || !userId || !sessionSid) {
+      return
+    }
+    const expectedAuthIdentity = { userId, sid: sessionSid }
+    const controller = new AbortController()
+    pinRequest.current = controller
+    const isCurrentPin = () => {
+      const auth = useAuthStore.getState().auth
+      return (
+        pinRequest.current === controller &&
+        !controller.signal.aborted &&
+        auth.user?.id === userId &&
+        auth.session?.sid === sessionSid
+      )
+    }
+
+    setIsPinning(true)
+    setHasError(false)
+    try {
+      await api.post(pinPath, undefined, {
+        expectedAuthIdentity,
+        signal: controller.signal,
+        singleUseAuthorization: true,
+        skipBusinessError: true,
+        skipErrorHandler: true,
+        disableDuplicate: true,
+      })
+      if (!isCurrentPin()) return
+      setNeedsPin(false)
+      setLoadRevision((revision) => revision + 1)
+    } catch {
+      if (isCurrentPin()) setHasError(true)
+    } finally {
+      if (isCurrentPin()) setIsPinning(false)
+      if (pinRequest.current === controller) pinRequest.current = null
+    }
+  }
 
   const handleImageLoad = () => {
     setIsLoading(false)
@@ -255,6 +357,18 @@ export function ImageDialog({
                 data-icon='inline-start'
               />
               {t('Download')}
+            </Button>
+          ) : null}
+
+          {!isAdmin && pinPath && needsPin ? (
+            <Button
+              variant='outline'
+              size='sm'
+              onClick={() => void handlePin()}
+              disabled={isPinning}
+            >
+              {isPinning ? <Spinner data-icon='inline-start' /> : null}
+              {t('Save preview')}
             </Button>
           ) : null}
 
