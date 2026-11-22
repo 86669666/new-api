@@ -49,6 +49,18 @@ export class TaskArtifactApiError extends Error {
   }
 }
 
+function isMediaRowId(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0
+}
+
+/** Build the logical authenticated path used by the dashboard MJ viewer. */
+export function getPersonalMidjourneyImagePath(
+  rowId: number
+): string | undefined {
+  if (!isMediaRowId(rowId)) return undefined
+  return `/api/mj/media/${rowId}/image`
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }

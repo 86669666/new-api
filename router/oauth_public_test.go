@@ -2930,7 +2930,7 @@ func TestOAuthCleanupSecurityEvents(t *testing.T) {
 		t.Run(event, func(t *testing.T) {
 			f := newOrganizationHTTPFixture(t)
 			oauthPublicDatabase(t, f)
-			require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Organization{}, &model.OrganizationMember{}, &model.UserAccessToken{}, &model.ExternalIdentityClaim{}, &model.TwoFABackupCode{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.Token{}, &model.UserOAuthBinding{}))
+			require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Organization{}, &model.OrganizationMember{}, &model.UserAccessToken{}, &model.ExternalIdentityClaim{}, &model.TwoFABackupCode{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.Token{}, &model.UserOAuthBinding{}, &model.MidjourneyImageVersion{}))
 			common.IsMasterNode = true
 			require.NoError(t, model.InitOAuthGrantStore(true))
 			common.IsMasterNode = false
@@ -3054,7 +3054,7 @@ func TestOAuthCleanupFlowDeletionOrder(t *testing.T) {
 		t.Run(purpose, func(t *testing.T) {
 			f := newOrganizationHTTPFixture(t)
 			oauthPublicDatabase(t, f)
-			require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Organization{}, &model.OrganizationMember{}, &model.UserAccessToken{}, &model.ExternalIdentityClaim{}, &model.TwoFABackupCode{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.Token{}, &model.UserOAuthBinding{}))
+			require.NoError(t, f.db.AutoMigrate(&model.AuthFlow{}, &model.Organization{}, &model.OrganizationMember{}, &model.UserAccessToken{}, &model.ExternalIdentityClaim{}, &model.TwoFABackupCode{}, &model.TwoFA{}, &model.PasskeyCredential{}, &model.Token{}, &model.UserOAuthBinding{}, &model.MidjourneyImageVersion{}))
 			user := *f.users["empty"]
 			token, _, err := model.CreateAuthFlow(model.AuthFlowCreate{Purpose: purpose, UserId: user.Id, SessionId: f.sids["empty"], ExpiresAt: time.Now().Add(time.Minute)})
 			require.NoError(t, err)

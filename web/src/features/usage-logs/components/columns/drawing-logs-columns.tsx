@@ -216,6 +216,8 @@ export function useDrawingLogsColumns(
                 </span>
               </button>
               <ImageDialog
+                isAdmin={isAdmin}
+                rowId={log.id}
                 imageUrl={imageUrl}
                 taskId={log.mj_id}
                 open={dialogOpen}

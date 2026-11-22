@@ -21,6 +21,7 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
 
 import {
+  getPersonalMidjourneyImagePath,
   getSafePluginAuthorUrl,
   parseLegacyAudioClips,
   parseTaskArtifactsResponse,
@@ -63,6 +64,11 @@ function taskFixture(overrides: Partial<TaskLog> = {}): TaskLog {
 }
 
 describe('task artifact projection', () => {
+  test('builds same-origin personal media paths from log row identities', () => {
+    assert.equal(getPersonalMidjourneyImagePath(42), '/api/mj/media/42/image')
+    assert.equal(getPersonalMidjourneyImagePath(0), undefined)
+  })
+
   test('enables projection only after a successful artifact viewer opens', () => {
     const successfulPluginTask = taskFixture()
 

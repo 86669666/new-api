@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -687,6 +688,32 @@ func TestProxyTaskMediaReadsArtifactFromJSONContentPath(t *testing.T) {
 			assert.Equal(t, testCase.body, recorder.Body.String())
 		})
 	}
+
+	t.Run("final authorization covers decoded media", func(t *testing.T) {
+		replyStatus = http.StatusOK
+		reply = `{"done":true,"response":{"videos":[{"bytesBase64Encoded":"` + inline + `"}]}}`
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/tasks/task_generic/artifacts/video/content", nil)
+
+		checks := 0
+		denied := errors.New("authorization was revoked")
+		err := proxyTaskMedia(c, task, &relaychannel.TaskContentRequest{
+			URL: upstream.URL, Method: http.MethodPost, Body: []byte(`{"operationName":"op"}`),
+			Headers:     map[string]string{"Authorization": "Bearer access-token"},
+			ContentPath: []any{"response", "videos", int64(0), "bytesBase64Encoded"}, MimeType: "video/webm",
+		}, func() error {
+			checks++
+			if checks > 1 {
+				return denied
+			}
+			return nil
+		})
+		require.ErrorIs(t, err, denied)
+		assert.False(t, c.Writer.Written())
+		assert.Empty(t, recorder.Body.String())
+		assert.Empty(t, recorder.Header().Get("Content-Length"))
+	})
 }
 
 func TestWriteVideoDataURLStreamsAndSupportsHead(t *testing.T) {
