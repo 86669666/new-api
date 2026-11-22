@@ -1,11 +1,16 @@
 package model
 
 import (
+	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/proto"
@@ -41,30 +46,52 @@ func newGormLogger(w io.Writer) logger.Interface {
 		SlowThreshold:             time.Duration(slowThresholdMs) * time.Millisecond,
 		LogLevel:                  logger.Warn,
 		IgnoreRecordNotFoundError: true,
-		ParameterizedQueries:      !common.DebugEnabled,
+		ParameterizedQueries:      true,
 		Colorful:                  true,
 	})
 }
 
-// ParameterizedQueries 只过滤 SQL 字符串,驱动错误消息(如 MySQL 1062)同样会
-// 内联数据值,在这里收敛为错误码;DEBUG=true 保留原文。
+// ParameterizedQueries covers SQL arguments. Driver and scan errors can also
+// contain data values, regardless of the configured SQL log level.
 type sanitizedLogWriter struct {
 	delegate *log.Logger
 }
 
 func (s *sanitizedLogWriter) Printf(format string, args ...any) {
-	if !common.DebugEnabled {
-		for i, arg := range args {
-			if err, ok := arg.(error); ok {
-				args[i] = sanitizeDBError(err)
-			}
+	// GORM's success, slow, and error trace formats all end in the rendered
+	// SQL after [rows:%v]. Scan uses a recorder that bypasses ParamsFilter,
+	// so even a parameterized logger must discard that final SQL argument.
+	if strings.Contains(format, "[%.3fms] ") && strings.Contains(format, "[rows:%v]") && len(args) > 0 {
+		last := len(args) - 1
+		statement, _ := args[last].(string)
+		args[last] = "operation=" + sqlLogOperation(statement)
+	}
+	for i, arg := range args {
+		if err, ok := arg.(error); ok {
+			args[i] = sanitizeDBError(err)
 		}
 	}
 	s.delegate.Printf(format, args...)
 }
 
-// 只收敛数据库服务端生成的驱动错误(消息可能内联数据值);网络/上下文等
-// 其它错误不含查询数据,原样保留以便排障。
+func sqlLogOperation(statement string) string {
+	for word := range strings.FieldsSeq(statement) {
+		operation := strings.ToUpper(word)
+		switch operation {
+		case "SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "CREATE", "ALTER",
+			"DROP", "TRUNCATE", "SHOW", "PRAGMA", "EXPLAIN", "REPLACE",
+			"MERGE", "SET", "BEGIN", "COMMIT", "ROLLBACK":
+			return operation
+		}
+		break
+	}
+	return "OTHER"
+}
+
+var validSQLState = regexp.MustCompile(`^[0-9A-Z]{5}$`)
+
+// sanitizeDBError projects diagnostics without changing the error returned to
+// the database caller.
 func sanitizeDBError(err error) error {
 	var mysqlErr *mysql.MySQLError
 	if errors.As(err, &mysqlErr) {
@@ -72,6 +99,9 @@ func sanitizeDBError(err error) error {
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
+		if !validSQLState.MatchString(pgErr.Code) {
+			return errors.New("postgres error")
+		}
 		// 08P01 是 PgBouncer 对同连接重名 Parse 的 FATAL,42P05 是原生 PostgreSQL 的
 		// duplicate_prepared_statement;都指向预处理语句与事务池代理不兼容。
 		if pgErr.Code == "08P01" || pgErr.Code == "42P05" {
@@ -87,5 +117,17 @@ func sanitizeDBError(err error) error {
 	if errors.As(err, &sqliteErr) {
 		return fmt.Errorf("sqlite error %d", sqliteErr.Code())
 	}
-	return err
+	switch {
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
+	case errors.Is(err, driver.ErrBadConn):
+		return driver.ErrBadConn
+	}
+	var networkErr *net.OpError
+	if errors.As(err, &networkErr) {
+		return errors.New("database network error")
+	}
+	return errors.New("database operation failed")
 }

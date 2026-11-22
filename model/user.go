@@ -1518,7 +1518,7 @@ func UpdateUserUsedQuota(id int, quota int) {
 		return
 	}
 	if err := DB.Model(&User{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error; err != nil {
-		common.SysLog(common.LogText("failed to update user used quota: %s", err.Error()))
+		common.SysLog(common.LogText("failed to update user used quota: %s", sanitizeDBError(err)))
 	}
 }
 
@@ -1530,7 +1530,7 @@ func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
 		},
 	).Error
 	if err != nil {
-		common.SysLog(common.LogText("failed to update user used quota and request count: %s", err.Error()))
+		common.SysLog(common.LogText("failed to update user used quota and request count: %s", sanitizeDBError(err)))
 		return
 	}
 

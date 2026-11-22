@@ -452,7 +452,7 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	}
 	err := createLog(log)
 	if err != nil {
-		common.SysLog(common.LogText("failed to record task billing log: %s", err.Error()))
+		common.SysLog(common.LogText("failed to record task billing log: %s", sanitizeDBError(err)))
 	}
 	if params.LogType == LogTypeConsume && common.DataExportEnabled {
 		nodeName := params.NodeName

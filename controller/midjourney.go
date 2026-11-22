@@ -63,7 +63,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			"progress": "100%",
 		})
 		if err != nil {
-			logger.LogError(ctx, common.LogText("Fix null mj_id task error: %v", err))
+			logger.LogError(ctx, common.LogText("Midjourney poll failed to update rows without a task ID (tasks=%d)", len(nullTaskIds)))
 		} else {
 			logger.LogInfo(ctx, common.LogText("Fix null mj_id task success: %v", nullTaskIds))
 		}
@@ -89,14 +89,14 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		}
 		midjourneyChannel, err := model.CacheGetChannel(channelId)
 		if err != nil {
-			logger.LogError(ctx, common.LogText("CacheGetChannel: %v", err))
+			logger.LogError(ctx, common.LogText("Midjourney poll channel lookup failed (channel_id=%d)", channelId))
 			err := model.MjBulkUpdate(taskIds, map[string]any{
 				"fail_reason": "Failed to get the channel information. Please contact the administrator",
 				"status":      "FAILURE",
 				"progress":    "100%",
 			})
 			if err != nil {
-				logger.LogInfo(ctx, common.LogText("UpdateMidjourneyTask error: %v", err))
+				logger.LogInfo(ctx, common.LogText("Midjourney poll failed to update tasks for missing channel (channel_id=%d)", channelId))
 			}
 			continue
 		}
@@ -106,7 +106,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			"ids": taskIds,
 		})
 		if err != nil {
-			logger.LogError(ctx, common.LogText("Get Task marshal body error: %v", err))
+			logger.LogError(ctx, common.LogText("Midjourney poll request encoding failed (channel_id=%d)", channelId))
 			continue
 		}
 		timeout := time.Second * 15
@@ -114,26 +114,26 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		req, err := http.NewRequestWithContext(requestCtx, "POST", requestUrl, bytes.NewBuffer(body))
 		if err != nil {
 			cancel()
-			logger.LogError(ctx, common.LogText("Get Task error: %v", err))
+			logger.LogError(ctx, common.LogText("Midjourney poll request construction failed (channel_id=%d)", channelId))
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("mj-api-secret", midjourneyChannel.Key)
 		resp, err := service.GetHttpClient().Do(req)
 		if err != nil {
-			logger.LogError(ctx, common.LogText("Get Task Do req error: %v", err))
+			logger.LogError(ctx, common.LogText("Midjourney poll transport failed (channel_id=%d)", channelId))
 			cancel()
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			logger.LogError(ctx, common.LogText("Get Task status code: %d", resp.StatusCode))
+			logger.LogError(ctx, common.LogText("Midjourney poll upstream rejected request (channel_id=%d, http=%d)", channelId, resp.StatusCode))
 			resp.Body.Close()
 			cancel()
 			continue
 		}
 		responseBody, err := io.ReadAll(resp.Body)
 		if err != nil {
-			logger.LogError(ctx, common.LogText("Get Mjp Task parse body error: %v", err))
+			logger.LogError(ctx, common.LogText("Midjourney poll response read failed (channel_id=%d, http=%d)", channelId, resp.StatusCode))
 			resp.Body.Close()
 			cancel()
 			continue
@@ -141,7 +141,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		var responseItems []dto.MidjourneyDto
 		err = common.Unmarshal(responseBody, &responseItems)
 		if err != nil {
-			logger.LogError(ctx, common.LogText("Get Mjp Task parse body error2: %v, body: %s", err, string(responseBody)))
+			logger.LogError(ctx, common.LogText("Midjourney poll response decode failed (channel_id=%d, http=%d, body_bytes=%d)", channelId, resp.StatusCode, len(responseBody)))
 			resp.Body.Close()
 			cancel()
 			continue
@@ -153,7 +153,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		for _, responseItem := range responseItems {
 			task := taskM[responseItem.MjId]
 			if task == nil {
-				logger.LogWarn(ctx, common.LogText("Midjourney task response ignored: unknown mj_id=%s", responseItem.MjId))
+				logger.LogWarn(ctx, common.LogText("Midjourney poll ignored unknown task (channel_id=%d)", channelId))
 				continue
 			}
 
@@ -192,7 +192,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			if responseItem.VideoUrls != nil && len(responseItem.VideoUrls) > 0 {
 				videoUrlsStr, err := common.Marshal(responseItem.VideoUrls)
 				if err != nil {
-					logger.LogError(ctx, common.LogText("failed to serialize VideoUrls: %v", err))
+					logger.LogError(ctx, common.LogText("Midjourney poll video URL encoding failed (task_row_id=%d)", task.Id))
 					task.VideoUrls = "[]" // 失败时设置为空数组
 				} else {
 					task.VideoUrls = string(videoUrlsStr)
@@ -203,7 +203,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 
 			shouldReturnQuota := false
 			if (task.Progress != "100%" && responseItem.FailReason != "") || (task.Progress == "100%" && task.Status == "FAILURE") {
-				logger.LogInfo(ctx, common.LogText("%s failed: %s", task.MjId, task.FailReason))
+				logger.LogInfo(ctx, common.LogText("Midjourney task failed (task_row_id=%d)", task.Id))
 				task.Progress = "100%"
 				if task.Quota != 0 {
 					shouldReturnQuota = true
@@ -211,7 +211,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			}
 			won, err := task.UpdateWithStatus(preStatus)
 			if err != nil {
-				logger.LogError(ctx, common.LogText("UpdateMidjourneyTask task error: %s", err.Error()))
+				logger.LogError(ctx, common.LogText("Midjourney poll task update failed (task_row_id=%d)", task.Id))
 			} else if won && shouldReturnQuota {
 				service.RefundMidjourneyQuota(ctx, task, "Composition failed")
 			}
