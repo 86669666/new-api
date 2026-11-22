@@ -126,7 +126,7 @@ def publish_delta(reference, reader, fetch, publication, journal, installation_t
                   policy.invitation_delta, policy.oauth_delta, policy.client_events_delta, policy.relay_log_delta,
                   policy.upstream_errors_delta, policy.provider_logs_delta,
                   policy.independent_stream_delta, policy.request_plugin_delta, policy.sql_midjourney_delta,
-                  policy.authz_policy_reload_delta, policy.legacy_media_delta, policy.personal_media_delta, policy.personal_media_share_delta):
+                  policy.authz_policy_reload_delta, policy.legacy_media_delta, policy.personal_media_delta, policy.personal_media_share_delta, policy.personal_media_video_delta):
         if reference['schema'] == delta.REFERENCE_SCHEMA:
             break
     else:
@@ -148,9 +148,17 @@ def publish_delta(reference, reader, fetch, publication, journal, installation_t
     published = complete_terminal_check(check_id, request, installation_token, reader, policy=policy, clock=clock)
     policy.require(published['id'] == check_id, 'wrong signed delta check')
     policy.validate_gate(published, request, completed=True)
-    current = reader.check(check_id)
-    policy.require(policy.consumer.canonical(current) == policy.consumer.canonical(published),
-                   'signed delta check changed on readback')
+    expected = policy.consumer.canonical(published)
+    delays = (0, 1, 2, 4) if request['schema'] == policy.TERMINAL_SCHEMA_V22 else (0,)
+    for delay in delays:
+        if delay:
+            clock()
+            time.sleep(delay)
+        current = reader.check(check_id)
+        if policy.consumer.canonical(current) == expected:
+            break
+    else:
+        raise ValueError('signed delta check changed on readback')
     policy.consumer.evidence.check_times(current, binding, int(clock()))
     journal.consume(request, check_id)
     return check_id
