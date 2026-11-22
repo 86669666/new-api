@@ -1,8 +1,12 @@
 package middleware
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +17,9 @@ import (
 )
 
 const TaskArtifactAccessContextKey = "task_artifact_access"
+
+const midjourneyShareAccessContextKey = "midjourney_share_access"
+const midjourneySharePrefix = "/api/media-shares"
 
 const (
 	taskArtifactAccessRawContextKey       = "task_artifact_access_raw"
@@ -39,6 +46,10 @@ type taskArtifactAccessLimiter struct {
 }
 
 var taskArtifactAnonymousLimiter = newTaskArtifactAccessLimiter(
+	system_setting.LoadTaskArtifactAccessLimits(),
+)
+
+var midjourneyShareAnonymousLimiter = newTaskArtifactAccessLimiter(
 	system_setting.LoadTaskArtifactAccessLimits(),
 )
 
@@ -110,12 +121,26 @@ func (l *taskArtifactAccessLimiter) acquire(ip, taskID, artifactKey string) (fun
 
 func redactTaskArtifactAccessQuery() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		path := c.Request.URL.Path
-		isArtifactContent := strings.HasPrefix(path, "/v1/tasks/") &&
-			strings.Contains(path, "/artifacts/") &&
-			strings.HasSuffix(path, "/content")
-		isLegacyVideoContent := strings.HasPrefix(path, "/v1/videos/") &&
-			strings.HasSuffix(path, "/content")
+		requestPath := c.Request.URL.Path
+		isArtifactContent := strings.HasPrefix(requestPath, "/v1/tasks/") &&
+			strings.Contains(requestPath, "/artifacts/") &&
+			strings.HasSuffix(requestPath, "/content")
+		isLegacyVideoContent := strings.HasPrefix(requestPath, "/v1/videos/") &&
+			strings.HasSuffix(requestPath, "/content")
+		if isMidjourneySharePath(requestPath) || isMidjourneySharePath(path.Clean(requestPath)) {
+			digest, valid := takeMidjourneyShareAccess(c.Request)
+			if c.Request.URL.EscapedPath() != midjourneySharePrefix+"/mj/image" ||
+				(c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead) {
+				c.Header("Cache-Control", "no-store")
+				writeTaskArtifactAccessNotFound(c)
+				return
+			}
+			if valid {
+				c.Set(midjourneyShareAccessContextKey, digest)
+			}
+			c.Next()
+			return
+		}
 		if !isArtifactContent && !isLegacyVideoContent {
 			c.Next()
 			return
@@ -131,6 +156,75 @@ func redactTaskArtifactAccessQuery() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func isMidjourneySharePath(path string) bool {
+	return path == midjourneySharePrefix || strings.HasPrefix(path, midjourneySharePrefix+"/")
+}
+
+func takeMidjourneyShareAccess(request *http.Request) (string, bool) {
+	rawQuery := request.URL.RawQuery
+	request.URL.RawQuery = ""
+	request.URL.ForceQuery = false
+	request.RequestURI = request.URL.RequestURI()
+	rawAccess, found := strings.CutPrefix(rawQuery, "access=")
+	if !found {
+		return "", false
+	}
+	return canonicalMidjourneyShareDigest(rawAccess)
+}
+
+// MidjourneyShareAccessAuth authenticates only the fixed bearer query route.
+// It intentionally does not accept dashboard credentials or redirect to login.
+func MidjourneyShareAccessAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		digest := c.GetString(midjourneyShareAccessContextKey)
+		if digest == "" {
+			digest, _ = takeMidjourneyShareAccess(c.Request)
+		}
+		if digest == "" {
+			ip := c.ClientIP()
+			if ip == "" {
+				ip = "unknown"
+			}
+			if !midjourneyShareAnonymousLimiter.invalidAttempt(time.Now(), ip) {
+				writeTaskArtifactAccessLimited(c)
+				return
+			}
+			writeTaskArtifactAccessNotFound(c)
+			return
+		}
+		ip := c.ClientIP()
+		if ip == "" {
+			ip = "unknown"
+		}
+		accessKey := digest
+		release, ok := midjourneyShareAnonymousLimiter.acquire(ip, "mj-share", accessKey)
+		if !ok {
+			writeTaskArtifactAccessLimited(c)
+			return
+		}
+		defer release()
+		c.Set(midjourneyShareAccessContextKey, accessKey)
+		c.Next()
+	}
+}
+
+func canonicalMidjourneyShareDigest(rawAccess string) (string, bool) {
+	decoded, err := base64.RawURLEncoding.DecodeString(rawAccess)
+	if err != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != rawAccess {
+		return "", false
+	}
+	digest := sha256.Sum256(decoded)
+	return hex.EncodeToString(digest[:]), true
+}
+
+func MidjourneyShareAccess(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	return c.GetString(midjourneyShareAccessContextKey)
 }
 
 func popTaskArtifactAccessQuery(request *http.Request) (string, bool, bool) {

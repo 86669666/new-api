@@ -3,6 +3,10 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"image"
@@ -45,6 +49,20 @@ func personalMediaRequest(c *gin.Context) (model.AuthSessionIdentity, int64, boo
 	return identity, rowID, true
 }
 
+func personalMediaVersionRequest(c *gin.Context) (model.AuthSessionIdentity, int64, int64, bool) {
+	identity, rowID, ok := personalMediaRequest(c)
+	if !ok {
+		return model.AuthSessionIdentity{}, 0, 0, false
+	}
+	rawVersion := c.Param("version")
+	version, err := strconv.ParseInt(rawVersion, 10, 64)
+	if err != nil || version != model.PersonalMidjourneyImageVersion || strconv.FormatInt(version, 10) != rawVersion {
+		writePersonalMediaError(c, gorm.ErrRecordNotFound)
+		return model.AuthSessionIdentity{}, 0, 0, false
+	}
+	return identity, rowID, version, true
+}
+
 func writePersonalMediaError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound), errors.Is(err, model.ErrUserSessionInactive):
@@ -53,9 +71,93 @@ func writePersonalMediaError(c *gin.Context, err error) {
 		writeTaskArtifactError(c, http.StatusConflict, "artifact_not_ready", "Midjourney image is not complete")
 	case errors.Is(err, model.ErrMidjourneyImageChanged):
 		writeTaskArtifactError(c, http.StatusConflict, "artifact_changed", "Midjourney image changed while it was being pinned")
+	case errors.Is(err, model.ErrMidjourneyShareLimit):
+		writeTaskArtifactError(c, http.StatusConflict, "share_limit_exceeded", "Too many active image shares")
 	default:
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")
 	}
+}
+
+func CreatePersonalMidjourneyShare(c *gin.Context) {
+	identity, rowID, version, ok := personalMediaVersionRequest(c)
+	if !ok {
+		return
+	}
+	secretBytes := make([]byte, 32)
+	if _, err := rand.Read(secretBytes); err != nil {
+		writePersonalMediaError(c, err)
+		return
+	}
+	access := base64.RawURLEncoding.EncodeToString(secretBytes)
+	digest := sha256.Sum256(secretBytes)
+	share, err := model.CreatePersonalMidjourneyShare(c.Request.Context(), identity, rowID, version, hex.EncodeToString(digest[:]), time.Now().Unix())
+	if err != nil {
+		writePersonalMediaError(c, err)
+		return
+	}
+	accessURL := "/api/media-shares/mj/image?access=" + url.QueryEscape(access)
+	c.JSON(http.StatusCreated, gin.H{
+		"access":     access,
+		"access_url": accessURL,
+		"id":         share.ID,
+		"version":    share.Version,
+		"expires_at": share.ExpiresAt,
+		"created_at": share.CreatedAt,
+	})
+}
+
+func ListPersonalMidjourneyShares(c *gin.Context) {
+	identity, rowID, version, ok := personalMediaVersionRequest(c)
+	if !ok {
+		return
+	}
+	shares, err := model.ListPersonalMidjourneyShares(c.Request.Context(), identity, rowID, version, time.Now().Unix())
+	if err != nil {
+		writePersonalMediaError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"shares": shares})
+}
+
+func RevokePersonalMidjourneyShare(c *gin.Context) {
+	identity, rowID, version, ok := personalMediaVersionRequest(c)
+	if !ok {
+		return
+	}
+	rawID := c.Param("share_id")
+	shareID, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || shareID <= 0 || strconv.FormatInt(shareID, 10) != rawID {
+		writePersonalMediaError(c, gorm.ErrRecordNotFound)
+		return
+	}
+	if err := model.RevokePersonalMidjourneyShare(c.Request.Context(), identity, rowID, version, shareID, time.Now().Unix()); err != nil {
+		writePersonalMediaError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func PersonalMidjourneySharedImage(c *gin.Context) {
+	setTaskMediaResponseSecurityHeaders(c.Writer.Header())
+	digest := middleware.MidjourneyShareAccess(c)
+	version, err := model.ReadPublicPersonalMidjourneyShare(c.Request.Context(), digest, time.Now().Unix())
+	if err != nil {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		return
+	}
+	c.Header("Content-Type", version.MIME)
+	c.Header("Content-Length", strconv.FormatInt(version.Length, 10))
+	c.Header("ETag", `"`+version.Digest+`"`)
+	if c.Request.Method == http.MethodHead {
+		c.Status(http.StatusOK)
+		return
+	}
+	c.Data(http.StatusOK, version.MIME, version.Data)
+}
+
+func RejectPersonalMidjourneySharePath(c *gin.Context) {
+	setTaskMediaResponseSecurityHeaders(c.Writer.Header())
+	c.Status(http.StatusNotFound)
 }
 
 func PersonalTaskArtifactContent(c *gin.Context) {

@@ -14,7 +14,7 @@ import (
 )
 
 func TestSanitizeURLForLogMasksSensitiveQueryValues(t *testing.T) {
-	rawURL := "https://example.test/v1beta/models/gemini:streamGenerateContent?alt=sse&key=sk-secret&access_token=ya29-secret&api-version=2024-02-01"
+	rawURL := "https://example.test/v1beta/models/gemini:streamGenerateContent?alt=sse&key=sk-secret&access_token=ya29-secret&access=opaque-value&api-version=2024-02-01"
 
 	got := SanitizeURLForLog(rawURL)
 
@@ -25,6 +25,7 @@ func TestSanitizeURLForLogMasksSensitiveQueryValues(t *testing.T) {
 	query := parsedURL.Query()
 	assert.Equal(t, "***masked***", query.Get("key"))
 	assert.Equal(t, "***masked***", query.Get("access_token"))
+	assert.Equal(t, "***masked***", query.Get("access"))
 	assert.Equal(t, "sse", query.Get("alt"))
 	assert.Equal(t, "2024-02-01", query.Get("api-version"))
 }

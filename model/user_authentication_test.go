@@ -111,6 +111,7 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	}).Error)
 	require.NoError(t, DB.Create(&MidjourneyImageVersion{MidjourneyID: 52, UserID: user.Id, Version: 1,
 		Data: []byte("fixture"), Length: 7, MIME: "image/png"}).Error)
+	require.NoError(t, DB.Create(&MidjourneyImageShare{MidjourneyID: 52, UserID: user.Id, Version: 1, AccessHash: strings.Repeat("a", 64)}).Error)
 	require.NoError(t, populateUserCache(user))
 	// Administrative hard deletion commonly targets an already soft-deleted
 	// user; the shared version increment must therefore query unscoped.
@@ -134,6 +135,7 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 		&ExternalIdentityClaim{},
 		&UserAccessToken{},
 		&MidjourneyImageVersion{},
+		&MidjourneyImageShare{},
 	} {
 		require.NoError(t, DB.Unscoped().Model(record).Where("user_id = ?", user.Id).Count(&count).Error)
 		assert.Zero(t, count)

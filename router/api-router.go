@@ -24,6 +24,7 @@ func SetApiRouter(router *gin.Engine) {
 		`^/api/organizations/[0-9]+/tasks/[0-9]+/artifacts/[^/]+/content$`,
 		`^/api/task/media/[0-9]+/artifacts/[^/]+/content$`,
 		`^/api/mj/media/[0-9]+/(image|versions/[0-9]+)$`,
+		`^/api/media-shares/mj/image$`,
 	})))
 	apiRouter.Use(middleware.AccessTokenAudit())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
@@ -450,6 +451,9 @@ func SetApiRouter(router *gin.Engine) {
 		mjRoute.POST("/media/:row_id/versions", middleware.DisableCache(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-media-pin"), controller.PinPersonalMidjourneyImage)
 		mjRoute.GET("/media/:row_id/versions/:version", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalMidjourneyImageVersion)
 		mjRoute.HEAD("/media/:row_id/versions/:version", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalMidjourneyImageVersion)
+		mjRoute.POST("/media/:row_id/versions/:version/shares", middleware.DisableCache(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-media-share"), controller.CreatePersonalMidjourneyShare)
+		mjRoute.GET("/media/:row_id/versions/:version/shares", middleware.DisableCache(), middleware.UserAuth(), controller.ListPersonalMidjourneyShares)
+		mjRoute.DELETE("/media/:row_id/versions/:version/shares/:share_id", middleware.DisableCache(), middleware.UserAuth(), controller.RevokePersonalMidjourneyShare)
 		mjRoute.GET("/self", middleware.UserAuth(), controller.GetUserMidjourney)
 		mjRoute.GET("/", middleware.AdminAuth(), controller.GetAllMidjourney)
 
@@ -462,6 +466,10 @@ func SetApiRouter(router *gin.Engine) {
 			taskRoute.GET("/:task_id/artifacts", middleware.UserAuth(), controller.GetDashboardTaskArtifacts)
 			taskRoute.POST("/media/:row_id/artifacts/:artifact_key/content/context", middleware.SessionCookieOriginGuard(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-media-context"), controller.PersonalTaskArtifactContext)
 		}
+		apiRouter.GET("/media-shares/mj/image", middleware.MidjourneyShareAccessAuth(), controller.PersonalMidjourneySharedImage)
+		apiRouter.HEAD("/media-shares/mj/image", middleware.MidjourneyShareAccessAuth(), controller.PersonalMidjourneySharedImage)
+		apiRouter.GET("/media-shares/mj/image/*trailing", controller.RejectPersonalMidjourneySharePath)
+		apiRouter.HEAD("/media-shares/mj/image/*trailing", controller.RejectPersonalMidjourneySharePath)
 
 		vendorRoute := apiRouter.Group("/vendors")
 		vendorRoute.Use(middleware.AdminAuth())

@@ -14758,6 +14758,319 @@
         }
       }
     },
+      "/api/mj/media/{row_id}/versions/{version}/shares": {
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1"
+              ]
+            }
+          }
+        ],
+        "post": {
+          "summary": "Create a short-lived image share",
+          "operationId": "createPersonalMidjourneyImageShare",
+          "tags": [
+            "任务"
+          ],
+          "description": "Creates a 15-minute bearer share for a fixed personal image version. Each owner can have up to eight active shares. The credential is returned once. Responses are not cacheable.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "responses": {
+            "201": {
+              "description": "Share created",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "id",
+                      "version",
+                      "expires_at",
+                      "created_at",
+                      "access",
+                      "access_url"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "version": {
+                        "type": "integer",
+                        "enum": [
+                          1
+                        ]
+                      },
+                      "expires_at": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "created_at": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "access": {
+                        "type": "string",
+                        "description": "Opaque bearer credential returned only on creation"
+                      },
+                      "access_url": {
+                        "type": "string",
+                        "description": "Application-relative access path containing the bearer credential. Use the configured application base path for a prefixed deployment."
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "401": {
+              "description": "Current owner dashboard JWT session required"
+            },
+            "403": {
+              "description": "Personal access token or organization scope cannot authorize this operation"
+            },
+            "404": {
+              "description": "Owned fixed image version or share not found"
+            },
+            "409": {
+            "description": "Owner already has eight active shares"
+          },
+          "429": {
+              "description": "Request rate limit reached"
+            },
+            "500": {
+              "description": "Share storage operation failed"
+            }
+          }
+        },
+        "get": {
+          "summary": "List active image shares",
+          "operationId": "listPersonalMidjourneyImageShares",
+          "tags": [
+            "任务"
+          ],
+          "description": "Returns active shares of the fixed version without their bearer credentials.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Active shares",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "shares"
+                    ],
+                    "properties": {
+                      "shares": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "integer",
+                              "format": "int64"
+                            },
+                            "version": {
+                              "type": "integer",
+                              "enum": [
+                                1
+                              ]
+                            },
+                            "expires_at": {
+                              "type": "integer",
+                              "format": "int64"
+                            },
+                            "created_at": {
+                              "type": "integer",
+                              "format": "int64"
+                            },
+                            "revoked_at": {
+                              "type": "integer",
+                              "format": "int64"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "401": {
+              "description": "Current owner dashboard JWT session required"
+            },
+            "403": {
+              "description": "Personal access token or organization scope cannot authorize this operation"
+            },
+            "404": {
+              "description": "Owned fixed image version or share not found"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            },
+            "500": {
+              "description": "Share storage operation failed"
+            }
+          }
+        }
+      },
+      "/api/mj/media/{row_id}/versions/{version}/shares/{share_id}": {
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1"
+              ]
+            }
+          },
+          {
+            "name": "share_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          }
+        ],
+        "delete": {
+          "summary": "Revoke an image share",
+          "operationId": "revokePersonalMidjourneyImageShare",
+          "tags": [
+            "任务"
+          ],
+          "description": "Revokes one share. Subsequent reads with its credential are denied. An already revoked share can be revoked again while its record is retained.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "responses": {
+            "204": {
+              "description": "Share revoked"
+            },
+            "401": {
+              "description": "Current owner dashboard JWT session required"
+            },
+            "403": {
+              "description": "Personal access token or organization scope cannot authorize this operation"
+            },
+            "404": {
+              "description": "Owned fixed image version or share not found"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            },
+            "500": {
+              "description": "Share storage operation failed"
+            }
+          }
+        }
+      },
+      "/api/media-shares/mj/image": {
+        "parameters": [
+          {
+            "name": "access",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "description": "Opaque credential from the share creation response"
+          }
+        ],
+        "get": {
+          "summary": "Read a shared fixed image",
+          "operationId": "getPersonalMidjourneySharedImage",
+          "tags": [
+            "任务"
+          ],
+          "description": "Reads the exact stored image. No dashboard session is required. The response is not cacheable.",
+          "security": [],
+          "responses": {
+            "200": {
+              "description": "Shared PNG or JPEG bytes",
+              "content": {
+                "image/png": {
+                  "schema": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                },
+                "image/jpeg": {
+                  "schema": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                }
+              }
+            },
+            "404": {
+              "description": "Share missing, expired, revoked, or image unavailable"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            }
+          }
+        },
+        "head": {
+          "summary": "Read a shared fixed image's headers",
+          "operationId": "headPersonalMidjourneySharedImage",
+          "tags": [
+            "任务"
+          ],
+          "description": "Reads the exact stored image metadata. No dashboard session is required.",
+          "security": [],
+          "responses": {
+            "200": {
+              "description": "Image headers"
+            },
+            "404": {
+              "description": "Share missing, expired, revoked, or image unavailable"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            }
+          }
+        }
+      },
     "/api/task/media/{row_id}/artifacts/{artifact_key}/content": {
       "get": {
         "summary": "Read personal task artifact",
