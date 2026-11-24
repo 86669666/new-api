@@ -7149,7 +7149,22 @@ func TestTokenAuthStaleExpiryDeniesHTTP(t *testing.T) {
 	}
 }
 
+func TestPersonalLegacyMediaRevocationDefaultsOff(t *testing.T) {
+	t.Setenv("LEGACY_MEDIA_OWNER_REVOCATION_ENABLED", "")
+	f := newOrganizationHTTPFixture(t)
+	for _, path := range []string{
+		"/api/mj/media/1/legacy-links/revoke",
+		"/api/task/media/1/artifacts/image-1/legacy-links/revoke",
+	} {
+		status, headers, body := f.request(t, http.MethodPost, path, "owner", "", http.Header{"Origin": {f.server.URL}})
+		assert.Equal(t, http.StatusNotFound, status)
+		assert.Equal(t, "artifact_not_found", body["code"])
+		assert.Contains(t, headers.Get("Cache-Control"), "no-store")
+	}
+}
+
 func TestPersonalHistoricalMediaReading(t *testing.T) {
+	t.Setenv("LEGACY_MEDIA_OWNER_REVOCATION_ENABLED", "true")
 	f := newOrganizationHTTPFixture(t)
 	require.NoError(t, f.db.AutoMigrate(&model.Midjourney{}, &model.Channel{}, &model.MidjourneyImageVersion{}, &model.MidjourneyImageShare{}, &model.PersonalTaskImage{}))
 	started := make(chan struct{})
@@ -7355,6 +7370,35 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 		require.NoError(t, err)
 		taskPath := "/v1/tasks/" + job.TaskID + "/artifacts/image-1/content"
 		taskLink := taskPath + "?access=" + url.QueryEscape(access)
+		mjRevoke := fmt.Sprintf("/api/mj/media/%d/legacy-links/revoke", revokedMJ.RowID)
+		taskRevoke := fmt.Sprintf("/api/task/media/%d/artifacts/image-1/legacy-links/revoke", job.ID)
+		secure := common.SessionCookieSecure
+		common.SessionCookieSecure = true
+		t.Cleanup(func() { common.SessionCookieSecure = secure })
+		origin := http.Header{"Origin": {f.server.URL}}
+		for _, tc := range []struct {
+			path, actor string
+			headers     http.Header
+			status      int
+		}{
+			{mjRevoke, "", origin, http.StatusUnauthorized},
+			{mjRevoke, "relay", origin, http.StatusUnauthorized},
+			{mjRevoke, "foreign", origin, http.StatusNotFound},
+			{taskRevoke, "admin", origin, http.StatusNotFound},
+			{taskRevoke + "?org_id=" + strconv.FormatInt(f.orgA, 10), "owner", origin, http.StatusForbidden},
+			{strings.Replace(taskRevoke, "image-1", "video", 1), "owner", origin, http.StatusNotFound},
+			{fmt.Sprintf("/api/mj/media/%d/legacy-links/revoke", unlisted.Id), "owner", origin, http.StatusNotFound},
+			{mjRevoke, "owner", http.Header{"Origin": {"https://unrelated.invalid"}}, http.StatusForbidden},
+		} {
+			status, _, _ := f.request(t, http.MethodPost, tc.path, tc.actor, "", tc.headers)
+			assert.Equal(t, tc.status, status, "path=%s actor=%s", tc.path, tc.actor)
+		}
+		revoke := func(path string) {
+			t.Helper()
+			status, headers, _ := f.request(t, http.MethodPost, path, "owner", "", origin)
+			require.Equal(t, http.StatusNoContent, status)
+			assert.Equal(t, "private, no-store", headers.Get("Cache-Control"))
+		}
 		mjLink := "/mj/image/" + frozenMJ.PublicID
 		revokedLink := "/mj/image/" + revokedMJ.PublicID
 		unknownLink := "/mj/image/" + unlisted.MjId
@@ -7377,7 +7421,8 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("compatibility read did not reach the local origin")
 		}
-		require.NoError(t, model.RevokePreparedLegacyMedia(t.Context(), cs, id, revokedMJ.LegacyMediaRoute))
+		revoke(mjRevoke)
+		revoke(mjRevoke)
 		legacyReadingReleaseOnce.Do(func() { close(legacyReadingRelease) })
 		select {
 		case got := <-inFlight:
@@ -7422,7 +7467,7 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 				assert.Empty(t, got.body)
 			}
 		}
-		require.NoError(t, model.RevokePreparedLegacyMedia(t.Context(), cs, id, taskBinding.LegacyMediaRoute))
+		revoke(taskRevoke)
 		for _, path := range []string{unknownLink, revokedLink, taskLink, taskPath + "?access=invalid"} {
 			got := request(http.MethodGet, path, "", http.Header{"If-None-Match": {tag}})
 			require.NoError(t, got.err)
@@ -7433,6 +7478,10 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 		require.NoError(t, head.err)
 		assert.Equal(t, http.StatusNotFound, head.status)
 		assert.Empty(t, head.header.Get("ETag"))
+		partial := request(http.MethodGet, taskLink, "", http.Header{"Range": {"bytes=0-7"}})
+		require.NoError(t, partial.err)
+		assert.Equal(t, http.StatusNotFound, partial.status)
+		assert.Empty(t, partial.header.Get("Content-Range"))
 		private := request(http.MethodGet, fmt.Sprintf("/api/task/media/%d/artifacts/image-1/versions/1", job.ID), f.bearer["owner"], nil)
 		require.NoError(t, private.err)
 		require.Equal(t, http.StatusOK, private.status)

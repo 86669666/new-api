@@ -409,20 +409,14 @@ func checkLegacyMediaRevocation(tx *gorm.DB, subject LegacyMediaSubject) error {
 // revocation. It applies across prepared manifests and is independent of new
 // short-lived shares. The old gateway routes consult it before delivery.
 func RevokePreparedLegacyMedia(ctx context.Context, identity AuthSessionIdentity, snapshotID string, route LegacyMediaRoute) error {
-	if _, isAccessToken := ParseAccessTokenSessionID(identity.SessionID); isAccessToken || identity.UserID <= 0 {
-		return ErrUserSessionInactive
-	}
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
-			return err
-		}
+	return revokeLegacyMedia(ctx, identity, func(tx *gorm.DB) (LegacyMediaSubject, error) {
 		entry, err := legacySnapshotEntry(tx, snapshotID, route)
 		if err != nil {
-			return err
+			return LegacyMediaSubject{}, err
 		}
 		subject := entry.LegacyMediaSubject
 		if subject.OwnerID != identity.UserID {
-			return ErrLegacyMediaUnproven
+			return LegacyMediaSubject{}, ErrLegacyMediaUnproven
 		}
 		owned := lockForUpdate(tx).Where("id = ? AND user_id = ?", subject.RowID, identity.UserID)
 		// Revocation must work even while the same resource is temporarily
@@ -433,8 +427,71 @@ func RevokePreparedLegacyMedia(ctx context.Context, identity AuthSessionIdentity
 			err = owned.Where("organization_id = 0").Select("id").Take(&Task{}).Error
 		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrLegacyMediaUnproven
+			return LegacyMediaSubject{}, ErrLegacyMediaUnproven
 		}
+		return subject, err
+	})
+}
+
+// RevokeOwnedLegacyMedia resolves a prepared resource from its private row
+// ID and exact artifact key. It works independently of the media cutover.
+func RevokeOwnedLegacyMedia(ctx context.Context, identity AuthSessionIdentity, family string, rowID int64, artifactKey string) error {
+	return revokeLegacyMedia(ctx, identity, func(tx *gorm.DB) (LegacyMediaSubject, error) {
+		subject := LegacyMediaSubject{
+			LegacyMediaRoute: LegacyMediaRoute{Family: family, ArtifactKey: artifactKey},
+			RowID:            rowID, OwnerID: identity.UserID,
+		}
+		owned := lockForUpdate(tx).Where("id = ? AND user_id = ?", rowID, identity.UserID)
+		var err error
+		switch family {
+		case LegacyMidjourneyImage:
+			var row Midjourney
+			err = owned.Select("mj_id", "submit_time").Take(&row).Error
+			subject.PublicID, subject.SubmitTime = row.MjId, row.SubmitTime
+		case LegacyTaskArtifactV1:
+			var row Task
+			err = owned.Where("organization_id = 0").Select("task_id", "submit_time").Take(&row).Error
+			subject.PublicID, subject.SubmitTime = row.TaskID, row.SubmitTime
+		default:
+			return LegacyMediaSubject{}, ErrLegacyMediaUnproven
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return LegacyMediaSubject{}, ErrLegacyMediaUnproven
+		}
+		if err != nil {
+			return LegacyMediaSubject{}, err
+		}
+		if rowID <= 0 || subject.SubmitTime <= 0 || !subject.LegacyMediaRoute.valid() {
+			return LegacyMediaSubject{}, ErrLegacyMediaUnproven
+		}
+
+		// The live row is already locked. A completed manifest entry proves
+		// this particular subject even when its retained bytes are unavailable.
+		manifests := tx.Model(&LegacyMediaSnapshot{}).Select("id")
+		var entry LegacyMediaSnapshotEntry
+		err = tx.Where("snapshot_id IN (?)", manifests).
+			Where("route_digest = ? AND row_id = ? AND owner_id = ? AND submit_time = ?",
+				legacySnapshotDigest(subject.LegacyMediaRoute), rowID, identity.UserID, subject.SubmitTime).
+			Take(&entry).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return LegacyMediaSubject{}, err
+		}
+		if err != nil || entry.LegacyMediaSubject != subject {
+			return LegacyMediaSubject{}, ErrLegacyMediaUnproven
+		}
+		return subject, nil
+	})
+}
+
+func revokeLegacyMedia(ctx context.Context, identity AuthSessionIdentity, resolve func(*gorm.DB) (LegacyMediaSubject, error)) error {
+	if _, isAccessToken := ParseAccessTokenSessionID(identity.SessionID); isAccessToken || identity.UserID <= 0 {
+		return ErrUserSessionInactive
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
+			return err
+		}
+		subject, err := resolve(tx)
 		if err != nil {
 			return err
 		}

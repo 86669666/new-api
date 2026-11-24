@@ -137,6 +137,35 @@ func RevokePersonalMidjourneyShare(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// PersonalLegacyMediaRevocation keeps owner writes off until the deployment
+// serving all old links is verified. This gate does not arm the cutover clock.
+func PersonalLegacyMediaRevocation(family string) gin.HandlerFunc {
+	enabled := common.GetEnvOrDefaultString("LEGACY_MEDIA_OWNER_REVOCATION_ENABLED", "") == "true"
+	return func(c *gin.Context) {
+		if !enabled {
+			writePersonalMediaError(c, gorm.ErrRecordNotFound)
+			return
+		}
+		identity, rowID, ok := personalMediaRequest(c)
+		if !ok {
+			return
+		}
+		key := c.Param("artifact_key")
+		if family == model.LegacyMidjourneyImage {
+			key = "image"
+		}
+		err := model.RevokeOwnedLegacyMedia(c.Request.Context(), identity, family, rowID, key)
+		if errors.Is(err, model.ErrLegacyMediaUnproven) {
+			err = gorm.ErrRecordNotFound
+		}
+		if err != nil {
+			writePersonalMediaError(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
+}
+
 func PersonalMidjourneySharedImage(c *gin.Context) {
 	setTaskMediaResponseSecurityHeaders(c.Writer.Header())
 	digest := middleware.MidjourneyShareAccess(c)

@@ -322,6 +322,9 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"DELETE /api/prefill_group/:id": accessTokenScopeRule("group:write"),
 
 	// router/api-router.go: /api/mj, /api/task
+	"POST /api/mj/media/:row_id/legacy-links/revoke":                           accessTokenSessionRule,
+	"POST /api/task/media/:row_id/artifacts/:artifact_key/legacy-links/revoke": accessTokenSessionRule,
+
 	"GET /api/mj/self":                                                       accessTokenScopeRule("usage:read"),
 	"GET /api/mj/":                                                           accessTokenScopeRule("log:read"),
 	"GET /api/task/self":                                                     accessTokenScopeRule("usage:read"),
