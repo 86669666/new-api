@@ -32,7 +32,7 @@ func setupGenericTaskTest(t *testing.T) *model.Task {
 	common.RedisEnabled = false
 	// The dialect harness lets the same fixture run against MySQL and
 	// PostgreSQL when TEST_TASK_DB_DIALECT selects them; SQLite stays the default.
-	database, _ := openTaskDialectDatabase(t, &model.Task{}, &model.Channel{}, &model.User{})
+	database, _ := openTaskDialectDatabase(t, &model.Task{}, &model.Channel{}, &model.User{}, &model.LegacyMediaCutover{})
 	model.DB = database
 	t.Cleanup(func() {
 		model.DB = originalDB
@@ -332,25 +332,37 @@ func TestLegacyVideoArtifactContentUsesGetResultURL(t *testing.T) {
 	task.FailReason = "https://stale.invalid/legacy-fallback.mp4"
 	require.NoError(t, model.DB.Save(task).Error)
 
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Set(middleware.TaskArtifactAccessContextKey, true)
-	c.Params = gin.Params{
-		{Key: "key", Value: task.TaskID},
-		{Key: "artifact_key", Value: "video"},
+	for _, test := range []struct {
+		name   string
+		legacy bool
+	}{
+		{"compatibility_capability", true},
+		{"authenticated_read_after_cutover", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !test.legacy {
+				require.NoError(t, model.DB.Create(&model.LegacyMediaCutover{
+					ID: 1, SnapshotID: strings.Repeat("a", 64), StartedAt: time.Now().Unix(),
+				}).Error)
+			}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Set("id", task.UserId)
+			c.Set(middleware.TaskArtifactAccessContextKey, test.legacy)
+			c.Params = gin.Params{
+				{Key: "key", Value: task.TaskID},
+				{Key: "artifact_key", Value: "video"},
+			}
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/tasks/"+task.TaskID+"/artifacts/video/content", nil)
+			c.Request.Header.Set("Range", "bytes=0-3")
+
+			TaskArtifactContent(c)
+
+			assert.Equal(t, http.StatusPartialContent, recorder.Code)
+			assert.Equal(t, "data", recorder.Body.String())
+			assert.Equal(t, "bytes 0-3/4", recorder.Header().Get("Content-Range"))
+		})
 	}
-	c.Request = httptest.NewRequest(
-		http.MethodGet,
-		"/v1/tasks/"+task.TaskID+"/artifacts/video/content",
-		nil,
-	)
-	c.Request.Header.Set("Range", "bytes=0-3")
-
-	TaskArtifactContent(c)
-
-	assert.Equal(t, http.StatusPartialContent, recorder.Code)
-	assert.Equal(t, "data", recorder.Body.String())
-	assert.Equal(t, "bytes 0-3/4", recorder.Header().Get("Content-Range"))
 }
 
 func TestDisabledArtifactStorePreservesPluginUpstreamContent(t *testing.T) {

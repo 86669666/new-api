@@ -195,13 +195,20 @@ func lockLegacyMediaSubject(tx *gorm.DB, subject LegacyMediaSubject) error {
 	return nil
 }
 
-func verifyLegacyMediaVersion(tx *gorm.DB, binding LegacyMediaBinding) error {
+type LegacyMediaContent struct {
+	MIME      string
+	Digest    string
+	Data      []byte
+	ExpiresAt time.Time
+}
+
+func readLegacyMediaVersion(tx *gorm.DB, binding LegacyMediaBinding) (*LegacyMediaContent, error) {
 	if binding.Family == LegacyMidjourneyImage {
 		var row MidjourneyImageVersion
 		err := lockForUpdate(tx).Where("id = ? AND midjourney_id = ? AND user_id = ? AND version = ?",
 			binding.VersionID, binding.RowID, binding.OwnerID, binding.Version).Take(&row).Error
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
+			return nil, err
 		}
 		sum := sha256.Sum256(row.Data)
 		if err != nil || row.MjID != binding.PublicID || row.SubmitTime != binding.SubmitTime ||
@@ -209,23 +216,23 @@ func verifyLegacyMediaVersion(tx *gorm.DB, binding LegacyMediaBinding) error {
 			row.Length <= 0 || row.Length > PersonalMidjourneyImageMaxBytes ||
 			row.Digest != binding.ContentDigest || hex.EncodeToString(sum[:]) != row.Digest ||
 			(row.MIME != "image/png" && row.MIME != "image/jpeg") {
-			return ErrLegacyMediaUnproven
+			return nil, ErrLegacyMediaUnproven
 		}
-		return nil
+		return &LegacyMediaContent{MIME: row.MIME, Digest: row.Digest, Data: row.Data}, nil
 	}
 
 	var row PersonalTaskImage
 	err := lockForUpdate(tx).Where("id = ? AND task_row_id = ? AND user_id = ? AND version = ?",
 		binding.VersionID, binding.RowID, binding.OwnerID, binding.Version).Take(&row).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return err
+		return nil, err
 	}
 	if err != nil || row.TaskID != binding.PublicID || row.SubmitTime != binding.SubmitTime ||
 		row.ArtifactKey != binding.ArtifactKey || row.Length != binding.ContentLength ||
 		row.Digest != binding.ContentDigest || row.checkIntegrity() != nil {
-		return ErrLegacyMediaUnproven
+		return nil, ErrLegacyMediaUnproven
 	}
-	return nil
+	return &LegacyMediaContent{MIME: row.MIME, Digest: row.Digest, Data: row.Data}, nil
 }
 
 // PrepareLegacyMediaSnapshot freezes exactly the supplied inventory batch in
@@ -276,7 +283,7 @@ func PrepareLegacyMediaSnapshot(ctx context.Context, proposed []LegacyMediaBindi
 			if err := lockLegacyMediaSubject(tx, entry.LegacyMediaSubject); err != nil {
 				return err
 			}
-			if err := verifyLegacyMediaVersion(tx, entry.LegacyMediaBinding); err != nil {
+			if _, err := readLegacyMediaVersion(tx, entry.LegacyMediaBinding); err != nil {
 				return err
 			}
 			entry.SnapshotID = id
@@ -344,49 +351,63 @@ func legacySnapshotEntry(tx *gorm.DB, snapshotID string, route LegacyMediaRoute)
 // ReadPreparedLegacyMedia checks a preparation snapshot against current primary
 // data. It returns binding metadata for verification, never a content response.
 func ReadPreparedLegacyMedia(ctx context.Context, snapshotID string, route LegacyMediaRoute) (*LegacyMediaBinding, error) {
-	var binding LegacyMediaBinding
+	var binding *LegacyMediaBinding
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		entry, err := legacySnapshotEntry(tx, snapshotID, route)
-		if err != nil {
-			return err
-		}
-		binding = entry.LegacyMediaBinding
-		if err := verifyLegacyMediaComparison(tx, route.Family); err != nil {
-			return err
-		}
-		if err := lockLegacyMediaSubject(tx, binding.LegacyMediaSubject); err != nil {
-			return err
-		}
-		if err := verifyLegacyMediaVersion(tx, binding); err != nil {
-			return err
-		}
-		var observed []LegacyMediaRouteObservation
-		if err := lockForUpdate(legacyRouteObservations(tx, route)).Limit(2).Find(&observed).Error; err != nil {
-			return err
-		}
-		if len(observed) != 1 || observed[0].Ambiguous || observed[0].LegacyMediaRoute != route ||
-			observed[0].SubjectDigest != legacySnapshotDigest(binding.LegacyMediaSubject) {
-			return ErrLegacyMediaUnproven
-		}
-		var revoked LegacyMediaRevocation
-		err = lockForUpdate(tx).Take(&revoked, "subject_digest = ?", binding.revocationDigest()).Error
-		if err == nil {
-			return ErrLegacyMediaRevoked
-		}
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil
-		}
+		var err error
+		binding, _, err = readFrozenLegacyMedia(tx, snapshotID, route)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &binding, nil
+	return binding, nil
+}
+
+func readFrozenLegacyMedia(tx *gorm.DB, snapshotID string, route LegacyMediaRoute) (*LegacyMediaBinding, *LegacyMediaContent, error) {
+	entry, err := legacySnapshotEntry(tx, snapshotID, route)
+	if err != nil {
+		return nil, nil, err
+	}
+	binding := entry.LegacyMediaBinding
+	if err := verifyLegacyMediaComparison(tx, route.Family); err != nil {
+		return nil, nil, err
+	}
+	if err := lockLegacyMediaSubject(tx, binding.LegacyMediaSubject); err != nil {
+		return nil, nil, err
+	}
+	content, err := readLegacyMediaVersion(tx, binding)
+	if err != nil {
+		return nil, nil, err
+	}
+	var observed []LegacyMediaRouteObservation
+	if err := lockForUpdate(legacyRouteObservations(tx, route)).Limit(2).Find(&observed).Error; err != nil {
+		return nil, nil, err
+	}
+	if len(observed) != 1 || observed[0].Ambiguous || observed[0].LegacyMediaRoute != route ||
+		observed[0].SubjectDigest != legacySnapshotDigest(binding.LegacyMediaSubject) {
+		return nil, nil, ErrLegacyMediaUnproven
+	}
+	if err := checkLegacyMediaRevocation(tx, binding.LegacyMediaSubject); err != nil {
+		return nil, nil, err
+	}
+	return &binding, content, nil
+}
+
+func checkLegacyMediaRevocation(tx *gorm.DB, subject LegacyMediaSubject) error {
+	var revoked LegacyMediaRevocation
+	err := lockForUpdate(tx).Take(&revoked, "subject_digest = ?", subject.revocationDigest()).Error
+	if err == nil {
+		return ErrLegacyMediaRevoked
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	return err
 }
 
 // RevokePreparedLegacyMedia saves an irreversible, object- and artifact-level
 // revocation. It applies across prepared manifests and is independent of new
-// short-lived shares. Existing anonymous routes do not yet consult it.
+// short-lived shares. The old gateway routes consult it before delivery.
 func RevokePreparedLegacyMedia(ctx context.Context, identity AuthSessionIdentity, snapshotID string, route LegacyMediaRoute) error {
 	if _, isAccessToken := ParseAccessTokenSessionID(identity.SessionID); isAccessToken || identity.UserID <= 0 {
 		return ErrUserSessionInactive

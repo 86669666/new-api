@@ -333,7 +333,23 @@ func writeTaskArtifactError(c *gin.Context, status int, code, message string) {
 }
 
 func TaskArtifactContent(c *gin.Context) {
-	task, exists, err := getTaskForArtifactRequest(c, c.Param("key"))
+	ctx := c.Request.Context()
+	publicID := c.Param("key")
+	legacy := middleware.IsTaskArtifactAccess(c)
+	route := model.LegacyMediaRoute{
+		Family: model.LegacyTaskArtifactV1, PublicID: publicID, ArtifactKey: strings.TrimSpace(c.Param("artifact_key")),
+	}
+	if legacy {
+		served, err := service.ServeLegacyMediaContent(c, route)
+		if err != nil {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		if served {
+			return
+		}
+	}
+	task, exists, err := getTaskForArtifactRequest(c, publicID)
 	if err != nil {
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")
 		return
@@ -342,7 +358,22 @@ func TaskArtifactContent(c *gin.Context) {
 		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
 		return
 	}
-	_ = writeTaskArtifactContent(c, task, nil)
+	if !legacy {
+		_ = writeTaskArtifactContent(c, task, nil)
+		return
+	}
+	if task.OrganizationID != 0 {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		return
+	}
+	route.PublicID = task.TaskID
+	subject := model.LegacyMediaSubject{
+		LegacyMediaRoute: route, RowID: task.ID, OwnerID: task.UserId, SubmitTime: task.SubmitTime,
+	}
+	beforePublish := func() error { return model.CheckLegacyMediaCompatibility(ctx, subject) }
+	if beforePublish() != nil || writeTaskArtifactContent(c, task, beforePublish) != nil {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+	}
 }
 
 func writeTaskArtifactContent(c *gin.Context, task *model.Task, beforePublish func() error) error {

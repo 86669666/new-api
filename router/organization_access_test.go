@@ -498,7 +498,7 @@ func newOrganizationHTTPFixture(t *testing.T) *organizationHTTPFixture {
 		}
 		require.NoError(t, validationErr)
 	} else {
-		require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}))
+		require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.SessionRevocationEvent{}, &model.UserAccessToken{}, &model.Option{}, &model.Token{}, &model.Task{}, &model.LegacyMediaCutover{}, &model.Log{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Organization{}, &model.OrganizationMember{}, &model.OrganizationInvitation{}, &model.OrganizationOwnershipTransfer{}, &model.OrganizationEvent{}, &model.OrganizationCreationRequest{}, &model.OrganizationWallet{}, &model.OrganizationWalletEntry{}))
 	}
 	t.Setenv("LOG_SQL_DSN", "")
 	require.NoError(t, model.InitLogDB())
@@ -7160,6 +7160,8 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 	var pinOnce sync.Once
 	taskImageStarted, taskImageRelease := make(chan struct{}), make(chan struct{})
 	var taskImageReleaseOnce sync.Once
+	legacyReadingStarted, legacyReadingRelease := make(chan struct{}), make(chan struct{})
+	var legacyReadingReleaseOnce sync.Once
 	var upstreamRequests atomic.Int64
 	raster := image.NewRGBA(image.Rect(0, 0, 1, 1))
 	raster.Set(0, 0, color.RGBA{R: 11, G: 22, B: 33, A: 255})
@@ -7181,6 +7183,17 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 			}
 		}
 		switch r.URL.Path {
+		case "/legacy-reading-paused":
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			close(legacyReadingStarted)
+			select {
+			case <-legacyReadingRelease:
+				_, _ = w.Write(originalImage.Bytes())
+			case <-r.Context().Done():
+				return
+			}
+			return
 		case "/task-image-pin-paused":
 			close(taskImageStarted)
 			select {
@@ -7229,6 +7242,7 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 		_, _ = io.WriteString(w, "abc")
 	}))
 	defer upstream.Close()
+	defer legacyReadingReleaseOnce.Do(func() { close(legacyReadingRelease) })
 	defer releaseOnce.Do(func() { close(release) })
 	defer taskImageReleaseOnce.Do(func() { close(taskImageRelease) })
 	defer pinOnce.Do(func() { close(pinRelease) })
@@ -7281,6 +7295,150 @@ func TestPersonalHistoricalMediaReading(t *testing.T) {
 		body, err := io.ReadAll(resp.Body)
 		return result{resp.StatusCode, resp.Header, string(body), err}
 	}
+
+	t.Run("old_mj_and_v1_enforce_the_shared_policy", func(t *testing.T) {
+		require.NoError(t, f.db.AutoMigrate(&model.LegacyMediaSnapshot{}, &model.LegacyMediaSnapshotEntry{},
+			&model.LegacyMediaRouteObservation{}, &model.LegacyMediaRevocation{}))
+		service.InitHttpClient()
+		oldSecret, oldRegistry := common.CryptoSecret, jsplugin.DefaultRegistry
+		common.CryptoSecret, jsplugin.DefaultRegistry = "isolated-legacy-reading-fixture", jsplugin.NewRegistry()
+		t.Cleanup(func() { common.CryptoSecret, jsplugin.DefaultRegistry = oldSecret, oldRegistry })
+		cs := model.AuthSessionIdentity{UserID: owner, SessionID: f.sids["owner"], UserAuthVersion: 1, SessionVersion: 1}
+
+		makeMJ := func(id, source string) model.LegacyMediaBinding {
+			t.Helper()
+			job := model.Midjourney{MjId: id, UserId: owner, ChannelId: channel.Id, SubmitTime: 2010, Status: "SUCCESS",
+				Progress: "100%", ImageUrl: upstream.URL + source}
+			require.NoError(t, f.db.Create(&job).Error)
+			pinned, _, err := model.PinPersonalMidjourneyImage(t.Context(), cs, &job, originalImage.Bytes(), "image/png")
+			require.NoError(t, err)
+			return model.LegacyMediaBinding{
+				LegacyMediaSubject: model.LegacyMediaSubject{
+					LegacyMediaRoute: model.LegacyMediaRoute{Family: model.LegacyMidjourneyImage, PublicID: id, ArtifactKey: "image"},
+					RowID:            int64(job.Id), OwnerID: owner, SubmitTime: job.SubmitTime,
+				},
+				VersionID: pinned.ID, Version: pinned.Version, ContentDigest: pinned.Digest,
+				ContentLength: pinned.Length, EvidenceDigest: strings.Repeat("a", 64),
+			}
+		}
+		frozenMJ := makeMJ("frozen-mj", "/original")
+		revokedMJ := makeMJ("revoked-mj", "/legacy-reading-paused")
+		unlisted := model.Midjourney{MjId: "unlisted-mj", UserId: owner, ChannelId: channel.Id, ImageUrl: upstream.URL + "/original"}
+		require.NoError(t, f.db.Create(&unlisted).Error)
+
+		source, err := plugins.Source("alibaba")
+		require.NoError(t, err)
+		plugin, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "alibaba"})
+		require.NoError(t, err)
+		job := model.Task{TaskID: "old-v1-frozen", UserId: owner, Platform: "alibaba", ChannelId: channel.Id,
+			SubmitTime: 2011, Status: model.TaskStatusSuccess, Action: "image",
+			PrivateData: model.TaskPrivateData{Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{
+				Key: "alibaba", Version: plugin.Meta.Version, APIVersion: plugin.Meta.APIVersion,
+			}}},
+		}
+		job.SetData(map[string]any{"output": map[string]any{"task_status": "SUCCEEDED",
+			"results": []map[string]string{{"url": upstream.URL + "/original"}}}})
+		require.NoError(t, f.db.Create(&job).Error)
+		pinned, _, err := model.PinPersonalTaskImage(t.Context(), cs, &job, originalImage.Bytes(), "image/png")
+		require.NoError(t, err)
+		taskBinding := model.LegacyMediaBinding{
+			LegacyMediaSubject: model.LegacyMediaSubject{
+				LegacyMediaRoute: model.LegacyMediaRoute{Family: model.LegacyTaskArtifactV1, PublicID: job.TaskID, ArtifactKey: model.PersonalTaskImageKey},
+				RowID:            job.ID, OwnerID: owner, SubmitTime: job.SubmitTime,
+			},
+			VersionID: pinned.ID, Version: pinned.Version, ContentDigest: pinned.Digest,
+			ContentLength: pinned.Length, EvidenceDigest: strings.Repeat("b", 64),
+		}
+		id, err := model.PrepareLegacyMediaSnapshot(t.Context(), []model.LegacyMediaBinding{frozenMJ, revokedMJ, taskBinding})
+		require.NoError(t, err)
+		access, err := service.IssueTaskArtifactAccess(job.TaskID, model.PersonalTaskImageKey)
+		require.NoError(t, err)
+		taskPath := "/v1/tasks/" + job.TaskID + "/artifacts/image-1/content"
+		taskLink := taskPath + "?access=" + url.QueryEscape(access)
+		mjLink := "/mj/image/" + frozenMJ.PublicID
+		revokedLink := "/mj/image/" + revokedMJ.PublicID
+		unknownLink := "/mj/image/" + unlisted.MjId
+
+		readImage := func(path string) {
+			t.Helper()
+			got := request(http.MethodGet, path, "", nil)
+			require.NoError(t, got.err)
+			require.Equal(t, http.StatusOK, got.status, got.body)
+			assert.Equal(t, originalImage.String(), got.body)
+			assert.Equal(t, "private, no-store", got.header.Get("Cache-Control"))
+		}
+		for _, path := range []string{mjLink, unknownLink, taskLink} {
+			readImage(path)
+		}
+		inFlight := make(chan result, 1)
+		go func() { inFlight <- request(http.MethodGet, revokedLink, "", nil) }()
+		select {
+		case <-legacyReadingStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("compatibility read did not reach the local origin")
+		}
+		require.NoError(t, model.RevokePreparedLegacyMedia(t.Context(), cs, id, revokedMJ.LegacyMediaRoute))
+		legacyReadingReleaseOnce.Do(func() { close(legacyReadingRelease) })
+		select {
+		case got := <-inFlight:
+			require.NoError(t, got.err)
+			assert.Equal(t, http.StatusNotFound, got.status)
+			assert.NotEqual(t, originalImage.String(), got.body)
+		case <-time.After(5 * time.Second):
+			t.Fatal("in-flight compatibility read did not finish")
+		}
+		before := upstreamRequests.Load()
+		denied := request(http.MethodGet, "/fast"+revokedLink, "", nil)
+		require.NoError(t, denied.err)
+		assert.Equal(t, http.StatusNotFound, denied.status)
+		assert.Equal(t, before, upstreamRequests.Load())
+
+		cutover := model.LegacyMediaCutover{ID: 1, SnapshotID: id, StartedAt: time.Now().Unix()}
+		require.NoError(t, f.db.Create(&cutover).Error)
+		t.Cleanup(func() { require.NoError(t, f.db.Delete(&cutover).Error) })
+		for _, path := range []string{mjLink, "/fast" + mjLink, taskLink} {
+			readImage(path)
+		}
+		tag := strconv.Quote(pinned.Digest)
+		for _, check := range []struct {
+			method string
+			header http.Header
+			status int
+		}{
+			{http.MethodHead, nil, http.StatusOK},
+			{http.MethodGet, http.Header{"Range": {"bytes=0-7"}}, http.StatusPartialContent},
+			{http.MethodGet, http.Header{"If-None-Match": {tag}}, http.StatusNotModified},
+			{http.MethodGet, http.Header{"Range": {"bytes=9999-"}}, http.StatusRequestedRangeNotSatisfiable},
+		} {
+			got := request(check.method, taskLink, "", check.header)
+			require.NoError(t, got.err)
+			require.Equal(t, check.status, got.status, got.body)
+			assert.Equal(t, "private, no-store", got.header.Get("Cache-Control"), "%s response %d", check.method, check.status)
+			if check.status == http.StatusPartialContent {
+				assert.Equal(t, originalImage.String()[:8], got.body)
+				assert.Equal(t, fmt.Sprintf("bytes 0-7/%d", originalImage.Len()), got.header.Get("Content-Range"))
+			}
+			if check.method == http.MethodHead || check.status == http.StatusNotModified {
+				assert.Empty(t, got.body)
+			}
+		}
+		require.NoError(t, model.RevokePreparedLegacyMedia(t.Context(), cs, id, taskBinding.LegacyMediaRoute))
+		for _, path := range []string{unknownLink, revokedLink, taskLink, taskPath + "?access=invalid"} {
+			got := request(http.MethodGet, path, "", http.Header{"If-None-Match": {tag}})
+			require.NoError(t, got.err)
+			assert.Equal(t, http.StatusNotFound, got.status)
+			assert.Empty(t, got.header.Get("ETag"))
+		}
+		head := request(http.MethodHead, taskLink, "", http.Header{"If-None-Match": {tag}})
+		require.NoError(t, head.err)
+		assert.Equal(t, http.StatusNotFound, head.status)
+		assert.Empty(t, head.header.Get("ETag"))
+		private := request(http.MethodGet, fmt.Sprintf("/api/task/media/%d/artifacts/image-1/versions/1", job.ID), f.bearer["owner"], nil)
+		require.NoError(t, private.err)
+		require.Equal(t, http.StatusOK, private.status)
+		assert.Equal(t, originalImage.String(), private.body)
+		assert.Equal(t, before, upstreamRequests.Load(), "frozen, rejected and private pinned reads need no origin")
+	})
 
 	t.Run("session_owner_get_head_and_range", func(t *testing.T) {
 		for _, path := range []string{mjPath, taskPath} {
