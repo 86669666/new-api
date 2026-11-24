@@ -1960,7 +1960,7 @@ func TestOrganizationInvitationPresentation(t *testing.T) {
 func newOrganizationTaskReadClient(t *testing.T, upstream string) (*organizationLifecycleClient, map[string]*model.Task) {
 	t.Helper()
 	c := newOrganizationLifecycleClient(t)
-	require.NoError(t, c.db.AutoMigrate(&model.Channel{}))
+	require.NoError(t, c.db.AutoMigrate(&model.Channel{}, &model.LegacyMediaCutover{}))
 	originalFetch := *system_setting.GetFetchSetting()
 	originalSecret := common.CryptoSecret
 	common.CryptoSecret = common.SessionSecret

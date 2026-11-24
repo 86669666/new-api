@@ -24,7 +24,7 @@ func TestPreparedLegacyMedia(t *testing.T) {
 		t.Run(dialect, func(t *testing.T) {
 			f := organizationDatabase(t, dialect)
 			tables := []any{&Midjourney{}, &Task{}, &MidjourneyImageVersion{}, &PersonalTaskImage{},
-				&LegacyMediaSnapshot{}, &LegacyMediaSnapshotEntry{}, &LegacyMediaRouteObservation{}, &LegacyMediaRevocation{}}
+				&LegacyMediaSnapshot{}, &LegacyMediaSnapshotEntry{}, &LegacyMediaRouteObservation{}, &LegacyMediaRevocation{}, &LegacyMediaCutover{}}
 			for _, table := range tables {
 				require.False(t, DB.Migrator().HasTable(table), "fixture must own every migrated table")
 			}
@@ -68,6 +68,24 @@ func TestPreparedLegacyMedia(t *testing.T) {
 				ContentLength: taskBytes.Length, EvidenceDigest: strings.Repeat("b", 64),
 			}
 
+			if dialect == "mysql" {
+				var charset, original string
+				require.NoError(t, DB.Raw(`SELECT character_set_name, collation_name FROM information_schema.columns
+					WHERE table_schema = DATABASE() AND table_name = 'legacy_media_route_observations' AND column_name = 'public_id'`).
+					Row().Scan(&charset, &original))
+				require.Regexp(t, "^[a-zA-Z0-9_]+$", charset)
+				require.Regexp(t, "^[a-zA-Z0-9_]+$", original)
+				different := "utf8mb4_bin"
+				if different == original {
+					different = "utf8mb4_unicode_ci"
+				}
+				const alter = "ALTER TABLE legacy_media_route_observations MODIFY COLUMN public_id VARCHAR(191) CHARACTER SET "
+				require.NoError(t, DB.Exec(alter+"utf8mb4 COLLATE "+different+" NOT NULL").Error)
+				require.NoError(t, CheckLegacyMediaCompatibility(ctx, mjBinding.LegacyMediaSubject),
+					"preparation collation must not affect an empty inventory")
+				require.NoError(t, DB.Exec(alter+charset+" COLLATE "+original+" NOT NULL").Error)
+			}
+
 			// An unresolved entry aborts the entire batch, including a valid entry.
 			wrong := taskBinding
 			wrong.ContentDigest = strings.Repeat("c", 64)
@@ -97,6 +115,42 @@ func TestPreparedLegacyMedia(t *testing.T) {
 			assert.EqualValues(t, 2, count)
 
 			id, mjRoute, taskRoute := first.id, mjBinding.LegacyMediaRoute, taskBinding.LegacyMediaRoute
+			now := time.Unix(1_790_000_000, 0)
+			content, err := ReadLegacyMediaContent(ctx, taskRoute, now)
+			require.NoError(t, err)
+			assert.Nil(t, content, "preparing a snapshot must not start compatibility deadlines")
+			require.NoError(t, CheckLegacyMediaCompatibility(ctx, mjBinding.LegacyMediaSubject))
+			require.NoError(t, CheckLegacyMediaCompatibility(ctx, taskBinding.LegacyMediaSubject))
+			longMJ := Midjourney{MjId: strings.Repeat("图", 70), UserId: owner.UserID, SubmitTime: 1930}
+			require.NoError(t, DB.Create(&longMJ).Error)
+			require.NoError(t, CheckLegacyMediaCompatibility(ctx, LegacyMediaSubject{
+				LegacyMediaRoute: LegacyMediaRoute{Family: LegacyMidjourneyImage, PublicID: longMJ.MjId, ArtifactKey: "image"},
+				RowID:            int64(longMJ.Id), OwnerID: owner.UserID, SubmitTime: longMJ.SubmitTime,
+			}), "snapshot byte limits do not apply to unobserved legacy addresses")
+			t.Run("shared_deadline", func(t *testing.T) {
+				cutover := LegacyMediaCutover{ID: legacyMediaCutoverID, SnapshotID: id, StartedAt: now.Unix()}
+				require.NoError(t, DB.Create(&cutover).Error)
+				t.Cleanup(func() { require.NoError(t, DB.Delete(&cutover).Error) })
+				assert.ErrorIs(t, CheckLegacyMediaCompatibility(ctx, taskBinding.LegacyMediaSubject), ErrLegacyMediaUnproven)
+				for _, test := range []struct {
+					route LegacyMediaRoute
+					days  int
+				}{{mjRoute, 30}, {taskRoute, 90}} {
+					deadline := now.Add(time.Duration(test.days) * 24 * time.Hour)
+					loaded, err := ReadLegacyMediaContent(ctx, test.route, deadline.Add(-time.Nanosecond))
+					require.NoError(t, err)
+					assert.Equal(t, data.Bytes(), loaded.Data)
+					assert.Equal(t, "image/png", loaded.MIME)
+					assert.Equal(t, deadline, loaded.ExpiresAt)
+					loaded, err = ReadLegacyMediaContent(ctx, test.route, deadline)
+					assert.ErrorIs(t, err, ErrLegacyMediaUnproven)
+					assert.Nil(t, loaded)
+				}
+				require.NoError(t, DB.Model(&cutover).Update("snapshot_id", strings.Repeat("f", 64)).Error)
+				loaded, err := ReadLegacyMediaContent(ctx, taskRoute, now)
+				assert.ErrorIs(t, err, ErrLegacyMediaUnproven)
+				assert.Nil(t, loaded, "an invalid cutover must not reopen live compatibility delivery")
+			})
 			got, err := ReadPreparedLegacyMedia(ctx, id, taskRoute)
 			require.NoError(t, err)
 			assert.Equal(t, taskBinding, *got)
@@ -133,6 +187,7 @@ func TestPreparedLegacyMedia(t *testing.T) {
 			require.NoError(t, RevokePreparedLegacyMedia(ctx, owner, id, mjRoute))
 			require.NoError(t, DB.Model(&mj).Update("image_url", "https://fixture.invalid/image.png").Error)
 			require.NoError(t, RevokePreparedLegacyMedia(ctx, owner, id, mjRoute))
+			assert.ErrorIs(t, CheckLegacyMediaCompatibility(ctx, mjBinding.LegacyMediaSubject), ErrLegacyMediaRevoked)
 			require.NoError(t, DB.Model(&LegacyMediaRevocation{}).Count(&count).Error)
 			assert.EqualValues(t, 1, count)
 
@@ -161,6 +216,7 @@ func TestPreparedLegacyMedia(t *testing.T) {
 			newBinding.PublicID, newBinding.OwnerID, newBinding.RowID, newBinding.SubmitTime =
 				reused.MjId, reused.UserId, int64(reused.Id), reused.SubmitTime
 			newBinding.VersionID = replacement.ID
+			assert.ErrorIs(t, CheckLegacyMediaCompatibility(ctx, newBinding.LegacyMediaSubject), ErrLegacyMediaUnproven)
 			_, err = PrepareLegacyMediaSnapshot(ctx, []LegacyMediaBinding{newBinding})
 			require.ErrorIs(t, err, ErrLegacyMediaUnproven)
 			require.NoError(t, DB.Delete(&reused).Error)
@@ -187,6 +243,7 @@ func TestPreparedLegacyMedia(t *testing.T) {
 				}
 				const alter = "ALTER TABLE legacy_media_route_observations MODIFY COLUMN public_id VARCHAR(191) CHARACTER SET "
 				require.NoError(t, DB.Exec(alter+"utf8mb4 COLLATE "+different+" NOT NULL").Error)
+				assert.ErrorIs(t, CheckLegacyMediaCompatibility(ctx, taskBinding.LegacyMediaSubject), ErrLegacyMediaUnproven)
 				unmatched := taskBinding
 				unmatched.EvidenceDigest = strings.Repeat("e", 64)
 				_, err = PrepareLegacyMediaSnapshot(ctx, []LegacyMediaBinding{unmatched})

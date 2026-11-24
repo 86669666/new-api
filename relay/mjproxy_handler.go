@@ -1,7 +1,9 @@
 package relay
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,12 +29,41 @@ import (
 )
 
 func RelayMidjourneyImage(c *gin.Context) {
-	taskId := c.Param("id")
-	midjourneyTask := model.GetByOnlyMJId(taskId)
+	c.Header("Cache-Control", "private, no-store")
+	route := model.LegacyMediaRoute{
+		Family: model.LegacyMidjourneyImage, PublicID: c.Param("id"), ArtifactKey: "image",
+	}
+	unavailable := func() {
+		c.JSON(http.StatusNotFound, gin.H{"error": "midjourney_task_not_found"})
+	}
+	served, err := service.ServeLegacyMediaContent(c, route)
+	if err != nil {
+		unavailable()
+		return
+	}
+	if served {
+		return
+	}
+	midjourneyTask := model.GetByOnlyMJId(route.PublicID)
 	if midjourneyTask == nil {
 		c.JSON(400, gin.H{
 			"error": "midjourney_task_not_found",
 		})
+		return
+	}
+	route.PublicID = midjourneyTask.MjId
+	subject := model.LegacyMediaSubject{
+		LegacyMediaRoute: route, RowID: int64(midjourneyTask.Id), OwnerID: midjourneyTask.UserId,
+		SubmitTime: midjourneyTask.SubmitTime,
+	}
+	legacyAllowed := func() bool {
+		if model.CheckLegacyMediaCompatibility(c.Request.Context(), subject) != nil {
+			unavailable()
+			return false
+		}
+		return true
+	}
+	if !legacyAllowed() {
 		return
 	}
 	var httpClient *http.Client
@@ -77,9 +108,23 @@ func RelayMidjourneyImage(c *gin.Context) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		responseBody, _ := io.ReadAll(resp.Body)
+		if !legacyAllowed() {
+			return
+		}
 		c.JSON(resp.StatusCode, gin.H{
 			"error": string(responseBody),
 		})
+		return
+	}
+	// The origin may send headers long before the first body bytes. Wait for
+	// the first byte before the final decision and response publication.
+	body := bufio.NewReader(resp.Body)
+	_, firstReadErr := body.Peek(1)
+	if !legacyAllowed() {
+		return
+	}
+	if firstReadErr != nil && !errors.Is(firstReadErr, io.EOF) {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "http_get_image_failed"})
 		return
 	}
 	// 从Content-Type头获取MIME类型
@@ -90,8 +135,9 @@ func RelayMidjourneyImage(c *gin.Context) {
 	}
 	// 设置响应的内容类型
 	c.Writer.Header().Set("Content-Type", contentType)
+	c.Writer.WriteHeaderNow()
 	// 将图片流式传输到响应体
-	_, err = io.Copy(c.Writer, resp.Body)
+	_, err = io.Copy(c.Writer, body)
 	if err != nil {
 		log.Println(common.LogText("Failed to stream image: %v", err))
 	}

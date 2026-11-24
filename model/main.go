@@ -393,6 +393,7 @@ func migrateDB() error {
 		&LegacyMediaSnapshotEntry{},
 		&LegacyMediaRouteObservation{},
 		&LegacyMediaRevocation{},
+		&LegacyMediaCutover{},
 		&TopUp{},
 		&QuotaData{},
 		&Task{},
