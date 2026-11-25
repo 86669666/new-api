@@ -126,7 +126,7 @@ def publish_delta(reference, reader, fetch, publication, journal, installation_t
                   policy.invitation_delta, policy.oauth_delta, policy.client_events_delta, policy.relay_log_delta,
                   policy.upstream_errors_delta, policy.provider_logs_delta,
                   policy.independent_stream_delta, policy.request_plugin_delta, policy.sql_midjourney_delta,
-                  policy.authz_policy_reload_delta, policy.legacy_media_delta, policy.personal_media_delta, policy.personal_media_share_delta, policy.personal_media_video_delta, policy.personal_task_image_delta, policy.legacy_media_preparation_delta, policy.legacy_media_read_delta):
+                  policy.authz_policy_reload_delta, policy.legacy_media_delta, policy.personal_media_delta, policy.personal_media_share_delta, policy.personal_media_video_delta, policy.personal_task_image_delta, policy.legacy_media_preparation_delta, policy.legacy_media_read_delta, policy.legacy_owner_revocation_delta):
         if reference['schema'] == delta.REFERENCE_SCHEMA:
             break
     else:
@@ -149,7 +149,7 @@ def publish_delta(reference, reader, fetch, publication, journal, installation_t
     policy.require(published['id'] == check_id, 'wrong signed delta check')
     policy.validate_gate(published, request, completed=True)
     expected = policy.consumer.canonical(published)
-    delays = (0, 1, 2, 4) if request['schema'] in (policy.TERMINAL_SCHEMA_V22, policy.TERMINAL_SCHEMA_V23, policy.TERMINAL_SCHEMA_V24, policy.TERMINAL_SCHEMA_V25) else (0,)
+    delays = (0, 1, 2, 4) if request['schema'] in (policy.TERMINAL_SCHEMA_V22, policy.TERMINAL_SCHEMA_V23, policy.TERMINAL_SCHEMA_V24, policy.TERMINAL_SCHEMA_V25, policy.TERMINAL_SCHEMA_V26) else (0,)
     for delay in delays:
         if delay:
             clock()
