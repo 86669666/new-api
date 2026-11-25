@@ -15003,6 +15003,109 @@
           }
         }
       },
+      "/api/mj/media/{row_id}/legacy-links/revoke": {
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          }
+        ],
+        "post": {
+          "summary": "Revoke legacy links for a prepared personal artifact",
+          "operationId": "revokePersonalMidjourneyLegacyLinks",
+          "tags": [
+            "任务"
+          ],
+          "description": "Owner-only idempotent revocation. The operation is disabled by default and independent of the compatibility window.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "responses": {
+            "204": {
+              "description": "Legacy links for this artifact revoked"
+            },
+            "401": {
+              "description": "Dashboard login session required"
+            },
+            "403": {
+              "description": "Credential, organization scope or origin denied"
+            },
+            "404": {
+              "description": "Feature disabled or prepared personal artifact unavailable"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            },
+            "500": {
+              "description": "Revocation storage operation failed"
+            }
+          }
+        }
+      },
+      "/api/task/media/{row_id}/artifacts/{artifact_key}/legacy-links/revoke": {
+        "parameters": [
+          {
+            "name": "row_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          {
+            "name": "artifact_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "image-1"
+              ]
+            }
+          }
+        ],
+        "post": {
+          "summary": "Revoke legacy links for a prepared personal artifact",
+          "operationId": "revokePersonalTaskArtifactLegacyLinks",
+          "tags": [
+            "任务"
+          ],
+          "description": "Owner-only idempotent revocation. The operation is disabled by default and independent of the compatibility window.",
+          "security": [
+            {
+              "DashboardJWT": []
+            }
+          ],
+          "responses": {
+            "204": {
+              "description": "Legacy links for this artifact revoked"
+            },
+            "401": {
+              "description": "Dashboard login session required"
+            },
+            "403": {
+              "description": "Credential, organization scope or origin denied"
+            },
+            "404": {
+              "description": "Feature disabled or prepared personal artifact unavailable"
+            },
+            "429": {
+              "description": "Request rate limit reached"
+            },
+            "500": {
+              "description": "Revocation storage operation failed"
+            }
+          }
+        }
+      },
       "/api/media-shares/mj/image": {
         "parameters": [
           {

@@ -151,6 +151,33 @@ func TestPreparedLegacyMedia(t *testing.T) {
 				assert.ErrorIs(t, err, ErrLegacyMediaUnproven)
 				assert.Nil(t, loaded, "an invalid cutover must not reopen live compatibility delivery")
 			})
+			t.Run("owner_internal_row", func(t *testing.T) {
+				assert.ErrorIs(t, RevokeOwnedLegacyMedia(ctx, other, LegacyMidjourneyImage, int64(mj.Id), "image"), ErrLegacyMediaUnproven)
+				assert.ErrorIs(t, RevokeOwnedLegacyMedia(ctx, administrator, LegacyTaskArtifactV1, task.ID, PersonalTaskImageKey), ErrLegacyMediaUnproven)
+				assert.ErrorIs(t, RevokeOwnedLegacyMedia(ctx, owner, LegacyTaskArtifactV1, task.ID, "image-2"), ErrLegacyMediaUnproven)
+				require.NoError(t, DB.Model(&task).Update("organization_id", 42).Error)
+				assert.ErrorIs(t, RevokeOwnedLegacyMedia(ctx, owner, LegacyTaskArtifactV1, task.ID, PersonalTaskImageKey), ErrLegacyMediaUnproven)
+				require.NoError(t, DB.Model(&task).Update("organization_id", 0).Error)
+				require.NoError(t, DB.Model(&task).Update("submit_time", task.SubmitTime+1).Error)
+				assert.ErrorIs(t, RevokeOwnedLegacyMedia(ctx, owner, LegacyTaskArtifactV1, task.ID, PersonalTaskImageKey), ErrLegacyMediaUnproven)
+				require.NoError(t, DB.Model(&task).Update("submit_time", taskBinding.SubmitTime).Error)
+				require.NoError(t, DB.Model(&mj).Update("image_url", "").Error)
+				t.Cleanup(func() {
+					require.NoError(t, DB.Model(&mj).Update("image_url", "https://fixture.invalid/image.png").Error)
+					for _, subject := range []LegacyMediaSubject{mjBinding.LegacyMediaSubject, taskBinding.LegacyMediaSubject} {
+						require.NoError(t, DB.Delete(&LegacyMediaRevocation{}, "subject_digest = ?", subject.revocationDigest()).Error)
+					}
+				})
+				for i := 0; i < 2; i++ {
+					require.NoError(t, RevokeOwnedLegacyMedia(ctx, owner, LegacyMidjourneyImage, int64(mj.Id), "image"))
+					require.NoError(t, RevokeOwnedLegacyMedia(ctx, owner, LegacyTaskArtifactV1, task.ID, PersonalTaskImageKey))
+				}
+				var count int64
+				require.NoError(t, DB.Model(&LegacyMediaRevocation{}).Count(&count).Error)
+				assert.EqualValues(t, 2, count)
+				_, err := ReadPreparedLegacyMedia(ctx, id, taskRoute)
+				assert.ErrorIs(t, err, ErrLegacyMediaRevoked)
+			})
 			got, err := ReadPreparedLegacyMedia(ctx, id, taskRoute)
 			require.NoError(t, err)
 			assert.Equal(t, taskBinding, *got)

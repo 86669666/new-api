@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/authz"
 
 	// Import oauth package to register providers via init()
@@ -454,6 +455,8 @@ func SetApiRouter(router *gin.Engine) {
 		mjRoute.POST("/media/:row_id/versions/:version/shares", middleware.DisableCache(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-media-share"), controller.CreatePersonalMidjourneyShare)
 		mjRoute.GET("/media/:row_id/versions/:version/shares", middleware.DisableCache(), middleware.UserAuth(), controller.ListPersonalMidjourneyShares)
 		mjRoute.DELETE("/media/:row_id/versions/:version/shares/:share_id", middleware.DisableCache(), middleware.UserAuth(), controller.RevokePersonalMidjourneyShare)
+		mjRoute.POST("/media/:row_id/legacy-links/revoke", middleware.DisableCache(), middleware.SessionCookieOriginGuard(), middleware.UserAuth(),
+			middleware.UserCriticalRateLimit("personal-legacy-media-revocation"), controller.PersonalLegacyMediaRevocation(model.LegacyMidjourneyImage))
 		mjRoute.GET("/self", middleware.UserAuth(), controller.GetUserMidjourney)
 		mjRoute.GET("/", middleware.AdminAuth(), controller.GetAllMidjourney)
 
@@ -466,6 +469,8 @@ func SetApiRouter(router *gin.Engine) {
 			taskRoute.POST("/media/:row_id/artifacts/:artifact_key/versions", middleware.DisableCache(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-task-image-pin"), controller.PinPersonalTaskImage)
 			taskRoute.GET("/media/:row_id/artifacts/:artifact_key/versions/:version", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalTaskImageVersion)
 			taskRoute.HEAD("/media/:row_id/artifacts/:artifact_key/versions/:version", middleware.DisableCache(), middleware.UserAuth(), controller.PersonalTaskImageVersion)
+			taskRoute.POST("/media/:row_id/artifacts/:artifact_key/legacy-links/revoke", middleware.DisableCache(), middleware.SessionCookieOriginGuard(), middleware.UserAuth(),
+				middleware.UserCriticalRateLimit("personal-legacy-media-revocation"), controller.PersonalLegacyMediaRevocation(model.LegacyTaskArtifactV1))
 			taskRoute.GET("/:task_id/artifacts", middleware.UserAuth(), controller.GetDashboardTaskArtifacts)
 			taskRoute.POST("/media/:row_id/artifacts/:artifact_key/content/context", middleware.SessionCookieOriginGuard(), middleware.UserAuth(), middleware.UserCriticalRateLimit("personal-media-context"), controller.PersonalTaskArtifactContext)
 		}
