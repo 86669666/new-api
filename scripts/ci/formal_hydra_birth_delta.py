@@ -261,26 +261,39 @@ def verify_dispatch(policy, environment, *, terminal, clock):
 
 
 def verify_public(policy, environment, reader, *, clock):
+    policy.reader_stage('r27_native_event')
     event = policy.ci_premerge_event(environment)
     policy.require(environment['GITHUB_EVENT_NAME'] == 'pull_request' and environment['GITHUB_RUN_ID'] == str(HOSTED['run_id'])
                    and event['number'] == PR and event['pull_request']['head']['sha'] == HEAD, 'wrong native Hydra birth gate')
+    policy.reader_stage('r27_c2_lookup')
     check = reader.formal_quality_check(HEAD)
+    policy.reader_stage('r27_c2_decode')
     request = policy.consumer.evidence.decode(check['output']['text'])
     now = int(clock())
     reference = request['artifact']
+    policy.reader_stage('r27_window')
     validate_reference(reference, now)
+    policy.reader_stage('r27_ci_binding')
     policy.validate_ci_evidence_reference(event, environment, reference['identity'])
+    policy.reader_stage('r27_c2_authenticity')
     policy.validate_gate(check, request, completed=True)
+    policy.reader_stage('r27_history')
     proof = historical_baseline(policy, reader)
+    policy.reader_stage('r27_receipt_binding')
     terminal = request['terminal_run']
     policy.require(type(terminal) is int and check['id'] not in (C1, PR277_C2) and
                    policy.consumer.canonical(request) == policy.consumer.canonical(result(reference, terminal, proof)),
                    'Hydra birth result differs from exact scope and subjects')
+    policy.reader_stage('r27_approvals')
     done = verify_approvals(policy, reader, reference, terminal, now)
+    policy.reader_stage('r27_publication_order')
     evidence = policy.consumer.evidence
     evidence.check_times(check, reference['identity'], now)
     policy.require(done <= evidence.github_time(check, 'started_at'), 'Hydra birth signature predates second approval')
+    policy.reader_stage('r27_current_candidate')
     current_subject(policy, reader, reference['identity'])
+    policy.reader_stage('r27_premerge_readback')
     policy.resolve_ci_candidate(environment, reader)
+    policy.reader_stage('r27_final_window')
     validate_reference(reference, int(clock()))
     return request

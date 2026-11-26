@@ -26,6 +26,7 @@ import re
 import sqlite3
 import sys
 import time
+from urllib.error import HTTPError
 import urllib.request
 from typing import Protocol
 
@@ -647,12 +648,39 @@ def verify_terminal_evidence(admission, bundle, reader, terminal_run, hosted, tr
                 consumer_run=workflow['run_id'], terminal_run=terminal_run, hosted=hosted)
 
 
+_reader_stage = 'entry'
+
+
+def reader_stage(stage):
+    global _reader_stage
+    _reader_stage = stage
+
+
+def report_reader_rejection(error):
+    if (os.environ.get('GITHUB_REPOSITORY') != REPOSITORY or
+            os.environ.get('GITHUB_RUN_ID') != '45708355860' or
+            os.environ.get('EXPECTED_SHA') != hydra_birth_delta.HEAD):
+        return
+    diagnostic = {'stage': _reader_stage}
+    if isinstance(error, HTTPError):
+        diagnostic['http_status'] = error.code
+        for header, name in (('X-RateLimit-Remaining', 'rate_remaining'),
+                             ('X-RateLimit-Reset', 'rate_reset')):
+            raw = error.headers.get(header, '')
+            if re.fullmatch('[0-9]{1,12}', raw):
+                diagnostic[name] = int(raw)
+    print('FORMAL_READER_DIAGNOSTIC ' + json.dumps(diagnostic, sort_keys=True),
+          file=sys.stderr, flush=True)
+
+
 def verify_public_terminal(environment, reader, *, clock=time.time):
     """Verify the App result from the native PR gate using public metadata only."""
     event = ci_premerge_event(environment)
     require(environment['GITHUB_EVENT_NAME'] == 'pull_request', 'native PR event required')
+    reader_stage('c2_lookup')
     sha = event['pull_request']['head']['sha']
     check = reader.formal_quality_check(sha)
+    reader_stage('c2_decode')
     result = consumer.evidence.decode(check['output']['text'])
     if isinstance(result, dict) and result.get('schema') == TERMINAL_SCHEMA_V6:
         return delta.verify_public(sys.modules[__name__], environment, reader, clock=clock)
@@ -1384,9 +1412,13 @@ def main():
         result = verify_terminal_evidence(admission, bundle, GitHubReader(os.environ['GITHUB_TOKEN']),
                                           int(os.environ['GITHUB_RUN_ID']), hosted, trusted_sha, now, active=True)
     elif sys.argv[1:] == ['public-terminal']:
+        reader_stage('native_event')
         ci_premerge_event(os.environ)
+        reader_stage('hosted_results')
         release_policy.quality_results(json.loads(os.environ['QUALITY_RESULTS']))
+        reader_stage('reader_environment')
         result = verify_public_terminal(os.environ, GitHubReader(os.environ['GITHUB_TOKEN']))
+        reader_stage('result_projection')
     elif sys.argv[1:] == ['ci']:
         event = ci_premerge_event(os.environ)
         admission, bundle = consumer.configured_evidence(
@@ -1405,8 +1437,12 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except UnsupportedCIEvent:
+    except UnsupportedCIEvent as error:
+        if sys.argv[1:] == ['public-terminal']:
+            report_reader_rejection(error)
         raise SystemExit('Unsupported CI lifecycle: only open-PR premerge verification is supported; '
                          'postmerge, tag and publication reuse cannot authorize a SHA.')
-    except Exception:
+    except Exception as error:
+        if sys.argv[1:] == ['public-terminal']:
+            report_reader_rejection(error)
         raise SystemExit('Quality evidence rejected; no publication authorization granted.')
