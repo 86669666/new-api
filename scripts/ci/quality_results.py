@@ -649,6 +649,7 @@ def verify_terminal_evidence(admission, bundle, reader, terminal_run, hosted, tr
 
 
 _reader_stage = 'entry'
+_reader_binding_mismatches = ()
 
 
 def reader_stage(stage):
@@ -662,6 +663,8 @@ def report_reader_rejection(error):
             os.environ.get('EXPECTED_SHA') != hydra_birth_delta.HEAD):
         return
     diagnostic = {'stage': _reader_stage}
+    if _reader_stage == 'r27_ci_binding' and _reader_binding_mismatches:
+        diagnostic['binding_mismatches'] = _reader_binding_mismatches
     if isinstance(error, HTTPError):
         diagnostic['http_status'] = error.code
         for header, name in (('X-RateLimit-Remaining', 'rate_remaining'),
@@ -1048,8 +1051,18 @@ def validate_ci_evidence_reference(event, environment, binding):
         pull = event['pull_request']
         native.update(pull_number=event['number'], candidate_sha=pull['head']['sha'],
                       base_sha=pull['base']['sha'], head_repository_id=pull['head']['repo']['id'])
-    require(consumer.canonical(native) == consumer.canonical({key: binding.get(key) for key in native}),
-            'private evidence does not match native CI event')
+    try:
+        require(consumer.canonical(native) == consumer.canonical({key: binding.get(key) for key in native}),
+                'private evidence does not match native CI event')
+    except ValueError:
+        if _reader_stage == 'r27_ci_binding':
+            global _reader_binding_mismatches
+            _reader_binding_mismatches = tuple(
+                key for key in ('repository', 'repository_id', 'consumer_sha', 'pull_number',
+                                'candidate_sha', 'base_sha', 'head_repository_id')
+                if consumer.canonical(native[key]) != consumer.canonical(binding.get(key))
+            )
+        raise
 
 
 def resolve_ci_candidate(environment, reader=None):
