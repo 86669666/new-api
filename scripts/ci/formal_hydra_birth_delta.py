@@ -24,6 +24,7 @@ PR277_A, PR277_B = 45671837790, 45672499128
 PR277_NATIVE_JOB = 139416811406
 R26 = '2b71c2c266348a521e44b438c5c8e9309170ac34'
 HOSTED = {'attempt': 1, 'run_id': 45708355860, 'workflow_blob': 'c123990e4a8c9fd981b721455a8edbc65b62dfc5'}
+NATIVE_MERGE = '286b0b9bee489f9c168b95f565a215cead2eee9a'
 BASELINE = {'pull_number': 277, 'candidate_sha': '81cf5f19d7287b8576961982c9c560a844c5cd49', 'candidate_tree': '45012a9a841c166de310bf2bb9f45d9b5c870d73', 'merge_commit': '838c4a4c623faabd9e42022be8d2d0b8391b742c', 'terminal_check_id': 139415772844, 'native_run': 45506805073, 'native_attempt': 2, 'native_job': 139416811406}
 MANIFEST = 'ed626e81fccba3584506f6ef3329b2686bcb909f11660266404b3487d7101c74'
 ARCHIVE = {'commit': '06c8483ee16be1f691b9fbd6c1282fdf608e20d4', 'path': 'eligibility/pr255-d8df0222-hydra-birth.zip', 'bytes': 22984, 'sha256': '3232150be4c7553c18ea8971f53cc206870fa427faff024ef799c1d5f6c52dc0'}
@@ -260,6 +261,25 @@ def verify_dispatch(policy, environment, *, terminal, clock):
     return checked
 
 
+def native_event_with_verified_base(policy, event, environment, reader):
+    pull = event['pull_request']
+    if pull['base']['sha'] == BASE:
+        return event
+
+    # A rerun can carry a stale base in its event payload. The exact merge
+    # commit from the original hosted run binds both inputs and the tested tree.
+    attempt = environment.get('GITHUB_RUN_ATTEMPT', '')
+    policy.require(re.fullmatch('[1-9][0-9]?', attempt) is not None and int(attempt) > 1 and
+                   environment.get('GITHUB_SHA') == NATIVE_MERGE and
+                   environment['GITHUB_RUN_ID'] == str(HOSTED['run_id']),
+                   'wrong native rerun merge identity')
+    merge = reader.commit(NATIVE_MERGE)
+    policy.require(merge['sha'] == NATIVE_MERGE and merge['tree']['sha'] == TREE and
+                   [parent['sha'] for parent in merge['parents']] == [BASE, HEAD],
+                   'wrong native rerun merge parents or tree')
+    return dict(event, pull_request=dict(pull, base=dict(pull['base'], sha=BASE)))
+
+
 def verify_public(policy, environment, reader, *, clock):
     policy.reader_stage('r27_native_event')
     event = policy.ci_premerge_event(environment)
@@ -273,6 +293,8 @@ def verify_public(policy, environment, reader, *, clock):
     reference = request['artifact']
     policy.reader_stage('r27_window')
     validate_reference(reference, now)
+    policy.reader_stage('r27_native_merge_anchor')
+    event = native_event_with_verified_base(policy, event, environment, reader)
     policy.reader_stage('r27_ci_binding')
     policy.validate_ci_evidence_reference(event, environment, reference['identity'])
     policy.reader_stage('r27_c2_authenticity')
@@ -293,7 +315,7 @@ def verify_public(policy, environment, reader, *, clock):
     policy.reader_stage('r27_current_candidate')
     current_subject(policy, reader, reference['identity'])
     policy.reader_stage('r27_premerge_readback')
-    policy.resolve_ci_candidate(environment, reader)
+    policy._resolve_ci_candidate(event, environment, reader)
     policy.reader_stage('r27_final_window')
     validate_reference(reference, int(clock()))
     return request

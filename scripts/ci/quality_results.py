@@ -1072,6 +1072,10 @@ def resolve_ci_candidate(environment, reader=None):
     binds admission and rechecks the current PR and complete App evidence.
     """
     event = ci_premerge_event(environment)
+    return _resolve_ci_candidate(event, environment, reader)
+
+
+def _resolve_ci_candidate(event, environment, reader):
     dispatch = environment['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
     number = int(event['inputs']['pull_number']) if dispatch else event['number']
     head = event['inputs']['sha'] if dispatch else event['pull_request']['head']['sha']
