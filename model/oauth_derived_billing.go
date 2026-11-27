@@ -127,27 +127,27 @@ func (f OAuthTextFacts) fingerprint(reserve int) (string, string, error) {
 func withOAuthTextAdmission(ctx context.Context, f OAuthTextFacts, action func(*gorm.DB, *User, *Token, *OAuthDerivedTokenSource, *UserSession, *OAuthGrant) error) error {
 	return withCurrentOAuthGrant(ctx, f.GrantRef, f.UserID, func(tx *gorm.DB, u *User, session *UserSession, g *OAuthGrant) error {
 		now := time.Now().Unix()
-		if g.State != "active" {
+		if g.State != "active" || u.GetSetting().BillingPreference != "wallet_only" {
 			return ErrOAuthTextCharge
 		}
 		if err := validateOAuthDerivedTokenStore(tx, now); err != nil {
 			return err
 		}
-		var source OAuthDerivedTokenSource
-		if err := lockForUpdate(tx).Where("grant_ref = ?", f.GrantRef).First(&source).Error; err != nil {
+		source, err := lockOAuthSource(tx, f.UserID, f.GrantRef)
+		if err != nil {
 			return err
 		}
 		var token Token
 		if err := lockForUpdate(tx).First(&token, f.TokenID).Error; err != nil {
 			return err
 		}
-		if err := validateOAuthDerivedTokenBinding(&source, g, &token, now); err != nil {
+		if err := validateOAuthDerivedTokenBinding(source, g, &token, now); err != nil {
 			return err
 		}
 		if source.TerminalAt != nil || source.ExpiresAt <= now || token.ExpiredTime <= now || token.Status != common.TokenStatusEnabled || source.PolicyHash != f.PolicyHash {
 			return ErrOAuthTextCharge
 		}
-		return action(tx, u, &token, &source, session, g)
+		return action(tx, u, &token, source, session, g)
 	})
 }
 
@@ -191,6 +191,9 @@ func ReserveOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, 
 		if err := oauthTextUnresolved(tx, u.Id, ref); err != nil {
 			return err
 		}
+		if err := taskWalletUnresolved(tx, u.Id, 0); err != nil {
+			return err
+		}
 		if u.Quota < reserve || u.Quota > common.MaxWalletQuota || t.RemainQuota < reserve || t.UsedQuota > common.MaxWalletQuota-reserve {
 			return ErrOAuthTextCharge
 		}
@@ -228,6 +231,9 @@ func claimOAuthDerivedText(ctx context.Context, ref string, f OAuthTextFacts, re
 	var permit *OAuthTextSendPermit
 	err := withOAuthTextAdmission(ctx, f, func(tx *gorm.DB, u *User, t *Token, source *OAuthDerivedTokenSource, session *UserSession, grant *OAuthGrant) error {
 		if err := oauthTextUnresolved(tx, u.Id, ref); err != nil {
+			return err
+		}
+		if err := taskWalletUnresolved(tx, u.Id, 0); err != nil {
 			return err
 		}
 		var c OAuthDerivedTextCharge
@@ -393,11 +399,15 @@ func finalizeOAuthDerivedText(ctx context.Context, ref string, actual int, usage
 
 // ReadOAuthDerivedTextCharge retains historical authority; it does not admit spending.
 func ReadOAuthDerivedTextCharge(ctx context.Context, ref string) (*OAuthDerivedTextCharge, error) {
-	if DB == nil || !oauthDerivedDigest(ref) {
+	return readOAuthDerivedTextCharge(ctx, DB, ref)
+}
+
+func readOAuthDerivedTextCharge(ctx context.Context, db *gorm.DB, ref string) (*OAuthDerivedTextCharge, error) {
+	if db == nil || !oauthDerivedDigest(ref) {
 		return nil, ErrOAuthTextCharge
 	}
 	var c OAuthDerivedTextCharge
-	if err := DB.WithContext(ctx).Where("ref = ?", ref).First(&c).Error; err != nil {
+	if err := db.WithContext(ctx).Where("ref = ?", ref).First(&c).Error; err != nil {
 		return nil, err
 	}
 	var f OAuthTextFacts
@@ -405,7 +415,8 @@ func ReadOAuthDerivedTextCharge(ctx context.Context, ref string) (*OAuthDerivedT
 		return nil, ErrOAuthTextCharge
 	}
 	facts, fp, err := f.fingerprint(c.Reserve)
-	if err != nil || facts != c.Facts || fp != c.Fingerprint {
+	if err != nil || facts != c.Facts || fp != c.Fingerprint ||
+		c.UserID != f.UserID || c.PayerID != f.UserID || c.TokenID != f.TokenID || c.GrantRef != f.GrantRef {
 		return nil, ErrOAuthTextCharge
 	}
 	return &c, nil

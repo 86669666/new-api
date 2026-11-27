@@ -31,12 +31,16 @@ func oauthGrantError(err error) error {
 	return ErrOAuthResourceUnavailable
 }
 
-func authorizeOAuthGrant(ctx context.Context, identity OAuthResourceIdentity, activate bool) (*model.OAuthGrantSnapshot, error) {
-	user, err := model.AuthorizeOAuthGrant(ctx, model.OAuthGrantAuthorization{
+func oauthGrantClaims(identity OAuthResourceIdentity, activate bool) model.OAuthGrantAuthorization {
+	return model.OAuthGrantAuthorization{
 		Issuer: identity.issuer, GrantID: identity.grantID, ClientID: identity.clientID,
 		Subject: strconv.Itoa(identity.userID), UserID: identity.userID, AuthVersion: identity.authVersion,
 		GrantExpiresAt: identity.grantExpiresAt, TokenExpiresAt: identity.expiresAt, NotBefore: identity.notBefore,
 		Scopes: identity.scopes, Activate: activate,
-	})
+	}
+}
+
+func authorizeOAuthGrant(ctx context.Context, identity OAuthResourceIdentity, activate bool) (*model.OAuthGrantSnapshot, error) {
+	user, err := model.AuthorizeOAuthGrant(ctx, oauthGrantClaims(identity, activate))
 	return user, oauthGrantError(err)
 }

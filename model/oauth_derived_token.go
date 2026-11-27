@@ -455,8 +455,10 @@ func oauthTokenSource(tx *gorm.DB, token *Token, locked bool) (*OAuthDerivedToke
 		return nil, ErrOAuthDerivedTokenUnknown
 	}
 	if locked {
-		if err := lockForUpdate(tx).Where("grant_ref = ?", source.GrantRef).First(source).Error; err != nil {
-			return nil, ErrOAuthDerivedTokenUnknown
+		var err error
+		source, err = lockOAuthSource(tx, token.UserId, source.GrantRef)
+		if err != nil {
+			return nil, err
 		}
 		if err := lockForUpdate(tx.Unscoped()).Where("user_id = ?", token.UserId).First(token, token.Id).Error; err != nil {
 			return nil, ErrOAuthDerivedTokenUnknown
@@ -616,6 +618,9 @@ func terminalOAuthToken(tx *gorm.DB, source *OAuthDerivedTokenSource, reason str
 	if source.TerminalAt != nil && reason != "deleted" {
 		return nil
 	}
+	if protectedOAuthSources(tx) {
+		return applyProtectedOAuthTerminal(tx, source, reason, now)
+	}
 	source.TerminalAt, source.TerminalReason = &now, &reason
 	if err := tx.Model(source).Select("terminal_at", "terminal_reason").Updates(source).Error; err != nil {
 		return ErrOAuthDerivedTokenUnknown
@@ -661,8 +666,8 @@ func revokeOAuthDerivedTokens(tx *gorm.DB, userID int, grants []OAuthGrant, matc
 			}
 		}
 	}
-	var sources []OAuthDerivedTokenSource
-	if err := lockForUpdate(tx).Where("user_id = ?", userID).Order("grant_ref").Find(&sources).Error; err != nil {
+	sources, err := lockOAuthSources(tx, userID, "")
+	if err != nil {
 		return ErrOAuthDerivedTokenUnknown
 	}
 	byRef := make(map[string]*OAuthGrant, len(grants))

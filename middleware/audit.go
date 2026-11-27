@@ -284,11 +284,24 @@ func OAuthOrdinaryTokenAudit() gin.HandlerFunc {
 			params["failure_class"] = "identity_revalidation_failed"
 		case http.StatusForbidden:
 			params["failure_class"] = "insufficient_scope"
+		case http.StatusConflict:
+			params["failure_class"] = "idempotency_conflict"
+		case http.StatusTooManyRequests:
+			params["failure_class"] = "issuance_limit"
 		case http.StatusServiceUnavailable:
 			params["failure_class"] = "creation_unavailable"
 		case http.StatusOK:
 			created, _ := common.GetContextKeyType[model.AuditFields](c, constant.ContextKeyTokenAuditParams)
 			id, _ := created["id"].(int)
+			derived, _ := created["derived"].(bool)
+			receipt, _ := created["receipt_only"].(bool)
+			if derived {
+				entry.Content = "OAuth derived API token issuance"
+			}
+			if derived && receipt && id > 0 {
+				entry.Success = true
+				params["id"], params["result"], params["failure_class"] = id, "receipt", "none"
+			}
 			if id > 0 && common.GetContextKeyBool(c, constant.ContextKeyTokenAuditSucceeded) {
 				entry.Success = true
 				params["id"], params["result"], params["failure_class"] = id, "created", "none"

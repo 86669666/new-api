@@ -66,13 +66,15 @@ func OAuthProviderHandler(bridge *service.OAuthProviderBridge, phase string, pre
 		}
 		data, err := io.ReadAll(io.LimitReader(c.Request.Body, 65537))
 		required := []string{"challenge"}
+		var optional []string
 		if !preview {
 			required = append(required, "preview_token", "decision")
 			if phase == "consent" {
 				required = append(required, "selected_scopes")
+				optional = append(optional, "derived")
 			}
 		}
-		if err != nil || len(data) > 65536 || common.ValidateJSONObjectFields(data, required, nil) != nil {
+		if err != nil || len(data) > 65536 || common.ValidateJSONObjectFields(data, required, optional) != nil {
 			middleware.WriteOAuthProviderError(c, service.ErrOAuthProviderRequest)
 			return
 		}

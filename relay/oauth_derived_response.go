@@ -17,15 +17,19 @@ import (
 // must not retry, refund, run legacy billing, or append another response after
 // this call, even on error: settlement may have committed and output may be
 // partial. This boundary does not authorize a send or enable derived spending.
-func consumeOAuthDerivedTextResponse(ctx context.Context, ref string, resp *http.Response, writer http.ResponseWriter) error {
-	return consumeOAuthDerivedTextResponseWithFinalizer(ctx, ref, resp, writer, service.FinalizeOAuthDerivedText)
+func consumeOAuthDerivedTextResponse(ctx context.Context, ref, selectedModel string, resp *http.Response, writer http.ResponseWriter) error {
+	finalize := service.FinalizeOAuthDerivedText
+	if selectedModel != "" {
+		finalize = service.FinalizeSelectedOAuthDerivedText
+	}
+	return consumeOAuthDerivedTextResponseWithFinalizer(ctx, ref, selectedModel, resp, writer, finalize)
 }
 
 // The per-call seam stays private; the production entry always binds the real
 // finalizer, which loads historical billing facts from the durable receipt.
-func consumeOAuthDerivedTextResponseWithFinalizer(ctx context.Context, ref string, resp *http.Response, writer http.ResponseWriter, finalize func(context.Context, string, []byte) (*model.OAuthDerivedTextCharge, error)) error {
+func consumeOAuthDerivedTextResponseWithFinalizer(ctx context.Context, ref, selectedModel string, resp *http.Response, writer http.ResponseWriter, finalize func(context.Context, string, []byte) (*model.OAuthDerivedTextCharge, error)) error {
 	failed := errors.New("OAuth derived text response could not be completed")
-	body, rawUsage, err := openai.ReadOAuthDerivedTextResponse(resp)
+	body, rawUsage, err := openai.ReadOAuthDerivedTextResponse(resp, selectedModel)
 	if err != nil {
 		return failed
 	}

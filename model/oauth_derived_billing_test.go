@@ -56,9 +56,9 @@ func newOAuthTextDatabaseFixture(t *testing.T, database common.DatabaseType, dri
 	require.NoError(t, InitOAuthCleanupStore(true))
 	now := time.Now().Unix()
 	h := strings.Repeat("a", 64)
-	u := User{Username: "charge", AffCode: "charge", Quota: 100, Status: common.UserStatusEnabled, AuthVersion: 1}
+	u := User{Username: "charge", AffCode: "charge", Quota: 100, Status: common.UserStatusEnabled, AuthVersion: 1, Setting: `{"billing_preference":"wallet_only"}`}
 	require.NoError(t, db.Create(&u).Error)
-	token := Token{UserId: u.Id, Key: "synthetic-unit-key", Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: now + 100}
+	token := Token{UserId: u.Id, Key: "syntheticunitkey", Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: now + 100}
 	require.NoError(t, db.Create(&token).Error)
 	session := UserSession{SID: "unit-session", UserID: u.Id, Version: 1, UserAuthVersion: 1, Status: UserSessionStatusActive, ExpiresAt: now + 200}
 	require.NoError(t, db.Create(&session).Error)
@@ -343,6 +343,76 @@ func TestOAuthDerivedTextClaimDeadline(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOAuthDerivedTextTaskAdmission(t *testing.T) {
+	db, facts := newOAuthTextFixture(t)
+	ctx := t.Context()
+	ref := strings.Repeat("b", 64)
+	observer, err := openOAuthBootstrapDB(db.Dialector.Name(), os.Getenv("SQL_DSN"))
+	require.NoError(t, err)
+	pool, err := observer.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, pool.Close()) })
+	checkBalance := func(want int) {
+		t.Helper()
+		var user User
+		var token Token
+		require.NoError(t, observer.First(&user, facts.UserID).Error)
+		require.NoError(t, observer.First(&token, facts.TokenID).Error)
+		assert.Equal(t, want, user.Quota)
+		assert.Equal(t, want, token.RemainQuota)
+		assert.Equal(t, 100-want, token.UsedQuota)
+	}
+
+	blocker := Task{UserId: facts.UserID, BillingProtocol: 1, BillingState: TaskBillingIntent}
+	require.NoError(t, db.Create(&blocker).Error)
+	require.NoError(t, db.Create(&Task{UserId: facts.UserID + 1, BillingProtocol: 1, BillingState: TaskBillingHeld}).Error)
+	for _, state := range []string{TaskBillingIntent, TaskBillingClaimed, TaskBillingPending, TaskBillingHeld} {
+		require.NoError(t, db.Model(&blocker).UpdateColumn("billing_state", state).Error)
+		receipt, err := ReserveOAuthDerivedText(ctx, ref, facts, 80)
+		require.ErrorIs(t, err, ErrTaskObligationConflict)
+		require.Nil(t, receipt)
+	}
+	var count int64
+	require.NoError(t, observer.Model(&OAuthDerivedTextCharge{}).Count(&count).Error)
+	assert.Zero(t, count)
+	checkBalance(100)
+
+	require.NoError(t, db.Model(&blocker).UpdateColumn("billing_state", TaskBillingSettled).Error)
+	reserved, err := ReserveOAuthDerivedText(ctx, ref, facts, 80)
+	require.NoError(t, err)
+	checkBalance(20)
+	require.NoError(t, db.Model(&blocker).UpdateColumn("billing_state", TaskBillingPending).Error)
+	replay, err := ReserveOAuthDerivedText(ctx, ref, facts, 80)
+	require.NoError(t, err)
+	assert.Equal(t, reserved, replay)
+	permit, err := ClaimOAuthDerivedText(ctx, ref, facts, 80)
+	require.ErrorIs(t, err, ErrTaskObligationConflict)
+	require.Nil(t, permit)
+	var unchanged OAuthDerivedTextCharge
+	require.NoError(t, observer.First(&unchanged, "ref = ?", ref).Error)
+	assert.Equal(t, *reserved, unchanged)
+	checkBalance(20)
+
+	require.NoError(t, db.Model(&blocker).UpdateColumn("billing_state", TaskBillingSettled).Error)
+	require.NoError(t, db.Model(&User{}).Where("id = ?", facts.UserID).UpdateColumn("setting", `{"billing_preference":"subscription_only"}`).Error)
+	permit, err = ClaimOAuthDerivedText(ctx, ref, facts, 80)
+	require.ErrorIs(t, err, ErrOAuthTextCharge)
+	require.Nil(t, permit)
+	checkBalance(20)
+	require.NoError(t, db.Model(&User{}).Where("id = ?", facts.UserID).UpdateColumn("setting", `{"billing_preference":"wallet_only"}`).Error)
+	permit, err = ClaimOAuthDerivedText(ctx, ref, facts, 80)
+	require.NoError(t, err)
+	require.NotNil(t, permit)
+	permit, err = ClaimOAuthDerivedText(ctx, ref, facts, 80)
+	require.NoError(t, err)
+	require.Nil(t, permit)
+	require.NoError(t, db.Model(&blocker).UpdateColumn("billing_state", TaskBillingHeld).Error)
+	settled, err := FinalizeOAuthDerivedText(ctx, ref, 60, OAuthTextUsage{Prompt: 20, Completion: 40, Total: 60})
+	require.NoError(t, err)
+	assert.Equal(t, "settled", settled.State)
+	checkBalance(40)
 }
 
 func TestOAuthDerivedTextCachedSettlement(t *testing.T) {

@@ -55,7 +55,7 @@ func TestReadOAuthDerivedTextResponseQuotaBoundary(t *testing.T) {
 			original := `{"id":"chatcmpl-boundary","object":"chat.completion","created":1,"model":"` + observedModel + `","choices":[{"index":0,"message":{"role":"assistant","content":"` + responseText + `"},"finish_reason":"stop"}],"usage":` + tc.usage + `}`
 			body := &oauthDerivedResponseBody{reader: strings.NewReader(original)}
 			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: body, ContentLength: -1}
-			rawBody, rawUsage, err := ReadOAuthDerivedTextResponse(resp)
+			rawBody, rawUsage, err := ReadOAuthDerivedTextResponse(resp, "")
 			assert.Equal(t, 1, body.closeCount)
 			require.NoError(t, err)
 			assert.Equal(t, original, string(rawBody))
@@ -222,7 +222,7 @@ func TestReadOAuthDerivedTextResponse(t *testing.T) {
 			if tc.nilResponse {
 				resp = nil
 			}
-			got, usage, err := ReadOAuthDerivedTextResponse(resp)
+			got, usage, err := ReadOAuthDerivedTextResponse(resp, "")
 			if tc.ok {
 				require.NoError(t, err)
 				assert.Equal(t, tc.body, string(got))

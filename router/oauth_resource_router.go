@@ -15,7 +15,7 @@ func SetOAuthResourceRouter(router *gin.Engine, resource *service.OAuthUserInfoR
 	group.Use(middleware.RouteTag("api"), middleware.OAuthResourceNoStore, middleware.GlobalAPIRateLimit())
 	group.Any("/tokens", middleware.OAuthTokensBoundary, middleware.OAuthOrdinaryTokenAudit(), middleware.OAuthTokensAuth(resource), func(c *gin.Context) {
 		if c.Request.Method == "POST" {
-			controller.CreateOAuthOrdinaryToken(c)
+			controller.CreateOAuthAPIToken(c)
 			return
 		}
 		controller.GetOAuthDerivedTokenMetadata(c)

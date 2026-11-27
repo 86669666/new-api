@@ -288,8 +288,11 @@ func RunOAuthDatabaseBootstrap(args []string, out io.Writer) int {
 	engine := fs.String("engine", "", "sqlite|mysql|postgres (local protected sockets only)")
 	target := fs.String("target", "", "new absolute SQLite file or new database name")
 	journal := fs.String("journal", "", "installer-root-owned absolute journal path")
+	role := fs.String("service-role", "", "existing restricted PostgreSQL role or MySQL localhost account")
+	attestor := fs.String("attestor-role", "", "optional existing separate consent attestor account")
+	issuer := fs.String("issuer-role", "", "optional existing separate derived key issuer account")
 	if len(args) == 0 {
-		fmt.Fprintln(out, "db-bootstrap fresh|resume --engine ... --target ... --journal ...; admin credentials via BOOTSTRAP_ADMIN_DSN only")
+		fmt.Fprintln(out, "db-bootstrap fresh|resume|protect-source --engine ... --target ... --journal ...; admin credentials via BOOTSTRAP_ADMIN_DSN only")
 		return 2
 	}
 	mode := args[0]
@@ -297,10 +300,21 @@ func RunOAuthDatabaseBootstrap(args []string, out io.Writer) int {
 		fs.PrintDefaults()
 		return 0
 	}
-	if mode != "fresh" && mode != "resume" {
+	if mode != "fresh" && mode != "resume" && mode != "protect-source" {
 		return 2
 	}
 	if fs.Parse(args[1:]) != nil || fs.NArg() != 0 {
+		return 2
+	}
+	if mode == "protect-source" {
+		if err := installOAuthSourceOperations(context.Background(), *engine, *target, *journal, *role, *attestor, *issuer); err != nil {
+			fmt.Fprintln(out, "database bootstrap refused protected source operations")
+			return 1
+		}
+		fmt.Fprintln(out, "protected source operations installed")
+		return 0
+	}
+	if *role != "" || *attestor != "" || *issuer != "" {
 		return 2
 	}
 	if err := oauthBootstrap(context.Background(), mode, *engine, *target, *journal, out); err != nil {

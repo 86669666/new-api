@@ -22,3 +22,8 @@ func oauthBootstrap(_ context.Context, _, _, _, _ string, out io.Writer) error {
 func oauthBootstrapRegressionJournal(string, string) (*oauthBirthJournal, error) {
 	return nil, errOAuthBootstrap
 }
+
+func RunOAuthTextReconcile(_ []string, out io.Writer) int {
+	fmt.Fprintln(out, "oauth-text-reconcile requires Linux")
+	return 1
+}

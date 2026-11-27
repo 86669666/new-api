@@ -2278,7 +2278,7 @@ func TestOAuthDerivedTokenOwnerLifecycle(t *testing.T) {
 		_, jwt := ownerLifecycleRouter(t, db)
 		require.NotEmpty(t, jwt)
 		grant, source, token := ownerDerivedFixture(t, db, 1, "settle", false)
-		require.NoError(t, db.Model(&model.User{}).Where("id = ?", 1).Update("quota", 1000).Error)
+		require.NoError(t, db.Model(&model.User{}).Where("id = ?", 1).Updates(map[string]any{"quota": 1000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
 		facts := model.OAuthTextFacts{GrantRef: grant.GrantRef, UserID: 1, TokenID: token.Id, PolicyHash: source.PolicyHash, Model: "gpt-test", ChannelID: 1, RouteHash: strings.Repeat("c", 64), BodyHash: strings.Repeat("d", 64), ModelRatio: 1, CompletionRatio: 1, GroupRatio: 1, CacheRatio: 1, PromptEstimate: 10, MaxCompletion: 10}
 		ref := strings.Repeat("e", 64)
 		_, err := model.ReserveOAuthDerivedText(context.Background(), ref, facts, 80)
