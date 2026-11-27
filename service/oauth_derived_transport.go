@@ -44,6 +44,21 @@ func DoOAuthDerivedTextOnce(ctx context.Context, ref string, facts model.OAuthTe
 	return op.do(ctx)
 }
 
+// SendSelectedOAuthDerivedText is used by the relay's bound server policy.
+// Prepare the complete immutable wire operation before making any debit.
+func SendSelectedOAuthDerivedText(ctx context.Context, ref string, facts model.OAuthTextFacts, reserve int, selected OAuthDerivedTextSelectedRequest) (*http.Response, error) {
+	op, err := newOAuthTextSendOperation(ref, facts, reserve, selected)
+	if err != nil {
+		return nil, err
+	}
+	receipt, err := model.ReserveOAuthDerivedText(ctx, ref, facts, reserve)
+	if err != nil || receipt == nil || receipt.State != "reserved" {
+		return nil, errOAuthTextTransport
+	}
+	op.claim = model.ClaimOAuthDerivedText
+	return op.do(ctx)
+}
+
 // Dependencies are per operation, private, and never populated from HTTP input.
 // Tests may supply a claim, clock and local CA without opening production Claim.
 type oauthTextSendOperation struct {

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -138,6 +139,14 @@ func WriteOAuthResourceError(c *gin.Context, err error, requiredScope ...string)
 			scope = requiredScope[0]
 		}
 		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+scope+`"`)
+	} else if errors.Is(err, service.ErrOAuthIssueIdempotency) {
+		status, code = http.StatusBadRequest, "invalid_request"
+	} else if errors.Is(err, model.ErrOAuthIssueConflict) {
+		status, code = http.StatusConflict, "idempotency_conflict"
+	} else if errors.Is(err, model.ErrOAuthIssueLimit) {
+		status, code = http.StatusTooManyRequests, "issuance_limit"
+	} else if errors.Is(err, model.ErrOAuthIssueClosed) {
+		status, code = http.StatusForbidden, "issuance_unavailable"
 	}
 	c.Header("Cache-Control", "private, no-store")
 	c.Header("Referrer-Policy", "no-referrer")

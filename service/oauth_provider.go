@@ -46,25 +46,30 @@ type OAuthProviderBridge struct {
 	policy    string
 	revoke    string
 	public    *OAuthPublic
+	attestor  *model.OAuthIssueAttestationWriter
 }
 
 type OAuthProviderPreview struct {
-	PreviewToken   string   `json:"preview_token"`
-	ExpiresAt      int64    `json:"expires_at"`
-	Phase          string   `json:"phase"`
-	ClientID       string   `json:"client_id"`
-	ClientName     string   `json:"client_name"`
-	Username       string   `json:"username"`
-	RequestedScope []string `json:"requested_scopes"`
-	AllowedScope   []string `json:"allowed_scopes"`
-	Audience       string   `json:"audience"`
+	PreviewToken      string   `json:"preview_token"`
+	ExpiresAt         int64    `json:"expires_at"`
+	Phase             string   `json:"phase"`
+	ClientID          string   `json:"client_id"`
+	ClientName        string   `json:"client_name"`
+	Username          string   `json:"username"`
+	RequestedScope    []string `json:"requested_scopes"`
+	AllowedScope      []string `json:"allowed_scopes"`
+	Audience          string   `json:"audience"`
+	DerivedConsentRef string   `json:"derived_consent_ref,omitempty"`
+	DerivedPolicyHash string   `json:"derived_policy_hash,omitempty"`
+	DerivedIssuer     string   `json:"derived_issuer,omitempty"`
 }
 
 type OAuthProviderDecision struct {
-	Challenge      string   `json:"challenge"`
-	PreviewToken   string   `json:"preview_token"`
-	Decision       string   `json:"decision"`
-	SelectedScopes []string `json:"selected_scopes,omitempty"`
+	Challenge      string                    `json:"challenge"`
+	PreviewToken   string                    `json:"preview_token"`
+	Decision       string                    `json:"decision"`
+	SelectedScopes []string                  `json:"selected_scopes,omitempty"`
+	Derived        *OAuthDerivedConsentInput `json:"derived,omitempty"`
 }
 
 type OAuthProviderRedirect struct {
@@ -138,6 +143,38 @@ func InitOAuthProviderBridge() error {
 		return err
 	}
 	currentOAuthProvider.Store(bridge)
+	return nil
+}
+
+// InitOAuthDerivedConsentAttestor runs once after the application's SQL
+// connection and the OAuth grant store have been initialized.
+func InitOAuthDerivedConsentAttestor() error {
+	writerDSN := os.Getenv("OAUTH_DERIVED_ATTESTOR_DSN")
+	issuerDSN := os.Getenv("OAUTH_DERIVED_ISSUER_DSN")
+	if writerDSN == "" {
+		if issuerDSN != "" {
+			return ErrOAuthProviderConfiguration
+		}
+		return nil
+	}
+	bridge := CurrentOAuthProviderBridge()
+	if bridge == nil || bridge.public == nil || os.Getenv("OAUTH_PROTECTED_SOURCE_OPS") != "true" {
+		return ErrOAuthProviderConfiguration
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	writer, err := model.OpenOAuthIssueAttestationWriter(ctx, os.Getenv("SQL_DSN"), writerDSN)
+	if err != nil {
+		return ErrOAuthProviderConfiguration
+	}
+	if issuerDSN != "" {
+		issuer, err := model.OpenOAuthFirstKeyIssuer(ctx, os.Getenv("SQL_DSN"), issuerDSN)
+		if err != nil {
+			return ErrOAuthProviderConfiguration
+		}
+		bridge.resource.firstKeyIssuer = issuer
+	}
+	bridge.attestor = writer
 	return nil
 }
 
@@ -266,9 +303,15 @@ func (b *OAuthProviderBridge) Preview(ctx context.Context, actor AuthIdentity, p
 	if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
 		return nil, err
 	}
-	return &OAuthProviderPreview{PreviewToken: token, ExpiresAt: expires, Phase: phase, ClientID: request.clientID,
+	preview := &OAuthProviderPreview{PreviewToken: token, ExpiresAt: expires, Phase: phase, ClientID: request.clientID,
 		ClientName: request.clientName, Username: user.Username, RequestedScope: request.requested,
-		AllowedScope: request.allowed, Audience: b.resource.audience}, nil
+		AllowedScope: request.allowed, Audience: b.resource.audience}
+	if b.attestor != nil && phase == "consent" && slices.Contains(request.allowed, "tokens:write") {
+		preview.DerivedConsentRef = model.OAuthConsentRef(b.resource.issuer, request.consentRequestID)
+		preview.DerivedPolicyHash = fmt.Sprintf("%x", sha256.Sum256([]byte(b.policy)))
+		preview.DerivedIssuer = b.resource.issuer
+	}
+	return preview, nil
 }
 
 func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, phase string, input OAuthProviderDecision) (*OAuthProviderRedirect, error) {
@@ -282,8 +325,12 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 	if err != nil {
 		return nil, err
 	}
+	if input.Derived != nil && (b.attestor == nil || b.public == nil || phase != "consent" || input.Decision != "approve") {
+		return nil, ErrOAuthProviderDenied
+	}
 	var body any
 	var prepared *model.OAuthGrant
+	var attestation *model.OAuthIssueAttestation
 	suffix := "accept"
 	if input.Decision == "deny" {
 		if len(input.SelectedScopes) != 0 {
@@ -327,6 +374,16 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 		}
 	} else {
 		return nil, ErrOAuthProviderRequest
+	}
+	if input.Derived != nil {
+		consent := OAuthDerivedConsentContext{Issuer: prepared.Issuer,
+			ConsentRef: model.OAuthConsentRef(prepared.Issuer, prepared.ConsentRequestID),
+			ClientID:   prepared.ClientID, Scopes: slices.Clone(input.SelectedScopes), PolicyHash: prepared.PolicyHash,
+			QuotaLimit: input.Derived.QuotaLimit, ExpiresAt: input.Derived.ExpiresAt}
+		attestation, err = authorizeOAuthDerivedConsent(ctx, actor, consent, input.Derived.ProofToken)
+		if err != nil {
+			return nil, err
+		}
 	}
 	_, err = model.ConsumeAuthFlowWithActionWithContext(ctx, input.PreviewToken, model.AuthFlowMatch{
 		Purpose: model.AuthFlowPurposeOAuthProviderPreview, Provider: "hydra", Intent: phase, UserId: actor.UserID, SessionId: actor.SessionID,
@@ -406,7 +463,16 @@ func (b *OAuthProviderBridge) Decide(ctx context.Context, actor AuthIdentity, ph
 		}
 	}
 	if prepared != nil {
-		if err := model.ApproveOAuthGrant(ctx, prepared); err != nil {
+		if attestation != nil {
+			attestation.GrantRef = prepared.GrantRef
+			if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {
+				return nil, err
+			}
+			if !oauthDerivedConsentGrantMatches(prepared, attestation) || b.attestor.Append(ctx, *attestation) != nil {
+				return nil, ErrOAuthResourceUnavailable
+			}
+		}
+		if err := model.ApproveOAuthGrantWithIssueReservation(ctx, prepared, attestation != nil); err != nil {
 			return nil, oauthGrantError(err)
 		}
 	} else if _, _, err := currentOAuthProviderActor(ctx, actor); err != nil {

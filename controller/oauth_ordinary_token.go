@@ -13,8 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// CreateOAuthOrdinaryToken reveals a new ordinary key only in this response.
-func CreateOAuthOrdinaryToken(c *gin.Context) {
+// CreateOAuthAPIToken discloses a newly committed key once.
+func CreateOAuthAPIToken(c *gin.Context) {
 	access, ok := middleware.GetOAuthUserInfoAccess(c)
 	if !ok {
 		middleware.WriteOAuthResourceError(c, service.ErrOAuthInvalidToken, "tokens:write")
@@ -32,12 +32,14 @@ func CreateOAuthOrdinaryToken(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
 		return
 	}
-	token, err := access.CreateOrdinaryToken(c.Request.Context(), name)
+	token, err := access.CreateAPIToken(c.Request.Context(), name, c.Request.Header.Values("Idempotency-Key"))
 	if err != nil {
 		middleware.WriteOAuthResourceError(c, err, "tokens:write")
 		return
 	}
-	tokenAuditParams(c)["id"] = token.Id
-	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"id": token.Id, "name": token.Name, "key": token.Key}})
+	params := tokenAuditParams(c)
+	params["id"], params["derived"] = token.ID, token.Derived
+	params["receipt_only"] = token.Derived && token.Key == ""
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, token.Key != "")
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": token})
 }

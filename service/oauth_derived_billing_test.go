@@ -204,7 +204,7 @@ func newOAuthDerivedTextBillingFixture(t *testing.T, kind common.DatabaseType, d
 	require.NoError(t, model.InitOAuthCleanupStore(true))
 	now := time.Now().Unix()
 	h := strings.Repeat("a", 64)
-	u := model.User{Username: "charge", AffCode: "charge", Quota: 100, Status: common.UserStatusEnabled, AuthVersion: 1}
+	u := model.User{Username: "charge", AffCode: "charge", Quota: 100, Status: common.UserStatusEnabled, AuthVersion: 1, Setting: `{"billing_preference":"wallet_only"}`}
 	require.NoError(t, db.Create(&u).Error)
 	token := model.Token{UserId: u.Id, Key: "synthetic-unit-key", Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: now + 100}
 	require.NoError(t, db.Create(&token).Error)

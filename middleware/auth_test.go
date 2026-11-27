@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,9 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func setupDashboardAuthMiddlewareTest(t *testing.T) {
@@ -707,4 +710,59 @@ func TestDashboardSessionCacheRequiresSQLFreshness(t *testing.T) {
 			assert.Equal(t, want, response.Code, response.Body.String())
 		})
 	}
+}
+
+func TestOAuthFirstKeyRelayRevocation(t *testing.T) {
+	dsn := os.Getenv("NEWAPI_FIRST_KEY_RELAY_DSN")
+	if dsn == "" {
+		t.Skip("requires the isolated first-key PostgreSQL fixture")
+	}
+	require.NoError(t, i18n.Init())
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	pool, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, pool.Close()) })
+	var target string
+	require.NoError(t, db.Raw("SELECT current_database()").Row().Scan(&target))
+	require.Regexp(t, "^h29_key_[a-z0-9_]+$", target)
+	priorDB, priorKind, redis, master := model.DB, common.MainDatabaseType(), common.RedisEnabled, common.IsMasterNode
+	t.Cleanup(func() {
+		model.DB, common.RedisEnabled, common.IsMasterNode = priorDB, redis, master
+		common.SetMainDatabaseType(priorKind)
+	})
+	model.DB, common.RedisEnabled, common.IsMasterNode = db, false, false
+	common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
+	t.Setenv("SQL_DSN", dsn)
+	t.Setenv("OAUTH_PROTECTED_SOURCE_OPS", "true")
+	require.NoError(t, model.InitOAuthGrantStore(true))
+	var source model.OAuthDerivedTokenSource
+	require.NoError(t, db.Where("user_id = ? AND token_id IS NOT NULL AND terminal_at IS NULL", 1).First(&source).Error)
+	require.NotNil(t, source.TokenID)
+	var key model.Token
+	require.NoError(t, db.First(&key, *source.TokenID).Error)
+	var actor model.User
+	require.NoError(t, db.First(&actor, key.UserId).Error)
+	setting := actor.GetSetting()
+	setting.BillingPreference = "wallet_only"
+	actor.SetSetting(setting)
+	require.NoError(t, db.Model(&actor).Update("setting", actor.Setting).Error)
+	_, err = model.GetTokenKeysByIds([]int{key.Id}, key.UserId)
+	require.ErrorIs(t, err, model.ErrOAuthDerivedTokenOwnerAction)
+	router := gin.New()
+	router.POST("/v1/chat/completions", TokenAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	call := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"fixture"}],"max_tokens":16}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer sk-"+key.Key)
+		router.ServeHTTP(response, req)
+		return response
+	}
+	require.Equal(t, http.StatusNoContent, call().Code)
+	require.NoError(t, model.RevokeOAuth(t.Context(), key.UserId, "grant", source.GrantRef))
+	response := call()
+	require.Equal(t, http.StatusUnauthorized, response.Code)
+	require.Contains(t, response.Body.String(), "token_disabled")
 }

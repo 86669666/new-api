@@ -49,6 +49,7 @@ type OAuthUserInfoResource struct {
 	clients        []string
 	client         *http.Client
 	grantsRequired bool
+	firstKeyIssuer *model.OAuthFirstKeyIssuer
 }
 
 // OAuthResourceIdentity is deliberately separate from AuthIdentity. It cannot
@@ -431,9 +432,11 @@ func (a *OAuthUserInfoAccess) RequireOrdinaryTokenWriteScope() error {
 	return nil
 }
 
-// CreateOrdinaryToken uses normal token management. OAuth revocation does not
-// revoke this key; it is not a protected derived credential or issuance permit.
-func (a *OAuthUserInfoAccess) CreateOrdinaryToken(ctx context.Context, name string) (*model.Token, error) {
+var ErrOAuthIssueIdempotency = errors.New("a valid Idempotency-Key is required")
+
+// CreateAPIToken selects the mode from the verified grant and the protected
+// source. A reserved grant cannot reach the ordinary key creation path.
+func (a *OAuthUserInfoAccess) CreateAPIToken(ctx context.Context, name string, keys []string) (*model.OAuthIssuedKey, error) {
 	if err := a.RequireOrdinaryTokenWriteScope(); err != nil {
 		return nil, err
 	}
@@ -443,6 +446,33 @@ func (a *OAuthUserInfoAccess) CreateOrdinaryToken(ctx context.Context, name stri
 	}
 	if identity.expiresAt != a.identity.expiresAt || identity.notBefore != a.identity.notBefore || identity.userID != a.identity.userID || identity.authVersion != a.identity.authVersion || identity.issuer != a.identity.issuer || identity.clientID != a.identity.clientID || identity.grantID != a.identity.grantID || identity.grantExpiresAt != a.identity.grantExpiresAt || identity.grantRevision != a.identity.grantRevision || !sameOAuthProviderSet(identity.scopes, a.identity.scopes) {
 		return nil, ErrOAuthInvalidToken
+	}
+	// Grant-bound issuance permits may only be used for limited derived keys.
+	reserved, err := model.OAuthGrantHasIssueReservation(ctx, model.OAuthGrantRef(identity.issuer, identity.grantID))
+	if err != nil {
+		return nil, ErrOAuthResourceUnavailable
+	}
+	if reserved {
+		if a.resource.firstKeyIssuer == nil {
+			return nil, ErrOAuthResourceUnavailable
+		}
+		if len(keys) != 1 || len(keys[0]) == 0 || len(keys[0]) > 128 {
+			return nil, ErrOAuthIssueIdempotency
+		}
+		for _, ch := range keys[0] {
+			if ch < 0x21 || ch > 0x7e || ch == ',' {
+				return nil, ErrOAuthIssueIdempotency
+			}
+		}
+		result, err := a.resource.firstKeyIssuer.Issue(ctx, oauthGrantClaims(identity, false), identity.grantRevision, name, keys[0])
+		switch {
+		case err == nil:
+			return result, nil
+		case errors.Is(err, model.ErrOAuthIssueConflict), errors.Is(err, model.ErrOAuthIssueLimit), errors.Is(err, model.ErrOAuthIssueClosed):
+			return nil, err
+		default:
+			return nil, oauthGrantError(err)
+		}
 	}
 	key, err := common.GenerateKey()
 	if err != nil {
@@ -456,5 +486,5 @@ func (a *OAuthUserInfoAccess) CreateOrdinaryToken(ctx context.Context, name stri
 	if err := token.Insert(); err != nil {
 		return nil, ErrOAuthResourceUnavailable
 	}
-	return token, nil
+	return &model.OAuthIssuedKey{ID: token.Id, Name: token.Name, Key: token.Key}, nil
 }

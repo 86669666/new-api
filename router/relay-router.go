@@ -13,6 +13,10 @@ import (
 )
 
 func SetRelayRouter(router *gin.Engine) {
+	setRelayRouter(router, nil)
+}
+
+func setRelayRouter(router *gin.Engine, textPolicy *relay.OAuthDerivedTextPolicy) {
 	router.Use(middleware.CORS())
 	router.Use(middleware.DecompressRequestMiddleware())
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
@@ -102,9 +106,7 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/completions", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAI)
 		})
-		httpRouter.POST("/chat/completions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
-		})
+		httpRouter.POST("/chat/completions", controller.OpenAIChatCompletions(textPolicy))
 
 		// response related routes
 		httpRouter.POST("/responses/compact", func(c *gin.Context) {

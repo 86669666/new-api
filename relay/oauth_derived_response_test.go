@@ -126,7 +126,7 @@ func TestConsumeOAuthDerivedTextResponse(t *testing.T) {
 			}
 			calls := 0
 			var finalizedContext context.Context
-			err := consumeOAuthDerivedTextResponseWithFinalizer(ctx, ref, resp, writer, func(settleCtx context.Context, gotRef string, rawUsage []byte) (*model.OAuthDerivedTextCharge, error) {
+			err := consumeOAuthDerivedTextResponseWithFinalizer(ctx, ref, "", resp, writer, func(settleCtx context.Context, gotRef string, rawUsage []byte) (*model.OAuthDerivedTextCharge, error) {
 				calls++
 				finalizedContext = settleCtx
 				require.Empty(t, writer.events, "no success headers/status/body before finalization returns")
@@ -188,7 +188,7 @@ func TestConsumeOAuthDerivedTextResponseFinalizerDeadline(t *testing.T) {
 		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: body, ContentLength: -1}
 		writer := &oauthConsumerWriter{recorder: httptest.NewRecorder()}
 		calls := 0
-		err := consumeOAuthDerivedTextResponseWithFinalizer(context.Background(), "receipt", resp, writer, func(ctx context.Context, ref string, _ []byte) (*model.OAuthDerivedTextCharge, error) {
+		err := consumeOAuthDerivedTextResponseWithFinalizer(context.Background(), "receipt", "", resp, writer, func(ctx context.Context, ref string, _ []byte) (*model.OAuthDerivedTextCharge, error) {
 			calls++
 			deadline, ok := ctx.Deadline()
 			require.True(t, ok)
@@ -406,7 +406,7 @@ func TestConsumeOAuthDerivedTextResponsePersistentSettlement(t *testing.T) {
 						assert.Equal(t, 13, committedToken.UsedQuota)
 					}}
 					// Actual default entry: real reader -> real service Finalize -> SQL commit.
-					err = consumeOAuthDerivedTextResponse(ctx, callRef, resp, writer)
+					err = consumeOAuthDerivedTextResponse(ctx, callRef, "", resp, writer)
 					assert.Equal(t, 1, body.closes)
 					if name == "settled_before_output" {
 						require.NoError(t, err)

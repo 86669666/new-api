@@ -98,6 +98,17 @@ func CalculateOAuthDerivedTextQuota(f model.OAuthTextFacts, rawUsage []byte) (in
 // Historical obligations survive admission closure. Actual is recomputed from
 // persisted price facts and raw usage, never accepted as a caller-supplied price.
 func FinalizeOAuthDerivedText(ctx context.Context, ref string, rawUsage []byte) (*model.OAuthDerivedTextCharge, error) {
+	return finalizeOAuthDerivedText(ctx, ref, rawUsage, false)
+}
+
+// FinalizeSelectedOAuthDerivedText also enforces the hard completion limit
+// attached to the selected HTTP wire request. Generation outside that limit
+// leaves the claimed receipt available for reconciliation.
+func FinalizeSelectedOAuthDerivedText(ctx context.Context, ref string, rawUsage []byte) (*model.OAuthDerivedTextCharge, error) {
+	return finalizeOAuthDerivedText(ctx, ref, rawUsage, true)
+}
+
+func finalizeOAuthDerivedText(ctx context.Context, ref string, rawUsage []byte, enforceCompletionLimit bool) (*model.OAuthDerivedTextCharge, error) {
 	charge, err := model.ReadOAuthDerivedTextCharge(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -109,6 +120,9 @@ func FinalizeOAuthDerivedText(ctx context.Context, ref string, rawUsage []byte) 
 	actual, usage, err := CalculateOAuthDerivedTextQuota(f, rawUsage)
 	if err != nil {
 		return nil, err
+	}
+	if enforceCompletionLimit && usage.Completion > f.MaxCompletion {
+		return nil, model.ErrOAuthTextCharge
 	}
 	return model.FinalizeOAuthDerivedTextSnapshot(ctx, ref, actual, usage, charge.Fingerprint)
 }

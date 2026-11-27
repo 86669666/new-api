@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"slices"
@@ -169,7 +170,7 @@ func CreateOAuthGrantWithTx(tx *gorm.DB, grant *OAuthGrant) error {
 	}
 	now := time.Now().Unix()
 	grant.GrantRef = OAuthGrantRef(grant.Issuer, grant.GrantID)
-	grant.ConsentRef = fmt.Sprintf("%x", sha256.Sum256([]byte("newapi.oauth.consent.v1\x00"+grant.Issuer+"\x00"+grant.ConsentRequestID)))
+	grant.ConsentRef = OAuthConsentRef(grant.Issuer, grant.ConsentRequestID)
 	grant.State, grant.Revision, grant.CreatedAt = "prepared", 1, now
 	grant.ExpiresAt = min(now+7*24*60*60, session.ExpiresAt)
 	if grant.ExpiresAt <= now {
@@ -183,32 +184,53 @@ func CreateOAuthGrantWithTx(tx *gorm.DB, grant *OAuthGrant) error {
 // are read again under locks. SQLite takes its writer reservation before reads
 // so it cannot authorize from a stale snapshot after a concurrent logout.
 func withCurrentOAuthGrant(ctx context.Context, ref string, userID int, action func(*gorm.DB, *User, *UserSession, *OAuthGrant) error) error {
-	if DB == nil {
+	return withCurrentOAuthGrantOn(ctx, DB, ref, userID, false, action)
+}
+
+func withCurrentOAuthGrantOn(ctx context.Context, db *gorm.DB, ref string, userID int, issue bool, action func(*gorm.DB, *User, *UserSession, *OAuthGrant) error) error {
+	if db == nil {
 		return errors.New("OAuth grant database unavailable")
 	}
 	var seed OAuthGrant
-	if err := DB.WithContext(ctx).Where("grant_ref = ?", ref).First(&seed).Error; err != nil {
+	if err := db.WithContext(ctx).Where("grant_ref = ?", ref).First(&seed).Error; err != nil {
 		return err
 	}
 	if seed.UserID != userID {
 		return ErrOAuthGrantInvalid
 	}
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	var options []*sql.TxOptions
+	if issue {
+		options = append(options, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := func() *gorm.DB { return lockForUpdate(tx) }
+		if issue {
+			if err := lockOAuthIssueGrant(tx, ref, userID); err != nil {
+				return err
+			}
+			query = func() *gorm.DB { return tx.Session(&gorm.Session{}) }
+		}
 		if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 			if err := tx.Model(&User{}).Where("id = ?", userID).UpdateColumn("auth_version", gorm.Expr("auth_version")).Error; err != nil {
 				return err
 			}
 		}
+		userFields := []string{"id", "username", "display_name", "email", "group", "status", "auth_version", "quota", "used_quota", "setting"}
+		sessionQuery := query()
+		if issue {
+			userFields = []string{"id", "status", "auth_version"}
+			sessionQuery = sessionQuery.Select("sid", "user_id", "status", "revoked_at", "expires_at", "version", "user_auth_version")
+		}
 		var user User
-		if err := lockForUpdate(tx).Select("id", "username", "display_name", "email", "group", "status", "auth_version", "quota", "used_quota").First(&user, userID).Error; err != nil {
+		if err := query().Select(userFields).First(&user, userID).Error; err != nil {
 			return err
 		}
 		var session UserSession
-		if err := lockForUpdate(tx).Where("sid = ? AND user_id = ?", seed.OriginSID, userID).First(&session).Error; err != nil {
+		if err := sessionQuery.Where("sid = ? AND user_id = ?", seed.OriginSID, userID).First(&session).Error; err != nil {
 			return err
 		}
 		var grant OAuthGrant
-		if err := lockForUpdate(tx).Where("grant_ref = ?", ref).First(&grant).Error; err != nil {
+		if err := query().Where("grant_ref = ?", ref).First(&grant).Error; err != nil {
 			return err
 		}
 		now := time.Now().Unix()
@@ -219,11 +241,15 @@ func withCurrentOAuthGrant(ctx context.Context, ref string, userID int, action f
 			return err
 		}
 		return action(tx, &user, &session, &grant)
-	})
+	}, options...)
 }
 
 // ApproveOAuthGrant atomically couples the final actor check to approval.
 func ApproveOAuthGrant(ctx context.Context, prepared *OAuthGrant) error {
+	return ApproveOAuthGrantWithIssueReservation(ctx, prepared, false)
+}
+
+func ApproveOAuthGrantWithIssueReservation(ctx context.Context, prepared *OAuthGrant, reserve bool) error {
 	return withCurrentOAuthGrant(ctx, prepared.GrantRef, prepared.UserID, func(tx *gorm.DB, _ *User, _ *UserSession, grant *OAuthGrant) error {
 		if *grant != *prepared || grant.State != "prepared" {
 			return ErrOAuthGrantInvalid
@@ -235,6 +261,9 @@ func ApproveOAuthGrant(ctx context.Context, prepared *OAuthGrant) error {
 		}
 		if result.RowsAffected != 1 {
 			return ErrOAuthGrantInvalid
+		}
+		if reserve {
+			return reserveAttestedOAuthSource(tx, grant)
 		}
 		return nil
 	})
@@ -258,18 +287,24 @@ type OAuthGrantSnapshot struct {
 	SourceSessionExpiresAt int64
 }
 
+func oauthGrantMatchesClaims(grant *OAuthGrant, claims OAuthGrantAuthorization, now int64) bool {
+	var scopes []string
+	if grant.Issuer != claims.Issuer || grant.GrantID != claims.GrantID || grant.ClientID != claims.ClientID || grant.Subject != claims.Subject || grant.UserAuthVersion != claims.AuthVersion || grant.ExpiresAt != claims.GrantExpiresAt || claims.TokenExpiresAt <= now || claims.NotBefore > now || common.UnmarshalJsonStr(grant.Scopes, &scopes) != nil {
+		return false
+	}
+	expected := slices.Clone(claims.Scopes)
+	slices.Sort(expected)
+	slices.Sort(scopes)
+	if !slices.Equal(scopes, expected) {
+		return false
+	}
+	return true
+}
+
 func AuthorizeOAuthGrant(ctx context.Context, claims OAuthGrantAuthorization) (*OAuthGrantSnapshot, error) {
 	var snapshot *OAuthGrantSnapshot
 	err := withCurrentOAuthGrant(ctx, OAuthGrantRef(claims.Issuer, claims.GrantID), claims.UserID, func(tx *gorm.DB, user *User, session *UserSession, grant *OAuthGrant) error {
-		var scopes []string
-		now := time.Now().Unix()
-		if grant.Issuer != claims.Issuer || grant.GrantID != claims.GrantID || grant.ClientID != claims.ClientID || grant.Subject != claims.Subject || grant.UserAuthVersion != claims.AuthVersion || grant.ExpiresAt != claims.GrantExpiresAt || claims.TokenExpiresAt <= now || claims.NotBefore > now || common.UnmarshalJsonStr(grant.Scopes, &scopes) != nil {
-			return ErrOAuthGrantInvalid
-		}
-		expected := slices.Clone(claims.Scopes)
-		slices.Sort(expected)
-		slices.Sort(scopes)
-		if !slices.Equal(scopes, expected) {
+		if !oauthGrantMatchesClaims(grant, claims, time.Now().Unix()) {
 			return ErrOAuthGrantInvalid
 		}
 		if claims.Activate {

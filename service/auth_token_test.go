@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -181,4 +182,54 @@ func TestSecurityProofBindsAccessTokenSession(t *testing.T) {
 		_, err = verifySecurityProof(proof, other, binding)
 		assert.ErrorIs(t, err, ErrAuthTokenInvalid, sessionID)
 	}
+}
+
+func TestOAuthDerivedConsentUsesBoundSecurityProof(t *testing.T) {
+	user := setupAuthSessionTestDB(t)
+	useTestSessionSecret(t)
+	t.Setenv("OAUTH_DERIVED_ATTESTOR_DSN", "enabled-for-proof-test")
+	passwordLoginEnabled, encrypted := common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled
+	common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled = true, false
+	t.Cleanup(func() {
+		common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled = passwordLoginEnabled, encrypted
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}))
+	password := "local-fixture-password"
+	hash, err := common.Password2Hash(password)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(user).Update("password", hash).Error)
+	now := time.Now().Unix()
+	session := model.UserSession{SID: "fixture-session", UserID: user.Id, UserAuthVersion: 1, Version: 1,
+		Status: model.UserSessionStatusActive, ExpiresAt: now + 3600}
+	require.NoError(t, model.DB.Create(&session).Error)
+	actor := AuthIdentity{UserID: user.Id, SessionID: session.SID, UserAuthVersion: 1, SessionVersion: 1}
+	consent := OAuthDerivedConsentContext{Issuer: "https://issuer.invalid/", ClientID: "fixture-client",
+		ConsentRef: model.OAuthConsentRef("https://issuer.invalid/", "one"), PolicyHash: strings.Repeat("b", 64),
+		Scopes: []string{"tokens:write", "profile"}, QuotaLimit: 100, ExpiresAt: now + 1200}
+	raw, err := common.Marshal(consent)
+	require.NoError(t, err)
+	input := VerificationInput{Scope: VerificationScopeOAuthDerivedIssue, Context: raw, Method: VerificationMethodPassword}
+	input.Password = "incorrect-fixture-password"
+	_, err = VerifySecurityInput(actor, input)
+	require.ErrorIs(t, err, ErrVerificationFailed)
+	input.Password = password
+	proof, err := VerifySecurityInput(actor, input)
+	require.NoError(t, err)
+	ctx := t.Context()
+	wrong := consent
+	wrong.QuotaLimit++
+	_, err = authorizeOAuthDerivedConsent(ctx, actor, wrong, proof.ProofToken)
+	require.ErrorIs(t, err, ErrOAuthProviderDenied)
+	wrong = consent
+	wrong.ConsentRef = model.OAuthConsentRef(consent.Issuer, "other")
+	_, err = authorizeOAuthDerivedConsent(ctx, actor, wrong, proof.ProofToken)
+	require.ErrorIs(t, err, ErrOAuthProviderDenied)
+	got, err := authorizeOAuthDerivedConsent(ctx, actor, consent, proof.ProofToken)
+	require.NoError(t, err)
+	require.Equal(t, consent.ConsentRef, got.ConsentRef)
+	require.Equal(t, `["profile","tokens:write"]`, got.Scopes)
+	require.Equal(t, proof.ExpiresAt, got.ProofExpiresAt)
+	require.Positive(t, got.ProofFlowID)
+	_, err = authorizeOAuthDerivedConsent(ctx, actor, consent, proof.ProofToken)
+	require.ErrorIs(t, err, ErrOAuthProviderDenied)
 }

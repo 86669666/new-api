@@ -367,7 +367,17 @@ def check_oauth_ordinary_token(api, source_root):
     assert operation['x-query-policy'] == 'forbidden'
     assert path['get']['x-required-scopes'] == ['tokens:read']
     assert 'OAuth revocation does NOT reclaim' in operation['description']
-    assert operation['responses']['200']['content']['application/json']['schema'] == {'$ref': '#/components/schemas/OAuthOrdinaryTokenResult'}
+    success = operation['responses']['200']['content']['application/json']['schema']
+    assert success == {'oneOf': [
+        {'$ref': '#/components/schemas/OAuthOrdinaryTokenResult'},
+        {'$ref': '#/components/schemas/OAuthDerivedTokenIssueResult'},
+    ]}
+    assert operation['parameters'][0]['name'] == 'Idempotency-Key'
+    assert '409' in operation['responses']
+    ordinary = {'success': True, 'data': {'id': 1, 'name': 'example', 'key': 'synthetic-key'}}
+    receipt = {'success': True, 'data': {'id': 2, 'name': 'example', 'derived': True, 'quota_limit': 10, 'expires_at': 100}}
+    for response in [ordinary, receipt, {**receipt, 'data': {**receipt['data'], 'key': 'synthetic-key'}}]:
+        validate_value(api, success, response)
     request = api['components']['schemas']['OAuthOrdinaryTokenRequest']
     assert request['additionalProperties'] is False and set(request['properties']) == {'name'}
     validate_value(api, request, {'name': 'personal model key'})
@@ -375,8 +385,8 @@ def check_oauth_ordinary_token(api, source_root):
         assert list(OAS30Validator(request).iter_errors(invalid)), 'invalid ordinary-key request accepted'
     source = (source_root / 'controller/oauth_ordinary_token.go').read_text()
     assert 'common.ValidateStrictJSONObject(data)' in source and 'len(name) > 30' in source
-    assert 'CreateOrdinaryToken(c.Request.Context(), name)' in source
-    assert 'controller.CreateOAuthOrdinaryToken(c)' in (source_root / 'router/oauth_resource_router.go').read_text()
+    assert 'CreateAPIToken(c.Request.Context(), name, c.Request.Header.Values' in source
+    assert 'controller.CreateOAuthAPIToken(c)' in (source_root / 'router/oauth_resource_router.go').read_text()
     return {'post': True, 'metadata_get_unchanged': True, 'ordinary_lifecycle': True, 'live': False}
 
 

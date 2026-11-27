@@ -50,6 +50,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "db-bootstrap" {
 		os.Exit(model.RunOAuthDatabaseBootstrap(os.Args[2:], os.Stdout))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "oauth-text-reconcile" {
+		os.Exit(model.RunOAuthTextReconcile(os.Args[2:], os.Stdout))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "plugin" {
 		os.Exit(jsplugin.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
@@ -345,6 +348,9 @@ func InitResources() error {
 		return err
 	}
 	if err := service.InitOAuthGrantStore(); err != nil {
+		return err
+	}
+	if err := service.InitOAuthDerivedConsentAttestor(); err != nil {
 		return err
 	}
 	if err := model.ValidateSessionRevocationStore(); err != nil {

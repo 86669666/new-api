@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"encoding/json"
 	"errors"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -286,6 +287,12 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 			return VerificationBinding{}, ErrVerificationContextInvalid
 		}
 		normalized = context
+	case VerificationScopeOAuthDerivedIssue:
+		var context OAuthDerivedConsentContext
+		if len(fields) != 7 || common.UnmarshalStrictObject(operation.Context, &context) != nil || !context.normalize() {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
 	case VerificationScopeOAuthAppRevoke:
 		var context OAuthAppRevokeContext
 		if len(fields) != 1 || common.Unmarshal(operation.Context, &context) != nil || !validOAuthClientIDProof(context.ClientID) {
@@ -363,6 +370,10 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 	}
 	switch scope {
 	case VerificationScopeChannelKeyRead, VerificationScopePasskeyDelete, VerificationScopeLogin:
+	case VerificationScopeOAuthDerivedIssue:
+		if len(methods) == 0 && state.HasPassword && common.PasswordLoginEnabled {
+			methods = []string{VerificationMethodPassword}
+		}
 	case VerificationScopeTwoFADisable, VerificationScopeTwoFABackupCodes:
 		if !state.HasTwoFA {
 			return nil, model.ErrTwoFANotEnabled
@@ -416,7 +427,8 @@ func GetVerificationRequirementsWithContext(ctx context.Context, identity AuthId
 	if IsOrganizationScope(scope) {
 		return OrganizationVerificationRequirementsWithContext(ctx, identity, scope)
 	}
-	if scope == VerificationScopeLogin {
+	if scope == VerificationScopeLogin ||
+		scope == VerificationScopeOAuthDerivedIssue && os.Getenv("OAUTH_DERIVED_ATTESTOR_DSN") == "" {
 		return nil, ErrProofScope
 	}
 	state, err := model.GetUserVerificationState(identity.UserID)

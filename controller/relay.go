@@ -113,8 +113,20 @@ func bindToolsSearchLegacyPrice(info *relaycommon.RelayInfo) error {
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+	relayWithTextPolicy(c, relayFormat, nil)
+}
+
+func OpenAIChatCompletions(policy *relay.OAuthDerivedTextPolicy) gin.HandlerFunc {
+	if policy != nil {
+		frozen := *policy
+		policy = &frozen
+	}
+	return func(c *gin.Context) { relayWithTextPolicy(c, types.RelayFormatOpenAI, policy) }
+}
+
+func relayWithTextPolicy(c *gin.Context, relayFormat types.RelayFormat, policy *relay.OAuthDerivedTextPolicy) {
 	if kind, _, _ := middleware.OAuthTokenPrincipal(c); kind != model.OAuthDerivedTokenManualProven && !middleware.HasPlaygroundRelayPrincipal(c) {
-		relay.HandleOAuthDerivedSelectedText(c, relayFormat)
+		relay.HandleOAuthDerivedSelectedText(c, relayFormat, policy)
 		return
 	}
 

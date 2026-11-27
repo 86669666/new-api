@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -30,7 +31,7 @@ import (
 // CalculateOAuthDerivedTextQuota and confirm durable settlement before output.
 // Only one assistant text choice is supported; unknown response fields fail
 // closed. Content-Length never controls allocation or the read limit.
-func ReadOAuthDerivedTextResponse(resp *http.Response) (body, rawUsage []byte, err error) {
+func ReadOAuthDerivedTextResponse(resp *http.Response, selectedModel string) (body, rawUsage []byte, err error) {
 	invalid := errors.New("invalid OAuth derived text response")
 	if resp == nil || resp.Body == nil {
 		return nil, nil, invalid
@@ -62,7 +63,7 @@ func ReadOAuthDerivedTextResponse(resp *http.Response) (body, rawUsage []byte, e
 	}
 	const limit = 8 << 20
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if readErr != nil || len(body) > limit || resp.ContentLength >= 0 && resp.ContentLength != int64(len(body)) {
+	if readErr != nil || len(body) > limit || !utf8.Valid(body) || resp.ContentLength >= 0 && resp.ContentLength != int64(len(body)) {
 		return nil, nil, invalid
 	}
 	fields, decodeErr := common.DecodeRawJSONObject(body)
@@ -79,6 +80,9 @@ func ReadOAuthDerivedTextResponse(resp *http.Response) (body, rawUsage []byte, e
 	for _, key := range []string{"id", "object", "model"} {
 		var value string
 		if common.Unmarshal(fields[key], &value) != nil || value == "" || key == "object" && value != "chat.completion" {
+			return nil, nil, invalid
+		}
+		if key == "model" && selectedModel != "" && value != selectedModel {
 			return nil, nil, invalid
 		}
 	}
