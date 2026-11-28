@@ -43,6 +43,7 @@ import {
   type OrganizationMember,
 } from './api'
 import { OrganizationInvitationSlotsCard } from './organization-invitation-slots-card'
+import { OrganizationWalletSummary } from './organization-wallet-summary'
 import { useRemoveMember } from './use-remove-member'
 
 type OrganizationDetailsProps = {
@@ -318,6 +319,15 @@ function OrganizationDetails(props: OrganizationDetailsProps) {
           <Badge variant='secondary'>{roles[data.detail.my_role]}</Badge>
         </div>
       )}
+      {data &&
+        (data.detail.my_role === 'owner' ||
+          data.detail.my_role === 'admin') && (
+          <OrganizationWalletSummary
+            actorId={props.actorId}
+            sid={props.sid}
+            orgId={props.orgId}
+          />
+        )}
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <h4 className='font-medium'>{t('Organization members')}</h4>
         <Button

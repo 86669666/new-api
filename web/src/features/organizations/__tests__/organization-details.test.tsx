@@ -200,6 +200,17 @@ function payload(config: InternalAxiosRequestConfig) {
     }
   }
   if (config.url?.endsWith('/members')) return members()
+  if (config.url?.endsWith('/wallet')) {
+    return {
+      success: true,
+      data: {
+        organization_id: config.url.split('/').at(-2),
+        balance: '25000',
+        reserved: '0',
+        available: '25000',
+      },
+    }
+  }
   return detail(config.url?.split('/').at(-1))
 }
 async function openOrganization(name = 'Org A') {
@@ -1967,4 +1978,26 @@ test('mixed-case HTTP Retry-After headers retain only their primitive delta', ()
   })
   expect(error.retryAfter).toBe(12)
   assertSafeGraph(error, [headers])
+})
+
+test('owners see the selected organization wallet while ordinary members do not', async () => {
+  handler = async (config) =>
+    response(
+      config,
+      config.url === `/api/organizations/${orgId}`
+        ? detail(orgId, 'owner')
+        : payload(config)
+    )
+  show()
+  const owned = await openOrganization()
+  const wallet = await within(owned).findByRole('region', {
+    name: 'Organization wallet',
+  })
+  expect(await within(wallet).findByText('Available')).toBeVisible()
+  await userEvent.click(within(owned).getByRole('button', { name: 'Close' }))
+  const member = await openOrganization('Org B')
+  await within(member).findByText('alice')
+  expect(
+    within(member).queryByRole('region', { name: 'Organization wallet' })
+  ).not.toBeInTheDocument()
 })
