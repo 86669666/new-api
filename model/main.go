@@ -371,6 +371,7 @@ func migrateDB() error {
 		&OrganizationCreationRequest{},
 		&OrganizationWallet{},
 		&OrganizationWalletEntry{},
+		&OrganizationCharge{},
 		&UserSession{},
 		&SessionRevocationEvent{},
 		&OAuthDerivedTextCharge{},
