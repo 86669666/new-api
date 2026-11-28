@@ -104,7 +104,7 @@ func RecheckOrganizationTaskListAccessWithContext(ctx context.Context, identity 
 // ReadOrganizationTaskWithContext binds every lookup to an internal row ID and
 // current organization authority. Repeated delivery checks use this same path;
 // neither public task IDs nor cached membership can authorize a response.
-func ReadOrganizationTaskWithContext(ctx context.Context, identity AuthSessionIdentity, orgID, taskRowID int64) (*Task, int, error) {
+func ReadOrganizationTaskWithContext(ctx context.Context, identity AuthSessionIdentity, orgID, taskRowID int64, statusOnly bool) (*Task, int, error) {
 	if orgID <= 0 || taskRowID <= 0 {
 		return nil, 0, ErrOrganizationInvalidInput
 	}
@@ -131,7 +131,9 @@ func ReadOrganizationTaskWithContext(ctx context.Context, identity AuthSessionId
 			}
 			return err
 		}
-		if !task.ResultRetrievable() {
+		settledStatus := statusOnly && !task.PrivateData.ResultDiscarded && task.BillingProtocol == OrganizationTaskBillingProtocol &&
+			task.BillingState == TaskBillingSettled && (task.Status == TaskStatusSuccess || task.Status == TaskStatusFailure)
+		if !task.ResultRetrievable() && !settledStatus {
 			return ErrOrganizationNotFound
 		}
 		_, err := validateOrganizationIdentity(s.tx, identity, organizationNow().Unix())
