@@ -98,23 +98,33 @@ func withOrganizationChargeAdmission(ctx context.Context, actor AuthSessionIdent
 func ReserveOrganizationCharge(ctx context.Context, actor AuthSessionIdentity, req OrganizationChargeRequest) (OrganizationCharge, error) {
 	var result OrganizationCharge
 	err := withOrganizationChargeAdmission(ctx, actor, req, func(s *organizationState, wallet *OrganizationWallet, charge *OrganizationCharge) error {
-		if charge.ID == 0 {
-			if wallet.ID == 0 || wallet.Balance-wallet.Reserved < charge.Reserved {
-				return ErrOrganizationChargeFunds
-			}
-			now := organizationNow().Unix()
-			if err := writeOrganizationChargeWallet(s.tx, wallet, wallet.Balance, wallet.Reserved+charge.Reserved, now); err != nil {
-				return err
-			}
-			charge.State, charge.CreatedAt = OrganizationChargeReserved, now
-			if err := s.tx.Create(charge).Error; err != nil {
-				return err
-			}
+		if err := requireStandaloneOrganizationCharge(s.tx, charge.ID); err != nil {
+			return err
+		}
+		if err := reserveOrganizationCharge(s, wallet, charge); err != nil {
+			return err
 		}
 		result = *charge
 		return nil
 	})
 	return result, err
+}
+
+func reserveOrganizationCharge(s *organizationState, wallet *OrganizationWallet, charge *OrganizationCharge) error {
+	if charge.ID == 0 {
+		if wallet.ID == 0 || wallet.Balance-wallet.Reserved < charge.Reserved {
+			return ErrOrganizationChargeFunds
+		}
+		now := organizationNow().Unix()
+		if err := writeOrganizationChargeWallet(s.tx, wallet, wallet.Balance, wallet.Reserved+charge.Reserved, now); err != nil {
+			return err
+		}
+		charge.State, charge.CreatedAt = OrganizationChargeReserved, now
+		if err := s.tx.Create(charge).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DispatchOrganizationCharge returns a one-use permission only after commit.
@@ -123,25 +133,37 @@ func DispatchOrganizationCharge(ctx context.Context, actor AuthSessionIdentity, 
 	var result OrganizationCharge
 	var granted bool
 	err := withOrganizationChargeAdmission(ctx, actor, req, func(s *organizationState, wallet *OrganizationWallet, charge *OrganizationCharge) error {
-		if charge.ID == 0 {
-			return ErrOrganizationNotFound
+		if err := requireStandaloneOrganizationCharge(s.tx, charge.ID); err != nil {
+			return err
 		}
-		if charge.State == OrganizationChargeReserved {
-			if wallet.Reserved < charge.Reserved {
-				return ErrOrganizationConflict
-			}
-			now := organizationNow().Unix()
-			if err := organizationCAS(s.tx.Model(&OrganizationCharge{}).Where("id = ? AND state = ?", charge.ID, charge.State).
-				Updates(map[string]any{"state": OrganizationChargeDispatched, "dispatched_at": now})); err != nil {
-				return err
-			}
-			charge.State, charge.DispatchedAt = OrganizationChargeDispatched, now
-			granted = true
+		var err error
+		granted, err = dispatchOrganizationCharge(s.tx, wallet, charge)
+		if err != nil {
+			return err
 		}
 		result = *charge
 		return nil
 	})
 	return result, granted && err == nil, err
+}
+
+func dispatchOrganizationCharge(tx *gorm.DB, wallet *OrganizationWallet, charge *OrganizationCharge) (bool, error) {
+	if charge.ID == 0 {
+		return false, ErrOrganizationNotFound
+	}
+	if charge.State != OrganizationChargeReserved {
+		return false, nil
+	}
+	if wallet.Reserved < charge.Reserved {
+		return false, ErrOrganizationConflict
+	}
+	now := organizationNow().Unix()
+	if err := organizationCAS(tx.Model(&OrganizationCharge{}).Where("id = ? AND state = ?", charge.ID, charge.State).
+		Updates(map[string]any{"state": OrganizationChargeDispatched, "dispatched_at": now})); err != nil {
+		return false, err
+	}
+	charge.State, charge.DispatchedAt = OrganizationChargeDispatched, now
+	return true, nil
 }
 
 func lockOrganizationChargeWallet(tx *gorm.DB, orgID int64) (*OrganizationWallet, error) {
@@ -187,12 +209,41 @@ func RefundSettledOrganizationCharge(ctx context.Context, binding OrganizationCh
 
 func transitionOrganizationCharge(ctx context.Context, binding OrganizationCharge, from, to string, actual int64) (OrganizationCharge, error) {
 	var result OrganizationCharge
+	err := withLockedOrganizationCharge(ctx, binding, func(tx *gorm.DB, org Organization, wallet *OrganizationWallet, charge *OrganizationCharge) error {
+		if err := requireStandaloneOrganizationCharge(tx, charge.ID); err != nil {
+			return err
+		}
+		if err := applyOrganizationChargeTransition(tx, org, wallet, charge, from, to, actual); err != nil {
+			return err
+		}
+		result = *charge
+		return nil
+	})
+	return result, err
+}
+
+// Task-linked charges must transition only with their task row.
+func requireStandaloneOrganizationCharge(tx *gorm.DB, chargeID int64) error {
+	if chargeID == 0 {
+		return nil
+	}
+	var count int64
+	if err := tx.Model(&Task{}).Where("billing_ref = ?", organizationTaskBillingRef(chargeID)).Count(&count).Error; err != nil {
+		return err
+	}
+	if count != 0 {
+		return ErrOrganizationConflict
+	}
+	return nil
+}
+
+func withLockedOrganizationCharge(ctx context.Context, binding OrganizationCharge, run func(*gorm.DB, Organization, *OrganizationWallet, *OrganizationCharge) error) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if binding.ID <= 0 || binding.OrganizationID <= 0 || binding.WalletID <= 0 || binding.Reserved <= 0 || binding.Reserved > common.MaxWalletQuota || actual < 0 || actual > binding.Reserved {
-		return result, ErrOrganizationInvalidInput
+	if binding.ID <= 0 || binding.OrganizationID <= 0 || binding.WalletID <= 0 || binding.Reserved <= 0 || binding.Reserved > common.MaxWalletQuota {
+		return ErrOrganizationInvalidInput
 	}
-	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// The primary SQLite writer must take its write lock before any read.
 		if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 			if err := tx.Model(&Organization{}).Where("id = ?", binding.OrganizationID).UpdateColumn("revision", gorm.Expr("revision")).Error; err != nil {
@@ -216,53 +267,57 @@ func transitionOrganizationCharge(ctx context.Context, binding OrganizationCharg
 			charge.QuotaPerUnit != binding.QuotaPerUnit || charge.Reserved != binding.Reserved {
 			return ErrOrganizationConflict
 		}
-		if to == OrganizationChargeSettled && (charge.QuotaPerUnit <= 0 || actual%charge.QuotaPerUnit != 0) {
-			return ErrOrganizationInvalidInput
-		}
-		if charge.State == to || to == OrganizationChargeSettled && charge.State == OrganizationChargeRefunded {
-			if to == OrganizationChargeSettled && charge.Actual != actual ||
-				to == OrganizationChargeReleased && (from == OrganizationChargeReserved) != (charge.DispatchedAt == 0) {
-				return ErrOrganizationConflict
-			}
-			result = charge
-			return nil
-		}
-		if charge.State != from {
+		return run(tx, org, wallet, &charge)
+	})
+}
+
+func applyOrganizationChargeTransition(tx *gorm.DB, org Organization, wallet *OrganizationWallet, charge *OrganizationCharge, from, to string, actual int64) error {
+	if actual < 0 || actual > charge.Reserved {
+		return ErrOrganizationInvalidInput
+	}
+	if to == OrganizationChargeSettled && (charge.QuotaPerUnit <= 0 || actual%charge.QuotaPerUnit != 0) {
+		return ErrOrganizationInvalidInput
+	}
+	if charge.State == to || to == OrganizationChargeSettled && charge.State == OrganizationChargeRefunded {
+		if to == OrganizationChargeSettled && charge.Actual != actual ||
+			to == OrganizationChargeReleased && (from == OrganizationChargeReserved) != (charge.DispatchedAt == 0) {
 			return ErrOrganizationConflict
 		}
-		if org.DissolvedAt != 0 {
-			return ErrOrganizationTerminal
-		}
+		return nil
+	}
+	if charge.State != from {
+		return ErrOrganizationConflict
+	}
+	if org.DissolvedAt != 0 {
+		return ErrOrganizationTerminal
+	}
 
-		now := organizationNow().Unix()
-		balance, reserved := wallet.Balance, wallet.Reserved
-		updates := map[string]any{"state": to}
-		switch to {
-		case OrganizationChargeSettled:
-			balance, reserved = balance-actual, reserved-charge.Reserved
-			charge.Actual, charge.SettledAt = actual, now
-			updates["actual"], updates["settled_at"] = actual, now
-		case OrganizationChargeReleased:
-			reserved -= charge.Reserved
-			charge.ReleasedAt, updates["released_at"] = now, now
-		case OrganizationChargeRefunded:
-			if charge.Actual < 0 || charge.Actual > charge.Reserved || balance > common.MaxWalletQuota-charge.Actual {
-				return ErrOrganizationConflict
-			}
-			balance += charge.Actual
-			charge.RefundedAt, updates["refunded_at"] = now, now
+	now := organizationNow().Unix()
+	balance, reserved := wallet.Balance, wallet.Reserved
+	updates := map[string]any{"state": to}
+	switch to {
+	case OrganizationChargeSettled:
+		balance, reserved = balance-actual, reserved-charge.Reserved
+		charge.Actual, charge.SettledAt = actual, now
+		updates["actual"], updates["settled_at"] = actual, now
+	case OrganizationChargeReleased:
+		reserved -= charge.Reserved
+		charge.ReleasedAt, updates["released_at"] = now, now
+	case OrganizationChargeRefunded:
+		if charge.Actual < 0 || charge.Actual > charge.Reserved || balance > common.MaxWalletQuota-charge.Actual {
+			return ErrOrganizationConflict
 		}
-		if balance != wallet.Balance || reserved != wallet.Reserved {
-			if err := writeOrganizationChargeWallet(tx, wallet, balance, reserved, now); err != nil {
-				return err
-			}
-		}
-		if err := organizationCAS(tx.Model(&OrganizationCharge{}).Where("id = ? AND state = ?", charge.ID, from).Updates(updates)); err != nil {
+		balance += charge.Actual
+		charge.RefundedAt, updates["refunded_at"] = now, now
+	}
+	if balance != wallet.Balance || reserved != wallet.Reserved {
+		if err := writeOrganizationChargeWallet(tx, wallet, balance, reserved, now); err != nil {
 			return err
 		}
-		charge.State = to
-		result = charge
-		return nil
-	})
-	return result, err
+	}
+	if err := organizationCAS(tx.Model(&OrganizationCharge{}).Where("id = ? AND state = ?", charge.ID, from).Updates(updates)); err != nil {
+		return err
+	}
+	charge.State = to
+	return nil
 }

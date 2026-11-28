@@ -340,13 +340,13 @@ func OrganizationTaskReadHandler(kind string) gin.HandlerFunc {
 			writeOrganizationAccessDenial(c, identity.UserID, 0, orgID, model.ErrOrganizationInvalidInput)
 			return
 		}
-		task, actorRole, err := model.ReadOrganizationTaskWithContext(c.Request.Context(), identity, orgID, rowID)
+		task, actorRole, err := model.ReadOrganizationTaskWithContext(c.Request.Context(), identity, orgID, rowID, kind == "detail")
 		if err != nil {
 			writeOrganizationAccessDenial(c, identity.UserID, actorRole, orgID, err)
 			return
 		}
 		beforePublish := func() error {
-			_, role, err := model.ReadOrganizationTaskWithContext(c.Request.Context(), identity, orgID, rowID)
+			_, role, err := model.ReadOrganizationTaskWithContext(c.Request.Context(), identity, orgID, rowID, kind == "detail")
 			actorRole = role
 			return err
 		}
