@@ -293,7 +293,7 @@ async function readOrganizationData(
   sid: string,
   path: string,
   signal: AbortSignal,
-  params?: { after_id: string; limit: number }
+  params?: Record<string, number | string>
 ): Promise<unknown> {
   const assertIdentity = () => {
     const auth = useAuthStore.getState().auth
@@ -319,6 +319,76 @@ async function readOrganizationData(
   // A malformed/null envelope is unavailable, never an empty successful list.
   return z.object({ success: z.literal(true), data: z.unknown() }).parse(result)
     .data
+}
+
+const quotaUnitsSchema = z
+  .string()
+  .regex(/^(0|[1-9][0-9]*)$/)
+  .refine((value) => Number.isSafeInteger(Number(value)))
+const organizationWalletSchema = z.object({
+  organization_id: idSchema,
+  balance: quotaUnitsSchema,
+  reserved: quotaUnitsSchema,
+  available: quotaUnitsSchema,
+})
+const organizationTaskLogsSchema = z.object({
+  items: z
+    .array(
+      z.object({
+        task_row_id: idSchema,
+        task_id: z.string(),
+        status: z.string(),
+        submit_time: z.number().int(),
+      })
+    )
+    .max(20),
+  total: z.number().int().nonnegative(),
+})
+
+export async function getOrganizationWallet(
+  actorId: number,
+  sid: string,
+  orgId: string,
+  signal: AbortSignal
+) {
+  try {
+    idSchema.parse(orgId)
+    const wallet = organizationWalletSchema.parse(
+      await readOrganizationData(
+        actorId,
+        sid,
+        `/api/organizations/${orgId}/wallet`,
+        signal
+      )
+    )
+    if (wallet.organization_id !== orgId) {
+      throw new Error('Organization wallet identity mismatch')
+    }
+    return wallet
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, signal)
+  }
+}
+
+export async function getOrganizationTaskLogs(
+  actorId: number,
+  sid: string,
+  orgId: string,
+  page: number,
+  signal: AbortSignal
+) {
+  try {
+    idSchema.parse(orgId)
+    return organizationTaskLogsSchema.parse(
+      await readOrganizationData(actorId, sid, '/api/task/self', signal, {
+        org_id: orgId,
+        p: page,
+        page_size: 20,
+      })
+    )
+  } catch (error) {
+    throw projectOrganizationRequestFailure(error, signal)
+  }
 }
 
 function validateCursor(next: string | null, afterId: string) {
